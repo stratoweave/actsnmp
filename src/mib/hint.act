@@ -1,0 +1,937 @@
+"""DISPLAY-HINT: parse, validate, render and parse back (RFC 2579 §3.1)
+
+Meant for runtime use (values whose mibmeta conversion is `string-hint`, and the CLI), so it
+imports nothing from the MIB compiler.
+
+- `parse(text)` compiles a hint into a `DisplayHint` (`HintError` when it does not parse);
+  `try_parse(text)` returns None instead. An integer-format hint is `x`, `o`, `b`, `d` or `d-N`;
+  an octet-format hint is one or more `OctetSpec`s `[*]<length><format>[sep[term]]` with format
+  x, d, o, a or t. The two forms cannot be confused: an octet-format hint starts with `*` or a
+  digit.
+- `check(h, base, enumerated, strict)` says whether a hint fits an SMI base type ("" when it
+  does, else the reason). `strict` applies RFC 2579 §3.1 literally (no hint on Counter32,
+  Counter64, Opaque); without it, the hint only has to be renderable for the base type.
+- `render_octets(h, b)` and `render_int(h, v)` render a value. They never raise: when the value
+  does not fit the hint (or the hint is of the other form) they fall back to a plain rendering,
+  and `render_octets_ex` / `render_int_ex` return that fact as a `Rendered` with `ok = False`
+  and a reason. The octet fallback is lower-case hex pairs joined by `:` (the yang:hex-string
+  form, "" for no octets); the integer fallback is the decimal number.
+- `parse_octets(h, text)` and `parse_int(h, text)` are the inverse, for SET and configuration.
+  They raise `HintError` when the text does not match the hint or is ambiguous. Where the
+  rendering is not injective (a short final `d`/`o` application; `1d` renders both 01 02 and
+  0c as `12`), the octets returned render to the same text. Octets that a `t` application
+  discarded (an incomplete character) cannot be recovered.
+- `format_octets(text, b)` / `format_int(text, v)` parse the hint text and render in one step
+  (an unparseable hint gives the fallback).
+
+Rendering policy (RFC mode, the default), beyond the RFC text:
+
+- `x` renders every application zero-padded to two hex digits per octet consumed (matches
+  yang:mac-address and pysnmp for one-octet applications). `d` and `o` render the big-endian
+  unsigned number without leading zeros, also beyond 64 bits.
+- An application of length 0 consumes no octets and renders nothing (it only produces its
+  separator, as in the `0a[2x:...]0a:2d` idiom). When a length-0 specification would have to
+  be re-applied to remaining octets (it can never consume them), the value falls back.
+- When the specifications are used up, the last one is re-applied including its repeat
+  indicator (RFC 2579 §3.1 "the last octet-format specification is re-interpreted").
+- Repetitions stop when the value is exhausted. A separator or terminator is suppressed when
+  nothing but other separators and terminators follow it (RFC rule "suppressed if it would
+  occur as the last character of the display", applied repeatedly).
+- `a` is ASCII per the RFC, but octets >= 0x80 that form valid UTF-8 are accepted and rendered
+  as text (devices put UTF-8 into DisplayString). `t` is UTF-8. Octets that are not valid UTF-8
+  make the value fall back, except an incomplete character at the end of a `t` application,
+  which is discarded as the RFC says. When consecutive `a`/`t` applications are rendered with
+  nothing between them (no separator, as with the common `1t` and `1a` hints), a character
+  split between them is joined, so `1t` renders UTF-8 text instead of dropping every
+  multi-octet character.
+- Control characters (including NUL) are kept as they are; escaping them is the caller's job.
+
+`netsnmp=True` reproduces net-snmp 5.9 (`sprint_realloc_octet_string`,
+`sprint_realloc_hinted_integer`) for comparing CLI output, verified against libnetsnmp:
+
+- `x` without padding, except a one-octet application below 16 when the specification has no
+  separator and is the last one (`0:1a:2b:3c:4d:5e` for `1x:`, `0a0b0c` for `1x`);
+- the separator is written whenever octets remain, also before the repeat terminator; the
+  terminator is written when octets remain;
+- the re-applied last specification does not read a repeat count; a length of 0 counts as 1;
+- numbers are C `long`s: `d` of more than 7 octets wraps to a signed 64-bit value, `x` and `o`
+  print its 64-bit two's complement;
+- `a`/`t` octets are copied as they are; an application containing NUL prints printable
+  ASCII, escapes `\\` and `"` and prints other octets as `.`; octets that are not valid UTF-8
+  make the value fall back (net-snmp prints them raw);
+- integers: `d-N` without a leading zero (`.05`, `-.05`), `x` and `o` of a negative value in
+  64-bit two's complement, `b` as exactly 32 binary digits.
+- Not reproduced: net-snmp reads past the end of the value when a numeric application has
+  fewer octets left than its length (undefined behaviour); here only the remaining octets are
+  used.
+
+Known pysnmp 7.1 differences (`TextualConvention.prettyOut`; the comparison vectors are in
+test_hint.act): `x` pads to 2 digits per application (`2001:db8:00:...`), `o` pads to 3
+digits; the specification list restarts from the beginning instead of re-applying the last
+one; `*` is broken (the separator is dropped and the terminator written after every
+repetition, and missing octets render as 0); `a` and `t` drop non-ASCII or split characters;
+a length-0 specification loops forever; integers: `x` gives `0xff`, `o` `010`, `b` `101B`
+(and loops forever on a negative value), `d-N` computes with floats.
+"""
+
+_FORMATS = "xdoat"
+
+# The longest OCTET STRING (RFC 2578 section 7.1.2); parse_octets refuses to build a longer one
+MAX_OCTETS = 65535
+
+_HEX: list[str] = ["%02x" % i for i in range(256)]
+
+# UTF-8 scan results
+_UTF8_OK = 0
+_UTF8_INCOMPLETE = 1
+_UTF8_INVALID = 2
+
+
+class HintError(ValueError):
+    """A DISPLAY-HINT that does not parse, or text that does not match a hint (`parse_*`)."""
+    def __init__(self, msg: str):
+        ValueError.__init__(self, msg)
+
+
+class OctetSpec(object):
+    """One octet-format specification: `repeat` (leading `*`), `length` (octets per application,
+    may be 0), `fmt` (x, d, o, a or t), `sep` and `term` (one character each, "" when absent;
+    `term` only with `repeat` and `sep`)."""
+    repeat: bool
+    length: int
+    fmt: str
+    sep: str
+    term: str
+
+    def __init__(self, repeat: bool, length: int, fmt: str, sep: str, term: str):
+        self.repeat = repeat
+        self.length = length
+        self.fmt = fmt
+        self.sep = sep
+        self.term = term
+
+    def __str__(self) -> str:
+        return ("*" if self.repeat else "") + str(self.length) + self.fmt + self.sep + self.term
+
+    def __repr__(self) -> str:
+        return "OctetSpec(" + self.__str__() + ")"
+
+
+class DisplayHint(object):
+    """A compiled DISPLAY-HINT. `text` is the hint as written. `integer` tells the form: an
+    integer-format hint has `int_fmt` (d, x, o or b) and `decimals` (the N of `d-N`, else 0); an
+    octet-format hint has `specs`."""
+    text: str
+    integer: bool
+    int_fmt: str
+    decimals: int
+    specs: list[OctetSpec]
+
+    def __init__(self, text: str, integer: bool, int_fmt: str, decimals: int, specs: list[OctetSpec]):
+        self.text = text
+        self.integer = integer
+        self.int_fmt = int_fmt
+        self.decimals = decimals
+        self.specs = specs
+
+    def __str__(self) -> str:
+        return self.text
+
+    def __repr__(self) -> str:
+        return "DisplayHint(" + self.text + ")"
+
+
+class Rendered(object):
+    """A rendering: `text`, and `ok` False when the value did not fit the hint and `text` is
+    the fallback (`reason` says why)."""
+    text: str
+    ok: bool
+    reason: str
+
+    def __init__(self, text: str, ok: bool, reason: str):
+        self.text = text
+        self.ok = ok
+        self.reason = reason
+
+    def __repr__(self) -> str:
+        if self.ok:
+            return "Rendered(" + repr(self.text) + ")"
+        return "Rendered(" + repr(self.text) + ", fallback: " + self.reason + ")"
+
+
+# --- parsing -------------------------------------------------------------------------------------
+
+def _is_digit(c: str) -> bool:
+    return c >= "0" and c <= "9"
+
+
+def _all_digits(s: str) -> bool:
+    if s == "":
+        return False
+    for c in s:
+        if not _is_digit(c):
+            return False
+    return True
+
+
+def _is_sep(c: str) -> bool:
+    """A separator or terminator character: anything but a decimal digit and `*`."""
+    return c != "*" and not _is_digit(c)
+
+
+def _significant(s: str) -> int:
+    """The number of digits of s without its leading zeros (s is all digits; "0" counts 1)."""
+    k = 0
+    while k < len(s) - 1 and s[k] == "0":
+        k += 1
+    return len(s) - k
+
+
+def parse(text: str) -> DisplayHint:
+    """Compile a DISPLAY-HINT (RFC 2579 section 3.1); raises HintError.
+
+    The text is taken as it is: no white space is stripped (a blank can be a separator)."""
+    n = len(text)
+    if n == 0:
+        raise HintError("empty DISPLAY-HINT")
+    c0 = text[0]
+    if c0 == "x" or c0 == "o" or c0 == "b":
+        if n == 1:
+            return DisplayHint(text, True, c0, 0, [])
+        raise HintError("integer-format \"" + text + "\": nothing may follow " + c0)
+    if c0 == "d":
+        if n == 1:
+            return DisplayHint(text, True, "d", 0, [])
+        if text[1] == "-" and _all_digits(text[2:]):
+            if _significant(text[2:]) > 3:
+                raise HintError("integer-format \"" + text + "\": too many decimal places")
+            return DisplayHint(text, True, "d", int(text[2:]), [])
+        raise HintError("integer-format \"" + text + "\": expected d or d-<digits>")
+    specs: list[OctetSpec] = []
+    i = 0
+    while i < n:
+        rep = False
+        if text[i] == "*":
+            rep = True
+            i += 1
+        j = i
+        while i < n and _is_digit(text[i]):
+            i += 1
+        if i == j:
+            raise HintError("octet-format \"" + text + "\": octet length expected at position %d" % j)
+        if _significant(text[j:i]) > 6:
+            raise HintError("octet-format \"" + text + "\": octet length too large")
+        length = int(text[j:i])
+        if i >= n:
+            raise HintError("octet-format \"" + text + "\": display format expected at the end")
+        f = text[i]
+        if f not in _FORMATS:
+            raise HintError("octet-format \"" + text + "\": bad display format '" + f + "' at position %d" % i)
+        i += 1
+        sep = ""
+        term = ""
+        if i < n and _is_sep(text[i]):
+            sep = text[i]
+            i += 1
+            if rep and i < n and _is_sep(text[i]):
+                term = text[i]
+                i += 1
+        specs.append(OctetSpec(rep, length, f, sep, term))
+    return DisplayHint(text, False, "", 0, specs)
+
+
+def try_parse(text: str) -> ?DisplayHint:
+    """Like `parse`, but None when the hint does not parse."""
+    try:
+        return parse(text)
+    except HintError:
+        return None
+
+
+def check(h: DisplayHint, base: str, enumerated: bool=False, strict: bool=False) -> str:
+    """Why hint `h` does not fit the SMI base type `base`, "" when it fits.
+
+    `base` is a wire type name as in mibmeta's `SyntaxMeta.wire` (Integer32 is taken as
+    INTEGER). Nothing fits an enumeration (`enumerated`), BITS, OBJECT IDENTIFIER or IpAddress.
+    Otherwise, without `strict`, a hint fits when it can be rendered: an integer-format hint on
+    any integer type, an octet-format hint on OCTET STRING and Opaque. `strict` adds the RFC
+    2579 section 3.1 prohibitions (Counter32, Counter64) and allows octet-format hints only on OCTET
+    STRING."""
+    b = "INTEGER" if base == "Integer32" else base
+    if b == "BITS" or b == "OBJECT IDENTIFIER" or b == "IpAddress":
+        return "RFC 2579 §3.1 forbids a DISPLAY-HINT on " + b
+    if enumerated:
+        return "RFC 2579 §3.1 forbids a DISPLAY-HINT on an enumeration"
+    if h.integer:
+        if b == "INTEGER" or b == "Unsigned32" or b == "Gauge32" or b == "TimeTicks":
+            return ""
+        if b == "Counter32" or b == "Counter64":
+            return "RFC 2579 §3.1 forbids a DISPLAY-HINT on " + b if strict else ""
+        if b == "OCTET STRING" or b == "Opaque":
+            return "integer-format DISPLAY-HINT \"" + h.text + "\" on " + b
+        return "no DISPLAY-HINT applies to " + (b if b != "" else "an unknown type")
+    if b == "OCTET STRING":
+        return ""
+    if b == "Opaque":
+        return "an octet-format DISPLAY-HINT on Opaque is not RFC 2579" if strict else ""
+    if b == "INTEGER" or b == "Unsigned32" or b == "Gauge32" or b == "TimeTicks" or b == "Counter32" or b == "Counter64":
+        return "octet-format DISPLAY-HINT \"" + h.text + "\" on " + b
+    return "no DISPLAY-HINT applies to " + (b if b != "" else "an unknown type")
+
+
+# --- helpers ---------------------------------------------------------------------------------------
+
+def hex_fallback(b: bytes) -> str:
+    """The octet fallback: lower-case hex pairs joined by `:` ("" for no octets)."""
+    return ":".join([_HEX[c] for c in b])
+
+
+def _big_digits(v: bigint, base: int) -> str:
+    """Digits of a non-negative bigint in base 2, 8, 10 or 16, without leading zeros."""
+    if base == 10:
+        return str(v)
+    if v == bigint(0):
+        return "0"
+    bb = bigint(base)
+    out: list[str] = []
+    x = v
+    while x > bigint(0):
+        d = int(x % bb)
+        out.append("0123456789abcdef"[d])
+        x = x // bb
+    out.reverse()
+    return "".join(out)
+
+
+def _bin_digits(v: int) -> str:
+    """Binary digits of a non-negative int, without leading zeros."""
+    if v == 0:
+        return "0"
+    out: list[str] = []
+    x = v
+    while x > 0:
+        out.append("1" if (x & 1) == 1 else "0")
+        x = x >> 1
+    out.reverse()
+    return "".join(out)
+
+
+def _mag_digits(v: int, f: str) -> str:
+    """Digits of |v| for format d, x, o or b (also for the most negative int)."""
+    if v < 0:
+        if v == -9223372036854775807 - 1:
+            base = 10 if f == "d" else 16 if f == "x" else 8 if f == "o" else 2
+            return _big_digits(-bigint(v), base)
+        return _mag_digits(-v, f)
+    if f == "d":
+        return str(v)
+    if f == "x":
+        return "%x" % v
+    if f == "o":
+        return "%o" % v
+    return _bin_digits(v)
+
+
+def _u64_digits(v: int, f: str) -> str:
+    """Digits of v read as an unsigned 64-bit number (C `%lx`, `%lo`)."""
+    if v >= 0:
+        return _mag_digits(v, f)
+    u = bigint(v) + (bigint(1) << 64)
+    return _big_digits(u, 16 if f == "x" else 8 if f == "o" else 10)
+
+
+def _utf8_scan(b: bytes) -> (int, int):
+    """(end, status) of the longest valid UTF-8 prefix of b: status _UTF8_OK (all of b),
+    _UTF8_INCOMPLETE (b[end:] is a truncated but so far valid character) or _UTF8_INVALID."""
+    n = len(b)
+    i = 0
+    while i < n:
+        c = b[i]
+        if c < 0x80:
+            i += 1
+            continue
+        need = 0
+        lo = 0x80
+        hi = 0xbf
+        if c >= 0xc2 and c <= 0xdf:
+            need = 1
+        elif c == 0xe0:
+            need = 2
+            lo = 0xa0
+        elif (c >= 0xe1 and c <= 0xec) or c == 0xee or c == 0xef:
+            need = 2
+        elif c == 0xed:
+            need = 2
+            hi = 0x9f
+        elif c == 0xf0:
+            need = 3
+            lo = 0x90
+        elif c >= 0xf1 and c <= 0xf3:
+            need = 3
+        elif c == 0xf4:
+            need = 3
+            hi = 0x8f
+        else:
+            return (i, _UTF8_INVALID)
+        if i + 1 >= n:
+            return (i, _UTF8_INCOMPLETE)
+        c1 = b[i + 1]
+        if c1 < lo or c1 > hi:
+            return (i, _UTF8_INVALID)
+        k = 2
+        while k <= need:
+            if i + k >= n:
+                return (i, _UTF8_INCOMPLETE)
+            ck = b[i + k]
+            if ck < 0x80 or ck > 0xbf:
+                return (i, _UTF8_INVALID)
+            k += 1
+        i += need + 1
+    return (n, _UTF8_OK)
+
+
+def _decode(b: bytes) -> ?str:
+    """b as UTF-8 text (b was validated by _utf8_scan); None if the decoder disagrees."""
+    try:
+        return b.decode()
+    except ValueError:
+        return None
+
+
+def _netsnmp_ascii(b: bytes) -> str:
+    """net-snmp sprint_realloc_asciistring: printable ASCII, `\\` and `"` escaped, else `.`."""
+    out: list[str] = []
+    for c in b:
+        if c == 0x5c:
+            out.append("\\\\")
+        elif c == 0x22:
+            out.append("\\\"")
+        elif c >= 0x20 and c < 0x7f:
+            out.append(chr(c))
+        else:
+            out.append(".")
+    return "".join(out)
+
+
+def _number(b: bytes, s: int, e: int, f: str) -> str:
+    """RFC mode: octets b[s:e] as a big-endian unsigned number in format x, d or o."""
+    if e <= s:
+        return ""
+    if f == "x":
+        return "".join([_HEX[b[i]] for i in range(s, e)])
+    if e - s <= 7:
+        v: int = 0
+        for i in range(s, e):
+            v = v * 256 + b[i]
+        return str(v) if f == "d" else "%o" % v
+    bv = bigint(0)
+    for i in range(s, e):
+        bv = bv * bigint(256) + bigint(b[i])
+    return _big_digits(bv, 10 if f == "d" else 8)
+
+
+def _number_netsnmp(b: bytes, s: int, e: int, f: str, width: int, pad_ok: bool) -> str:
+    """net-snmp mode: octets b[s:e] as a C long (wrapping), printed with %lx, %ld or %lo."""
+    v: int = 0
+    for i in range(s, e):
+        v = v * 256 + b[i]
+    if f == "x":
+        if v >= 0 and v < 16 and width == 1 and pad_ok:
+            return "0%x" % v
+        return _u64_digits(v, "x")
+    if f == "d":
+        return str(v)
+    return _u64_digits(v, "o")
+
+
+# --- rendering -------------------------------------------------------------------------------------
+
+class _Out(object):
+    """Rendering state: the pieces, the number of pieces up to the last one with text (the
+    separators and terminators after it are suppressed), and an incomplete UTF-8 character
+    carried from the previous a/t application."""
+    pieces: list[str]
+    keep: int
+    carry: bytes
+    carry_fmt: str
+    error: str
+
+    def __init__(self):
+        self.pieces = []
+        self.keep = 0
+        self.carry = b""
+        self.carry_fmt = ""
+        self.error = ""
+
+    def resolve(self, netsnmp: bool) -> None:
+        """Something other than an a/t application follows: a carried incomplete character is
+        discarded after `t` (RFC), and makes the value fall back otherwise."""
+        if len(self.carry) > 0:
+            if self.carry_fmt == "t" and not netsnmp:
+                self.carry = b""
+            elif self.error == "":
+                self.error = "octets that are not valid UTF-8"
+
+    def text(self, t: str) -> None:
+        if t != "":
+            self.pieces.append(t)
+            self.keep = len(self.pieces)
+
+    def sep(self, c: str, netsnmp: bool) -> None:
+        self.resolve(netsnmp)
+        self.pieces.append(c)
+
+    def chars(self, data: bytes, f: str, netsnmp: bool) -> None:
+        """One a/t application."""
+        d = self.carry + data if len(self.carry) > 0 else data
+        self.carry = b""
+        r = _utf8_scan(d)
+        end = r.0
+        st = r.1
+        if st == _UTF8_INVALID:
+            if self.error == "":
+                self.error = "octets that are not valid UTF-8"
+            return
+        t = _decode(d[:end] if end < len(d) else d)
+        if t is not None:
+            self.text(t)
+        elif self.error == "":
+            self.error = "octets that are not valid UTF-8"
+        if st == _UTF8_INCOMPLETE:
+            self.carry = d[end:]
+            self.carry_fmt = f
+
+    def result(self) -> str:
+        if self.keep < len(self.pieces):
+            return "".join(self.pieces[:self.keep])
+        return "".join(self.pieces)
+
+
+def _render_octets(h: DisplayHint, b: bytes, netsnmp: bool) -> (str, str):
+    """(text, "") or ("", reason)."""
+    if h.integer:
+        return ("", "integer-format DISPLAY-HINT \"" + h.text + "\" on an octet string")
+    specs = h.specs
+    ns = len(specs)
+    if ns == 0:
+        return ("", "empty DISPLAY-HINT")
+    n = len(b)
+    o = _Out()
+    pos = 0
+    si = 0
+    while pos < n:
+        reuse = si >= ns
+        sp = specs[ns - 1] if reuse else specs[si]
+        is_last = si >= ns - 1
+        si += 1
+        width = sp.length
+        if netsnmp and width == 0:
+            width = 1
+        if reuse and width == 0 and not sp.repeat:
+            return ("", "the octet length 0 of the last octet-format specification cannot consume the remaining octets")
+        count = 1
+        if sp.repeat and not (netsnmp and reuse):
+            count = b[pos]
+            pos += 1
+        f = sp.fmt
+        r = 0
+        while r < count and pos < n:
+            e = pos + width
+            if e > n:
+                e = n
+            if f == "a" or f == "t":
+                if netsnmp and width > 0 and b.find(b"\x00", pos, e) >= 0:
+                    o.resolve(netsnmp)
+                    o.text(_netsnmp_ascii(b[pos:e]))
+                else:
+                    o.chars(b[pos:e], f, netsnmp)
+            else:
+                o.resolve(netsnmp)
+                if netsnmp:
+                    o.text(_number_netsnmp(b, pos, e, f, width, sp.sep == "" and is_last))
+                else:
+                    o.text(_number(b, pos, e, f))
+            pos = e
+            r += 1
+            if sp.sep != "":
+                if netsnmp:
+                    if pos < n:
+                        o.sep(sp.sep, netsnmp)
+                elif not (r == count and sp.term != ""):
+                    o.sep(sp.sep, netsnmp)
+        if sp.term != "":
+            if netsnmp:
+                if pos < n:
+                    o.sep(sp.term, netsnmp)
+            else:
+                o.sep(sp.term, netsnmp)
+        if o.error != "":
+            return ("", o.error)
+    o.resolve(netsnmp)
+    if o.error != "":
+        return ("", o.error)
+    return (o.result(), "")
+
+
+def render_octets_ex(h: DisplayHint, b: bytes, netsnmp: bool=False) -> Rendered:
+    """Render an OCTET STRING value with an octet-format hint (see the module doc); never raises.
+    `netsnmp` selects the net-snmp 5.9 compatible rendering."""
+    r = _render_octets(h, b, netsnmp)
+    if r.1 == "":
+        return Rendered(r.0, True, "")
+    return Rendered(hex_fallback(b), False, r.1)
+
+
+def render_octets(h: DisplayHint, b: bytes, netsnmp: bool=False) -> str:
+    """The text of `render_octets_ex` (the hex fallback when the value does not fit)."""
+    r = _render_octets(h, b, netsnmp)
+    if r.1 == "":
+        return r.0
+    return hex_fallback(b)
+
+
+def _render_int(h: DisplayHint, v: int, netsnmp: bool) -> (str, str):
+    if not h.integer:
+        return ("", "octet-format DISPLAY-HINT \"" + h.text + "\" on an integer")
+    f = h.int_fmt
+    if netsnmp:
+        if f == "x" or f == "o":
+            return (_u64_digits(v, f), "")
+        if f == "b":
+            out: list[str] = []
+            bit = 31
+            while bit >= 0:
+                out.append("1" if ((v >> bit) & 1) == 1 else "0")
+                bit -= 1
+            return ("".join(out), "")
+        digits = _mag_digits(v, "d")
+        k = h.decimals
+        if k > 0:
+            ln = len(digits)
+            if k <= ln:
+                digits = digits[:ln - k] + "." + digits[ln - k:]
+            else:
+                digits = "." + "0" * (k - ln) + digits
+        return ("-" + digits if v < 0 else digits, "")
+    digits = _mag_digits(v, f)
+    k = h.decimals
+    if f == "d" and k > 0:
+        ln = len(digits)
+        if ln <= k:
+            digits = "0" * (k - ln + 1) + digits
+            ln = k + 1
+        digits = digits[:ln - k] + "." + digits[ln - k:]
+    return ("-" + digits if v < 0 else digits, "")
+
+
+def render_int_ex(h: DisplayHint, v: int, netsnmp: bool=False) -> Rendered:
+    """Render an integer with an integer-format hint: `d` decimal, `d-N` with N implied decimal
+    places (`12.34`, `-0.05`), `x` hex (lower case), `o` octal, `b` binary, a minus sign before
+    the digits of a negative value (RFC 2579 section 3.1). Never raises; an octet-format hint gives the
+    decimal fallback with `ok = False`."""
+    r = _render_int(h, v, netsnmp)
+    if r.1 == "":
+        return Rendered(r.0, True, "")
+    return Rendered(str(v), False, r.1)
+
+
+def render_int(h: DisplayHint, v: int, netsnmp: bool=False) -> str:
+    """The text of `render_int_ex`."""
+    r = _render_int(h, v, netsnmp)
+    if r.1 == "":
+        return r.0
+    return str(v)
+
+
+def format_octets(hint: str, b: bytes, netsnmp: bool=False) -> str:
+    """Parse `hint` and render `b`; the hex fallback when the hint does not parse."""
+    h = try_parse(hint)
+    if h is not None:
+        return render_octets(h, b, netsnmp)
+    return hex_fallback(b)
+
+
+def format_int(hint: str, v: int, netsnmp: bool=False) -> str:
+    """Parse `hint` and render `v`; the decimal number when the hint does not parse."""
+    h = try_parse(hint)
+    if h is not None:
+        return render_int(h, v, netsnmp)
+    return str(v)
+
+
+# --- parsing values back (SET, configuration) ------------------------------------------------------
+
+def _digit_value(c: str, f: str) -> int:
+    """The value of digit c in format f (x, d, o, b), or -1."""
+    o = ord(c)
+    v = -1
+    if o >= 48 and o <= 57:
+        v = o - 48
+    elif o >= 97 and o <= 102:
+        v = o - 87
+    elif o >= 65 and o <= 70:
+        v = o - 55
+    base = 16 if f == "x" else 10 if f == "d" else 8 if f == "o" else 2
+    if v >= base:
+        return -1
+    return v
+
+
+def _utf8_len(c: str) -> int:
+    o = ord(c)
+    if o < 0x80:
+        return 1
+    if o < 0x800:
+        return 2
+    if o < 0x10000:
+        return 3
+    return 4
+
+
+class _In(object):
+    """Parsing state over the text."""
+    text: str
+    pos: int
+    out: list[int]
+
+    def __init__(self, text: str):
+        self.text = text
+        self.pos = 0
+        self.out = []
+
+    def more(self) -> bool:
+        return self.pos < len(self.text)
+
+    def at(self, c: str) -> bool:
+        return c != "" and self.pos < len(self.text) and self.text[self.pos] == c
+
+    def fail(self, msg: str) -> HintError:
+        return HintError(msg + " at position %d of \"" % self.pos + self.text + "\"")
+
+
+def _parse_number(st: _In, sp: OctetSpec, stops: str) -> None:
+    """One x/d/o application: digits, then the value as `length` big-endian octets, or as
+    fewer octets for a short final `x` application (an even number of digits, fewer than two
+    per octet of the length, that ends the text: the renderer pads to 2 digits per octet, so
+    only the end of the value gives fewer)."""
+    if sp.length == 0:
+        # renders nothing, so it reads nothing (its digits belong to the next application)
+        return
+    t = st.text
+    n = len(t)
+    f = sp.fmt
+    start = st.pos
+    limit = n
+    stop_chars = stops
+    if f == "x" and (sp.sep == "" or _digit_value(sp.sep, "x") >= 0):
+        # fixed width (the renderer writes 2 digits per octet) without a separator, or with a
+        # separator that is itself a hex digit (`1xa`: unpadded groups would be ambiguous)
+        stop_chars = ""
+        if start + 2 * sp.length < limit:
+            limit = start + 2 * sp.length
+    # without a separator, a 0 is an application of its own: the renderer writes no leading
+    # zeros, so 0 followed by more digits is two applications (`1d` over 00 39 renders 057)
+    zero_app = (f == "d" or f == "o") and sp.sep == "" and start < n and t[start] == "0"
+    if zero_app:
+        limit = start + 1
+    bv = bigint(0)
+    base = bigint(16 if f == "x" else 10 if f == "d" else 8)
+    # significant digits of the largest value that fits (3 per octet bound d and o): more is an
+    # error, and is not accumulated (bigint arithmetic on long input is quadratic)
+    maxsig = (2 if f == "x" else 3) * (sp.length if sp.length < MAX_OCTETS else MAX_OCTETS)
+    sig = 0
+    i = start
+    while i < limit:
+        c = t[i]
+        if c in stop_chars:
+            break
+        d = _digit_value(c, f)
+        if d < 0:
+            break
+        if sig > 0 or d > 0:
+            sig += 1
+        if sig <= maxsig:
+            bv = bv * base + bigint(d)
+        i += 1
+    if i == start:
+        raise st.fail("digits expected for \"" + str(sp) + "\"")
+    if (f == "d" or f == "o") and sp.sep == "" and i < n and not zero_app:
+        raise st.fail("ambiguous: \"" + str(sp) + "\" has no separator and more text follows")
+    st.pos = i
+    if sig > maxsig:
+        raise HintError("value " + t[start:i] + " does not fit in %d octets (\"" % sp.length + str(sp) + "\")")
+    nb = sp.length
+    nd = i - start
+    if f == "x" and i == n and nd < 2 * nb and nd % 2 == 0:
+        nb = nd // 2
+    if len(st.out) + nb > MAX_OCTETS:
+        raise st.fail("more than %d octets" % MAX_OCTETS)
+    octs: list[int] = [0] * nb
+    x = bv
+    k = nb - 1
+    b256 = bigint(256)
+    while k >= 0 and x != bigint(0):
+        octs[k] = int(x % b256)
+        x = x // b256
+        k -= 1
+    if x != bigint(0):
+        raise HintError("value " + t[start:i] + " does not fit in %d octets (\"" % nb + str(sp) + "\")")
+    for o in octs:
+        st.out.append(o)
+
+
+def _parse_chars(st: _In, sp: OctetSpec, join: bool) -> None:
+    """One a/t application: the characters of `length` octets, or of fewer at the end of the
+    text. The renderer only ends an application early at the end of the value, so separator
+    and terminator characters before the length is reached are data. A character that would
+    cross the length is left to the next application, except when it is the first and `join`
+    (the next applications are of the same specification with nothing between them, so the
+    renderer joins a character split between them); otherwise it does not fit."""
+    t = st.text
+    n = len(t)
+    used = 0
+    i = st.pos
+    while i < n and used < sp.length:
+        ln = _utf8_len(t[i])
+        if used + ln > sp.length and (used > 0 or not join):
+            break
+        used += ln
+        i += 1
+    if i == st.pos and i < n and sp.length > 0:
+        raise st.fail("a character does not fit in \"" + str(sp) + "\"")
+    if i > st.pos:
+        for x in t[st.pos:i].encode():
+            st.out.append(x)
+    st.pos = i
+
+
+def _parse_app(st: _In, sp: OctetSpec, stops: str, join: bool) -> None:
+    if sp.fmt == "a" or sp.fmt == "t":
+        _parse_chars(st, sp, join)
+    else:
+        _parse_number(st, sp, stops)
+
+
+def parse_octets(h: DisplayHint, text: str) -> bytes:
+    """The octets whose rendering (RFC mode) is `text`; raises HintError.
+
+    Lenient where the rendering is not: hex digits in either case, leading zeros, and unpadded
+    hex groups when the separator is not itself a hex digit (`0:1a:2b:3c:4d:5e` for `1x:`).
+    Text that only a short final application can produce (`2x` over three octets renders
+    `000102`) parses to the shorter value. A repeat specification needs a terminator unless it
+    is the last one. `d` and `o` without a separator are only accepted at the end of the text.
+    More than MAX_OCTETS octets are refused."""
+    if h.integer:
+        raise HintError("integer-format DISPLAY-HINT \"" + h.text + "\" on an octet string")
+    specs = h.specs
+    ns = len(specs)
+    st = _In(text)
+    si = 0
+    while st.more():
+        reuse = si >= ns
+        sp = specs[ns - 1] if reuse else specs[si]
+        last = si >= ns - 1
+        si += 1
+        if sp.repeat and (sp.fmt == "a" or sp.fmt == "t") and sp.sep == "":
+            # without a separator (so without a terminator) only as the last specification:
+            # the renderer joins characters across its applications and repeat counts, so the
+            # rest of the text is cut into groups of 255 applications of `length` octets
+            if not last or sp.length == 0:
+                raise st.fail("ambiguous: repeat \"" + str(sp) + "\" " + ("has no terminator" if not last else "consumes no octets"))
+            data = st.text[st.pos:].encode()
+            st.pos = len(st.text)
+            group = 255 * sp.length
+            k = 0
+            while k < len(data) and len(st.out) <= MAX_OCTETS:
+                e = k + group if k + group < len(data) else len(data)
+                st.out.append((e - k + sp.length - 1) // sp.length)
+                for o in data[k:e]:
+                    st.out.append(o)
+                k = e
+        elif sp.repeat:
+            if sp.term == "" and not last:
+                raise st.fail("ambiguous: repeat \"" + str(sp) + "\" has no terminator")
+            stops = sp.sep + sp.term
+            cpos = len(st.out)
+            st.out.append(0)
+            count = 0
+            # the renderer drops the separator before the terminator, and a terminator that
+            # would be the last character, so after an a/t separator, and at the end of the
+            # text, an a/t character is data even when it is the terminator character
+            chars = sp.fmt == "a" or sp.fmt == "t"
+            after_sep = False
+            while st.more() and ((chars and (after_sep or st.pos == len(st.text) - 1)) or not st.at(sp.term)):
+                if count == 255:
+                    if sp.term != "":
+                        raise st.fail("more than 255 repetitions")
+                    break
+                before = st.pos
+                _parse_app(st, sp, stops, False)
+                if st.pos == before:
+                    raise st.fail("cannot parse \"" + str(sp) + "\"")
+                count += 1
+                after_sep = False
+                if st.at(sp.sep):
+                    st.pos += 1
+                    after_sep = True
+                elif st.more() and not st.at(sp.term) and sp.sep != "":
+                    raise st.fail("separator '" + sp.sep + "' expected")
+            st.out[cpos] = count
+            if st.at(sp.term):
+                st.pos += 1
+        else:
+            if reuse and sp.length == 0:
+                raise st.fail("the last octet-format \"" + str(sp) + "\" consumes no octets")
+            _parse_app(st, sp, sp.sep, sp.sep == "" and last)
+            if st.more() and sp.sep != "":
+                if not st.at(sp.sep):
+                    raise st.fail("separator '" + sp.sep + "' expected")
+                st.pos += 1
+        if len(st.out) > MAX_OCTETS:
+            raise st.fail("more than %d octets" % MAX_OCTETS)
+    return bytes(st.out)
+
+
+def parse_int(h: DisplayHint, text: str) -> int:
+    """The integer whose rendering (RFC mode) is `text`; raises HintError.
+
+    `d-N` accepts up to N decimal places (`12.3` is 1230 for `d-2`, `.05` is 5); `x` accepts an
+    optional `0x` prefix and either case; a leading `-` is accepted for every format."""
+    if not h.integer:
+        raise HintError("octet-format DISPLAY-HINT \"" + h.text + "\" on an integer")
+    t = text.strip()
+    neg = False
+    if t.startswith("-"):
+        neg = True
+        t = t[1:]
+    f = h.int_fmt
+    if f == "x" and (t.startswith("0x") or t.startswith("0X")):
+        t = t[2:]
+    k = h.decimals
+    frac = ""
+    if f == "d" and "." in t:
+        if k == 0:
+            raise HintError("\"" + text + "\": no decimal places in \"" + h.text + "\"")
+        p = t.find(".")
+        frac = t[p + 1:]
+        t = t[:p]
+        if len(frac) > k:
+            raise HintError("\"" + text + "\": more than %d decimal places" % k)
+        if t == "" and frac == "":
+            raise HintError("\"" + text + "\": digits expected")
+    elif t == "":
+        raise HintError("\"" + text + "\": digits expected")
+    if f == "d":
+        t = t + frac + "0" * (k - len(frac))
+    bv = bigint(0)
+    base = bigint(16 if f == "x" else 10 if f == "d" else 8 if f == "o" else 2)
+    for c in t:
+        d = _digit_value(c, f)
+        if d < 0:
+            raise HintError("\"" + text + "\": bad digit '" + c + "' for \"" + h.text + "\"")
+        bv = bv * base + bigint(d)
+    if neg:
+        bv = -bv
+    if bv > bigint(9223372036854775807) or bv < -bigint(9223372036854775807) - bigint(1):
+        raise HintError("\"" + text + "\": out of range")
+    return int(bv)

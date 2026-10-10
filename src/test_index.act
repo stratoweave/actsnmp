@@ -1,0 +1,537 @@
+"""Tests for index: instance suffix decoding and encoding
+
+Covers every encoding kind of IndexPart.enc, multi-part indexes from
+standard MIBs and the lab dataset's tables as both lab agents serve them.
+"""
+
+import testing
+import errors
+import index
+import mib.meta
+import values
+from index import IndexPart, IndexDecodeError
+from oid import Oid
+from values import Value, Integer, OctetString, ObjectIdentifier, IpAddress
+from testutil import Lcg
+
+
+def spec(s: str) -> list[IndexPart]:
+    return index.parse_spec(s)
+
+
+def od(s: str) -> list[int]:
+    """Dotted sub-ids ("" is the empty suffix)."""
+    if s == "":
+        return []
+    return [int(x) for x in s.split(".")]
+
+
+def os(s: str) -> Value:
+    return OctetString(s.encode())
+
+
+def oh(s: str) -> Value:
+    return OctetString(bytes.from_hex(s))
+
+
+def oi(s: str) -> Value:
+    return ObjectIdentifier(Oid.parse(s))
+
+
+def ip(a: int, b: int, c: int, d: int) -> Value:
+    return IpAddress(bytes([a, b, c, d]))
+
+
+def check(suffix: str, sp: str, vals: list[Value]) -> None:
+    """suffix decodes to vals under spec sp, and vals encode back to suffix."""
+    parts = spec(sp)
+    testing.assertEqual(index.decode_index(od(suffix), parts), vals, sp + " decode " + suffix)
+    testing.assertEqual(index.encode_index(vals, parts), od(suffix), sp + " encode " + suffix)
+
+
+def _test_each_kind() -> None:
+    check("5", "int", [Integer(5)])
+    check("0", "int", [Integer(0)])
+    check("4294967295", "int", [Integer(4294967295)])
+    check("0.26.43.60.77.94", "fixed(6)", [oh("001a2b3c4d5e")])
+    check("", "fixed(0)", [oh("")])
+    check("4.101.116.104.48", "var", [os("eth0")])
+    check("0", "var", [os("")])
+    check("101.116.104.48", "implied", [os("eth0")])
+    check("", "implied", [os("")])
+    check("3.1.3.6", "oid", [oi("1.3.6")])
+    check("0", "oid", [ObjectIdentifier(Oid([]))])
+    check("1.3.6.1.4294967295", "oid-implied", [oi("1.3.6.1.4294967295")])
+    check("", "oid-implied", [ObjectIdentifier(Oid([]))])
+    check("192.0.2.1", "ipv4", [ip(192, 0, 2, 1)])
+    check("1.192.0.2.1", "netaddr", [ip(192, 0, 2, 1)])
+    check("", "", [])
+    # 128 octets fill a whole OID
+    long = "128." + ".".join(["97"] * 128)
+    testing.assertEqual(index.decode_index(od(long), spec("var")), [os("a" * 128)])
+    testing.assertEqual(index.decode_index(od(".".join(["7"] * 128)), spec("oid-implied")),
+                        [ObjectIdentifier(Oid([7] * 128))])
+
+
+def _test_standard_tables() -> None:
+    # IP-MIB ipAddressTable INDEX { ipAddressAddrType, ipAddressAddr } (InetAddressType, InetAddress)
+    check("1.4.192.0.2.1", "int,var", [Integer(1), oh("c0000201")])
+    check("2.16.32.1.13.184.0.0.0.0.0.0.0.0.0.0.0.1", "int,var", [Integer(2), oh("20010db8000000000000000000000001")])
+    # ipv4z: InetAddressIPv4z is 8 octets
+    check("3.8.192.0.2.1.0.0.0.5", "int,var", [Integer(3), oh("c000020100000005")])
+    # IP-MIB ipNetToPhysicalTable INDEX { ipNetToPhysicalIfIndex, ...NetAddressType, ...NetAddress }
+    check("7.1.4.10.0.0.1", "int,int,var", [Integer(7), Integer(1), oh("0a000001")])
+    # IP-MIB ipSystemStatsTable INDEX { ipSystemStatsIPVersion } (an enumeration)
+    check("2", "int", [Integer(2)])
+    # IF-MIB ifRcvAddressTable INDEX { ifIndex, ifRcvAddressAddress } (PhysAddress, var)
+    check("2.6.0.26.43.60.77.94", "int,var", [Integer(2), oh("001a2b3c4d5e")])
+    # Q-BRIDGE-MIB dot1qTpFdbTable INDEX { dot1qFdbId, dot1qTpFdbAddress } (MacAddress, fixed(6))
+    check("1.0.26.43.60.77.94", "int,fixed(6)", [Integer(1), oh("001a2b3c4d5e")])
+    check("4094.255.255.255.255.255.255", "int,fixed(6)", [Integer(4094), oh("ffffffffffff")])
+    # BRIDGE-MIB dot1dTpFdbTable INDEX { dot1dTpFdbAddress }
+    check("0.26.43.60.77.94", "fixed(6)", [oh("001a2b3c4d5e")])
+    # IP-FORWARD-MIB inetCidrRouteTable INDEX { DestType, Dest, PfxLen, Policy, NextHopType, NextHop }
+    check("1.4.192.0.2.0.24.2.0.0.1.4.10.0.0.1", "int,var,int,oid,int,var",
+          [Integer(1), oh("c0000200"), Integer(24), oi("0.0"), Integer(1), oh("0a000001")])
+    # SNMP-NOTIFICATION-MIB snmpNotifyFilterTable INDEX { snmpNotifyFilterProfileName, IMPLIED snmpNotifyFilterSubtree }
+    check("2.112.49.1.3.6.1.2.1", "var,oid-implied", [os("p1"), oi("1.3.6.1.2.1")])
+    # SNMP-TARGET-MIB snmpTargetAddrTable INDEX { IMPLIED snmpTargetAddrName }
+    check("116.49", "implied", [os("t1")])
+    # SNMP-VIEW-BASED-ACM-MIB vacmViewTreeFamilyTable INDEX { vacmViewTreeFamilyViewName, vacmViewTreeFamilySubtree }
+    check("3.97.108.108.2.1.3", "var,oid", [os("all"), oi("1.3")])
+    # vacmAccessTable INDEX { vacmGroupName, vacmAccessContextPrefix, vacmAccessSecurityModel, vacmAccessSecurityLevel }
+    check("2.103.49.0.3.3", "var,var,int,int", [os("g1"), os(""), Integer(3), Integer(3)])
+    # SNMP-USER-BASED-SM-MIB usmUserTable INDEX { usmUserEngineID, usmUserName }
+    check("5.128.0.31.136.4.4.117.115.101.114", "var,var", [oh("80001f8804"), os("user")])
+    # RFC1213-MIB atTable INDEX { atIfIndex, atNetAddress } (NetworkAddress)
+    check("2.1.192.0.2.1", "int,netaddr", [Integer(2), ip(192, 0, 2, 1)])
+    # TCP-MIB tcpConnTable INDEX { LocalAddress, LocalPort, RemAddress, RemPort }
+    check("192.0.2.1.22.198.51.100.7.40000", "ipv4,int,ipv4,int",
+          [ip(192, 0, 2, 1), Integer(22), ip(198, 51, 100, 7), Integer(40000)])
+
+
+def _test_adversarial() -> None:
+    """Odd but legal combinations (RFC 2578 section 7.7, RFC 1212 section 4.1.6)."""
+    # IMPLIED on the last part only, after other parts; an IMPLIED part may be empty
+    check("2.97.98.99.100", "var,implied", [os("ab"), os("cd")])
+    check("0", "var,implied", [os(""), os("")])
+    check("2.97.98", "var,implied", [os("ab"), os("")])
+    check("7.1.3.6.1", "int,oid-implied", [Integer(7), oi("1.3.6.1")])
+    check("0.1.3", "oid,oid-implied", [ObjectIdentifier(Oid([])), oi("1.3")])
+    # the same sub-ids under IMPLIED and var differ only in the length prefix
+    testing.assertEqual(index.decode_index(od("3.97.98.99"), spec("implied")), [oh("03616263")])
+    testing.assertEqual(index.decode_index(od("3.97.98.99"), spec("var")), [os("abc")])
+    # netaddr anywhere, and next to ipv4
+    check("1.10.0.0.1.10.0.0.2", "netaddr,ipv4", [ip(10, 0, 0, 1), ip(10, 0, 0, 2)])
+    check("7.1.10.0.0.1.9", "int,netaddr,int", [Integer(7), ip(10, 0, 0, 1), Integer(9)])
+    check("1.0.0.0.0.1.0.0.0.0", "netaddr,netaddr", [ip(0, 0, 0, 0), IpAddress(bytes([0, 0, 0, 0]))])
+    _decode_fails(od("1.10.0.0.1.2.10.0.0.2"), "netaddr,netaddr", 5, 1, "NetworkAddress tag 2")
+    _decode_fails(od("1.10.0.0"), "netaddr", 0, 0, "needs 5 sub-ids, 4 left")
+    # zero-size and zero-length parts in the middle
+    check("5.2.97.98", "int,fixed(0),var", [Integer(5), oh(""), os("ab")])
+    check("0.0.0", "var,oid,var", [os(""), ObjectIdentifier(Oid([])), os("")])
+    # the largest lengths: a var part of 127 octets plus its length fill 128 sub-ids
+    big = [127] + [255] * 127
+    testing.assertEqual(index.encode_index(index.decode_index(big, spec("var")), spec("var")), big)
+    # IMPLIED after a part: up to 128 sub-ids of its own
+    imp = [1, 9] + [1] * 128
+    testing.assertEqual(index.decode_index(imp, spec("var,oid-implied")), [oh("09"), ObjectIdentifier(Oid([1] * 128))])
+    _decode_fails([1, 9] + [1] * 129, "var,oid-implied", 2, 1, "length 129 exceeds 128")
+    # IMPLIED on the last part only: a second IMPLIED part is rejected at its own position
+    _decode_fails(od("97.98"), "implied,implied", 0, 0, "not the last")
+    _decode_fails(od("2.97.98.99"), "var,implied,int", 3, 1, "not the last")
+    _encode_fails([os("ab"), os("cd")], "implied,implied", "not the last")
+    testing.assertTrue("not the last" in index.check_spec(spec("oid-implied,oid-implied")))
+    # a prefix of the parts of an IMPLIED spec encodes as a prefix of the suffix
+    parts = spec("var,implied")
+    full = index.encode_index([os("ab"), os("cd")], parts)
+    pre = index.encode_index([os("ab")], parts[:1])
+    testing.assertEqual(full[:len(pre)], pre)
+    testing.assertEqual(pre, od("2.97.98"))
+    # an int part holds the full unsigned range; negative and too large values are refused
+    check("4294967295.0", "int,int", [Integer(4294967295), Integer(0)])
+    _encode_fails([Integer(4294967296)], "int", "outside 0..2^32-1")
+    _encode_fails([values.TimeTicks(-1)], "int", "outside 0..2^32-1")
+    # octet sub-ids: negative ones are refused like those above 255
+    _decode_fails([2, 97, -1], "var", 2, 0, "octet sub-id -1")
+    _decode_fails([-5], "ipv4,int", 0, 0, "short suffix")
+    _decode_fails([-5, 0, 0, 0], "ipv4", 0, 0, "octet sub-id -5")
+    _decode_fails([1, 0, 0, 0, -5], "netaddr", 4, 0, "octet sub-id -5")
+
+
+def _decode_fails(suffix: list[int], sp: str, offset: int, part: int, words: str) -> None:
+    try:
+        index.decode_index(suffix, spec(sp) if sp != "unknown" else [IndexPart("unknown", 0, "x")])
+        testing.error("no IndexDecodeError: " + sp + " " + str(suffix))
+    except IndexDecodeError as e:
+        testing.assertEqual(e.offset, offset, sp + " offset: " + e.error_message)
+        testing.assertEqual(e.part, part, sp + " part: " + e.error_message)
+        testing.assertTrue(words in e.error_message, sp + ": " + e.error_message)
+
+
+def _test_decode_errors() -> None:
+    # short suffix, for every kind
+    _decode_fails([], "int", 0, 0, "short suffix")
+    _decode_fails([0, 26, 43], "fixed(6)", 0, 0, "needs 6 sub-ids, 3 left")
+    _decode_fails([], "var", 0, 0, "short suffix")
+    _decode_fails([4, 101, 116], "var", 1, 0, "needs 4 sub-ids, 2 left")
+    _decode_fails([3, 1, 3], "oid", 1, 0, "short suffix")
+    _decode_fails([192, 0, 2], "ipv4", 0, 0, "short suffix")
+    _decode_fails([1, 192, 0, 2], "netaddr", 0, 0, "short suffix")
+    _decode_fails([7], "int,var", 1, 1, "short suffix")
+    _decode_fails([7, 4, 10, 0, 0, 1], "int,var,int", 6, 2, "short suffix")
+    # trailing sub-ids
+    _decode_fails([5, 6], "int", 1, 1, "1 trailing sub-ids")
+    _decode_fails([1, 2, 3], "", 0, 0, "3 trailing")
+    _decode_fails([2, 97, 98, 99], "var", 3, 1, "trailing")
+    _decode_fails([1, 192, 0, 2, 1, 9, 9], "netaddr", 5, 1, "2 trailing")
+    # octet sub-id above 255
+    _decode_fails([0, 256, 0, 0, 0, 0], "fixed(6)", 1, 0, "octet sub-id 256 exceeds 255")
+    _decode_fails([2, 97, 1000], "var", 2, 0, "exceeds 255")
+    _decode_fails([97, 300], "implied", 1, 0, "exceeds 255")
+    _decode_fails([192, 0, 2, 256], "ipv4", 3, 0, "exceeds 255")
+    _decode_fails([1, 192, 0, 999, 1], "netaddr", 3, 0, "exceeds 255")
+    # length above 128
+    _decode_fails([129] + [97] * 129, "var", 0, 0, "length 129 exceeds 128")
+    _decode_fails([200, 1, 3], "oid", 0, 0, "length 200 exceeds 128")
+    _decode_fails([97] * 129, "implied", 0, 0, "length 129 exceeds 128")
+    _decode_fails([1] * 129, "oid-implied", 0, 0, "length 129 exceeds 128")
+    _decode_fails([4294967295], "var", 0, 0, "exceeds 128")
+    # NetworkAddress tag
+    _decode_fails([0, 192, 0, 2, 1], "netaddr", 0, 0, "NetworkAddress tag 0")
+    _decode_fails([2, 3, 192, 0, 2, 1], "int,netaddr", 1, 1, "NetworkAddress tag 3 is not 1")
+    # sub-ids out of range (a hand-made suffix)
+    _decode_fails([-1], "int", 0, 0, "outside 0..2^32-1")
+    _decode_fails([4294967296], "int", 0, 0, "outside")
+    _decode_fails([2, 1, 4294967296], "oid", 2, 0, "outside")
+    _decode_fails([1, -3], "oid-implied", 1, 0, "outside")
+    _decode_fails([-1, 97], "var", 0, 0, "negative length -1")
+    # bad specs
+    _decode_fails([1, 2], "implied,int", 0, 0, "not the last")
+    _decode_fails([1, 2], "oid-implied,int", 0, 0, "not the last")
+    _decode_fails([1], "unknown", 0, 0, "unknown index encoding")
+    # IndexDecodeError is a DecodeError, the only exception decoders raise
+    try:
+        index.decode_index([1], spec("var"))
+        testing.error("no DecodeError for a short var part")
+    except errors.DecodeError as e:
+        testing.assertTrue("index part 1 (var)" in e.error_message, e.error_message)
+    named = [IndexPart("int", 0, "ifIndex"), IndexPart("var", 0, "ifRcvAddressAddress")]
+    try:
+        index.decode_index([2, 9, 1], named)
+        testing.error("no IndexDecodeError for a short named part")
+    except IndexDecodeError as e:
+        testing.assertEqual(e.error_message, "index part 2 (ifRcvAddressAddress, var): needs 9 sub-ids, 1 left (short suffix) at offset 2")
+
+
+def _encode_fails(vals: list[Value], sp: str, words: str) -> None:
+    try:
+        index.encode_index(vals, spec(sp) if sp != "unknown" else [IndexPart("unknown")])
+        testing.error("no EncodeError: " + sp)
+    except errors.EncodeError as e:
+        testing.assertTrue(words in e.error_message, sp + ": " + e.error_message)
+
+
+def _test_encode_errors() -> None:
+    _encode_fails([Integer(-1)], "int", "outside 0..2^32-1")
+    _encode_fails([values.Gauge32(4294967296)], "int", "outside")
+    _encode_fails([os("x")], "int", "integer value expected, got STRING")
+    _encode_fails([Integer(1)], "var", "octet string expected, got INTEGER")
+    _encode_fails([oh("0011223344")], "fixed(6)", "5 octets, the size is 6")
+    _encode_fails([os("a" * 129)], "var", "length 129 exceeds 128")
+    _encode_fails([os("a" * 129)], "implied", "length 129 exceeds 128")
+    _encode_fails([ObjectIdentifier(Oid([1] * 129))], "oid", "length 129 exceeds 128")
+    _encode_fails([os("abc")], "oid", "object identifier expected")
+    _encode_fails([oh("c00002")], "ipv4", "4 octets, got 3")
+    _encode_fails([values.Opaque(bytes.from_hex("c0000201"))], "ipv4", "IpAddress expected, got Opaque")
+    _encode_fails([IpAddress(bytes.from_hex("c000020100"))], "netaddr", "4 octets, got 5")
+    _encode_fails([os("ab"), Integer(1)], "implied,int", "not the last")
+    _encode_fails([oi("1.3"), Integer(1)], "oid-implied,int", "not the last")
+    _encode_fails([Integer(1)], "int,int", "1 index values for 2 index parts")
+    _encode_fails([Integer(1)], "unknown", "unknown index encoding")
+    _encode_fails([os("a" * 100), os("b" * 30)], "var,var", "needs 132 sub-ids, more than 128")
+
+
+def _test_encode_accepts() -> None:
+    # unsigned and other integer classes, IpAddress for strings, OctetString for addresses
+    testing.assertEqual(index.encode_index([values.Gauge32(4294967295)], spec("int")), [4294967295])
+    testing.assertEqual(index.encode_index([values.TimeTicks(7), values.Counter32(8)], spec("int,int")), [7, 8])
+    testing.assertEqual(index.encode_index([ip(10, 0, 0, 1)], spec("fixed(4)")), [10, 0, 0, 1])
+    testing.assertEqual(index.encode_index([oh("0a000001")], spec("ipv4")), [10, 0, 0, 1])
+    testing.assertEqual(index.encode_index([oh("0a000001")], spec("netaddr")), [1, 10, 0, 0, 1])
+    # a prefix of the parts gives a prefix of the suffix (walk narrowing)
+    parts = spec("int,var,int,oid,int,var")
+    full = index.encode_index([Integer(1), oh("c0000200"), Integer(24), oi("0.0"), Integer(1), oh("0a000001")], parts)
+    pre = index.encode_index([Integer(1), oh("c0000200")], parts[:2])
+    testing.assertEqual(full[:len(pre)], pre)
+
+
+def _test_spec_text() -> None:
+    p = spec("int, fixed(6) var,implied")
+    testing.assertEqual([str(x) for x in p], ["int", "fixed(6)", "var", "implied"])
+    testing.assertEqual(index.spec_str(p), "int,fixed(6),var,implied")
+    testing.assertEqual(spec("fixed:6"), [IndexPart("fixed", 6)])
+    testing.assertEqual(spec(index.spec_str(spec("oid,oid-implied,ipv4,netaddr"))), spec("oid,oid-implied,ipv4,netaddr"))
+    testing.assertEqual(spec(""), [])
+    for bad in ["integer", "fixed", "fixed()", "fixed(x)", "fixed(-1)", "fixed:", "int;var", "IMPLIED", "fixed(1234)"]:
+        try:
+            spec(bad)
+            testing.error("parse_spec(" + repr(bad) + ") did not raise")
+        except ValueError:
+            pass
+    testing.assertEqual(index.check_spec(spec("int,var,implied")), "")
+    testing.assertEqual(index.check_spec(spec("implied,int")), "index part 1 (implied): IMPLIED on a part that is not the last")
+    testing.assertTrue("unknown index encoding" in index.check_spec([IndexPart("unknown")]))
+    testing.assertTrue("negative size" in index.check_spec([IndexPart("fixed", -1)]))
+    testing.assertEqual(repr(IndexPart("var", 0, "ifRcvAddressAddress")), "IndexPart(var, ifRcvAddressAddress)")
+    testing.assertEqual(index.ENCODINGS, ["int", "fixed", "var", "implied", "oid", "oid-implied", "ipv4", "netaddr"])
+
+
+IF_MIB_META = r"""{"format":"actsnmp-mibmeta/1","module":"IF-MIB","smi":"v2",
+ "nodes":[
+  {"name":"ifRcvAddressEntry","oid":"1.3.6.1.2.1.31.1.4.1","kind":"row","status":"current","implied":false,
+   "index":[
+    {"object":"IF-MIB::ifIndex","key":"ifIndex","enc":"int",
+     "syntax":{"wire":"INTEGER","tc":"IF-MIB::InterfaceIndex","conv":"int","hint":"d","ranges":[[1,2147483647]]}},
+    {"object":"IF-MIB::ifRcvAddressAddress","key":"ifRcvAddressAddress","enc":"var",
+     "syntax":{"wire":"OCTET STRING","tc":"SNMPv2-TC::PhysAddress","conv":"phys-address","hint":"1x:"}}]},
+  {"name":"dot1qTpFdbEntry","oid":"1.3.6.1.2.1.17.7.1.2.2.1","kind":"row","status":"current","implied":false,
+   "index":[
+    {"object":"Q-BRIDGE-MIB::dot1qFdbId","key":"dot1qFdbId","enc":"int"},
+    {"object":"Q-BRIDGE-MIB::dot1qTpFdbAddress","key":"dot1qTpFdbAddress","enc":"fixed","size":6}]}]}
+"""
+
+
+def _test_from_mibmeta() -> None:
+    """mibmeta IndexParts convert one to one (enc, size, key)."""
+    mm = mib.meta.from_json(IF_MIB_META)
+    rcv = [index.IndexPart(p.enc, p.size, p.key) for p in mm.nodes[0].index]
+    testing.assertEqual(index.spec_str(rcv), "int,var")
+    testing.assertEqual(index.decode_index(od("2.6.0.26.43.60.77.94"), rcv), [Integer(2), oh("001a2b3c4d5e")])
+    col = Oid.parse("1.3.6.1.2.1.31.1.4.1.2")
+    inst = Oid.parse("1.3.6.1.2.1.31.1.4.1.2.2.6.0.26.43.60.77.94")
+    testing.assertEqual(index.decode_instance(inst, col, rcv), [Integer(2), oh("001a2b3c4d5e")])
+    try:
+        index.decode_instance(Oid.parse("1.3.6.1.2.1.2.2.1.1.1"), col, rcv)
+        testing.error("decode_instance accepted a foreign OID")
+    except IndexDecodeError:
+        pass
+    fdb = [index.IndexPart(p.enc, p.size, p.key) for p in mm.nodes[1].index]
+    testing.assertEqual(index.spec_str(fdb), "int,fixed(6)")
+    testing.assertEqual(index.encode_index([Integer(1), oh("001a2b3c4d5e")], fdb), od("1.0.26.43.60.77.94"))
+
+
+# The interop lab's B.11 string-indexed table, as both agents serve it
+# (interop/expected/canon/strtable.txt): index = length-prefixed name.
+LAB_STRTABLE = r""".1.3.6.1.4.1.8072.9999.1.11.1.1.1.120 = STRING: "x"
+.1.3.6.1.4.1.8072.9999.1.11.1.1.2.108.111 = STRING: "lo"
+.1.3.6.1.4.1.8072.9999.1.11.1.1.3.108.111.48 = STRING: "lo0"
+.1.3.6.1.4.1.8072.9999.1.11.1.1.4.101.116.104.48 = STRING: "eth0"
+.1.3.6.1.4.1.8072.9999.1.11.1.1.4.101.116.104.49 = STRING: "eth1"
+.1.3.6.1.4.1.8072.9999.1.11.1.1.4.101.116.104.50 = STRING: "eth2"
+.1.3.6.1.4.1.8072.9999.1.11.1.1.4.101.116.104.51 = STRING: "eth3"
+.1.3.6.1.4.1.8072.9999.1.11.1.1.4.101.116.104.52 = STRING: "eth4"
+.1.3.6.1.4.1.8072.9999.1.11.1.1.4.101.116.104.53 = STRING: "eth5"
+.1.3.6.1.4.1.8072.9999.1.11.1.1.4.101.116.104.54 = STRING: "eth6"
+.1.3.6.1.4.1.8072.9999.1.11.1.1.4.101.116.104.55 = STRING: "eth7"
+.1.3.6.1.4.1.8072.9999.1.11.1.1.4.101.116.104.56 = STRING: "eth8"
+.1.3.6.1.4.1.8072.9999.1.11.1.1.4.101.116.104.57 = STRING: "eth9"
+.1.3.6.1.4.1.8072.9999.1.11.1.1.5.109.103.109.116.48 = STRING: "mgmt0"
+.1.3.6.1.4.1.8072.9999.1.11.1.1.8.103.101.45.48.47.48.47.48 = STRING: "ge-0/0/0"
+.1.3.6.1.4.1.8072.9999.1.11.1.1.8.103.101.45.48.47.48.47.49 = STRING: "ge-0/0/1"
+.1.3.6.1.4.1.8072.9999.1.11.1.1.8.103.101.45.48.47.48.47.50 = STRING: "ge-0/0/2"
+.1.3.6.1.4.1.8072.9999.1.11.1.1.8.103.101.45.48.47.48.47.51 = STRING: "ge-0/0/3"
+.1.3.6.1.4.1.8072.9999.1.11.1.1.8.103.101.45.48.47.48.47.52 = STRING: "ge-0/0/4"
+.1.3.6.1.4.1.8072.9999.1.11.1.1.37.97.45.108.111.110.103.45.105.110.116.101.114.102.97.99.101.45.110.97.109.101.45.102.111.114.45.105.110.100.101.120.45.116.101.115.116.115 = STRING: "a-long-interface-name-for-index-tests"
+.1.3.6.1.4.1.8072.9999.1.11.1.2.1.120 = INTEGER: 1518
+.1.3.6.1.4.1.8072.9999.1.11.1.2.2.108.111 = INTEGER: 1515
+.1.3.6.1.4.1.8072.9999.1.11.1.2.3.108.111.48 = INTEGER: 1516
+.1.3.6.1.4.1.8072.9999.1.11.1.2.4.101.116.104.48 = INTEGER: 1500
+.1.3.6.1.4.1.8072.9999.1.11.1.2.4.101.116.104.49 = INTEGER: 1501
+.1.3.6.1.4.1.8072.9999.1.11.1.2.4.101.116.104.50 = INTEGER: 1502
+.1.3.6.1.4.1.8072.9999.1.11.1.2.4.101.116.104.51 = INTEGER: 1503
+.1.3.6.1.4.1.8072.9999.1.11.1.2.4.101.116.104.52 = INTEGER: 1504
+.1.3.6.1.4.1.8072.9999.1.11.1.2.4.101.116.104.53 = INTEGER: 1505
+.1.3.6.1.4.1.8072.9999.1.11.1.2.4.101.116.104.54 = INTEGER: 1506
+.1.3.6.1.4.1.8072.9999.1.11.1.2.4.101.116.104.55 = INTEGER: 1507
+.1.3.6.1.4.1.8072.9999.1.11.1.2.4.101.116.104.56 = INTEGER: 1508
+.1.3.6.1.4.1.8072.9999.1.11.1.2.4.101.116.104.57 = INTEGER: 1509
+.1.3.6.1.4.1.8072.9999.1.11.1.2.5.109.103.109.116.48 = INTEGER: 1517
+.1.3.6.1.4.1.8072.9999.1.11.1.2.8.103.101.45.48.47.48.47.48 = INTEGER: 1510
+.1.3.6.1.4.1.8072.9999.1.11.1.2.8.103.101.45.48.47.48.47.49 = INTEGER: 1511
+.1.3.6.1.4.1.8072.9999.1.11.1.2.8.103.101.45.48.47.48.47.50 = INTEGER: 1512
+.1.3.6.1.4.1.8072.9999.1.11.1.2.8.103.101.45.48.47.48.47.51 = INTEGER: 1513
+.1.3.6.1.4.1.8072.9999.1.11.1.2.8.103.101.45.48.47.48.47.52 = INTEGER: 1514
+.1.3.6.1.4.1.8072.9999.1.11.1.2.37.97.45.108.111.110.103.45.105.110.116.101.114.102.97.99.101.45.110.97.109.101.45.102.111.114.45.105.110.100.101.120.45.116.101.115.116.115 = INTEGER: 1519
+.1.3.6.1.4.1.8072.9999.1.11.1.3.1.120 = INTEGER: 1
+.1.3.6.1.4.1.8072.9999.1.11.1.3.2.108.111 = INTEGER: 2
+.1.3.6.1.4.1.8072.9999.1.11.1.3.3.108.111.48 = INTEGER: 1
+.1.3.6.1.4.1.8072.9999.1.11.1.3.4.101.116.104.48 = INTEGER: 1
+.1.3.6.1.4.1.8072.9999.1.11.1.3.4.101.116.104.49 = INTEGER: 2
+.1.3.6.1.4.1.8072.9999.1.11.1.3.4.101.116.104.50 = INTEGER: 1
+.1.3.6.1.4.1.8072.9999.1.11.1.3.4.101.116.104.51 = INTEGER: 2
+.1.3.6.1.4.1.8072.9999.1.11.1.3.4.101.116.104.52 = INTEGER: 1
+.1.3.6.1.4.1.8072.9999.1.11.1.3.4.101.116.104.53 = INTEGER: 2
+.1.3.6.1.4.1.8072.9999.1.11.1.3.4.101.116.104.54 = INTEGER: 1
+.1.3.6.1.4.1.8072.9999.1.11.1.3.4.101.116.104.55 = INTEGER: 2
+.1.3.6.1.4.1.8072.9999.1.11.1.3.4.101.116.104.56 = INTEGER: 1
+.1.3.6.1.4.1.8072.9999.1.11.1.3.4.101.116.104.57 = INTEGER: 2
+.1.3.6.1.4.1.8072.9999.1.11.1.3.5.109.103.109.116.48 = INTEGER: 2
+.1.3.6.1.4.1.8072.9999.1.11.1.3.8.103.101.45.48.47.48.47.48 = INTEGER: 1
+.1.3.6.1.4.1.8072.9999.1.11.1.3.8.103.101.45.48.47.48.47.49 = INTEGER: 2
+.1.3.6.1.4.1.8072.9999.1.11.1.3.8.103.101.45.48.47.48.47.50 = INTEGER: 1
+.1.3.6.1.4.1.8072.9999.1.11.1.3.8.103.101.45.48.47.48.47.51 = INTEGER: 2
+.1.3.6.1.4.1.8072.9999.1.11.1.3.8.103.101.45.48.47.48.47.52 = INTEGER: 1
+.1.3.6.1.4.1.8072.9999.1.11.1.3.37.97.45.108.111.110.103.45.105.110.116.101.114.102.97.99.101.45.110.97.109.101.45.102.111.114.45.105.110.100.101.120.45.116.101.115.116.115 = INTEGER: 2"""
+
+# Rows of the B.10 table (interop/expected/canon/table.txt): c=1 INTEGER i, c=6 OID B.10.1.1.i.
+LAB_TABLE = r""".1.3.6.1.4.1.8072.9999.1.10.1.1.1 = INTEGER: 1
+.1.3.6.1.4.1.8072.9999.1.10.1.1.2 = INTEGER: 2
+.1.3.6.1.4.1.8072.9999.1.10.1.1.3 = INTEGER: 3
+.1.3.6.1.4.1.8072.9999.1.10.1.1.99 = INTEGER: 99
+.1.3.6.1.4.1.8072.9999.1.10.1.1.100 = INTEGER: 100
+.1.3.6.1.4.1.8072.9999.1.10.1.1.255 = INTEGER: 255
+.1.3.6.1.4.1.8072.9999.1.10.1.1.256 = INTEGER: 256
+.1.3.6.1.4.1.8072.9999.1.10.1.1.299 = INTEGER: 299
+.1.3.6.1.4.1.8072.9999.1.10.1.1.300 = INTEGER: 300
+.1.3.6.1.4.1.8072.9999.1.10.1.6.1 = OID: .1.3.6.1.4.1.8072.9999.1.10.1.1.1
+.1.3.6.1.4.1.8072.9999.1.10.1.6.2 = OID: .1.3.6.1.4.1.8072.9999.1.10.1.1.2
+.1.3.6.1.4.1.8072.9999.1.10.1.6.3 = OID: .1.3.6.1.4.1.8072.9999.1.10.1.1.3
+.1.3.6.1.4.1.8072.9999.1.10.1.6.99 = OID: .1.3.6.1.4.1.8072.9999.1.10.1.1.99
+.1.3.6.1.4.1.8072.9999.1.10.1.6.100 = OID: .1.3.6.1.4.1.8072.9999.1.10.1.1.100
+.1.3.6.1.4.1.8072.9999.1.10.1.6.255 = OID: .1.3.6.1.4.1.8072.9999.1.10.1.1.255
+.1.3.6.1.4.1.8072.9999.1.10.1.6.256 = OID: .1.3.6.1.4.1.8072.9999.1.10.1.1.256
+.1.3.6.1.4.1.8072.9999.1.10.1.6.299 = OID: .1.3.6.1.4.1.8072.9999.1.10.1.1.299
+.1.3.6.1.4.1.8072.9999.1.10.1.6.300 = OID: .1.3.6.1.4.1.8072.9999.1.10.1.1.300"""
+
+LAB_BASE = "1.3.6.1.4.1.8072.9999.1"
+
+
+def _canon_rows(text: str) -> list[(Oid, str, str)]:
+    """(oid, type, value text) of canonical `OID = TYPE: value` lines."""
+    out: list[(Oid, str, str)] = []
+    for line in text.splitlines():
+        if line == "":
+            continue
+        eq = line.find(" = ")
+        colon = line.find(": ", eq)
+        out.append((Oid.parse(line[:eq]), line[eq + 3:colon], line[colon + 2:]))
+    return out
+
+
+def _test_lab_strtable() -> None:
+    parts = spec("var")
+    rows = _canon_rows(LAB_STRTABLE)
+    testing.assertEqual(len(rows), 60)
+    names: dict[int, set[bytes]] = {}
+    for r in rows:
+        col = Oid.parse(LAB_BASE + ".11.1").arcs
+        c = r.0.arcs[len(col)]
+        vals = index.decode_instance(r.0, Oid(col + [c]), parts)
+        testing.assertEqual(len(vals), 1)
+        v = vals[0]
+        if isinstance(v, OctetString):
+            ns = names.get(c)
+            if ns is not None:
+                ns.add(v.value)
+            else:
+                names[c] = {v.value}
+            if c == 1:
+                # column 1 holds the name that is the index
+                testing.assertEqual(r.1, "STRING")
+                testing.assertEqual("\"" + v.value.decode() + "\"", r.2)
+        else:
+            testing.error("not an OctetString: " + repr(v))
+        testing.assertEqual(Oid(col + [c] + index.encode_index(vals, parts)), r.0)
+    testing.assertEqual(len(names[1]), 20)
+    testing.assertEqual(names[1], names[2])
+    testing.assertEqual(names[1], names[3])
+    testing.assertTrue(b"a-long-interface-name-for-index-tests" in names[1])
+    testing.assertTrue(b"ge-0/0/4" in names[1])
+    # the same rows as IMPLIED (no length) and fixed: the decoders disagree as they must
+    try:
+        index.decode_index(od("4.101.116.104.48"), spec("fixed(4)"))
+        testing.error("fixed(4) accepted a length-prefixed name")
+    except IndexDecodeError as e:
+        testing.assertTrue("trailing" in e.error_message)
+    testing.assertEqual(index.decode_index(od("4.101.116.104.48"), spec("implied")), [oh("0465746830")])
+
+
+def _test_lab_table() -> None:
+    rows = _canon_rows(LAB_TABLE)
+    testing.assertEqual(len(rows), 18)
+    col = Oid.parse(LAB_BASE + ".10.1").arcs
+    for r in rows:
+        c = r.0.arcs[len(col)]
+        vals = index.decode_instance(r.0, Oid(col + [c]), spec("int"))
+        i = vals[0]
+        if isinstance(i, Integer):
+            if c == 1:
+                testing.assertEqual(r.2, str(i.value))
+            else:
+                # c=6 points at column 1 of the same row
+                testing.assertEqual(Oid.parse(r.2), Oid(col + [1, i.value]))
+        else:
+            testing.error("not an Integer: " + repr(i))
+
+
+def _u32(rng: Lcg) -> int:
+    return (rng.next64() >> 32) & 0xffffffff
+
+
+def _random_value(rng: Lcg, p: IndexPart) -> Value:
+    k = p.enc
+    if k == "int":
+        return Integer(_u32(rng) if rng.below(2) == 0 else rng.below(10))
+    if k == "fixed" or k == "var" or k == "implied":
+        n = p.size if k == "fixed" else rng.below(12)
+        return OctetString(bytes([rng.below(256) for i in range(n)]))
+    if k == "oid" or k == "oid-implied":
+        n = rng.below(10)
+        return ObjectIdentifier(Oid([_u32(rng) if rng.below(4) == 0 else rng.below(200) for i in range(n)]))
+    return ip(rng.below(256), rng.below(256), rng.below(256), rng.below(256))
+
+
+def _random_spec(rng: Lcg) -> list[IndexPart]:
+    n = rng.below(5)
+    out: list[IndexPart] = []
+    for i in range(n):
+        e = index.ENCODINGS[rng.below(8)]
+        if (e == "implied" or e == "oid-implied") and i != n - 1:
+            e = "var"
+        out.append(IndexPart(e, rng.below(7) if e == "fixed" else 0))
+    return out
+
+
+def _test_round_trip_fuzz() -> None:
+    """Random specs and values: encode then decode gives the values back; every mutation of the
+    suffix (truncation, extension, changed sub-ids) decodes or raises IndexDecodeError, nothing
+    else."""
+    rng = Lcg(2578)
+    decoded = 0
+    rejected = 0
+    for t in range(2000):
+        parts = _random_spec(rng)
+        vals = [_random_value(rng, p) for p in parts]
+        suffix = index.encode_index(vals, parts)
+        testing.assertEqual(index.decode_index(suffix, parts), vals, index.spec_str(parts))
+        for m in range(4):
+            s2 = list(suffix)
+            how = rng.below(4)
+            if how == 0 and len(s2) > 0:
+                s2 = s2[:rng.below(len(s2))]
+            elif how == 1:
+                s2.append(rng.below(300))
+            elif how == 2 and len(s2) > 0:
+                s2[rng.below(len(s2))] = rng.below(4) * 100 if rng.below(2) == 0 else 4294967295
+            elif len(s2) > 0:
+                s2[rng.below(len(s2))] = -1 if rng.below(8) == 0 else 129
+            try:
+                v2 = index.decode_index(s2, parts)
+                testing.assertEqual(len(v2), len(parts))
+                testing.assertEqual(index.encode_index(v2, parts), s2)
+                decoded += 1
+            except IndexDecodeError:
+                rejected += 1
+    testing.assertTrue(decoded > 1000, "decoded %d" % decoded)
+    testing.assertTrue(rejected > 1000, "rejected %d" % rejected)

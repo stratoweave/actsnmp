@@ -1,0 +1,388 @@
+"""Table index decoding and encoding (RFC 2578 section 7.7, RFC 1212 section 4.1.6)
+
+A conceptual row is named by the sub-ids that follow the column OID, the
+instance suffix, built from the INDEX objects in order. decode_index(suffix,
+parts) turns a suffix into index values, and encode_index(values, parts)
+builds the suffix for a GET or SET of one row; encoding a prefix of the
+parts narrows a walk to the rows that start with the given values.
+
+Each part is encoded by its enc, the same names as in mibmeta IndexPart:
+
+  enc            sub-ids                                 value
+  int            1, the value (0..2^32-1)                values.Integer
+  fixed (n)      n, one per octet                        values.OctetString
+  var            length, then one per octet              values.OctetString
+  implied        one per octet, to the end (last only)   values.OctetString
+  oid            length, then the arcs                   values.ObjectIdentifier
+  oid-implied    the arcs, to the end (last only)        values.ObjectIdentifier
+  ipv4           4, one per octet                        values.IpAddress
+  netaddr        5: the tag 1, then 4 octets             values.IpAddress
+
+The values are the classes a column of that syntax carries, so the key
+values of a row convert to YANG like any other value: BITS and every OCTET
+STRING TC decode to OctetString, an enumeration or Unsigned32 to Integer.
+
+IndexPart is defined here rather than taken from mib.meta so that the
+adapter, the trap receiver and the CLI can decode indexes without the MIB
+compiler; build one as index.IndexPart(p.enc, p.size, p.key) from a
+mib.meta.IndexPart p. An unresolved part (enc "unknown") fails on use, not
+on construction. parse_spec("int,fixed(6)") builds a spec from text.
+
+Decoding raises only IndexDecodeError (an errors.DecodeError) for a
+suffix that does not fit the parts; an empty IMPLIED part is accepted.
+Encoding is strict and raises errors.EncodeError for a value of the wrong
+class or out of range, a fixed part of another length, or a suffix of more
+than 128 sub-ids.
+"""
+
+import errors
+import values
+from oid import Oid
+from values import Value
+
+# Part kinds (IndexPart.kind)
+K_UNKNOWN = 0
+K_INT = 1
+K_FIXED = 2
+K_VAR = 3
+K_IMPLIED = 4
+K_OID = 5
+K_OID_IMPLIED = 6
+K_IPV4 = 7
+K_NETADDR = 8
+
+# Longest length prefix, and longest suffix: an OID has at most 128 sub-ids (RFC 2578 section 3.5)
+MAX_LEN = 128
+MAX_SUBID = 4294967295
+
+ENCODINGS: list[str] = ["int", "fixed", "var", "implied", "oid", "oid-implied", "ipv4", "netaddr"]
+
+
+class IndexDecodeError(errors.DecodeError):
+    """An instance suffix that does not fit the index spec
+
+    offset is the position in the suffix (0-based) where the problem was found and part the
+    0-based number of the index part being decoded (len(parts) for trailing sub-ids)."""
+    part: int
+
+    def __init__(self, reason: str, offset: int, part: int):
+        errors.DecodeError.__init__(self, reason, offset)
+        self.part = part
+
+
+def _kind_of(enc: str) -> int:
+    if enc == "int":
+        return K_INT
+    if enc == "fixed":
+        return K_FIXED
+    if enc == "var":
+        return K_VAR
+    if enc == "implied":
+        return K_IMPLIED
+    if enc == "oid":
+        return K_OID
+    if enc == "oid-implied":
+        return K_OID_IMPLIED
+    if enc == "ipv4":
+        return K_IPV4
+    if enc == "netaddr":
+        return K_NETADDR
+    return K_UNKNOWN
+
+
+class IndexPart(object):
+    """One INDEX item: enc (see the module doc), size (octets, fixed only) and an optional
+    name (the key leaf or object, used in error messages)."""
+    enc: str
+    size: int
+    name: str
+    kind: int
+
+    def __init__(self, enc: str, size: int=0, name: str=""):
+        self.enc = enc
+        self.size = size
+        self.name = name
+        self.kind = _kind_of(enc)
+
+    def __str__(self) -> str:
+        """The spec text: fixed(6), var, ..."""
+        if self.kind == K_FIXED:
+            return "fixed(%d)" % self.size
+        return self.enc
+
+    def __repr__(self) -> str:
+        if self.name != "":
+            return "IndexPart(" + self.__str__() + ", " + self.name + ")"
+        return "IndexPart(" + self.__str__() + ")"
+
+    def describe(self, i: int) -> str:
+        """Part i (0-based) for messages: index part 2 (ifRcvAddressAddress, var)."""
+        if self.name != "":
+            return "index part %d (" % (i + 1) + self.name + ", " + self.__str__() + ")"
+        return "index part %d (" % (i + 1) + self.__str__() + ")"
+
+
+extension IndexPart(Eq):
+    def __eq__(self, other: IndexPart) -> bool:
+        return self.enc == other.enc and self.size == other.size and self.name == other.name
+
+
+def parse_spec(s: str) -> list[IndexPart]:
+    """Parts from text: encodings separated by commas or blanks, fixed(n) or fixed:n for a
+    fixed size ("int, fixed(6)", "int var"; "" is the empty spec of a keyless row). Raises
+    ValueError for an unknown encoding or a bad size."""
+    out: list[IndexPart] = []
+    for raw in s.replace(",", " ").replace("\t", " ").split(" "):
+        tok = raw.strip()
+        if tok == "":
+            continue
+        if tok.startswith("fixed"):
+            rest = tok[5:]
+            num = ""
+            if rest.startswith("(") and rest.endswith(")"):
+                num = rest[1:len(rest) - 1]
+            elif rest.startswith(":"):
+                num = rest[1:]
+            if num == "" or not num.isdecimal() or len(num) > 3:
+                raise ValueError("bad fixed index size in " + repr(tok))
+            out.append(IndexPart("fixed", int(num)))
+        elif _kind_of(tok) != K_UNKNOWN:
+            out.append(IndexPart(tok))
+        else:
+            raise ValueError("unknown index encoding " + repr(tok))
+    return out
+
+
+def spec_str(parts: list[IndexPart]) -> str:
+    """The text of a spec, readable by parse_spec: "int,fixed(6)"."""
+    return ",".join([str(p) for p in parts])
+
+
+def check_spec(parts: list[IndexPart]) -> str:
+    """Why the spec is not usable (an unknown encoding, IMPLIED not on the last part, a negative
+    fixed size), "" when it is."""
+    n = len(parts)
+    for i, p in enumerate(parts):
+        if p.kind == K_UNKNOWN:
+            return p.describe(i) + ": unknown index encoding " + repr(p.enc)
+        if (p.kind == K_IMPLIED or p.kind == K_OID_IMPLIED) and i != n - 1:
+            return p.describe(i) + ": IMPLIED on a part that is not the last"
+        if p.kind == K_FIXED and p.size < 0:
+            return p.describe(i) + ": negative size"
+    return ""
+
+
+# --- decoding --------------------------------------------------------------------------------------
+
+def _fail(p: IndexPart, i: int, reason: str, offset: int) -> IndexDecodeError:
+    return IndexDecodeError(p.describe(i) + ": " + reason, offset, i)
+
+
+def _need(suffix: list[int], pos: int, k: int, p: IndexPart, i: int) -> None:
+    left = len(suffix) - pos
+    if k > left:
+        raise _fail(p, i, "needs %d sub-ids, %d left (short suffix)" % (k, left), pos)
+
+
+def _octets(suffix: list[int], pos: int, end: int, p: IndexPart, i: int) -> bytes:
+    for j in range(pos, end):
+        c = suffix[j]
+        if c > 255:
+            raise _fail(p, i, "octet sub-id %d exceeds 255" % c, j)
+        if c < 0:
+            raise _fail(p, i, "negative octet sub-id %d" % c, j)
+    return bytes(suffix[pos:end])
+
+
+def _arcs(suffix: list[int], pos: int, end: int, p: IndexPart, i: int) -> Oid:
+    for j in range(pos, end):
+        c = suffix[j]
+        if c < 0 or c > MAX_SUBID:
+            raise _fail(p, i, "sub-id %d outside 0..2^32-1" % c, j)
+    return Oid(suffix[pos:end])
+
+
+def _length(suffix: list[int], pos: int, p: IndexPart, i: int) -> int:
+    _need(suffix, pos, 1, p, i)
+    ln = suffix[pos]
+    if ln > MAX_LEN:
+        raise _fail(p, i, "length %d exceeds 128" % ln, pos)
+    if ln < 0:
+        raise _fail(p, i, "negative length %d" % ln, pos)
+    _need(suffix, pos + 1, ln, p, i)
+    return ln
+
+
+def _decode_part(suffix: list[int], pos: int, p: IndexPart, i: int, last: bool) -> (Value, int):
+    """The value of part i at suffix[pos:] and the position after it."""
+    k = p.kind
+    n = len(suffix)
+    if k == K_INT:
+        _need(suffix, pos, 1, p, i)
+        v = suffix[pos]
+        if v < 0 or v > MAX_SUBID:
+            raise _fail(p, i, "sub-id %d outside 0..2^32-1" % v, pos)
+        return (values.Integer(v), pos + 1)
+    if k == K_FIXED:
+        if p.size < 0:
+            raise _fail(p, i, "negative size", pos)
+        _need(suffix, pos, p.size, p, i)
+        return (values.OctetString(_octets(suffix, pos, pos + p.size, p, i)), pos + p.size)
+    if k == K_VAR:
+        ln = _length(suffix, pos, p, i)
+        return (values.OctetString(_octets(suffix, pos + 1, pos + 1 + ln, p, i)), pos + 1 + ln)
+    if k == K_IMPLIED:
+        if not last:
+            raise _fail(p, i, "IMPLIED on a part that is not the last", pos)
+        if n - pos > MAX_LEN:
+            raise _fail(p, i, "length %d exceeds 128" % (n - pos), pos)
+        return (values.OctetString(_octets(suffix, pos, n, p, i)), n)
+    if k == K_OID:
+        ln = _length(suffix, pos, p, i)
+        return (values.ObjectIdentifier(_arcs(suffix, pos + 1, pos + 1 + ln, p, i)), pos + 1 + ln)
+    if k == K_OID_IMPLIED:
+        if not last:
+            raise _fail(p, i, "IMPLIED on a part that is not the last", pos)
+        if n - pos > MAX_LEN:
+            raise _fail(p, i, "length %d exceeds 128" % (n - pos), pos)
+        return (values.ObjectIdentifier(_arcs(suffix, pos, n, p, i)), n)
+    if k == K_IPV4:
+        _need(suffix, pos, 4, p, i)
+        return (values.IpAddress(_octets(suffix, pos, pos + 4, p, i)), pos + 4)
+    if k == K_NETADDR:
+        _need(suffix, pos, 5, p, i)
+        tag = suffix[pos]
+        if tag != 1:
+            raise _fail(p, i, "NetworkAddress tag %d is not 1 (internet)" % tag, pos)
+        return (values.IpAddress(_octets(suffix, pos + 1, pos + 5, p, i)), pos + 5)
+    raise _fail(p, i, "unknown index encoding " + repr(p.enc), pos)
+
+
+def decode_index(suffix: list[int], parts: list[IndexPart]) -> list[Value]:
+    """The index values of an instance suffix, one per part; raises IndexDecodeError (see the
+    module doc). A keyless row (no parts) has the empty suffix."""
+    out: list[Value] = []
+    pos = 0
+    np = len(parts)
+    for i in range(np):
+        r = _decode_part(suffix, pos, parts[i], i, i == np - 1)
+        out.append(r.0)
+        pos = r.1
+    if pos != len(suffix):
+        raise IndexDecodeError("%d trailing sub-ids after the index" % (len(suffix) - pos), pos, np)
+    return out
+
+
+def decode_instance(oid: Oid, column: Oid, parts: list[IndexPart]) -> list[Value]:
+    """decode_index of the suffix of oid after column; IndexDecodeError (offset 0) when
+    column is not a prefix of oid."""
+    if not oid.startswith(column):
+        raise IndexDecodeError(str(column) + " is not a prefix of " + str(oid), 0, 0)
+    return decode_index(oid.arcs[len(column.arcs):], parts)
+
+
+# --- encoding --------------------------------------------------------------------------------------
+
+def _efail(p: IndexPart, i: int, reason: str) -> errors.EncodeError:
+    return errors.EncodeError(p.describe(i) + ": " + reason)
+
+
+def _int_of(v: Value) -> ?int:
+    if isinstance(v, values.Integer):
+        return v.value
+    if isinstance(v, values.Gauge32):
+        return v.value
+    if isinstance(v, values.Counter32):
+        return v.value
+    if isinstance(v, values.TimeTicks):
+        return v.value
+    return None
+
+
+def _bytes_of(v: Value) -> ?bytes:
+    if isinstance(v, values.OctetString):
+        return v.value
+    if isinstance(v, values.IpAddress):
+        return v.value
+    if isinstance(v, values.Opaque):
+        return v.value
+    return None
+
+
+def _ip_of(v: Value) -> ?bytes:
+    if isinstance(v, values.IpAddress):
+        return v.value
+    if isinstance(v, values.OctetString):
+        return v.value
+    return None
+
+
+def _encode_part(out: list[int], v: Value, p: IndexPart, i: int, last: bool) -> None:
+    k = p.kind
+    if k == K_INT:
+        iv = _int_of(v)
+        if iv is not None:
+            if iv < 0 or iv > MAX_SUBID:
+                raise _efail(p, i, "integer %d outside 0..2^32-1" % iv)
+            out.append(iv)
+            return
+        raise _efail(p, i, "integer value expected, got " + v.type_name())
+    if k == K_FIXED or k == K_VAR or k == K_IMPLIED:
+        b = _bytes_of(v)
+        if b is not None:
+            if k == K_FIXED:
+                if len(b) != p.size:
+                    raise _efail(p, i, "%d octets, the size is %d" % (len(b), p.size))
+            elif len(b) > MAX_LEN:
+                raise _efail(p, i, "length %d exceeds 128" % len(b))
+            if k == K_VAR:
+                out.append(len(b))
+            elif k == K_IMPLIED and not last:
+                raise _efail(p, i, "IMPLIED on a part that is not the last")
+            for c in b:
+                out.append(c)
+            return
+        raise _efail(p, i, "octet string expected, got " + v.type_name())
+    if k == K_OID or k == K_OID_IMPLIED:
+        if isinstance(v, values.ObjectIdentifier):
+            arcs = v.value.arcs
+            if len(arcs) > MAX_LEN:
+                raise _efail(p, i, "length %d exceeds 128" % len(arcs))
+            if k == K_OID:
+                out.append(len(arcs))
+            elif not last:
+                raise _efail(p, i, "IMPLIED on a part that is not the last")
+            for a in arcs:
+                out.append(a)
+            return
+        raise _efail(p, i, "object identifier expected, got " + v.type_name())
+    if k == K_IPV4 or k == K_NETADDR:
+        b = _ip_of(v)
+        if b is not None:
+            if len(b) != 4:
+                raise _efail(p, i, "an IPv4 address has 4 octets, got %d" % len(b))
+            if k == K_NETADDR:
+                out.append(1)
+            for c in b:
+                out.append(c)
+            return
+        raise _efail(p, i, "IpAddress expected, got " + v.type_name())
+    raise _efail(p, i, "unknown index encoding " + repr(p.enc))
+
+
+def encode_index(vals: list[Value], parts: list[IndexPart]) -> list[int]:
+    """The instance suffix of a row with index values vals (one per part; pass a prefix of
+    the parts with as many values to get a prefix of the suffix). Raises errors.EncodeError.
+
+    Accepted values: int takes Integer, Gauge32 (Unsigned32), Counter32 and TimeTicks;
+    fixed/var/implied take OctetString, IpAddress and Opaque; oid/oid-implied take
+    ObjectIdentifier; ipv4/netaddr take IpAddress or a 4-octet OctetString."""
+    np = len(parts)
+    if len(vals) != np:
+        raise errors.EncodeError("%d index values for %d index parts" % (len(vals), np))
+    out: list[int] = []
+    for i in range(np):
+        _encode_part(out, vals[i], parts[i], i, i == np - 1)
+    if len(out) > MAX_LEN:
+        raise errors.EncodeError("the index needs %d sub-ids, more than 128" % len(out))
+    return out

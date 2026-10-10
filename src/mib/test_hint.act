@@ -1,0 +1,761 @@
+"""Tests of `mib.hint`: DISPLAY-HINT parsing, validation, rendering and parsing back.
+
+Vectors: worked DISPLAY-HINT examples, RFC 2579 (Hundredths, DateAndTime), and a
+comparison table generated in the actsnmp-interop:1 image with pysnmp 7.1.30
+(`TextualConvention.prettyOut`) and net-snmp 5.9.4 (libnetsnmp `snprint_octet_string` and
+`snprint_hinted_integer` called through ctypes), next to an independent Python reference
+renderer of the RFC rules with our padding policy.
+"""
+
+import testing
+import mib.hint
+import mib.resolver
+from mib.hint import DisplayHint, HintError
+from testutil import Lcg
+
+
+def hp(text: str) -> DisplayHint:
+    return mib.hint.parse(text)
+
+
+def unhex(s: str) -> bytes:
+    return bytes.from_hex(s)
+
+
+# Octet-format vectors: (hint, value hex, our rendering, ok, net-snmp 5.9.4, pysnmp 7.1.30,
+# why net-snmp differs, why pysnmp differs). Our rendering is the RFC mode; `ok` False means the
+# value falls back to hex. The net-snmp column is what `netsnmp=True` must produce exactly ("?":
+# not comparable: net-snmp prints octets that are not UTF-8, or reads past the end of the value).
+# A difference note is given exactly when that oracle differs from our RFC rendering:
+#   net-snmp: pad (x not zero-padded), sep-before-term (separator also written before the
+#     terminator), reuse-repeat (the re-applied last specification reads no repeat count), nul (an
+#     application with NUL prints `.` and escapes), long (numbers wrap at 64 bits), zero-length
+#     (length 0 counts as 1)
+#   pysnmp: pad (x pads 2 digits per application), o-pad (o pads to 3 digits), repeat (`*` is
+#     broken), restart (the specifications restart from the first one), non-ascii (a/t drop
+#     non-ASCII or split characters), invalid (bad UTF-8 is dropped where we fall back),
+#     zero-length (length 0 renders 00 or loops forever: "HANG")
+OCTET_VECTORS: list[(str, str, str, bool, str, str, str, str)] = [
+    ("255a", "68656c6c6f", "hello", True, "hello", "hello", "", ""),
+    ("255t", "636166c3a9", "café", True, "café", "café", "", ""),
+    ("1x:", "001a2b3c4d5e", "00:1a:2b:3c:4d:5e", True, "0:1a:2b:3c:4d:5e", "00:1a:2b:3c:4d:5e", "pad", ""),
+    ("1d.1d.1d.1d", "c0000201", "192.0.2.1", True, "192.0.2.1", "192.0.2.1", "", ""),
+    ("2x:2x:2x:2x:2x:2x:2x:2x", "20010db8000000000000000000000001", "2001:0db8:0000:0000:0000:0000:0000:0001", True, "2001:db8:0:0:0:0:0:1", "2001:db8:00:00:00:00:00:01", "pad", "pad"),
+    ("2d-1d-1d,1d:1d:1d.1d,1a1d:1d", "07e60a0a0d1e0f002b0200", "2022-10-10,13:30:15.0,+2:0", True, "2022-10-10,13:30:15.0,+2:0", "2022-10-10,13:30:15.0,+2:0", "", ""),
+    ("2d-1d-1d,1d:1d:1d.1d,1a1d:1d", "07e60a0a0d1e0f00", "2022-10-10,13:30:15.0", True, "2022-10-10,13:30:15.0", "2022-10-10,13:30:15.0", "", ""),
+    ("*1x:/1x", "03aabbccdd", "aa:bb:cc/dd", True, "aa:bb:cc:/dd", "aa/bb/cc/dd", "sep-before-term", "repeat"),
+    ("1x", "0a0b0c", "0a0b0c", True, "0a0b0c", "0a0b0c", "", ""),
+    ("2d-1d-1d,1d:1d:1d.1d,1a1d:1d", "07c8051a0d1e0f002d0400", "1992-5-26,13:30:15.0,-4:0", True, "1992-5-26,13:30:15.0,-4:0", "1992-5-26,13:30:15.0,-4:0", "", ""),
+    ("2d-1d-1d,1d:1d:1d.1d,1a1d:1d", "07c8051a0d1e0f002d04000506", "1992-5-26,13:30:15.0,-4:056", True, "1992-5-26,13:30:15.0,-4:056", "1992-5-26,13:30:15.0,-4:01286", "", "restart"),
+    ("2d-1d-1d,1d:1d:1d.1d,1a1d:1d", "07c8", "1992", True, "1992", "1992", "", ""),
+    ("2d-1d-1d,1d:1d:1d.1d,1a1d:1d", "", "", True, "", "", "", ""),
+    ("255a", "", "", True, "", "", "", ""),
+    ("255a", "72c3a46b736dc3b67267c3a573", "räksmörgås", True, "räksmörgås", "rksmrgs", "", "non-ascii"),
+    ("255a", "610062", "a\x00b", True, "a.b", "a\x00b", "nul", ""),
+    ("255a", "225c0041", "\"\\\x00A", True, "\\\"\\\\.A", "\"\\\x00A", "nul", ""),
+    ("255a", "746162096e6c0a", "tab\tnl\n", True, "tab\tnl\n", "tab\tnl\n", "", ""),
+    ("255a", "636166e9", "63:61:66:e9", False, "?", "caf", "", "invalid"),
+    ("255t", "636166c3", "caf", True, "?", "caf", "", ""),
+    ("255t", "636166c3a9c3", "café", True, "?", "café", "", ""),
+    ("255t", "63ff66", "63:ff:66", False, "?", "cf", "", "invalid"),
+    ("1t", "636166c3a9", "café", True, "café", "caf", "", "non-ascii"),
+    ("1a", "636166c3a9", "café", True, "café", "caf", "", "non-ascii"),
+    ("1t", "636166c3", "caf", True, "?", "caf", "", ""),
+    ("2a", "6162636465", "abcde", True, "abcde", "abcde", "", ""),
+    ("2a.", "6162636465", "ab.cd.e", True, "ab.cd.e", "ab.cd.e", "", ""),
+    ("1x:", "", "", True, "", "", "", ""),
+    ("1x:", "05", "05", True, "5", "05", "pad", ""),
+    ("1x:", "0a0b", "0a:0b", True, "a:b", "0a:0b", "pad", ""),
+    ("1x", "0a", "0a", True, "0a", "0a", "", ""),
+    ("1x", "", "", True, "", "", "", ""),
+    ("1x-", "001122334455", "00-11-22-33-44-55", True, "0-11-22-33-44-55", "00-11-22-33-44-55", "pad", ""),
+    ("1x ", "001122", "00 11 22", True, "0 11 22", "00 11 22", "pad", ""),
+    ("2x:", "010203", "0102:03", True, "?", "102:03", "", "pad"),
+    ("2x", "000102", "000102", True, "?", "0102", "", "pad"),
+    ("4d.4d", "00000001ffffffff", "1.4294967295", True, "1.4294967295", "1.4294967295", "", ""),
+    ("4d", "ffffffff", "4294967295", True, "4294967295", "4294967295", "", ""),
+    ("8d", "ffffffffffffffff", "18446744073709551615", True, "-1", "18446744073709551615", "long", ""),
+    ("8x", "000000000000000a", "000000000000000a", True, "a", "0a", "pad", "pad"),
+    ("16x", "000102030405060708090a0b0c0d0e0f", "000102030405060708090a0b0c0d0e0f", True, "8090a0b0c0d0e0f", "102030405060708090a0b0c0d0e0f", "long", "pad"),
+    ("16d", "000102030405060708090a0b0c0d0e0f", "5233100606242806050955395731361295", True, "579005069656919567", "5233100606242806050955395731361295", "long", ""),
+    ("1o", "08ff", "10377", True, "10377", "010377", "", "o-pad"),
+    ("2o", "0100", "400", True, "400", "400", "", ""),
+    ("1d", "0102", "12", True, "12", "12", "", ""),
+    ("1d.", "01020304", "1.2.3.4", True, "1.2.3.4", "1.2.3.4", "", ""),
+    ("2d.2d", "000100020003", "1.23", True, "1.23", "1.23", "", ""),
+    ("1d.1d.1d.1d%4d", "c000020100000005", "192.0.2.1%5", True, "192.0.2.1%5", "192.0.2.1%5", "", ""),
+    ("2x:2x:2x:2x:2x:2x:2x:2x%4d", "fe8000000000000002005efffe00530100000003", "fe80:0000:0000:0000:0200:5eff:fe00:5301%3", True, "fe80:0:0:0:200:5eff:fe00:5301%3", "fe80:00:00:00:200:5eff:fe00:5301%3", "pad", "pad"),
+    ("1d.1d.1d.1d/1d", "c0a8010018", "192.168.1.0/24", True, "192.168.1.0/24", "192.168.1.0/24", "", ""),
+    ("0a[2x:2x:2x:2x:2x:2x:2x:2x]0a:2d", "20010db80000000000000000000000010050", "[2001:0db8:0000:0000:0000:0000:0000:0001]:80", True, " [10d:b800:0:0:0:0:0:100]P", "[2001:db8:00:00:00:00:00:01]:80", "zero-length", "pad"),
+    ("0a[2x:2x:2x:2x:2x:2x:2x:2x]0a:2d", "", "", True, "", "", "", ""),
+    ("0a[2x:2x:2x:2x:2x:2x:2x:2x]0a:2d", "2001", "[2001", True, "?", "[2001", "", ""),
+    ("1d.1d.1d.1d:2d", "c000020101bb", "192.0.2.1:443", True, "192.0.2.1:443", "192.0.2.1:443", "", ""),
+    ("*1x:/1x", "00dd", "/dd", True, "/dd", "dd", "", "repeat"),
+    ("*1x:/1x", "05aabb", "aa:bb", True, "aa:bb", "aa/bb/000000", "", "repeat"),
+    ("*1x:/1x", "01aa", "aa", True, "aa", "aa/", "", "repeat"),
+    ("*1x:/1x:", "02aabbccdd", "aa:bb/cc:dd", True, "aa:bb:/cc:dd", "aa/bb/cc:0000000000000000000000000000000...", "sep-before-term", "repeat"),
+    ("*1d.", "020a0b0c", "10.11", True, "10.11.12", "1011.000000000000", "reuse-repeat", "repeat"),
+    ("*1d./1d", "020a0b0c0d", "10.11/1213", True, "10.11./1213", "10/11/120000000000000", "sep-before-term", "repeat"),
+    ("*1x:", "03aabbcc02ddee", "aa:bb:cc:dd:ee", True, "aa:bb:cc:2:dd:ee", "aabbcc:ddee", "reuse-repeat", "repeat"),
+    ("*2a,/1d", "026162636407", "ab,cd/7", True, "ab,cd,/7", "ab/cd/7", "sep-before-term", "repeat"),
+    ("*0x:/1x", "02aa", ":/aa", True, "aa", "00/00/aa", "zero-length", "zero-length"),
+    ("0x:", "01", "01", False, "1", "HANG", "zero-length", "zero-length"),
+    ("1d.0a", "01", "1", True, "1", "1", "", ""),
+    ("1d.0a", "0102", "01:02", False, "1.\x02", "1.2", "zero-length", "zero-length"),
+    ("0a-1a", "78", "-x", True, "x", "-x", "zero-length", ""),
+    ("1d,1d,1d", "0102", "1,2", True, "1,2", "1,2", "", ""),
+    ("1x:1x:1x:1x", "010203040506", "01:02:03:040506", True, "1:2:3:040506", "01:02:03:0405:06", "pad", "restart"),
+    ("4x-2x-2x-2x-6x", "00112233445566778899aabbccddeeff", "00112233-4455-6677-8899-aabbccddeeff", True, "112233-4455-6677-8899-aabbccddeeff", "112233-4455-6677-8899-aabbccddeeff", "pad", "pad"),
+]
+
+# Integer-format vectors: (hint, value, ours, net-snmp, pysnmp, net-snmp note, pysnmp note).
+#   net-snmp: dot (d-N without a leading 0), twos (x/o of a negative value in 64-bit two's
+#     complement), b32 (b always 32 digits)
+#   pysnmp: x-prefix (0x), o-prefix (leading 0), b-suffix (trailing B), b-hang (loops forever on
+#     a negative value)
+INT_VECTORS: list[(str, int, str, str, str, str, str)] = [
+    ("d", 1234, "1234", "1234", "1234", "", ""),
+    ("d", -1234, "-1234", "-1234", "-1234", "", ""),
+    ("d", 0, "0", "0", "0", "", ""),
+    ("d-2", 1234, "12.34", "12.34", "12.34", "", ""),
+    ("d-2", -5, "-0.05", "-.05", "-0.05", "dot", ""),
+    ("d-2", 5, "0.05", ".05", "0.05", "dot", ""),
+    ("d-2", 12, "0.12", ".12", "0.12", "dot", ""),
+    ("d-2", 0, "0.00", ".00", "0.00", "dot", ""),
+    ("d-2", -1234, "-12.34", "-12.34", "-12.34", "", ""),
+    ("d-0", 7, "7", "7", "7", "", ""),
+    ("d-1", -123, "-12.3", "-12.3", "-12.3", "", ""),
+    ("d-3", 1, "0.001", ".001", "0.001", "dot", ""),
+    ("d-3", 1000, "1.000", "1.000", "1.000", "", ""),
+    ("d-2", 2147483647, "21474836.47", "21474836.47", "21474836.47", "", ""),
+    ("d-2", -2147483648, "-21474836.48", "-21474836.48", "-21474836.48", "", ""),
+    ("d", 4294967295, "4294967295", "4294967295", "4294967295", "", ""),
+    ("x", 255, "ff", "ff", "0xff", "", "x-prefix"),
+    ("x", 0, "0", "0", "0x0", "", "x-prefix"),
+    ("x", -255, "-ff", "ffffffffffffff01", "0x-ff", "twos", "x-prefix"),
+    ("x", 2147483647, "7fffffff", "7fffffff", "0x7fffffff", "", "x-prefix"),
+    ("o", 8, "10", "10", "010", "", "o-prefix"),
+    ("o", 0, "0", "0", "00", "", "o-prefix"),
+    ("o", -8, "-10", "1777777777777777777770", "0-10", "twos", "o-prefix"),
+    ("b", 5, "101", "00000000000000000000000000000101", "101B", "b32", "b-suffix"),
+    ("b", 0, "0", "00000000000000000000000000000000", "B", "b32", "b-suffix"),
+    ("b", -5, "-101", "11111111111111111111111111111011", "HANG", "b32", "b-hang"),
+    ("b", 255, "11111111", "00000000000000000000000011111111", "11111111B", "b32", "b-suffix"),
+]
+
+
+def _test_octet_vectors() -> None:
+    for v in OCTET_VECTORS:
+        h = hp(v.0)
+        b = unhex(v.1)
+        what = v.0 + " " + v.1
+        r = mib.hint.render_octets_ex(h, b)
+        testing.assertEqual(r.text, v.2, "RFC rendering of " + what)
+        testing.assertEqual(r.ok, v.3, "ok flag of " + what)
+        testing.assertEqual(r.reason == "", v.3, "reason of " + what)
+        testing.assertEqual(mib.hint.render_octets(h, b), v.2, "render_octets of " + what)
+        if v.4 != "?":
+            testing.assertEqual(mib.hint.render_octets(h, b, True), v.4, "net-snmp rendering of " + what)
+            testing.assertEqual(v.4 != v.2, v.6 != "", "net-snmp note of " + what)
+        testing.assertEqual(v.5 != v.2, v.7 != "", "pysnmp note of " + what)
+
+
+def _test_int_vectors() -> None:
+    for v in INT_VECTORS:
+        h = hp(v.0)
+        what = v.0 + " " + str(v.1)
+        r = mib.hint.render_int_ex(h, v.1)
+        testing.assertEqual(r.text, v.2, "RFC rendering of " + what)
+        testing.assertTrue(r.ok, "ok flag of " + what)
+        testing.assertEqual(mib.hint.render_int(h, v.1), v.2, "render_int of " + what)
+        testing.assertEqual(mib.hint.render_int(h, v.1, True), v.3, "net-snmp rendering of " + what)
+        testing.assertEqual(v.3 != v.2, v.5 != "", "net-snmp note of " + what)
+        testing.assertEqual(v.4 != v.2, v.6 != "", "pysnmp note of " + what)
+
+
+def _test_spec_examples() -> None:
+    """Worked DISPLAY-HINT examples and the RFC 2579 examples, spelled out."""
+    dt = hp("2d-1d-1d,1d:1d:1d.1d,1a1d:1d")
+    testing.assertEqual(mib.hint.render_octets(hp("255a"), b"hello"), "hello")
+    testing.assertEqual(mib.hint.render_octets(hp("255t"), unhex("636166c3a9")), "café")
+    testing.assertEqual(mib.hint.render_octets(hp("1x:"), unhex("001a2b3c4d5e")), "00:1a:2b:3c:4d:5e")
+    testing.assertEqual(mib.hint.render_octets(hp("1x:"), unhex("001a2b3c4d5e"), True), "0:1a:2b:3c:4d:5e")
+    testing.assertEqual(mib.hint.render_octets(hp("1d.1d.1d.1d"), unhex("c0000201")), "192.0.2.1")
+    v6 = unhex("20010db8000000000000000000000001")
+    testing.assertEqual(mib.hint.render_octets(hp("2x:2x:2x:2x:2x:2x:2x:2x"), v6), "2001:0db8:0000:0000:0000:0000:0000:0001")
+    testing.assertEqual(mib.hint.render_octets(hp("2x:2x:2x:2x:2x:2x:2x:2x"), v6, True), "2001:db8:0:0:0:0:0:1")
+    testing.assertEqual(mib.hint.render_octets(dt, unhex("07e60a0a0d1e0f002b0200")), "2022-10-10,13:30:15.0,+2:0")
+    testing.assertEqual(mib.hint.render_octets(dt, unhex("07e60a0a0d1e0f00")), "2022-10-10,13:30:15.0")
+    testing.assertEqual(mib.hint.render_octets(hp("*1x:/1x"), unhex("03aabbccdd")), "aa:bb:cc/dd")
+    testing.assertEqual(mib.hint.render_octets(hp("1x"), unhex("0a0b0c")), "0a0b0c")
+    testing.assertEqual(mib.hint.render_int(hp("d-2"), 1234), "12.34")
+    testing.assertEqual(mib.hint.render_int(hp("d-2"), -5), "-0.05")
+    testing.assertEqual(mib.hint.render_int(hp("d-2"), -5, True), "-.05")
+    testing.assertEqual(mib.hint.render_int(hp("x"), 255), "ff")
+    # RFC 2579: Hundredths and DateAndTime
+    testing.assertEqual(mib.hint.render_int(hp("d-2"), 1234), "12.34")
+    testing.assertEqual(mib.hint.render_octets(dt, unhex("07c8051a0d1e0f002d0400")), "1992-5-26,13:30:15.0,-4:0")
+    # DisplayString, SnmpAdminString and the lab's UTF-8 string
+    testing.assertEqual(mib.hint.render_octets(hp("255a"), unhex("72c3a46b736dc3b67267c3a573")), "räksmörgås")
+    testing.assertEqual(mib.hint.render_octets(hp("255t"), unhex("72c3a46b736dc3b67267c3a573")), "räksmörgås")
+
+
+def _test_parse() -> None:
+    h = hp("d-2")
+    testing.assertTrue(h.integer)
+    testing.assertEqual(h.int_fmt, "d")
+    testing.assertEqual(h.decimals, 2)
+    for t in ["d", "x", "o", "b", "d-0", "d-10"]:
+        testing.assertTrue(hp(t).integer, t)
+    testing.assertEqual(hp("d").decimals, 0)
+    h2 = hp("2d-1d-1d,1d:1d:1d.1d,1a1d:1d")
+    testing.assertFalse(h2.integer)
+    testing.assertEqual([str(s) for s in h2.specs], ["2d-", "1d-", "1d,", "1d:", "1d:", "1d.", "1d,", "1a", "1d:", "1d"])
+    h3 = hp("*1x:/1x")
+    testing.assertEqual(len(h3.specs), 2)
+    s0 = h3.specs[0]
+    testing.assertTrue(s0.repeat)
+    testing.assertEqual(s0.length, 1)
+    testing.assertEqual(s0.fmt, "x")
+    testing.assertEqual(s0.sep, ":")
+    testing.assertEqual(s0.term, "/")
+    # a terminator needs a repeat indicator: without `*`, "1x:/" leaves "/" as a new spec
+    testing.assertEqual([str(s) for s in hp("0a[2x:2x:2x:2x:2x:2x:2x:2x]0a:2d").specs],
+                        ["0a[", "2x:", "2x:", "2x:", "2x:", "2x:", "2x:", "2x:", "2x]", "0a:", "2d"])
+    testing.assertEqual([str(s) for s in hp("1x ").specs], ["1x "])
+    testing.assertEqual([str(s) for s in hp("02x:02x").specs], ["2x:", "2x"])
+    testing.assertEqual([str(s) for s in hp("65535t").specs], ["65535t"])
+    testing.assertEqual([str(s) for s in hp("1d.1d.1d.1d:2d@*1t").specs], ["1d.", "1d.", "1d.", "1d:", "2d@", "*1t"])
+    testing.assertEqual(str(hp("255a")), "255a")
+    testing.assertEqual(repr(hp("*1x:/1x").specs[0]), "OctetSpec(*1x:/)")
+
+
+BAD_HINTS = ["", "d4", "d-", "d-x", "d-1%", "d watt", "d ", " d", "dd", "x1", "xx", "X", "D", "t", "a", "255A",
+             "1h:", "1q", "*x", "*", "1", "12", "1x:/", "1x:1", "1d-1x-1o-1b", "1x-1x [1x:1x]", "YYMMDDHHMMSS",
+             "Vxx.yy", "a.bcdE-n", "**1x", "1x**"]
+
+# Syntactically valid, but beyond our limits (octet length up to 6 digits, d-N up to 3 digits);
+# mib.resolver.hint_ok accepts them.
+HUGE_HINTS = ["1234567x", "d-1234"]
+
+GOOD_HINTS = ["d", "x", "o", "b", "d-0", "d-2", "d-10", "255a", "256a", "1t", "255t", "1x:", "2x:", "1x", "1d.", "1d.1d.1d.1d",
+              "2d-1d-1d,1d:1d:1d.1d,1a1d:1d", "*1x:/1x", "*1x:/1x:", "0a[2x:2x]0a:2d", "1d.1d.1d.1d%4d", "1x ", "0x:",
+              "1x-", "4x-2x-2x-2x-6x", "1d.1d.1d.1d/2d/32a", "65535t", "02x:02x", "2d-", "*2a,/1d", "1d.1d.1d.1d:2d@*1t"]
+
+
+def _test_parse_rejects() -> None:
+    for t in BAD_HINTS:
+        try:
+            mib.hint.parse(t)
+            testing.error("parse(" + repr(t) + ") did not raise")
+        except HintError as e:
+            testing.assertTrue(e.error_message != "", t)
+        testing.assertNone(mib.hint.try_parse(t), t)
+    for t in GOOD_HINTS:
+        testing.assertNotNone(mib.hint.try_parse(t), t)
+    for t in HUGE_HINTS:
+        testing.assertNone(mib.hint.try_parse(t), t)
+
+
+def _test_agrees_with_resolver() -> None:
+    """mib.resolver.hint_ok (the compile-time check) accepts exactly what parse + check accept."""
+    for t in BAD_HINTS + GOOD_HINTS:
+        h = mib.hint.try_parse(t)
+        for base in ["INTEGER", "Unsigned32", "Counter64", "OCTET STRING", "Opaque", "IpAddress", "BITS", "OBJECT IDENTIFIER"]:
+            ours = h is not None and mib.hint.check(h, base) == ""
+            testing.assertEqual(ours, mib.resolver.hint_ok(t, base), t + " on " + base)
+
+
+def _test_check() -> None:
+    d2 = hp("d-2")
+    a = hp("255a")
+    for base in ["INTEGER", "Integer32", "Unsigned32", "Gauge32", "TimeTicks"]:
+        testing.assertEqual(mib.hint.check(d2, base), "", base)
+        testing.assertEqual(mib.hint.check(d2, base, strict=True), "", base)
+        testing.assertNotEqual(mib.hint.check(a, base), "", base)
+    for base in ["Counter32", "Counter64"]:
+        testing.assertEqual(mib.hint.check(d2, base), "", base)
+        testing.assertNotEqual(mib.hint.check(d2, base, strict=True), "", base)
+    testing.assertEqual(mib.hint.check(a, "OCTET STRING"), "")
+    testing.assertEqual(mib.hint.check(a, "OCTET STRING", strict=True), "")
+    testing.assertEqual(mib.hint.check(a, "Opaque"), "")
+    testing.assertNotEqual(mib.hint.check(a, "Opaque", strict=True), "")
+    testing.assertNotEqual(mib.hint.check(d2, "OCTET STRING"), "")
+    for base in ["BITS", "OBJECT IDENTIFIER", "IpAddress", ""]:
+        testing.assertNotEqual(mib.hint.check(d2, base), "", base)
+        testing.assertNotEqual(mib.hint.check(a, base), "", base)
+    testing.assertNotEqual(mib.hint.check(d2, "INTEGER", enumerated=True), "")
+    testing.assertEqual(mib.hint.check(d2, "IpAddress"), "RFC 2579 §3.1 forbids a DISPLAY-HINT on IpAddress")
+
+
+def _test_fallbacks() -> None:
+    # hint of the other form
+    r = mib.hint.render_octets_ex(hp("d-2"), unhex("0102"))
+    testing.assertFalse(r.ok)
+    testing.assertEqual(r.text, "01:02")
+    testing.assertTrue("integer-format" in r.reason, r.reason)
+    r2 = mib.hint.render_int_ex(hp("255a"), -7)
+    testing.assertFalse(r2.ok)
+    testing.assertEqual(r2.text, "-7")
+    testing.assertEqual(mib.hint.render_int(hp("1x:"), 42), "42")
+    # bad UTF-8 in a and t, and a length-0 last specification
+    r3 = mib.hint.render_octets_ex(hp("255a"), unhex("636166e9"))
+    testing.assertEqual(r3.text, "63:61:66:e9")
+    testing.assertFalse(r3.ok)
+    testing.assertTrue("UTF-8" in r3.reason, r3.reason)
+    for bad in ["c080", "e0800a", "eda080", "f4908080", "ff", "80", "c3c3"]:
+        testing.assertFalse(mib.hint.render_octets_ex(hp("255t"), unhex(bad + "41")).ok, bad)
+    r4 = mib.hint.render_octets_ex(hp("1d.0a"), unhex("0102"))
+    testing.assertFalse(r4.ok)
+    testing.assertEqual(r4.text, "01:02")
+    testing.assertEqual(mib.hint.render_octets_ex(hp("1d.0a"), unhex("01")).text, "1")
+    # an incomplete character at the end of `t` is discarded, of `a` it is bad data
+    testing.assertEqual(mib.hint.render_octets_ex(hp("255t"), unhex("41f09f98")).text, "A")
+    testing.assertFalse(mib.hint.render_octets_ex(hp("255a"), unhex("41f09f98")).ok)
+    testing.assertEqual(mib.hint.render_octets(hp("255t"), unhex("f09f9880")), "😀")
+    testing.assertEqual(mib.hint.render_octets(hp("1t"), unhex("f09f9880")), "😀")
+    # a character split by a separator: the rest of it is not UTF-8, so the value falls back
+    testing.assertFalse(mib.hint.render_octets_ex(hp("1t."), unhex("41c3a942")).ok)
+    # an empty application between separators at the end: all of them are suppressed
+    testing.assertEqual(mib.hint.render_octets(hp("1t."), unhex("41c3")), "A")
+    testing.assertEqual(mib.hint.render_octets(hp("1t.0a:1t"), unhex("41c3")), "A")
+    testing.assertEqual(mib.hint.render_octets(hp("*1x:/0a-1x"), unhex("0201")), "01")
+    # empty values never fall back
+    for t in GOOD_HINTS:
+        h = hp(t)
+        if not h.integer:
+            r5 = mib.hint.render_octets_ex(h, b"")
+            testing.assertTrue(r5.ok, t)
+            testing.assertEqual(r5.text, "", t)
+    # format_* with hint text
+    testing.assertEqual(mib.hint.format_octets("1x:", unhex("0a0b")), "0a:0b")
+    testing.assertEqual(mib.hint.format_octets("1q", unhex("0a0b")), "0a:0b")
+    testing.assertEqual(mib.hint.format_int("d-1", 15), "1.5")
+    testing.assertEqual(mib.hint.format_int("d1", 15), "15")
+    testing.assertEqual(mib.hint.hex_fallback(b""), "")
+
+
+def _test_never_raises() -> None:
+    """Random values against every good hint, in both modes: no exception, and a fallback is
+    always the hex form."""
+    rng = Lcg(2579)
+    hints = [hp(t) for t in GOOD_HINTS]
+    for i in range(400):
+        n = rng.below(24)
+        vals: list[int] = []
+        for k in range(n):
+            vals.append(rng.below(256) if rng.below(4) != 0 else rng.below(128))
+        b = bytes(vals)
+        for h in hints:
+            for ns in [False, True]:
+                r = mib.hint.render_octets_ex(h, b, ns)
+                if not r.ok:
+                    testing.assertEqual(r.text, mib.hint.hex_fallback(b))
+            iv = rng.next64()
+            testing.assertEqual(mib.hint.render_int_ex(h, iv).ok, h.integer)
+            mib.hint.render_int(h, iv, True)
+
+
+def _test_int_extremes() -> None:
+    imin = -9223372036854775807 - 1
+    testing.assertEqual(mib.hint.render_int(hp("d"), imin), "-9223372036854775808")
+    testing.assertEqual(mib.hint.render_int(hp("x"), imin), "-8000000000000000")
+    testing.assertEqual(mib.hint.render_int(hp("o"), imin), "-1000000000000000000000")
+    testing.assertEqual(mib.hint.render_int(hp("b"), imin), "-1" + "0" * 63)
+    testing.assertEqual(mib.hint.render_int(hp("d-3"), imin), "-9223372036854775.808")
+    testing.assertEqual(mib.hint.render_int(hp("x"), 9223372036854775807), "7fffffffffffffff")
+    testing.assertEqual(mib.hint.render_int(hp("d-20"), 5), "0.00000000000000000005")
+    testing.assertEqual(mib.hint.render_int(hp("x"), -1, True), "ffffffffffffffff")
+    testing.assertEqual(mib.hint.render_int(hp("d-20"), 5, True), ".00000000000000000005")
+
+
+def _test_parse_octets() -> None:
+    mac = hp("1x:")
+    testing.assertEqual(mib.hint.parse_octets(mac, "00:1a:2b:3c:4d:5e"), unhex("001a2b3c4d5e"))
+    testing.assertEqual(mib.hint.parse_octets(mac, "0:1A:2b:3C:4d:5e"), unhex("001a2b3c4d5e"))
+    testing.assertEqual(mib.hint.parse_octets(mac, ""), b"")
+    v6 = hp("2x:2x:2x:2x:2x:2x:2x:2x")
+    testing.assertEqual(mib.hint.parse_octets(v6, "2001:db8:0:0:0:0:0:1"), unhex("20010db8000000000000000000000001"))
+    dt = hp("2d-1d-1d,1d:1d:1d.1d,1a1d:1d")
+    testing.assertEqual(mib.hint.parse_octets(dt, "1992-5-26,13:30:15.0,-4:0"), unhex("07c8051a0d1e0f002d0400"))
+    testing.assertEqual(mib.hint.parse_octets(dt, "2022-10-10,13:30:15.0"), unhex("07e60a0a0d1e0f00"))
+    testing.assertEqual(mib.hint.parse_octets(hp("255a"), "hello"), b"hello")
+    testing.assertEqual(mib.hint.parse_octets(hp("255t"), "räksmörgås"), unhex("72c3a46b736dc3b67267c3a573"))
+    testing.assertEqual(mib.hint.parse_octets(hp("1t"), "café"), unhex("636166c3a9"))
+    testing.assertEqual(mib.hint.parse_octets(hp("1x"), "0a0b0c"), unhex("0a0b0c"))
+    testing.assertEqual(mib.hint.parse_octets(hp("*1x:/1x"), "aa:bb:cc/dd"), unhex("03aabbccdd"))
+    testing.assertEqual(mib.hint.parse_octets(hp("*1x:/1x"), "/dd"), unhex("00dd"))
+    testing.assertEqual(mib.hint.parse_octets(hp("*1x:"), "aa:bb:cc:dd:ee"), unhex("05aabbccddee"))
+    testing.assertEqual(mib.hint.parse_octets(hp("0a[2x:2x:2x:2x:2x:2x:2x:2x]0a:2d"), "[2001:0db8:0000:0000:0000:0000:0000:0001]:80"),
+                        unhex("20010db80000000000000000000000010050"))
+    testing.assertEqual(mib.hint.parse_octets(hp("1d.1d.1d.1d%4d"), "192.0.2.1%5"), unhex("c000020100000005"))
+    testing.assertEqual(mib.hint.parse_octets(hp("1d.1d.1d.1d/1d"), "192.168.1.0/24"), unhex("c0a8010018"))
+    testing.assertEqual(mib.hint.parse_octets(hp("1d"), "200"), unhex("c8"))
+    testing.assertEqual(mib.hint.parse_octets(hp("4x-2x-2x-2x-6x"), "00112233-4455-6677-8899-aabbccddeeff"),
+                        unhex("00112233445566778899aabbccddeeff"))
+    # 300 repetitions without a terminator: groups of 255 and 45
+    long_text = ":".join(["%02x" % (i % 256) for i in range(300)])
+    pb = mib.hint.parse_octets(hp("*1x:"), long_text)
+    testing.assertEqual(len(pb), 302)
+    testing.assertEqual(pb[0], 255)
+    testing.assertEqual(pb[256], 45)
+    testing.assertEqual(mib.hint.render_octets(hp("*1x:"), pb), long_text)
+
+
+def _parse_fails(hint: str, text: str) -> None:
+    try:
+        mib.hint.parse_octets(hp(hint), text)
+        testing.error("parse_octets(" + hint + ", " + repr(text) + ") did not raise")
+    except HintError:
+        pass
+
+
+def _test_parse_octets_rejects() -> None:
+    _parse_fails("1x:", "zz:00")
+    _parse_fails("1x:", "00-11")
+    _parse_fails("1x:", "100:11")
+    _parse_fails("1d.1d.1d.1d", "256.0.0.1")
+    _parse_fails("1d.1d.1d.1d", "1.2.3.4.")
+    _parse_fails("1d1x", "120a")
+    _parse_fails("*1x:2x", "aa:bb")
+    _parse_fails("4a.", "abcdef")
+    _parse_fails("1d.0a", "1.2")
+    _parse_fails("d-2", "1.00")
+    _parse_fails("*1x:/1x", ":".join(["00"] * 256) + "/00")
+
+
+def _test_round_trips() -> None:
+    """parse_octets(render_octets(b)) == b where the rendering is injective, over random values."""
+    rng = Lcg(1903)
+    cases: list[(str, int, int)] = [("1x:", 0, 20), ("1x", 0, 20), ("2x:", 0, 0), ("1d.", 0, 12), ("255a", 0, 40),
+                                    ("255t", 0, 40), ("1x-", 6, 6), ("1d.1d.1d.1d", 4, 4), ("2x:2x:2x:2x:2x:2x:2x:2x", 16, 16),
+                                    ("1d.1d.1d.1d%4d", 8, 8), ("*1x:/1x", 0, 0), ("2d-1d-1d,1d:1d:1d.1d,1a1d:1d", 11, 11),
+                                    ("4d.4d", 8, 8)]
+    for c in cases:
+        h = hp(c.0)
+        for i in range(60):
+            lo = c.1
+            hi = c.2
+            n = lo + rng.below(hi - lo + 1) if hi > 0 else 2 * rng.below(9)
+            vals: list[int] = []
+            for k in range(n):
+                if c.0 == "255a" or c.0 == "255t":
+                    vals.append(32 + rng.below(95))
+                elif c.0 == "*1x:/1x" and k == 0:
+                    vals.append(n - 2 if n >= 2 else 0)
+                elif c.0.startswith("2d-") and k == 8:
+                    vals.append(43 if rng.below(2) == 0 else 45)
+                else:
+                    vals.append(rng.below(256))
+            b = bytes(vals)
+            if c.0 == "*1x:/1x" and n == 0:
+                continue
+            text = mib.hint.render_octets(h, b)
+            testing.assertEqual(mib.hint.parse_octets(h, text), b, c.0 + " " + text)
+    t8 = "ünïcödé ✓ 😀"
+    testing.assertEqual(mib.hint.render_octets(hp("255t"), mib.hint.parse_octets(hp("255t"), t8)), t8)
+
+
+def _render_ok(hint: str, hexv: str, want: str) -> None:
+    r = mib.hint.render_octets_ex(hp(hint), unhex(hexv))
+    testing.assertEqual(r.text, want, hint + " " + hexv)
+    testing.assertTrue(r.ok, hint + " " + hexv + ": " + r.reason)
+
+
+def _render_falls_back(hint: str, hexv: str) -> None:
+    r = mib.hint.render_octets_ex(hp(hint), unhex(hexv))
+    testing.assertFalse(r.ok, hint + " " + hexv)
+    testing.assertEqual(r.text, mib.hint.hex_fallback(unhex(hexv)), hint + " " + hexv)
+
+
+def _test_adversarial_render() -> None:
+    """Odd hints against RFC 2579 section 3.1: a value shorter or longer than the hint, re-applied
+    specifications, zero-length specifications and values, big lengths and repeat counts."""
+    # hint longer than the value: the excess specifications are ignored, and so is the
+    # separator of the last application; value longer: the last specification is re-applied
+    cidr = "1d.1d.1d.1d/1d"
+    _render_ok(cidr, "", "")
+    _render_ok(cidr, "c0", "192")
+    _render_ok(cidr, "c0a801", "192.168.1")
+    _render_ok(cidr, "c0a80100", "192.168.1.0")
+    _render_ok(cidr, "c0a8010018", "192.168.1.0/24")
+    _render_ok(cidr, "c0a80100180102", "192.168.1.0/2412")
+    _render_ok("2d-1d-1d,1d:1d:1d.1d,1a1d:1d", "07", "7")
+    _render_ok("1d.", "0102030405", "1.2.3.4.5")
+    _render_ok("1x:2x:3x:4x", "0a0b0c0d0e", "0a:0b0c:0d0e")
+    _render_ok("1x:2x:3x:4x", "0a0b0c0d0e0f1011121314", "0a:0b0c:0d0e0f:1011121314")
+    # repeat: the count octet of the re-applied specification is read again (RFC "the last
+    # octet-format specification is re-interpreted")
+    _render_ok("*1x:", "", "")
+    _render_ok("*1x:", "00", "")
+    _render_ok("*1x:", "00aa", "")
+    _render_ok("*1x:", "02aabbcc", "aa:bb")
+    _render_ok("*1x:", "02aabb01cc", "aa:bb:cc")
+    _render_ok("*1x:", "ffaabbcc", "aa:bb:cc")
+    full = "ff" + "".join(["%02x" % i for i in range(255)]) + "01ab"
+    _render_ok("*1x:", full, ":".join(["%02x" % i for i in range(255)] + ["ab"]))
+    _render_ok("*1x:/1x", "0000", "/00")
+    _render_ok("*1x:/1x", "02aabb", "aa:bb")
+    _render_ok("*1x:/1x", "03aabb", "aa:bb")
+    _render_ok("*1d./1d/1d", "020102030405", "1.2/3/45")
+    # big octet lengths
+    _render_ok("2048a", "61" * 3000, "a" * 3000)
+    _render_ok("2048a", "", "")
+    _render_ok("512x", "001a2b", "001a2b")
+    _render_ok("255d", "01020304", "16909060")
+    # zero-length specifications: only their separators, and never re-applied
+    _render_ok("0x", "", "")
+    _render_falls_back("0x", "01")
+    _render_falls_back("0a", "6162")
+    _render_ok("0a-1a", "7879", "-xy")
+    _render_ok("1x0a:", "01", "01")
+    _render_falls_back("1x0a:", "0102")
+    _render_ok("*0x:/1x", "00aa", "/aa")
+    # a and t: separator and terminator characters inside the data are data
+    _render_ok("19a.255a", "6162632e646566", "abc.def")
+    _render_ok("2a.1a", "2e6263", ".b.c")
+    _render_ok("2a-6a-6a-2a", "612d", "a-")
+    _render_ok("*2a,/1d", "0261622f6407", "ab,/d/7")
+    # negative integers with implied decimals
+    for v in [(-1, "-0.01"), (-99, "-0.99"), (-100, "-1.00"), (-101, "-1.01"), (100, "1.00")]:
+        testing.assertEqual(mib.hint.render_int(hp("d-2"), v.0), v.1, str(v.0))
+    testing.assertEqual(mib.hint.render_int(hp("d-0"), -7), "-7")
+    testing.assertEqual(mib.hint.render_int(hp("d-3"), -1000), "-1.000")
+    testing.assertEqual(mib.hint.render_int(hp("d-999"), 5), "0." + "0" * 998 + "5")
+
+
+ODD_BAD_HINTS = ["1x::", "*1x:::", "2048", "-1x", "1.5x", "1X", " 1x", "1 x", "d-2-", "d--2", "d-+2", "d-2.5",
+                 "x-2", "b-1", "o-1", "*-1x", "1x*", "1x:*", "*1x:/*", "0", "*0"]
+
+ODD_GOOD_HINTS = [("1d.1d.1d.1d/", ["1d.", "1d.", "1d.", "1d/"]), ("*1x::", ["*1x::"]), ("1x 1x", ["1x ", "1x"]),
+                  ("*1x/", ["*1x/"]), ("*1x:/*1x", ["*1x:/", "*1x"]), ("1x*1x", ["1x", "*1x"]),
+                  ("1xx", ["1xx"]), ("0xd", ["0xd"]), ("1x·", ["1x·"]), ("0000001x", ["1x"]),
+                  ("2048a", ["2048a"]), ("000000000000255a", ["255a"])]
+
+
+def _test_adversarial_parse() -> None:
+    for t in ODD_BAD_HINTS:
+        testing.assertNone(mib.hint.try_parse(t), t)
+    for g in ODD_GOOD_HINTS:
+        h = mib.hint.try_parse(g.0)
+        if h is not None:
+            testing.assertEqual([str(s) for s in h.specs], g.1, g.0)
+        else:
+            testing.error("try_parse(" + repr(g.0) + ") is None")
+    # leading zeros do not count against the length limits
+    testing.assertEqual(hp("d-0002").decimals, 2)
+    testing.assertEqual(mib.hint.render_int(hp("d-0002"), 1234), "12.34")
+    # a non-ASCII separator
+    testing.assertEqual(mib.hint.render_octets(hp("1x·"), unhex("0a0b")), "0a·0b")
+
+
+def _round_trip(hint: str, b: bytes) -> None:
+    h = hp(hint)
+    r = mib.hint.render_octets_ex(h, b)
+    testing.assertTrue(r.ok, hint + " " + mib.hint.hex_fallback(b))
+    testing.assertEqual(mib.hint.parse_octets(h, r.text), b, hint + " " + repr(r.text))
+
+
+def _test_parse_octets_separator_data() -> None:
+    """parse_octets inverts the rendering when an a/t application contains its own separator or
+    terminator character: the renderer only ends an application early at the end of the value,
+    so the characters up to the octet length are data."""
+    _round_trip("19a.255a", b"abc.def")
+    _round_trip("19a.255a", b"abc.def.ghi.jkl.mno.pqr")
+    _round_trip("2a.1a", b".bc")
+    _round_trip("2a.1a", b"a.c")
+    _round_trip("3a.1a", b"..........")
+    _round_trip("2a-6a-6a-2a", b"a--bcdef-hijkl-n-")
+    _round_trip("4a,", b"abcd,,e")
+    _round_trip("2t:", b"\xc3\xa9a:")
+    _round_trip("*2a,/1d", b"\x02ab/d\x07")
+    _round_trip("*2a,/1d", b"\x02a,,/\x07")
+    _round_trip("*2a,/1d", b"\x00\x07")
+    # multi-octet characters: joined across the applications of the last specification and
+    # across the repeat counts of a repeat without separator (counted in octets)
+    _round_trip("*1a", bytes([13]) + "951!26ɕ4599\x10".encode())
+    _round_trip("*1t", bytes([5]) + "ünï".encode())
+    _round_trip("*2t", bytes([2]) + "aé".encode())
+    _round_trip("*1t", bytes([255]) + b"a" * 254 + b"\xc3" + bytes([46]) + b"\xa9" + b"b" * 45)
+    _round_trip("1d.1d.1d.1d:2d@*1t", bytes.from_hex("c00002010050") + bytes([5]) + "hôst".encode())
+    _round_trip("2a.1a", "abé".encode())
+    _round_trip("1t", "😀é".encode())
+    # a character that cannot be split where the hint would split it
+    _parse_fails("1t,", "é")
+    _parse_fails("*1t,/1d", "é/5")
+    _parse_fails("1t1t1d", "é5")
+    # d and o without a separator: no leading zeros, so a 0 is an application of its own
+    _round_trip("1d", bytes([0, 57]))
+    _round_trip("1d", bytes([0, 0, 7]))
+    _round_trip("4d", bytes([0, 0, 0, 0, 0, 0, 0, 7]))
+    # (the short final 27o/ application comes back full length, which renders the same)
+    o27 = hp("1o0x027o/1o/")
+    testing.assertEqual(mib.hint.render_octets(o27, mib.hint.parse_octets(o27, "055")), "055")
+    testing.assertEqual(mib.hint.parse_octets(hp("1d.1d"), "007.1"), unhex("0701"))
+    # a terminator character at the end of the text is data (a trailing terminator is not shown)
+    _round_trip("1t.3a*2a..", b"\x0300:\x01.")
+    _round_trip("*1a,/", b"\x02,/")
+    # a zero-length numeric application renders nothing and reads nothing
+    _round_trip("0o205t2a:", b"0")
+    _round_trip("0d2a-*100d", b"01")
+    _round_trip("0x[1d]0x:1d", b"\x05\x07")
+    rng = Lcg(2579)
+    alphabet = "ab.-,/:"
+    for hint in ["19a.255a", "2a.1a", "3a.1a", "2a-6a-6a-2a", "4a,", "1a:", "2t:"]:
+        for i in range(80):
+            n = rng.below(40)
+            b = "".join([alphabet[rng.below(len(alphabet))] for k in range(n)]).encode()
+            _round_trip(hint, b)
+
+
+def _test_parse_octets_short_hex() -> None:
+    """A short final x application (the value ends inside it) renders 2 digits per octet; an
+    even number of digits fewer than the length at the end of the text is that application."""
+    _round_trip("512x", bytes.from_hex("001a2b"))
+    _round_trip("255x", bytes.from_hex("0a"))
+    _round_trip("2x", bytes.from_hex("000102"))
+    _round_trip("8x", bytes.from_hex("0a"))
+    _round_trip("2x:", bytes.from_hex("010203"))
+    _round_trip("1x:2x:3x:4x", bytes.from_hex("0a0b0c0d0e"))
+    _round_trip("4x-2x-2x-2x-6x", bytes.from_hex("0011223344556677889900aabbcc"))
+    _round_trip("0a[2x:2x:2x:2x:2x:2x:2x:2x]0a:2d", bytes.from_hex("20010db8000000000000000000000000"[:30]))
+    # a separator that is a hex digit: fixed-width groups
+    _round_trip("1xa", unhex("0a0b0c"))
+    _round_trip("77xb2x", unhex("31303643393833316bd7318c36366034"))
+    _round_trip("2xf", unhex("ffffff"))
+    # unpadded input (an odd number of digits) still takes the whole length
+    testing.assertEqual(mib.hint.parse_octets(hp("2x:2x:2x:2x:2x:2x:2x:2x"), "2001:db8:0:0:0:0:0:1"),
+                        unhex("20010db8000000000000000000000001"))
+    testing.assertEqual(mib.hint.parse_octets(hp("2x:"), "102:3"), unhex("01020003"))
+    rng = Lcg(1903)
+    for hint in ["2x", "2x:", "8x", "255x", "1x:2x:3x:4x", "4x-2x-2x-2x-6x", "2x:2x:2x:2x:2x:2x:2x:2x"]:
+        for i in range(60):
+            n = rng.below(24)
+            _round_trip(hint, bytes([rng.below(256) for k in range(n)]))
+
+
+def _fuzz_hint(rng: Lcg, h: DisplayHint, ht: str) -> int:
+    """One parsed random hint; the number of renderings that parsed back."""
+    text_chars = "0123456789abcdefABx.:-/ ,[]%é·"
+    reparsed = 0
+    utf8_chars = "aZ09:.-/ éü·€😀"
+    for j in range(6):
+        b = b""
+        if j % 3 == 2:
+            b = "".join([utf8_chars[rng.below(len(utf8_chars))] for k in range(rng.below(12))]).encode()
+            if rng.below(2) == 0:
+                b = bytes([rng.below(20)]) + b
+        else:
+            b = bytes([rng.below(256) if rng.below(3) == 0 else 48 + rng.below(10) for k in range(rng.below(20))])
+        for ns in [False, True]:
+            r = mib.hint.render_octets_ex(h, b, ns)
+            if not r.ok:
+                testing.assertEqual(r.text, mib.hint.hex_fallback(b), ht)
+        r2 = mib.hint.render_octets_ex(h, b)
+        # `t` discards an incomplete trailing character (RFC 2579), so only values without
+        # octets above 0x7f are known to be fully represented by the text
+        ascii = True
+        for c in b:
+            if c > 127:
+                ascii = False
+        if r2.ok and (ascii or "t" not in ht):
+            try:
+                b2 = mib.hint.parse_octets(h, r2.text)
+                testing.assertEqual(mib.hint.render_octets(h, b2), r2.text, ht + " " + repr(r2.text))
+                reparsed += 1
+            except HintError:
+                pass
+        t = "".join([text_chars[rng.below(len(text_chars))] for k in range(rng.below(16))])
+        try:
+            mib.hint.parse_octets(h, t)
+        except HintError:
+            pass
+        try:
+            mib.hint.parse_int(h, t)
+        except HintError:
+            pass
+        mib.hint.render_int_ex(h, rng.next64(), j % 2 == 0)
+    return reparsed
+
+
+def _test_fuzz_parsers() -> None:
+    """Random hint texts: parse raises only HintError; for every hint that parses, rendering
+    never raises and falls back to hex, parse_octets and parse_int raise only HintError, and a
+    rendering that parses back renders to the same text."""
+    rng = Lcg(3101)
+    hint_chars = "00123456789**xdoatb-:./ [d·"
+    seps = "-:./ [],·*0"
+    parsed = 0
+    reparsed = 0
+    for i in range(1500):
+        ht = ""
+        if i % 3 == 0:
+            n = 1 + rng.below(9)
+            ht = "".join([hint_chars[rng.below(len(hint_chars))] for k in range(n)])
+        else:
+            for k in range(1 + rng.below(4)):
+                if rng.below(4) == 0:
+                    ht += "*"
+                ht += str(rng.below(4) if rng.below(3) != 0 else rng.below(300))
+                ht += "xdoat"[rng.below(5)]
+                if rng.below(3) != 0:
+                    ht += seps[rng.below(len(seps))]
+                    if rng.below(3) == 0:
+                        ht += seps[rng.below(len(seps))]
+        try:
+            mib.hint.parse(ht)
+        except HintError:
+            pass
+        h = mib.hint.try_parse(ht)
+        if h is not None:
+            parsed += 1
+            reparsed += _fuzz_hint(rng, h, ht)
+    testing.assertTrue(parsed > 300, "parsed %d" % parsed)
+    testing.assertTrue(reparsed > 1000, "reparsed %d" % reparsed)
+
+
+def _test_parse_octets_limits() -> None:
+    """Long input: at most 65535 octets (the SMI limit), and digit runs that cannot fit fail
+    without being accumulated."""
+    _parse_fails("1x:", "1" * 100000)
+    testing.assertEqual(mib.hint.parse_octets(hp("1x:"), "0" * 100000 + "1"), unhex("01"))
+    _parse_fails("2x:", "1" * 5)
+    _parse_fails("1d.", "0256")
+    testing.assertEqual(mib.hint.parse_octets(hp("1d."), "000255.0001"), unhex("ff01"))
+    testing.assertEqual(mib.hint.parse_octets(hp("1x:"), "000a:0b"), unhex("0a0b"))
+    _parse_fails("65535a", "a" * 65536)
+    _parse_fails("100000x:", "00:00")
+    testing.assertEqual(len(mib.hint.parse_octets(hp("65535a"), "a" * 65535)), 65535)
+    testing.assertEqual(mib.hint.parse_octets(hp("100000x"), "0a0b"), unhex("0a0b"))
+    _parse_fails("1x:", ":".join(["00"] * 65536))
+
+
+def _test_parse_int() -> None:
+    d2 = hp("d-2")
+    testing.assertEqual(mib.hint.parse_int(d2, "12.34"), 1234)
+    testing.assertEqual(mib.hint.parse_int(d2, "-0.05"), -5)
+    testing.assertEqual(mib.hint.parse_int(d2, "-.05"), -5)
+    testing.assertEqual(mib.hint.parse_int(d2, ".05"), 5)
+    testing.assertEqual(mib.hint.parse_int(d2, "12"), 1200)
+    testing.assertEqual(mib.hint.parse_int(d2, "12.3"), 1230)
+    testing.assertEqual(mib.hint.parse_int(d2, " 7.00 "), 700)
+    testing.assertEqual(mib.hint.parse_int(hp("d"), "-42"), -42)
+    testing.assertEqual(mib.hint.parse_int(hp("x"), "ff"), 255)
+    testing.assertEqual(mib.hint.parse_int(hp("x"), "0xFF"), 255)
+    testing.assertEqual(mib.hint.parse_int(hp("x"), "-ff"), -255)
+    testing.assertEqual(mib.hint.parse_int(hp("o"), "10"), 8)
+    testing.assertEqual(mib.hint.parse_int(hp("b"), "101"), 5)
+    testing.assertEqual(mib.hint.parse_int(hp("d"), "-9223372036854775808"), -9223372036854775807 - 1)
+    for bad in [("d-2", "1.234"), ("d", "1.0"), ("d", ""), ("d-2", "."), ("x", "fg"), ("o", "8"), ("b", "2"),
+                ("d", "9223372036854775808"), ("255a", "1"), ("d", "1 2"), ("d-2", "-")]:
+        try:
+            mib.hint.parse_int(hp(bad.0), bad.1)
+            testing.error("parse_int(" + bad.0 + ", " + repr(bad.1) + ") did not raise")
+        except HintError:
+            pass
+    rng = Lcg(2578)
+    for f in ["d", "d-1", "d-2", "d-7", "x", "o", "b"]:
+        h = hp(f)
+        for i in range(200):
+            v = rng.next64() >> rng.below(64)
+            testing.assertEqual(mib.hint.parse_int(h, mib.hint.render_int(h, v)), v, f + " " + str(v))
