@@ -1,0 +1,4254 @@
+{
+ "EntryStatus": {
+  "class": "textualconvention",
+  "description": "The status of a table entry. Setting this object to the value invalid(4) has the effect of invalidating the corresponding entry. That is, it effectively disassociates the mapping identified with said entry. It is an implementation-specific matter as to whether the agent removes an invalidated entry from the table. Accordingly, management stations must be prepared to receive tabular information from agents that corresponds to entries currently not in use. Proper interpretation of such entries requires examination of the relevant EntryStatus object. An existing instance of this object cannot be set to createRequest(2). This object may only be set to createRequest(2) when this instance is created. When this object is created, the agent may wish to create supplemental object instances with default values to complete a conceptual row in this table. Because the creation of these default objects is entirely at the option of the agent, the manager must not assume that any will be created, but may make use of any that are created. Immediately after completing the create operation, the agent must set this object to underCreation(3). When in the underCreation(3) state, an entry is allowed to exist in a possibly incomplete, possibly inconsistent state, usually to allow it to be modified in multiple PDUs. When in this state, an entry is not fully active. Entries shall exist in the underCreation(3) state until the management station is finished configuring the entry and sets this object to valid(1) or aborts, setting this object to invalid(4). If the agent determines that an entry has been in the underCreation(3) state for an abnormally long time, it may decide that the management station has crashed. If the agent makes this decision, it may set this object to invalid(4) to reclaim the entry. A prudent agent will understand that the management station may need to wait for human input and will allow for that possibility in its determination of this abnormally long period. An entry in the valid(1) state is fully configured and consistent and fully represents the configuration or operation such a row is intended to represent. For example, it could be a statistical function that is configured and active, or a filter that is available in the list of filters processed by the packet capture process. A manager is restricted to changing the state of an entry in the following ways: To: valid createRequest underCreation invalid From: valid OK NO OK OK createRequest N/A N/A N/A N/A underCreation OK NO OK OK invalid NO NO NO OK nonExistent NO OK NO OK In the table above, it is not applicable to move the state from the createRequest state to any other state because the manager will never find the variable in that state. The nonExistent state is not a value of the enumeration, rather it means that the entryStatus variable does not exist at all. An agent may allow an entryStatus variable to change state in additional ways, so long as the semantics of the states are followed. This allowance is made to ease the implementation of the agent and is made despite the fact that managers should never exercise these additional state transitions.",
+  "name": "EntryStatus",
+  "status": "current",
+  "type": {
+   "class": "type",
+   "constraints": {
+    "enumeration": {
+     "createRequest": 2,
+     "invalid": 4,
+     "underCreation": 3,
+     "valid": 1
+    }
+   },
+   "tcbase": false,
+   "type": "INTEGER"
+  }
+ },
+ "OwnerString": {
+  "class": "textualconvention",
+  "description": "This data type is used to model an administratively assigned name of the owner of a resource. Implementations must accept values composed of well-formed NVT ASCII sequences. In addition, implementations should accept values composed of well-formed UTF-8 sequences. It is suggested that this name contain one or more of the following: IP address, management station name, network manager's name, location, or phone number. In some cases the agent itself will be the owner of an entry. In these cases, this string shall be set to a string starting with 'monitor'. SNMP access control is articulated entirely in terms of the contents of MIB views; access to a particular SNMP object instance depends only upon its presence or absence in a particular MIB view and never upon its value or the value of related object instances. Thus, objects of this type afford resolution of resource contention only among cooperating managers; they realize no access control function with respect to uncooperative parties.",
+  "name": "OwnerString",
+  "status": "current",
+  "type": {
+   "class": "type",
+   "constraints": {
+    "size": [
+     {
+      "max": 127,
+      "min": 0
+     }
+    ]
+   },
+   "tcbase": false,
+   "type": "OCTET STRING"
+  }
+ },
+ "alarm": {
+  "class": "objectidentity",
+  "name": "alarm",
+  "oid": "1.3.6.1.2.1.16.3"
+ },
+ "alarmEntry": {
+  "class": "objecttype",
+  "description": "A list of parameters that set up a periodic checking for alarm conditions. For example, an instance of the alarmValue object might be named alarmValue.8",
+  "indices": [
+   {
+    "implied": 0,
+    "module": "RMON-MIB",
+    "object": "alarmIndex"
+   }
+  ],
+  "maxaccess": "not-accessible",
+  "name": "alarmEntry",
+  "nodetype": "row",
+  "oid": "1.3.6.1.2.1.16.3.1.1",
+  "status": "current"
+ },
+ "alarmFallingEventIndex": {
+  "class": "objecttype",
+  "description": "The index of the eventEntry that is used when a falling threshold is crossed. The eventEntry identified by a particular value of this index is the same as identified by the same value of the eventIndex object. If there is no corresponding entry in the eventTable, then no association exists. In particular, if this value is zero, no associated event will be generated, as zero is not a valid event index. This object may not be modified if the associated alarmStatus object is equal to valid(1).",
+  "maxaccess": "read-create",
+  "name": "alarmFallingEventIndex",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.3.1.1.10",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 65535,
+      "min": 0
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "alarmFallingThreshold": {
+  "class": "objecttype",
+  "description": "A threshold for the sampled statistic. When the current sampled value is less than or equal to this threshold, and the value at the last sampling interval was greater than this threshold, a single event will be generated. A single event will also be generated if the first sample after this entry becomes valid is less than or equal to this threshold and the associated alarmStartupAlarm is equal to fallingAlarm(2) or risingOrFallingAlarm(3). After a falling event is generated, another such event will not be generated until the sampled value rises above this threshold and reaches the alarmRisingThreshold. This object may not be modified if the associated alarmStatus object is equal to valid(1).",
+  "maxaccess": "read-create",
+  "name": "alarmFallingThreshold",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.3.1.1.8",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Integer32"
+  }
+ },
+ "alarmIndex": {
+  "class": "objecttype",
+  "description": "An index that uniquely identifies an entry in the alarm table. Each such entry defines a diagnostic sample at a particular interval for an object on the device.",
+  "maxaccess": "read-only",
+  "name": "alarmIndex",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.3.1.1.1",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 65535,
+      "min": 1
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "alarmInterval": {
+  "class": "objecttype",
+  "description": "The interval in seconds over which the data is sampled and compared with the rising and falling thresholds. When setting this variable, care should be taken in the case of deltaValue sampling - the interval should be set short enough that the sampled variable is very unlikely to increase or decrease by more than 2^31 - 1 during a single sampling interval. This object may not be modified if the associated alarmStatus object is equal to valid(1).",
+  "maxaccess": "read-create",
+  "name": "alarmInterval",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.3.1.1.2",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Integer32"
+  },
+  "units": "Seconds"
+ },
+ "alarmOwner": {
+  "class": "objecttype",
+  "description": "The entity that configured this entry and is therefore using the resources assigned to it.",
+  "maxaccess": "read-create",
+  "name": "alarmOwner",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.3.1.1.11",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "OwnerString"
+  }
+ },
+ "alarmRisingEventIndex": {
+  "class": "objecttype",
+  "description": "The index of the eventEntry that is used when a rising threshold is crossed. The eventEntry identified by a particular value of this index is the same as identified by the same value of the eventIndex object. If there is no corresponding entry in the eventTable, then no association exists. In particular, if this value is zero, no associated event will be generated, as zero is not a valid event index. This object may not be modified if the associated alarmStatus object is equal to valid(1).",
+  "maxaccess": "read-create",
+  "name": "alarmRisingEventIndex",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.3.1.1.9",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 65535,
+      "min": 0
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "alarmRisingThreshold": {
+  "class": "objecttype",
+  "description": "A threshold for the sampled statistic. When the current sampled value is greater than or equal to this threshold, and the value at the last sampling interval was less than this threshold, a single event will be generated. A single event will also be generated if the first sample after this entry becomes valid is greater than or equal to this threshold and the associated alarmStartupAlarm is equal to risingAlarm(1) or risingOrFallingAlarm(3). After a rising event is generated, another such event will not be generated until the sampled value falls below this threshold and reaches the alarmFallingThreshold. This object may not be modified if the associated alarmStatus object is equal to valid(1).",
+  "maxaccess": "read-create",
+  "name": "alarmRisingThreshold",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.3.1.1.7",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Integer32"
+  }
+ },
+ "alarmSampleType": {
+  "class": "objecttype",
+  "description": "The method of sampling the selected variable and calculating the value to be compared against the thresholds. If the value of this object is absoluteValue(1), the value of the selected variable will be compared directly with the thresholds at the end of the sampling interval. If the value of this object is deltaValue(2), the value of the selected variable at the last sample will be subtracted from the current value, and the difference compared with the thresholds. This object may not be modified if the associated alarmStatus object is equal to valid(1).",
+  "maxaccess": "read-create",
+  "name": "alarmSampleType",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.3.1.1.4",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "enumeration": {
+     "absoluteValue": 1,
+     "deltaValue": 2
+    }
+   },
+   "type": "INTEGER"
+  }
+ },
+ "alarmStartupAlarm": {
+  "class": "objecttype",
+  "description": "The alarm that may be sent when this entry is first set to valid. If the first sample after this entry becomes valid is greater than or equal to the risingThreshold and alarmStartupAlarm is equal to risingAlarm(1) or risingOrFallingAlarm(3), then a single rising alarm will be generated. If the first sample after this entry becomes valid is less than or equal to the fallingThreshold and alarmStartupAlarm is equal to fallingAlarm(2) or risingOrFallingAlarm(3), then a single falling alarm will be generated. This object may not be modified if the associated alarmStatus object is equal to valid(1).",
+  "maxaccess": "read-create",
+  "name": "alarmStartupAlarm",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.3.1.1.6",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "enumeration": {
+     "fallingAlarm": 2,
+     "risingAlarm": 1,
+     "risingOrFallingAlarm": 3
+    }
+   },
+   "type": "INTEGER"
+  }
+ },
+ "alarmStatus": {
+  "class": "objecttype",
+  "description": "The status of this alarm entry.",
+  "maxaccess": "read-create",
+  "name": "alarmStatus",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.3.1.1.12",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "EntryStatus"
+  }
+ },
+ "alarmTable": {
+  "class": "objecttype",
+  "description": "A list of alarm entries.",
+  "maxaccess": "not-accessible",
+  "name": "alarmTable",
+  "nodetype": "table",
+  "oid": "1.3.6.1.2.1.16.3.1",
+  "status": "current"
+ },
+ "alarmValue": {
+  "class": "objecttype",
+  "description": "The value of the statistic during the last sampling period. For example, if the sample type is deltaValue, this value will be the difference between the samples at the beginning and end of the period. If the sample type is absoluteValue, this value will be the sampled value at the end of the period. This is the value that is compared with the rising and falling thresholds. The value during the current sampling period is not made available until the period is completed and will remain available until the next period completes.",
+  "maxaccess": "read-only",
+  "name": "alarmValue",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.3.1.1.5",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Integer32"
+  }
+ },
+ "alarmVariable": {
+  "class": "objecttype",
+  "description": "The object identifier of the particular variable to be sampled. Only variables that resolve to an ASN.1 primitive type of INTEGER (INTEGER, Integer32, Counter32, Counter64, Gauge, or TimeTicks) may be sampled. Because SNMP access control is articulated entirely in terms of the contents of MIB views, no access control mechanism exists that can restrict the value of this object to identify only those objects that exist in a particular MIB view. Because there is thus no acceptable means of restricting the read access that could be obtained through the alarm mechanism, the probe must only grant write access to this object in those views that have read access to all objects on the probe. During a set operation, if the supplied variable name is not available in the selected MIB view, a badValue error must be returned. If at any time the variable name of an established alarmEntry is no longer available in the selected MIB view, the probe must change the status of this alarmEntry to invalid(4). This object may not be modified if the associated alarmStatus object is equal to valid(1).",
+  "maxaccess": "read-create",
+  "name": "alarmVariable",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.3.1.1.3",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "OBJECT IDENTIFIER"
+  }
+ },
+ "bufferControlCaptureSliceSize": {
+  "class": "objecttype",
+  "default": {
+   "default": {
+    "basetype": "Integer32",
+    "format": "decimal",
+    "value": "100"
+   }
+  },
+  "description": "The maximum number of octets of each packet that will be saved in this capture buffer. For example, if a 1500 octet packet is received by the probe and this object is set to 500, then only 500 octets of the packet will be stored in the associated capture buffer. If this variable is set to 0, the capture buffer will save as many octets as is possible. This object may not be modified if the associated bufferControlStatus object is equal to valid(1).",
+  "maxaccess": "read-create",
+  "name": "bufferControlCaptureSliceSize",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.8.1.1.5",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Integer32"
+  },
+  "units": "Octets"
+ },
+ "bufferControlCapturedPackets": {
+  "class": "objecttype",
+  "description": "The number of packets currently in this captureBuffer.",
+  "maxaccess": "read-only",
+  "name": "bufferControlCapturedPackets",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.8.1.1.10",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Integer32"
+  },
+  "units": "Packets"
+ },
+ "bufferControlChannelIndex": {
+  "class": "objecttype",
+  "description": "An index that identifies the channel that is the source of packets for this bufferControl table. The channel identified by a particular value of this index is the same as identified by the same value of the channelIndex object. This object may not be modified if the associated bufferControlStatus object is equal to valid(1).",
+  "maxaccess": "read-create",
+  "name": "bufferControlChannelIndex",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.8.1.1.2",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 65535,
+      "min": 1
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "bufferControlDownloadOffset": {
+  "class": "objecttype",
+  "default": {
+   "default": {
+    "basetype": "Integer32",
+    "format": "decimal",
+    "value": "0"
+   }
+  },
+  "description": "The offset of the first octet of each packet in this capture buffer that will be returned in an SNMP retrieval of that packet. For example, if 500 octets of a packet have been stored in the associated capture buffer and this object is set to 100, then the captureBufferPacket object that contains the packet will contain bytes starting 100 octets into the packet.",
+  "maxaccess": "read-create",
+  "name": "bufferControlDownloadOffset",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.8.1.1.7",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Integer32"
+  },
+  "units": "Octets"
+ },
+ "bufferControlDownloadSliceSize": {
+  "class": "objecttype",
+  "default": {
+   "default": {
+    "basetype": "Integer32",
+    "format": "decimal",
+    "value": "100"
+   }
+  },
+  "description": "The maximum number of octets of each packet in this capture buffer that will be returned in an SNMP retrieval of that packet. For example, if 500 octets of a packet have been stored in the associated capture buffer, the associated bufferControlDownloadOffset is 0, and this object is set to 100, then the captureBufferPacket object that contains the packet will contain only the first 100 octets of the packet. A prudent manager will take into account possible interoperability or fragmentation problems that may occur if the download slice size is set too large. In particular, conformant SNMP implementations are not required to accept messages whose length exceeds 484 octets, although they are encouraged to support larger datagrams whenever feasible.",
+  "maxaccess": "read-create",
+  "name": "bufferControlDownloadSliceSize",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.8.1.1.6",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Integer32"
+  },
+  "units": "Octets"
+ },
+ "bufferControlEntry": {
+  "class": "objecttype",
+  "description": "A set of parameters that control the collection of a stream of packets that have matched filters. As an example, an instance of the bufferControlCaptureSliceSize object might be named bufferControlCaptureSliceSize.3",
+  "indices": [
+   {
+    "implied": 0,
+    "module": "RMON-MIB",
+    "object": "bufferControlIndex"
+   }
+  ],
+  "maxaccess": "not-accessible",
+  "name": "bufferControlEntry",
+  "nodetype": "row",
+  "oid": "1.3.6.1.2.1.16.8.1.1",
+  "status": "current"
+ },
+ "bufferControlFullAction": {
+  "class": "objecttype",
+  "description": "Controls the action of the buffer when it reaches the full status. When in the lockWhenFull(1) state and a packet is added to the buffer that fills the buffer, the bufferControlFullStatus will be set to full(2) and this buffer will stop capturing packets.",
+  "maxaccess": "read-create",
+  "name": "bufferControlFullAction",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.8.1.1.4",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "enumeration": {
+     "lockWhenFull": 1,
+     "wrapWhenFull": 2
+    }
+   },
+   "type": "INTEGER"
+  }
+ },
+ "bufferControlFullStatus": {
+  "class": "objecttype",
+  "description": "This object shows whether the buffer has room to accept new packets or if it is full. If the status is spaceAvailable(1), the buffer is accepting new packets normally. If the status is full(2) and the associated bufferControlFullAction object is wrapWhenFull, the buffer is accepting new packets by deleting enough of the oldest packets to make room for new ones as they arrive. Otherwise, if the status is full(2) and the bufferControlFullAction object is lockWhenFull, then the buffer has stopped collecting packets. When this object is set to full(2) the probe must not later set it to spaceAvailable(1) except in the case of a significant gain in resources such as an increase of bufferControlOctetsGranted. In particular, the wrap-mode action of deleting old packets to make room for newly arrived packets must not affect the value of this object.",
+  "maxaccess": "read-only",
+  "name": "bufferControlFullStatus",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.8.1.1.3",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "enumeration": {
+     "full": 2,
+     "spaceAvailable": 1
+    }
+   },
+   "type": "INTEGER"
+  }
+ },
+ "bufferControlIndex": {
+  "class": "objecttype",
+  "description": "An index that uniquely identifies an entry in the bufferControl table. The value of this index shall never be zero. Each such entry defines one set of packets that is captured and controlled by one or more filters.",
+  "maxaccess": "read-only",
+  "name": "bufferControlIndex",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.8.1.1.1",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 65535,
+      "min": 1
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "bufferControlMaxOctetsGranted": {
+  "class": "objecttype",
+  "description": "The maximum number of octets that can be saved in this captureBuffer, including overhead. If this variable is -1, the capture buffer will save as many octets as possible. When the bufferControlMaxOctetsRequested object is created or modified, the probe should set this object as closely to the requested value as is possible for the particular probe implementation and available resources. However, if the request object has the special value of -1, the probe must set this object to -1. The probe must not lower this value except as a result of a modification to the associated bufferControlMaxOctetsRequested object. When this maximum number of octets is reached and a new packet is to be added to this capture buffer and the corresponding bufferControlFullAction is set to wrapWhenFull(2), enough of the oldest packets associated with this capture buffer shall be deleted by the agent so that the new packet can be added. If the corresponding bufferControlFullAction is set to lockWhenFull(1), the new packet shall be discarded. In either case, the probe must set bufferControlFullStatus to full(2). When the value of this object changes to a value less than the current value, entries are deleted from the captureBufferTable associated with this bufferControlEntry. Enough of the oldest of these captureBufferEntries shall be deleted by the agent so that the number of octets used remains less than or equal to the new value of this object. When the value of this object changes to a value greater than the current value, the number of associated captureBufferEntries may be allowed to grow.",
+  "maxaccess": "read-only",
+  "name": "bufferControlMaxOctetsGranted",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.8.1.1.9",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Integer32"
+  },
+  "units": "Octets"
+ },
+ "bufferControlMaxOctetsRequested": {
+  "class": "objecttype",
+  "default": {
+   "default": {
+    "basetype": "Integer32",
+    "format": "decimal",
+    "value": "-1"
+   }
+  },
+  "description": "The requested maximum number of octets to be saved in this captureBuffer, including any implementation-specific overhead. If this variable is set to -1, the capture buffer will save as many octets as is possible. When this object is created or modified, the probe should set bufferControlMaxOctetsGranted as closely to this object as is possible for the particular probe implementation and available resources. However, if the object has the special value of -1, the probe must set bufferControlMaxOctetsGranted to -1.",
+  "maxaccess": "read-create",
+  "name": "bufferControlMaxOctetsRequested",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.8.1.1.8",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Integer32"
+  },
+  "units": "Octets"
+ },
+ "bufferControlOwner": {
+  "class": "objecttype",
+  "description": "The entity that configured this entry and is therefore using the resources assigned to it.",
+  "maxaccess": "read-create",
+  "name": "bufferControlOwner",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.8.1.1.12",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "OwnerString"
+  }
+ },
+ "bufferControlStatus": {
+  "class": "objecttype",
+  "description": "The status of this buffer Control Entry.",
+  "maxaccess": "read-create",
+  "name": "bufferControlStatus",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.8.1.1.13",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "EntryStatus"
+  }
+ },
+ "bufferControlTable": {
+  "class": "objecttype",
+  "description": "A list of buffers control entries.",
+  "maxaccess": "not-accessible",
+  "name": "bufferControlTable",
+  "nodetype": "table",
+  "oid": "1.3.6.1.2.1.16.8.1",
+  "status": "current"
+ },
+ "bufferControlTurnOnTime": {
+  "class": "objecttype",
+  "description": "The value of sysUpTime when this capture buffer was first turned on.",
+  "maxaccess": "read-only",
+  "name": "bufferControlTurnOnTime",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.8.1.1.11",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "TimeTicks"
+  }
+ },
+ "capture": {
+  "class": "objectidentity",
+  "name": "capture",
+  "oid": "1.3.6.1.2.1.16.8"
+ },
+ "captureBufferControlIndex": {
+  "class": "objecttype",
+  "description": "The index of the bufferControlEntry with which this packet is associated.",
+  "maxaccess": "read-only",
+  "name": "captureBufferControlIndex",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.8.2.1.1",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 65535,
+      "min": 1
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "captureBufferEntry": {
+  "class": "objecttype",
+  "description": "A packet captured off of an attached network. As an example, an instance of the captureBufferPacketData object might be named captureBufferPacketData.3.1783",
+  "indices": [
+   {
+    "implied": 0,
+    "module": "RMON-MIB",
+    "object": "captureBufferControlIndex"
+   },
+   {
+    "implied": 0,
+    "module": "RMON-MIB",
+    "object": "captureBufferIndex"
+   }
+  ],
+  "maxaccess": "not-accessible",
+  "name": "captureBufferEntry",
+  "nodetype": "row",
+  "oid": "1.3.6.1.2.1.16.8.2.1",
+  "status": "current"
+ },
+ "captureBufferIndex": {
+  "class": "objecttype",
+  "description": "An index that uniquely identifies an entry in the captureBuffer table associated with a particular bufferControlEntry. This index will start at 1 and increase by one for each new packet added with the same captureBufferControlIndex. Should this value reach 2147483647, the next packet added with the same captureBufferControlIndex shall cause this value to wrap around to 1.",
+  "maxaccess": "read-only",
+  "name": "captureBufferIndex",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.8.2.1.2",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 2147483647,
+      "min": 1
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "captureBufferPacketData": {
+  "class": "objecttype",
+  "description": "The data inside the packet, starting at the beginning of the packet plus any offset specified in the associated bufferControlDownloadOffset, including any link level headers. The length of the data in this object is the minimum of the length of the captured packet minus the offset, the length of the associated bufferControlCaptureSliceSize minus the offset, and the associated bufferControlDownloadSliceSize. If this minimum is less than zero, this object shall have a length of zero.",
+  "maxaccess": "read-only",
+  "name": "captureBufferPacketData",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.8.2.1.4",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "OCTET STRING"
+  }
+ },
+ "captureBufferPacketID": {
+  "class": "objecttype",
+  "description": "An index that describes the order of packets that are received on a particular interface. The packetID of a packet captured on an interface is defined to be greater than the packetID's of all packets captured previously on the same interface. As the captureBufferPacketID object has a maximum positive value of 2^31 - 1, any captureBufferPacketID object shall have the value of the associated packet's packetID mod 2^31.",
+  "maxaccess": "read-only",
+  "name": "captureBufferPacketID",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.8.2.1.3",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Integer32"
+  }
+ },
+ "captureBufferPacketLength": {
+  "class": "objecttype",
+  "description": "The actual length (off the wire) of the packet stored in this entry, including FCS octets.",
+  "maxaccess": "read-only",
+  "name": "captureBufferPacketLength",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.8.2.1.5",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Integer32"
+  },
+  "units": "Octets"
+ },
+ "captureBufferPacketStatus": {
+  "class": "objecttype",
+  "description": "A value which indicates the error status of this packet. The value of this object is defined in the same way as filterPktStatus. The value is a sum. This sum initially takes the value zero. Then, for each error, E, that has been discovered in this packet, 2 raised to a value representing E is added to the sum. The errors defined for a packet captured off of an Ethernet interface are as follows: bit # Error 0 Packet is longer than 1518 octets 1 Packet is shorter than 64 octets 2 Packet experienced a CRC or Alignment error 3 First packet in this capture buffer after it was detected that some packets were not processed correctly. 4 Packet's order in buffer is only approximate (May only be set for packets sent from the probe) For example, an Ethernet fragment would have a value of 6 (2^1 + 2^2). As this MIB is expanded to new media types, this object will have other media-specific errors defined.",
+  "maxaccess": "read-only",
+  "name": "captureBufferPacketStatus",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.8.2.1.7",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Integer32"
+  }
+ },
+ "captureBufferPacketTime": {
+  "class": "objecttype",
+  "description": "The number of milliseconds that had passed since this capture buffer was first turned on when this packet was captured.",
+  "maxaccess": "read-only",
+  "name": "captureBufferPacketTime",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.8.2.1.6",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Integer32"
+  },
+  "units": "Milliseconds"
+ },
+ "captureBufferTable": {
+  "class": "objecttype",
+  "description": "A list of packets captured off of a channel.",
+  "maxaccess": "not-accessible",
+  "name": "captureBufferTable",
+  "nodetype": "table",
+  "oid": "1.3.6.1.2.1.16.8.2",
+  "status": "current"
+ },
+ "channelAcceptType": {
+  "class": "objecttype",
+  "description": "This object controls the action of the filters associated with this channel. If this object is equal to acceptMatched(1), packets will be accepted to this channel if they are accepted by both the packet data and packet status matches of an associated filter. If this object is equal to acceptFailed(2), packets will be accepted to this channel only if they fail either the packet data match or the packet status match of each of the associated filters. In particular, a channel with no associated filters will match no packets if set to acceptMatched(1) case and will match all packets in the acceptFailed(2) case. This object may not be modified if the associated channelStatus object is equal to valid(1).",
+  "maxaccess": "read-create",
+  "name": "channelAcceptType",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.7.2.1.3",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "enumeration": {
+     "acceptFailed": 2,
+     "acceptMatched": 1
+    }
+   },
+   "type": "INTEGER"
+  }
+ },
+ "channelDataControl": {
+  "class": "objecttype",
+  "default": {
+   "default": {
+    "basetype": "Integer32",
+    "format": "decimal",
+    "value": "2"
+   }
+  },
+  "description": "This object controls the flow of data through this channel. If this object is on(1), data, status and events flow through this channel. If this object is off(2), data, status and events will not flow through this channel.",
+  "maxaccess": "read-create",
+  "name": "channelDataControl",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.7.2.1.4",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "enumeration": {
+     "off": 2,
+     "on": 1
+    }
+   },
+   "type": "INTEGER"
+  }
+ },
+ "channelDescription": {
+  "class": "objecttype",
+  "description": "A comment describing this channel.",
+  "maxaccess": "read-create",
+  "name": "channelDescription",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.7.2.1.10",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "size": [
+     {
+      "max": 127,
+      "min": 0
+     }
+    ]
+   },
+   "type": "DisplayString"
+  }
+ },
+ "channelEntry": {
+  "class": "objecttype",
+  "description": "A set of parameters for a packet channel applied on a particular interface. As an example, an instance of the channelMatches object might be named channelMatches.3",
+  "indices": [
+   {
+    "implied": 0,
+    "module": "RMON-MIB",
+    "object": "channelIndex"
+   }
+  ],
+  "maxaccess": "not-accessible",
+  "name": "channelEntry",
+  "nodetype": "row",
+  "oid": "1.3.6.1.2.1.16.7.2.1",
+  "status": "current"
+ },
+ "channelEventIndex": {
+  "class": "objecttype",
+  "description": "The value of this object identifies the event that is configured to be generated when the associated channelDataControl is on and a packet is matched. The event identified by a particular value of this object is the same event as identified by the same value of the eventIndex object. If there is no corresponding entry in the eventTable, then no association exists. In fact, if no event is intended for this channel, channelEventIndex must be set to zero, a non-existent event index. This object may not be modified if the associated channelStatus object is equal to valid(1).",
+  "maxaccess": "read-create",
+  "name": "channelEventIndex",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.7.2.1.7",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 65535,
+      "min": 0
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "channelEventStatus": {
+  "class": "objecttype",
+  "default": {
+   "default": {
+    "basetype": "Integer32",
+    "format": "decimal",
+    "value": "1"
+   }
+  },
+  "description": "The event status of this channel. If this channel is configured to generate events when packets are matched, a means of controlling the flow of those events is often needed. When this object is equal to eventReady(1), a single event may be generated, after which this object will be set by the probe to eventFired(2). While in the eventFired(2) state, no events will be generated until the object is modified to eventReady(1) (or eventAlwaysReady(3)). The management station can thus easily respond to a notification of an event by re-enabling this object. If the management station wishes to disable this flow control and allow events to be generated at will, this object may be set to eventAlwaysReady(3). Disabling the flow control is discouraged as it can result in high network traffic or other performance problems.",
+  "maxaccess": "read-create",
+  "name": "channelEventStatus",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.7.2.1.8",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "enumeration": {
+     "eventAlwaysReady": 3,
+     "eventFired": 2,
+     "eventReady": 1
+    }
+   },
+   "type": "INTEGER"
+  }
+ },
+ "channelIfIndex": {
+  "class": "objecttype",
+  "description": "The value of this object uniquely identifies the interface on this remote network monitoring device to which the associated filters are applied to allow data into this channel. The interface identified by a particular value of this object is the same interface as identified by the same value of the ifIndex object, defined in RFC 2233 [17]. The filters in this group are applied to all packets on the local network segment attached to the identified interface. An agent may or may not be able to tell if fundamental changes to the media of the interface have occurred and necessitate an invalidation of this entry. For example, a hot-pluggable ethernet card could be pulled out and replaced by a token-ring card. In such a case, if the agent has such knowledge of the change, it is recommended that it invalidate this entry. This object may not be modified if the associated channelStatus object is equal to valid(1).",
+  "maxaccess": "read-create",
+  "name": "channelIfIndex",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.7.2.1.2",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 65535,
+      "min": 1
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "channelIndex": {
+  "class": "objecttype",
+  "description": "An index that uniquely identifies an entry in the channel table. Each such entry defines one channel, a logical data and event stream. It is suggested that before creating a channel, an application should scan all instances of the filterChannelIndex object to make sure that there are no pre-existing filters that would be inadvertently be linked to the channel.",
+  "maxaccess": "read-only",
+  "name": "channelIndex",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.7.2.1.1",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 65535,
+      "min": 1
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "channelMatches": {
+  "class": "objecttype",
+  "description": "The number of times this channel has matched a packet. Note that this object is updated even when channelDataControl is set to off.",
+  "maxaccess": "read-only",
+  "name": "channelMatches",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.7.2.1.9",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  },
+  "units": "Packets"
+ },
+ "channelOwner": {
+  "class": "objecttype",
+  "description": "The entity that configured this entry and is therefore using the resources assigned to it.",
+  "maxaccess": "read-create",
+  "name": "channelOwner",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.7.2.1.11",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "OwnerString"
+  }
+ },
+ "channelStatus": {
+  "class": "objecttype",
+  "description": "The status of this channel entry.",
+  "maxaccess": "read-create",
+  "name": "channelStatus",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.7.2.1.12",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "EntryStatus"
+  }
+ },
+ "channelTable": {
+  "class": "objecttype",
+  "description": "A list of packet channel entries.",
+  "maxaccess": "not-accessible",
+  "name": "channelTable",
+  "nodetype": "table",
+  "oid": "1.3.6.1.2.1.16.7.2",
+  "status": "current"
+ },
+ "channelTurnOffEventIndex": {
+  "class": "objecttype",
+  "description": "The value of this object identifies the event that is configured to turn the associated channelDataControl from on to off when the event is generated. The event identified by a particular value of this object is the same event as identified by the same value of the eventIndex object. If there is no corresponding entry in the eventTable, then no association exists. In fact, if no event is intended for this channel, channelTurnOffEventIndex must be set to zero, a non-existent event index. This object may not be modified if the associated channelStatus object is equal to valid(1).",
+  "maxaccess": "read-create",
+  "name": "channelTurnOffEventIndex",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.7.2.1.6",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 65535,
+      "min": 0
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "channelTurnOnEventIndex": {
+  "class": "objecttype",
+  "description": "The value of this object identifies the event that is configured to turn the associated channelDataControl from off to on when the event is generated. The event identified by a particular value of this object is the same event as identified by the same value of the eventIndex object. If there is no corresponding entry in the eventTable, then no association exists. In fact, if no event is intended for this channel, channelTurnOnEventIndex must be set to zero, a non-existent event index. This object may not be modified if the associated channelStatus object is equal to valid(1).",
+  "maxaccess": "read-create",
+  "name": "channelTurnOnEventIndex",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.7.2.1.5",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 65535,
+      "min": 0
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "etherHistoryBroadcastPkts": {
+  "class": "objecttype",
+  "description": "The number of good packets received during this sampling interval that were directed to the broadcast address.",
+  "maxaccess": "read-only",
+  "name": "etherHistoryBroadcastPkts",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.2.2.1.7",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  },
+  "units": "Packets"
+ },
+ "etherHistoryCRCAlignErrors": {
+  "class": "objecttype",
+  "description": "The number of packets received during this sampling interval that had a length (excluding framing bits but including FCS octets) between 64 and 1518 octets, inclusive, but had either a bad Frame Check Sequence (FCS) with an integral number of octets (FCS Error) or a bad FCS with a non-integral number of octets (Alignment Error).",
+  "maxaccess": "read-only",
+  "name": "etherHistoryCRCAlignErrors",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.2.2.1.9",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  },
+  "units": "Packets"
+ },
+ "etherHistoryCollisions": {
+  "class": "objecttype",
+  "description": "The best estimate of the total number of collisions on this Ethernet segment during this sampling interval. The value returned will depend on the location of the RMON probe. Section 8.2.1.3 (10BASE-5) and section 10.3.1.3 (10BASE-2) of IEEE standard 802.3 states that a station must detect a collision, in the receive mode, if three or more stations are transmitting simultaneously. A repeater port must detect a collision when two or more stations are transmitting simultaneously. Thus a probe placed on a repeater port could record more collisions than a probe connected to a station on the same segment would. Probe location plays a much smaller role when considering 10BASE-T. 14.2.1.4 (10BASE-T) of IEEE standard 802.3 defines a collision as the simultaneous presence of signals on the DO and RD circuits (transmitting and receiving at the same time). A 10BASE-T station can only detect collisions when it is transmitting. Thus probes placed on a station and a repeater, should report the same number of collisions. Note also that an RMON probe inside a repeater should ideally report collisions between the repeater and one or more other hosts (transmit collisions as defined by IEEE 802.3k) plus receiver collisions observed on any coax segments to which the repeater is connected.",
+  "maxaccess": "read-only",
+  "name": "etherHistoryCollisions",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.2.2.1.14",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  },
+  "units": "Collisions"
+ },
+ "etherHistoryDropEvents": {
+  "class": "objecttype",
+  "description": "The total number of events in which packets were dropped by the probe due to lack of resources during this sampling interval. Note that this number is not necessarily the number of packets dropped, it is just the number of times this condition has been detected.",
+  "maxaccess": "read-only",
+  "name": "etherHistoryDropEvents",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.2.2.1.4",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  }
+ },
+ "etherHistoryEntry": {
+  "class": "objecttype",
+  "description": "An historical sample of Ethernet statistics on a particular Ethernet interface. This sample is associated with the historyControlEntry which set up the parameters for a regular collection of these samples. As an example, an instance of the etherHistoryPkts object might be named etherHistoryPkts.2.89",
+  "indices": [
+   {
+    "implied": 0,
+    "module": "RMON-MIB",
+    "object": "etherHistoryIndex"
+   },
+   {
+    "implied": 0,
+    "module": "RMON-MIB",
+    "object": "etherHistorySampleIndex"
+   }
+  ],
+  "maxaccess": "not-accessible",
+  "name": "etherHistoryEntry",
+  "nodetype": "row",
+  "oid": "1.3.6.1.2.1.16.2.2.1",
+  "status": "current"
+ },
+ "etherHistoryFragments": {
+  "class": "objecttype",
+  "description": "The total number of packets received during this sampling interval that were less than 64 octets in length (excluding framing bits but including FCS octets) had either a bad Frame Check Sequence (FCS) with an integral number of octets (FCS Error) or a bad FCS with a non-integral number of octets (Alignment Error). Note that it is entirely normal for etherHistoryFragments to increment. This is because it counts both runts (which are normal occurrences due to collisions) and noise hits.",
+  "maxaccess": "read-only",
+  "name": "etherHistoryFragments",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.2.2.1.12",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  },
+  "units": "Packets"
+ },
+ "etherHistoryIndex": {
+  "class": "objecttype",
+  "description": "The history of which this entry is a part. The history identified by a particular value of this index is the same history as identified by the same value of historyControlIndex.",
+  "maxaccess": "read-only",
+  "name": "etherHistoryIndex",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.2.2.1.1",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 65535,
+      "min": 1
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "etherHistoryIntervalStart": {
+  "class": "objecttype",
+  "description": "The value of sysUpTime at the start of the interval over which this sample was measured. If the probe keeps track of the time of day, it should start the first sample of the history at a time such that when the next hour of the day begins, a sample is started at that instant. Note that following this rule may require the probe to delay collecting the first sample of the history, as each sample must be of the same interval. Also note that the sample which is currently being collected is not accessible in this table until the end of its interval.",
+  "maxaccess": "read-only",
+  "name": "etherHistoryIntervalStart",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.2.2.1.3",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "TimeTicks"
+  }
+ },
+ "etherHistoryJabbers": {
+  "class": "objecttype",
+  "description": "The number of packets received during this sampling interval that were longer than 1518 octets (excluding framing bits but including FCS octets), and had either a bad Frame Check Sequence (FCS) with an integral number of octets (FCS Error) or a bad FCS with a non-integral number of octets (Alignment Error). Note that this definition of jabber is different than the definition in IEEE-802.3 section 8.2.1.5 (10BASE5) and section 10.3.1.4 (10BASE2). These documents define jabber as the condition where any packet exceeds 20 ms. The allowed range to detect jabber is between 20 ms and 150 ms.",
+  "maxaccess": "read-only",
+  "name": "etherHistoryJabbers",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.2.2.1.13",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  },
+  "units": "Packets"
+ },
+ "etherHistoryMulticastPkts": {
+  "class": "objecttype",
+  "description": "The number of good packets received during this sampling interval that were directed to a multicast address. Note that this number does not include packets addressed to the broadcast address.",
+  "maxaccess": "read-only",
+  "name": "etherHistoryMulticastPkts",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.2.2.1.8",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  },
+  "units": "Packets"
+ },
+ "etherHistoryOctets": {
+  "class": "objecttype",
+  "description": "The total number of octets of data (including those in bad packets) received on the network (excluding framing bits but including FCS octets).",
+  "maxaccess": "read-only",
+  "name": "etherHistoryOctets",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.2.2.1.5",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  },
+  "units": "Octets"
+ },
+ "etherHistoryOversizePkts": {
+  "class": "objecttype",
+  "description": "The number of packets received during this sampling interval that were longer than 1518 octets (excluding framing bits but including FCS octets) but were otherwise well formed.",
+  "maxaccess": "read-only",
+  "name": "etherHistoryOversizePkts",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.2.2.1.11",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  },
+  "units": "Packets"
+ },
+ "etherHistoryPkts": {
+  "class": "objecttype",
+  "description": "The number of packets (including bad packets) received during this sampling interval.",
+  "maxaccess": "read-only",
+  "name": "etherHistoryPkts",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.2.2.1.6",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  },
+  "units": "Packets"
+ },
+ "etherHistorySampleIndex": {
+  "class": "objecttype",
+  "description": "An index that uniquely identifies the particular sample this entry represents among all samples associated with the same historyControlEntry. This index starts at 1 and increases by one as each new sample is taken.",
+  "maxaccess": "read-only",
+  "name": "etherHistorySampleIndex",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.2.2.1.2",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 2147483647,
+      "min": 1
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "etherHistoryTable": {
+  "class": "objecttype",
+  "description": "A list of Ethernet history entries.",
+  "maxaccess": "not-accessible",
+  "name": "etherHistoryTable",
+  "nodetype": "table",
+  "oid": "1.3.6.1.2.1.16.2.2",
+  "status": "current"
+ },
+ "etherHistoryUndersizePkts": {
+  "class": "objecttype",
+  "description": "The number of packets received during this sampling interval that were less than 64 octets long (excluding framing bits but including FCS octets) and were otherwise well formed.",
+  "maxaccess": "read-only",
+  "name": "etherHistoryUndersizePkts",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.2.2.1.10",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  },
+  "units": "Packets"
+ },
+ "etherHistoryUtilization": {
+  "class": "objecttype",
+  "description": "The best estimate of the mean physical layer network utilization on this interface during this sampling interval, in hundredths of a percent.",
+  "maxaccess": "read-only",
+  "name": "etherHistoryUtilization",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.2.2.1.15",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 10000,
+      "min": 0
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "etherStatsBroadcastPkts": {
+  "class": "objecttype",
+  "description": "The total number of good packets received that were directed to the broadcast address. Note that this does not include multicast packets.",
+  "maxaccess": "read-only",
+  "name": "etherStatsBroadcastPkts",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.1.1.1.6",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  },
+  "units": "Packets"
+ },
+ "etherStatsCRCAlignErrors": {
+  "class": "objecttype",
+  "description": "The total number of packets received that had a length (excluding framing bits, but including FCS octets) of between 64 and 1518 octets, inclusive, but had either a bad Frame Check Sequence (FCS) with an integral number of octets (FCS Error) or a bad FCS with a non-integral number of octets (Alignment Error).",
+  "maxaccess": "read-only",
+  "name": "etherStatsCRCAlignErrors",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.1.1.1.8",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  },
+  "units": "Packets"
+ },
+ "etherStatsCollisions": {
+  "class": "objecttype",
+  "description": "The best estimate of the total number of collisions on this Ethernet segment. The value returned will depend on the location of the RMON probe. Section 8.2.1.3 (10BASE-5) and section 10.3.1.3 (10BASE-2) of IEEE standard 802.3 states that a station must detect a collision, in the receive mode, if three or more stations are transmitting simultaneously. A repeater port must detect a collision when two or more stations are transmitting simultaneously. Thus a probe placed on a repeater port could record more collisions than a probe connected to a station on the same segment would. Probe location plays a much smaller role when considering 10BASE-T. 14.2.1.4 (10BASE-T) of IEEE standard 802.3 defines a collision as the simultaneous presence of signals on the DO and RD circuits (transmitting and receiving at the same time). A 10BASE-T station can only detect collisions when it is transmitting. Thus probes placed on a station and a repeater, should report the same number of collisions. Note also that an RMON probe inside a repeater should ideally report collisions between the repeater and one or more other hosts (transmit collisions as defined by IEEE 802.3k) plus receiver collisions observed on any coax segments to which the repeater is connected.",
+  "maxaccess": "read-only",
+  "name": "etherStatsCollisions",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.1.1.1.13",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  },
+  "units": "Collisions"
+ },
+ "etherStatsDataSource": {
+  "class": "objecttype",
+  "description": "This object identifies the source of the data that this etherStats entry is configured to analyze. This source can be any ethernet interface on this device. In order to identify a particular interface, this object shall identify the instance of the ifIndex object, defined in RFC 2233 [17], for the desired interface. For example, if an entry were to receive data from interface #1, this object would be set to ifIndex.1. The statistics in this group reflect all packets on the local network segment attached to the identified interface. An agent may or may not be able to tell if fundamental changes to the media of the interface have occurred and necessitate an invalidation of this entry. For example, a hot-pluggable ethernet card could be pulled out and replaced by a token-ring card. In such a case, if the agent has such knowledge of the change, it is recommended that it invalidate this entry. This object may not be modified if the associated etherStatsStatus object is equal to valid(1).",
+  "maxaccess": "read-create",
+  "name": "etherStatsDataSource",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.1.1.1.2",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "OBJECT IDENTIFIER"
+  }
+ },
+ "etherStatsDropEvents": {
+  "class": "objecttype",
+  "description": "The total number of events in which packets were dropped by the probe due to lack of resources. Note that this number is not necessarily the number of packets dropped; it is just the number of times this condition has been detected.",
+  "maxaccess": "read-only",
+  "name": "etherStatsDropEvents",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.1.1.1.3",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  }
+ },
+ "etherStatsEntry": {
+  "class": "objecttype",
+  "description": "A collection of statistics kept for a particular Ethernet interface. As an example, an instance of the etherStatsPkts object might be named etherStatsPkts.1",
+  "indices": [
+   {
+    "implied": 0,
+    "module": "RMON-MIB",
+    "object": "etherStatsIndex"
+   }
+  ],
+  "maxaccess": "not-accessible",
+  "name": "etherStatsEntry",
+  "nodetype": "row",
+  "oid": "1.3.6.1.2.1.16.1.1.1",
+  "status": "current"
+ },
+ "etherStatsFragments": {
+  "class": "objecttype",
+  "description": "The total number of packets received that were less than 64 octets in length (excluding framing bits but including FCS octets) and had either a bad Frame Check Sequence (FCS) with an integral number of octets (FCS Error) or a bad FCS with a non-integral number of octets (Alignment Error). Note that it is entirely normal for etherStatsFragments to increment. This is because it counts both runts (which are normal occurrences due to collisions) and noise hits.",
+  "maxaccess": "read-only",
+  "name": "etherStatsFragments",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.1.1.1.11",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  },
+  "units": "Packets"
+ },
+ "etherStatsIndex": {
+  "class": "objecttype",
+  "description": "The value of this object uniquely identifies this etherStats entry.",
+  "maxaccess": "read-only",
+  "name": "etherStatsIndex",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.1.1.1.1",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 65535,
+      "min": 1
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "etherStatsJabbers": {
+  "class": "objecttype",
+  "description": "The total number of packets received that were longer than 1518 octets (excluding framing bits, but including FCS octets), and had either a bad Frame Check Sequence (FCS) with an integral number of octets (FCS Error) or a bad FCS with a non-integral number of octets (Alignment Error). Note that this definition of jabber is different than the definition in IEEE-802.3 section 8.2.1.5 (10BASE5) and section 10.3.1.4 (10BASE2). These documents define jabber as the condition where any packet exceeds 20 ms. The allowed range to detect jabber is between 20 ms and 150 ms.",
+  "maxaccess": "read-only",
+  "name": "etherStatsJabbers",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.1.1.1.12",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  },
+  "units": "Packets"
+ },
+ "etherStatsMulticastPkts": {
+  "class": "objecttype",
+  "description": "The total number of good packets received that were directed to a multicast address. Note that this number does not include packets directed to the broadcast address.",
+  "maxaccess": "read-only",
+  "name": "etherStatsMulticastPkts",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.1.1.1.7",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  },
+  "units": "Packets"
+ },
+ "etherStatsOctets": {
+  "class": "objecttype",
+  "description": "The total number of octets of data (including those in bad packets) received on the network (excluding framing bits but including FCS octets). This object can be used as a reasonable estimate of 10-Megabit ethernet utilization. If greater precision is desired, the etherStatsPkts and etherStatsOctets objects should be sampled before and after a common interval. The differences in the sampled values are Pkts and Octets, respectively, and the number of seconds in the interval is Interval. These values are used to calculate the Utilization as follows: Pkts * (9.6 + 6.4) + (Octets * .8) Utilization = ------------------------------------- Interval * 10,000 The result of this equation is the value Utilization which is the percent utilization of the ethernet segment on a scale of 0 to 100 percent.",
+  "maxaccess": "read-only",
+  "name": "etherStatsOctets",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.1.1.1.4",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  },
+  "units": "Octets"
+ },
+ "etherStatsOversizePkts": {
+  "class": "objecttype",
+  "description": "The total number of packets received that were longer than 1518 octets (excluding framing bits, but including FCS octets) and were otherwise well formed.",
+  "maxaccess": "read-only",
+  "name": "etherStatsOversizePkts",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.1.1.1.10",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  },
+  "units": "Packets"
+ },
+ "etherStatsOwner": {
+  "class": "objecttype",
+  "description": "The entity that configured this entry and is therefore using the resources assigned to it.",
+  "maxaccess": "read-create",
+  "name": "etherStatsOwner",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.1.1.1.20",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "OwnerString"
+  }
+ },
+ "etherStatsPkts": {
+  "class": "objecttype",
+  "description": "The total number of packets (including bad packets, broadcast packets, and multicast packets) received.",
+  "maxaccess": "read-only",
+  "name": "etherStatsPkts",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.1.1.1.5",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  },
+  "units": "Packets"
+ },
+ "etherStatsPkts1024to1518Octets": {
+  "class": "objecttype",
+  "description": "The total number of packets (including bad packets) received that were between 1024 and 1518 octets in length inclusive (excluding framing bits but including FCS octets).",
+  "maxaccess": "read-only",
+  "name": "etherStatsPkts1024to1518Octets",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.1.1.1.19",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  },
+  "units": "Packets"
+ },
+ "etherStatsPkts128to255Octets": {
+  "class": "objecttype",
+  "description": "The total number of packets (including bad packets) received that were between 128 and 255 octets in length inclusive (excluding framing bits but including FCS octets).",
+  "maxaccess": "read-only",
+  "name": "etherStatsPkts128to255Octets",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.1.1.1.16",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  },
+  "units": "Packets"
+ },
+ "etherStatsPkts256to511Octets": {
+  "class": "objecttype",
+  "description": "The total number of packets (including bad packets) received that were between 256 and 511 octets in length inclusive (excluding framing bits but including FCS octets).",
+  "maxaccess": "read-only",
+  "name": "etherStatsPkts256to511Octets",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.1.1.1.17",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  },
+  "units": "Packets"
+ },
+ "etherStatsPkts512to1023Octets": {
+  "class": "objecttype",
+  "description": "The total number of packets (including bad packets) received that were between 512 and 1023 octets in length inclusive (excluding framing bits but including FCS octets).",
+  "maxaccess": "read-only",
+  "name": "etherStatsPkts512to1023Octets",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.1.1.1.18",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  },
+  "units": "Packets"
+ },
+ "etherStatsPkts64Octets": {
+  "class": "objecttype",
+  "description": "The total number of packets (including bad packets) received that were 64 octets in length (excluding framing bits but including FCS octets).",
+  "maxaccess": "read-only",
+  "name": "etherStatsPkts64Octets",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.1.1.1.14",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  },
+  "units": "Packets"
+ },
+ "etherStatsPkts65to127Octets": {
+  "class": "objecttype",
+  "description": "The total number of packets (including bad packets) received that were between 65 and 127 octets in length inclusive (excluding framing bits but including FCS octets).",
+  "maxaccess": "read-only",
+  "name": "etherStatsPkts65to127Octets",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.1.1.1.15",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  },
+  "units": "Packets"
+ },
+ "etherStatsStatus": {
+  "class": "objecttype",
+  "description": "The status of this etherStats entry.",
+  "maxaccess": "read-create",
+  "name": "etherStatsStatus",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.1.1.1.21",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "EntryStatus"
+  }
+ },
+ "etherStatsTable": {
+  "class": "objecttype",
+  "description": "A list of Ethernet statistics entries.",
+  "maxaccess": "not-accessible",
+  "name": "etherStatsTable",
+  "nodetype": "table",
+  "oid": "1.3.6.1.2.1.16.1.1",
+  "status": "current"
+ },
+ "etherStatsUndersizePkts": {
+  "class": "objecttype",
+  "description": "The total number of packets received that were less than 64 octets long (excluding framing bits, but including FCS octets) and were otherwise well formed.",
+  "maxaccess": "read-only",
+  "name": "etherStatsUndersizePkts",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.1.1.1.9",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  },
+  "units": "Packets"
+ },
+ "event": {
+  "class": "objectidentity",
+  "name": "event",
+  "oid": "1.3.6.1.2.1.16.9"
+ },
+ "eventCommunity": {
+  "class": "objecttype",
+  "description": "If an SNMP trap is to be sent, it will be sent to the SNMP community specified by this octet string.",
+  "maxaccess": "read-create",
+  "name": "eventCommunity",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.9.1.1.4",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "size": [
+     {
+      "max": 127,
+      "min": 0
+     }
+    ]
+   },
+   "type": "OCTET STRING"
+  }
+ },
+ "eventDescription": {
+  "class": "objecttype",
+  "description": "A comment describing this event entry.",
+  "maxaccess": "read-create",
+  "name": "eventDescription",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.9.1.1.2",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "size": [
+     {
+      "max": 127,
+      "min": 0
+     }
+    ]
+   },
+   "type": "DisplayString"
+  }
+ },
+ "eventEntry": {
+  "class": "objecttype",
+  "description": "A set of parameters that describe an event to be generated when certain conditions are met. As an example, an instance of the eventLastTimeSent object might be named eventLastTimeSent.6",
+  "indices": [
+   {
+    "implied": 0,
+    "module": "RMON-MIB",
+    "object": "eventIndex"
+   }
+  ],
+  "maxaccess": "not-accessible",
+  "name": "eventEntry",
+  "nodetype": "row",
+  "oid": "1.3.6.1.2.1.16.9.1.1",
+  "status": "current"
+ },
+ "eventIndex": {
+  "class": "objecttype",
+  "description": "An index that uniquely identifies an entry in the event table. Each such entry defines one event that is to be generated when the appropriate conditions occur.",
+  "maxaccess": "read-only",
+  "name": "eventIndex",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.9.1.1.1",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 65535,
+      "min": 1
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "eventLastTimeSent": {
+  "class": "objecttype",
+  "description": "The value of sysUpTime at the time this event entry last generated an event. If this entry has not generated any events, this value will be zero.",
+  "maxaccess": "read-only",
+  "name": "eventLastTimeSent",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.9.1.1.5",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "TimeTicks"
+  }
+ },
+ "eventOwner": {
+  "class": "objecttype",
+  "description": "The entity that configured this entry and is therefore using the resources assigned to it. If this object contains a string starting with 'monitor' and has associated entries in the log table, all connected management stations should retrieve those log entries, as they may have significance to all management stations connected to this device",
+  "maxaccess": "read-create",
+  "name": "eventOwner",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.9.1.1.6",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "OwnerString"
+  }
+ },
+ "eventStatus": {
+  "class": "objecttype",
+  "description": "The status of this event entry. If this object is not equal to valid(1), all associated log entries shall be deleted by the agent.",
+  "maxaccess": "read-create",
+  "name": "eventStatus",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.9.1.1.7",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "EntryStatus"
+  }
+ },
+ "eventTable": {
+  "class": "objecttype",
+  "description": "A list of events to be generated.",
+  "maxaccess": "not-accessible",
+  "name": "eventTable",
+  "nodetype": "table",
+  "oid": "1.3.6.1.2.1.16.9.1",
+  "status": "current"
+ },
+ "eventType": {
+  "class": "objecttype",
+  "description": "The type of notification that the probe will make about this event. In the case of log, an entry is made in the log table for each event. In the case of snmp-trap, an SNMP trap is sent to one or more management stations.",
+  "maxaccess": "read-create",
+  "name": "eventType",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.9.1.1.3",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "enumeration": {
+     "log": 2,
+     "logandtrap": 4,
+     "none": 1,
+     "snmptrap": 3
+    }
+   },
+   "type": "INTEGER"
+  }
+ },
+ "fallingAlarm": {
+  "class": "notificationtype",
+  "description": "The SNMP trap that is generated when an alarm entry crosses its falling threshold and generates an event that is configured for sending SNMP traps.",
+  "name": "fallingAlarm",
+  "objects": [
+   {
+    "module": "RMON-MIB",
+    "object": "alarmIndex"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "alarmVariable"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "alarmSampleType"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "alarmValue"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "alarmFallingThreshold"
+   }
+  ],
+  "oid": "1.3.6.1.2.1.16.0.2",
+  "status": "current"
+ },
+ "filter": {
+  "class": "objectidentity",
+  "name": "filter",
+  "oid": "1.3.6.1.2.1.16.7"
+ },
+ "filterChannelIndex": {
+  "class": "objecttype",
+  "description": "This object identifies the channel of which this filter is a part. The filters identified by a particular value of this object are associated with the same channel as identified by the same value of the channelIndex object.",
+  "maxaccess": "read-create",
+  "name": "filterChannelIndex",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.7.1.1.2",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 65535,
+      "min": 1
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "filterEntry": {
+  "class": "objecttype",
+  "description": "A set of parameters for a packet filter applied on a particular interface. As an example, an instance of the filterPktData object might be named filterPktData.12",
+  "indices": [
+   {
+    "implied": 0,
+    "module": "RMON-MIB",
+    "object": "filterIndex"
+   }
+  ],
+  "maxaccess": "not-accessible",
+  "name": "filterEntry",
+  "nodetype": "row",
+  "oid": "1.3.6.1.2.1.16.7.1.1",
+  "status": "current"
+ },
+ "filterIndex": {
+  "class": "objecttype",
+  "description": "An index that uniquely identifies an entry in the filter table. Each such entry defines one filter that is to be applied to every packet received on an interface.",
+  "maxaccess": "read-only",
+  "name": "filterIndex",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.7.1.1.1",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 65535,
+      "min": 1
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "filterOwner": {
+  "class": "objecttype",
+  "description": "The entity that configured this entry and is therefore using the resources assigned to it.",
+  "maxaccess": "read-create",
+  "name": "filterOwner",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.7.1.1.10",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "OwnerString"
+  }
+ },
+ "filterPktData": {
+  "class": "objecttype",
+  "description": "The data that is to be matched with the input packet. For each packet received, this filter and the accompanying filterPktDataMask and filterPktDataNotMask will be adjusted for the offset. The only bits relevant to this match algorithm are those that have the corresponding filterPktDataMask bit equal to one. The following three rules are then applied to every packet: (1) If the packet is too short and does not have data corresponding to part of the filterPktData, the packet will fail this data match. (2) For each relevant bit from the packet with the corresponding filterPktDataNotMask bit set to zero, if the bit from the packet is not equal to the corresponding bit from the filterPktData, then the packet will fail this data match. (3) If for every relevant bit from the packet with the corresponding filterPktDataNotMask bit set to one, the bit from the packet is equal to the corresponding bit from the filterPktData, then the packet will fail this data match. Any packets that have not failed any of the three matches above have passed this data match. In particular, a zero length filter will match any packet. This object may not be modified if the associated filterStatus object is equal to valid(1).",
+  "maxaccess": "read-create",
+  "name": "filterPktData",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.7.1.1.4",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "OCTET STRING"
+  }
+ },
+ "filterPktDataMask": {
+  "class": "objecttype",
+  "description": "The mask that is applied to the match process. After adjusting this mask for the offset, only those bits in the received packet that correspond to bits set in this mask are relevant for further processing by the match algorithm. The offset is applied to filterPktDataMask in the same way it is applied to the filter. For the purposes of the matching algorithm, if the associated filterPktData object is longer than this mask, this mask is conceptually extended with '1' bits until it reaches the length of the filterPktData object. This object may not be modified if the associated filterStatus object is equal to valid(1).",
+  "maxaccess": "read-create",
+  "name": "filterPktDataMask",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.7.1.1.5",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "OCTET STRING"
+  }
+ },
+ "filterPktDataNotMask": {
+  "class": "objecttype",
+  "description": "The inversion mask that is applied to the match process. After adjusting this mask for the offset, those relevant bits in the received packet that correspond to bits cleared in this mask must all be equal to their corresponding bits in the filterPktData object for the packet to be accepted. In addition, at least one of those relevant bits in the received packet that correspond to bits set in this mask must be different to its corresponding bit in the filterPktData object. For the purposes of the matching algorithm, if the associated filterPktData object is longer than this mask, this mask is conceptually extended with '0' bits until it reaches the length of the filterPktData object. This object may not be modified if the associated filterStatus object is equal to valid(1).",
+  "maxaccess": "read-create",
+  "name": "filterPktDataNotMask",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.7.1.1.6",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "OCTET STRING"
+  }
+ },
+ "filterPktDataOffset": {
+  "class": "objecttype",
+  "default": {
+   "default": {
+    "basetype": "Integer32",
+    "format": "decimal",
+    "value": "0"
+   }
+  },
+  "description": "The offset from the beginning of each packet where a match of packet data will be attempted. This offset is measured from the point in the physical layer packet after the framing bits, if any. For example, in an Ethernet frame, this point is at the beginning of the destination MAC address. This object may not be modified if the associated filterStatus object is equal to valid(1).",
+  "maxaccess": "read-create",
+  "name": "filterPktDataOffset",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.7.1.1.3",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Integer32"
+  },
+  "units": "Octets"
+ },
+ "filterPktStatus": {
+  "class": "objecttype",
+  "description": "The status that is to be matched with the input packet. The only bits relevant to this match algorithm are those that have the corresponding filterPktStatusMask bit equal to one. The following two rules are then applied to every packet: (1) For each relevant bit from the packet status with the corresponding filterPktStatusNotMask bit set to zero, if the bit from the packet status is not equal to the corresponding bit from the filterPktStatus, then the packet will fail this status match. (2) If for every relevant bit from the packet status with the corresponding filterPktStatusNotMask bit set to one, the bit from the packet status is equal to the corresponding bit from the filterPktStatus, then the packet will fail this status match. Any packets that have not failed either of the two matches above have passed this status match. In particular, a zero length status filter will match any packet's status. The value of the packet status is a sum. This sum initially takes the value zero. Then, for each error, E, that has been discovered in this packet, 2 raised to a value representing E is added to the sum. The errors and the bits that represent them are dependent on the media type of the interface that this channel is receiving packets from. The errors defined for a packet captured off of an Ethernet interface are as follows: bit # Error 0 Packet is longer than 1518 octets 1 Packet is shorter than 64 octets 2 Packet experienced a CRC or Alignment error For example, an Ethernet fragment would have a value of 6 (2^1 + 2^2). As this MIB is expanded to new media types, this object will have other media-specific errors defined. For the purposes of this status matching algorithm, if the packet status is longer than this filterPktStatus object, this object is conceptually extended with '0' bits until it reaches the size of the packet status. This object may not be modified if the associated filterStatus object is equal to valid(1).",
+  "maxaccess": "read-create",
+  "name": "filterPktStatus",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.7.1.1.7",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Integer32"
+  }
+ },
+ "filterPktStatusMask": {
+  "class": "objecttype",
+  "description": "The mask that is applied to the status match process. Only those bits in the received packet that correspond to bits set in this mask are relevant for further processing by the status match algorithm. For the purposes of the matching algorithm, if the associated filterPktStatus object is longer than this mask, this mask is conceptually extended with '1' bits until it reaches the size of the filterPktStatus. In addition, if a packet status is longer than this mask, this mask is conceptually extended with '0' bits until it reaches the size of the packet status. This object may not be modified if the associated filterStatus object is equal to valid(1).",
+  "maxaccess": "read-create",
+  "name": "filterPktStatusMask",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.7.1.1.8",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Integer32"
+  }
+ },
+ "filterPktStatusNotMask": {
+  "class": "objecttype",
+  "description": "The inversion mask that is applied to the status match process. Those relevant bits in the received packet status that correspond to bits cleared in this mask must all be equal to their corresponding bits in the filterPktStatus object for the packet to be accepted. In addition, at least one of those relevant bits in the received packet status that correspond to bits set in this mask must be different to its corresponding bit in the filterPktStatus object for the packet to be accepted. For the purposes of the matching algorithm, if the associated filterPktStatus object or a packet status is longer than this mask, this mask is conceptually extended with '0' bits until it reaches the longer of the lengths of the filterPktStatus object and the packet status. This object may not be modified if the associated filterStatus object is equal to valid(1).",
+  "maxaccess": "read-create",
+  "name": "filterPktStatusNotMask",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.7.1.1.9",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Integer32"
+  }
+ },
+ "filterStatus": {
+  "class": "objecttype",
+  "description": "The status of this filter entry.",
+  "maxaccess": "read-create",
+  "name": "filterStatus",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.7.1.1.11",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "EntryStatus"
+  }
+ },
+ "filterTable": {
+  "class": "objecttype",
+  "description": "A list of packet filter entries.",
+  "maxaccess": "not-accessible",
+  "name": "filterTable",
+  "nodetype": "table",
+  "oid": "1.3.6.1.2.1.16.7.1",
+  "status": "current"
+ },
+ "history": {
+  "class": "objectidentity",
+  "name": "history",
+  "oid": "1.3.6.1.2.1.16.2"
+ },
+ "historyControlBucketsGranted": {
+  "class": "objecttype",
+  "description": "The number of discrete sampling intervals over which data shall be saved in the part of the media-specific table associated with this historyControlEntry. When the associated historyControlBucketsRequested object is created or modified, the probe should set this object as closely to the requested value as is possible for the particular probe implementation and available resources. The probe must not lower this value except as a result of a modification to the associated historyControlBucketsRequested object. There will be times when the actual number of buckets associated with this entry is less than the value of this object. In this case, at the end of each sampling interval, a new bucket will be added to the media-specific table. When the number of buckets reaches the value of this object and a new bucket is to be added to the media-specific table, the oldest bucket associated with this historyControlEntry shall be deleted by the agent so that the new bucket can be added. When the value of this object changes to a value less than the current value, entries are deleted from the media-specific table associated with this historyControlEntry. Enough of the oldest of these entries shall be deleted by the agent so that their number remains less than or equal to the new value of this object. When the value of this object changes to a value greater than the current value, the number of associated media- specific entries may be allowed to grow.",
+  "maxaccess": "read-only",
+  "name": "historyControlBucketsGranted",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.2.1.1.4",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 65535,
+      "min": 1
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "historyControlBucketsRequested": {
+  "class": "objecttype",
+  "default": {
+   "default": {
+    "basetype": "Integer32",
+    "format": "decimal",
+    "value": "50"
+   }
+  },
+  "description": "The requested number of discrete time intervals over which data is to be saved in the part of the media-specific table associated with this historyControlEntry. When this object is created or modified, the probe should set historyControlBucketsGranted as closely to this object as is possible for the particular probe implementation and available resources.",
+  "maxaccess": "read-create",
+  "name": "historyControlBucketsRequested",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.2.1.1.3",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 65535,
+      "min": 1
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "historyControlDataSource": {
+  "class": "objecttype",
+  "description": "This object identifies the source of the data for which historical data was collected and placed in a media-specific table on behalf of this historyControlEntry. This source can be any interface on this device. In order to identify a particular interface, this object shall identify the instance of the ifIndex object, defined in RFC 2233 [17], for the desired interface. For example, if an entry were to receive data from interface #1, this object would be set to ifIndex.1. The statistics in this group reflect all packets on the local network segment attached to the identified interface. An agent may or may not be able to tell if fundamental changes to the media of the interface have occurred and necessitate an invalidation of this entry. For example, a hot-pluggable ethernet card could be pulled out and replaced by a token-ring card. In such a case, if the agent has such knowledge of the change, it is recommended that it invalidate this entry. This object may not be modified if the associated historyControlStatus object is equal to valid(1).",
+  "maxaccess": "read-create",
+  "name": "historyControlDataSource",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.2.1.1.2",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "OBJECT IDENTIFIER"
+  }
+ },
+ "historyControlEntry": {
+  "class": "objecttype",
+  "description": "A list of parameters that set up a periodic sampling of statistics. As an example, an instance of the historyControlInterval object might be named historyControlInterval.2",
+  "indices": [
+   {
+    "implied": 0,
+    "module": "RMON-MIB",
+    "object": "historyControlIndex"
+   }
+  ],
+  "maxaccess": "not-accessible",
+  "name": "historyControlEntry",
+  "nodetype": "row",
+  "oid": "1.3.6.1.2.1.16.2.1.1",
+  "status": "current"
+ },
+ "historyControlIndex": {
+  "class": "objecttype",
+  "description": "An index that uniquely identifies an entry in the historyControl table. Each such entry defines a set of samples at a particular interval for an interface on the device.",
+  "maxaccess": "read-only",
+  "name": "historyControlIndex",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.2.1.1.1",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 65535,
+      "min": 1
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "historyControlInterval": {
+  "class": "objecttype",
+  "default": {
+   "default": {
+    "basetype": "Integer32",
+    "format": "decimal",
+    "value": "1800"
+   }
+  },
+  "description": "The interval in seconds over which the data is sampled for each bucket in the part of the media-specific table associated with this historyControlEntry. This interval can be set to any number of seconds between 1 and 3600 (1 hour). Because the counters in a bucket may overflow at their maximum value with no indication, a prudent manager will take into account the possibility of overflow in any of the associated counters. It is important to consider the minimum time in which any counter could overflow on a particular media type and set the historyControlInterval object to a value less than this interval. This is typically most important for the 'octets' counter in any media-specific table. For example, on an Ethernet network, the etherHistoryOctets counter could overflow in about one hour at the Ethernet's maximum utilization. This object may not be modified if the associated historyControlStatus object is equal to valid(1).",
+  "maxaccess": "read-create",
+  "name": "historyControlInterval",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.2.1.1.5",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 3600,
+      "min": 1
+     }
+    ]
+   },
+   "type": "Integer32"
+  },
+  "units": "Seconds"
+ },
+ "historyControlOwner": {
+  "class": "objecttype",
+  "description": "The entity that configured this entry and is therefore using the resources assigned to it.",
+  "maxaccess": "read-create",
+  "name": "historyControlOwner",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.2.1.1.6",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "OwnerString"
+  }
+ },
+ "historyControlStatus": {
+  "class": "objecttype",
+  "description": "The status of this historyControl entry. Each instance of the media-specific table associated with this historyControlEntry will be deleted by the agent if this historyControlEntry is not equal to valid(1).",
+  "maxaccess": "read-create",
+  "name": "historyControlStatus",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.2.1.1.7",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "EntryStatus"
+  }
+ },
+ "historyControlTable": {
+  "class": "objecttype",
+  "description": "A list of history control entries.",
+  "maxaccess": "not-accessible",
+  "name": "historyControlTable",
+  "nodetype": "table",
+  "oid": "1.3.6.1.2.1.16.2.1",
+  "status": "current"
+ },
+ "hostAddress": {
+  "class": "objecttype",
+  "description": "The physical address of this host.",
+  "maxaccess": "read-only",
+  "name": "hostAddress",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.4.2.1.1",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "OCTET STRING"
+  }
+ },
+ "hostControlDataSource": {
+  "class": "objecttype",
+  "description": "This object identifies the source of the data for this instance of the host function. This source can be any interface on this device. In order to identify a particular interface, this object shall identify the instance of the ifIndex object, defined in RFC 2233 [17], for the desired interface. For example, if an entry were to receive data from interface #1, this object would be set to ifIndex.1. The statistics in this group reflect all packets on the local network segment attached to the identified interface. An agent may or may not be able to tell if fundamental changes to the media of the interface have occurred and necessitate an invalidation of this entry. For example, a hot-pluggable ethernet card could be pulled out and replaced by a token-ring card. In such a case, if the agent has such knowledge of the change, it is recommended that it invalidate this entry. This object may not be modified if the associated hostControlStatus object is equal to valid(1).",
+  "maxaccess": "read-create",
+  "name": "hostControlDataSource",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.4.1.1.2",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "OBJECT IDENTIFIER"
+  }
+ },
+ "hostControlEntry": {
+  "class": "objecttype",
+  "description": "A list of parameters that set up the discovery of hosts on a particular interface and the collection of statistics about these hosts. For example, an instance of the hostControlTableSize object might be named hostControlTableSize.1",
+  "indices": [
+   {
+    "implied": 0,
+    "module": "RMON-MIB",
+    "object": "hostControlIndex"
+   }
+  ],
+  "maxaccess": "not-accessible",
+  "name": "hostControlEntry",
+  "nodetype": "row",
+  "oid": "1.3.6.1.2.1.16.4.1.1",
+  "status": "current"
+ },
+ "hostControlIndex": {
+  "class": "objecttype",
+  "description": "An index that uniquely identifies an entry in the hostControl table. Each such entry defines a function that discovers hosts on a particular interface and places statistics about them in the hostTable and the hostTimeTable on behalf of this hostControlEntry.",
+  "maxaccess": "read-only",
+  "name": "hostControlIndex",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.4.1.1.1",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 65535,
+      "min": 1
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "hostControlLastDeleteTime": {
+  "class": "objecttype",
+  "description": "The value of sysUpTime when the last entry was deleted from the portion of the hostTable associated with this hostControlEntry. If no deletions have occurred, this value shall be zero.",
+  "maxaccess": "read-only",
+  "name": "hostControlLastDeleteTime",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.4.1.1.4",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "TimeTicks"
+  }
+ },
+ "hostControlOwner": {
+  "class": "objecttype",
+  "description": "The entity that configured this entry and is therefore using the resources assigned to it.",
+  "maxaccess": "read-create",
+  "name": "hostControlOwner",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.4.1.1.5",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "OwnerString"
+  }
+ },
+ "hostControlStatus": {
+  "class": "objecttype",
+  "description": "The status of this hostControl entry. If this object is not equal to valid(1), all associated entries in the hostTable, hostTimeTable, and the hostTopNTable shall be deleted by the agent.",
+  "maxaccess": "read-create",
+  "name": "hostControlStatus",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.4.1.1.6",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "EntryStatus"
+  }
+ },
+ "hostControlTable": {
+  "class": "objecttype",
+  "description": "A list of host table control entries.",
+  "maxaccess": "not-accessible",
+  "name": "hostControlTable",
+  "nodetype": "table",
+  "oid": "1.3.6.1.2.1.16.4.1",
+  "status": "current"
+ },
+ "hostControlTableSize": {
+  "class": "objecttype",
+  "description": "The number of hostEntries in the hostTable and the hostTimeTable associated with this hostControlEntry.",
+  "maxaccess": "read-only",
+  "name": "hostControlTableSize",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.4.1.1.3",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Integer32"
+  }
+ },
+ "hostCreationOrder": {
+  "class": "objecttype",
+  "description": "An index that defines the relative ordering of the creation time of hosts captured for a particular hostControlEntry. This index shall be between 1 and N, where N is the value of the associated hostControlTableSize. The ordering of the indexes is based on the order of each entry's insertion into the table, in which entries added earlier have a lower index value than entries added later. It is important to note that the order for a particular entry may change as an (earlier) entry is deleted from the table. Because this order may change, management stations should make use of the hostControlLastDeleteTime variable in the hostControlEntry associated with the relevant portion of the hostTable. By observing this variable, the management station may detect the circumstances where a previous association between a value of hostCreationOrder and a hostEntry may no longer hold.",
+  "maxaccess": "read-only",
+  "name": "hostCreationOrder",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.4.2.1.2",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 65535,
+      "min": 1
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "hostEntry": {
+  "class": "objecttype",
+  "description": "A collection of statistics for a particular host that has been discovered on an interface of this device. For example, an instance of the hostOutBroadcastPkts object might be named hostOutBroadcastPkts.1.6.8.0.32.27.3.176",
+  "indices": [
+   {
+    "implied": 0,
+    "module": "RMON-MIB",
+    "object": "hostIndex"
+   },
+   {
+    "implied": 0,
+    "module": "RMON-MIB",
+    "object": "hostAddress"
+   }
+  ],
+  "maxaccess": "not-accessible",
+  "name": "hostEntry",
+  "nodetype": "row",
+  "oid": "1.3.6.1.2.1.16.4.2.1",
+  "status": "current"
+ },
+ "hostInOctets": {
+  "class": "objecttype",
+  "description": "The number of octets transmitted to this address since it was added to the hostTable (excluding framing bits but including FCS octets), except for those octets in bad packets.",
+  "maxaccess": "read-only",
+  "name": "hostInOctets",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.4.2.1.6",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  },
+  "units": "Octets"
+ },
+ "hostInPkts": {
+  "class": "objecttype",
+  "description": "The number of good packets transmitted to this address since it was added to the hostTable.",
+  "maxaccess": "read-only",
+  "name": "hostInPkts",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.4.2.1.4",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  },
+  "units": "Packets"
+ },
+ "hostIndex": {
+  "class": "objecttype",
+  "description": "The set of collected host statistics of which this entry is a part. The set of hosts identified by a particular value of this index is associated with the hostControlEntry as identified by the same value of hostControlIndex.",
+  "maxaccess": "read-only",
+  "name": "hostIndex",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.4.2.1.3",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 65535,
+      "min": 1
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "hostOutBroadcastPkts": {
+  "class": "objecttype",
+  "description": "The number of good packets transmitted by this address that were directed to the broadcast address since this host was added to the hostTable.",
+  "maxaccess": "read-only",
+  "name": "hostOutBroadcastPkts",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.4.2.1.9",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  },
+  "units": "Packets"
+ },
+ "hostOutErrors": {
+  "class": "objecttype",
+  "description": "The number of bad packets transmitted by this address since this host was added to the hostTable.",
+  "maxaccess": "read-only",
+  "name": "hostOutErrors",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.4.2.1.8",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  },
+  "units": "Packets"
+ },
+ "hostOutMulticastPkts": {
+  "class": "objecttype",
+  "description": "The number of good packets transmitted by this address that were directed to a multicast address since this host was added to the hostTable. Note that this number does not include packets directed to the broadcast address.",
+  "maxaccess": "read-only",
+  "name": "hostOutMulticastPkts",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.4.2.1.10",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  },
+  "units": "Packets"
+ },
+ "hostOutOctets": {
+  "class": "objecttype",
+  "description": "The number of octets transmitted by this address since it was added to the hostTable (excluding framing bits but including FCS octets), including those octets in bad packets.",
+  "maxaccess": "read-only",
+  "name": "hostOutOctets",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.4.2.1.7",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  },
+  "units": "Octets"
+ },
+ "hostOutPkts": {
+  "class": "objecttype",
+  "description": "The number of packets, including bad packets, transmitted by this address since it was added to the hostTable.",
+  "maxaccess": "read-only",
+  "name": "hostOutPkts",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.4.2.1.5",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  },
+  "units": "Packets"
+ },
+ "hostTable": {
+  "class": "objecttype",
+  "description": "A list of host entries.",
+  "maxaccess": "not-accessible",
+  "name": "hostTable",
+  "nodetype": "table",
+  "oid": "1.3.6.1.2.1.16.4.2",
+  "status": "current"
+ },
+ "hostTimeAddress": {
+  "class": "objecttype",
+  "description": "The physical address of this host.",
+  "maxaccess": "read-only",
+  "name": "hostTimeAddress",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.4.3.1.1",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "OCTET STRING"
+  }
+ },
+ "hostTimeCreationOrder": {
+  "class": "objecttype",
+  "description": "An index that uniquely identifies an entry in the hostTime table among those entries associated with the same hostControlEntry. This index shall be between 1 and N, where N is the value of the associated hostControlTableSize. The ordering of the indexes is based on the order of each entry's insertion into the table, in which entries added earlier have a lower index value than entries added later. Thus the management station has the ability to learn of new entries added to this table without downloading the entire table. It is important to note that the index for a particular entry may change as an (earlier) entry is deleted from the table. Because this order may change, management stations should make use of the hostControlLastDeleteTime variable in the hostControlEntry associated with the relevant portion of the hostTimeTable. By observing this variable, the management station may detect the circumstances where a download of the table may have missed entries, and where a previous association between a value of hostTimeCreationOrder and a hostTimeEntry may no longer hold.",
+  "maxaccess": "read-only",
+  "name": "hostTimeCreationOrder",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.4.3.1.2",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 65535,
+      "min": 1
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "hostTimeEntry": {
+  "class": "objecttype",
+  "description": "A collection of statistics for a particular host that has been discovered on an interface of this device. This collection includes the relative ordering of the creation time of this object. For example, an instance of the hostTimeOutBroadcastPkts object might be named hostTimeOutBroadcastPkts.1.687",
+  "indices": [
+   {
+    "implied": 0,
+    "module": "RMON-MIB",
+    "object": "hostTimeIndex"
+   },
+   {
+    "implied": 0,
+    "module": "RMON-MIB",
+    "object": "hostTimeCreationOrder"
+   }
+  ],
+  "maxaccess": "not-accessible",
+  "name": "hostTimeEntry",
+  "nodetype": "row",
+  "oid": "1.3.6.1.2.1.16.4.3.1",
+  "status": "current"
+ },
+ "hostTimeInOctets": {
+  "class": "objecttype",
+  "description": "The number of octets transmitted to this address since it was added to the hostTimeTable (excluding framing bits but including FCS octets), except for those octets in bad packets.",
+  "maxaccess": "read-only",
+  "name": "hostTimeInOctets",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.4.3.1.6",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  },
+  "units": "Octets"
+ },
+ "hostTimeInPkts": {
+  "class": "objecttype",
+  "description": "The number of good packets transmitted to this address since it was added to the hostTimeTable.",
+  "maxaccess": "read-only",
+  "name": "hostTimeInPkts",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.4.3.1.4",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  },
+  "units": "Packets"
+ },
+ "hostTimeIndex": {
+  "class": "objecttype",
+  "description": "The set of collected host statistics of which this entry is a part. The set of hosts identified by a particular value of this index is associated with the hostControlEntry as identified by the same value of hostControlIndex.",
+  "maxaccess": "read-only",
+  "name": "hostTimeIndex",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.4.3.1.3",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 65535,
+      "min": 1
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "hostTimeOutBroadcastPkts": {
+  "class": "objecttype",
+  "description": "The number of good packets transmitted by this address that were directed to the broadcast address since this host was added to the hostTimeTable.",
+  "maxaccess": "read-only",
+  "name": "hostTimeOutBroadcastPkts",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.4.3.1.9",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  },
+  "units": "Packets"
+ },
+ "hostTimeOutErrors": {
+  "class": "objecttype",
+  "description": "The number of bad packets transmitted by this address since this host was added to the hostTimeTable.",
+  "maxaccess": "read-only",
+  "name": "hostTimeOutErrors",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.4.3.1.8",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  },
+  "units": "Packets"
+ },
+ "hostTimeOutMulticastPkts": {
+  "class": "objecttype",
+  "description": "The number of good packets transmitted by this address that were directed to a multicast address since this host was added to the hostTimeTable. Note that this number does not include packets directed to the broadcast address.",
+  "maxaccess": "read-only",
+  "name": "hostTimeOutMulticastPkts",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.4.3.1.10",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  },
+  "units": "Packets"
+ },
+ "hostTimeOutOctets": {
+  "class": "objecttype",
+  "description": "The number of octets transmitted by this address since it was added to the hostTimeTable (excluding framing bits but including FCS octets), including those octets in bad packets.",
+  "maxaccess": "read-only",
+  "name": "hostTimeOutOctets",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.4.3.1.7",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  },
+  "units": "Octets"
+ },
+ "hostTimeOutPkts": {
+  "class": "objecttype",
+  "description": "The number of packets, including bad packets, transmitted by this address since it was added to the hostTimeTable.",
+  "maxaccess": "read-only",
+  "name": "hostTimeOutPkts",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.4.3.1.5",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  },
+  "units": "Packets"
+ },
+ "hostTimeTable": {
+  "class": "objecttype",
+  "description": "A list of time-ordered host table entries.",
+  "maxaccess": "not-accessible",
+  "name": "hostTimeTable",
+  "nodetype": "table",
+  "oid": "1.3.6.1.2.1.16.4.3",
+  "status": "current"
+ },
+ "hostTopN": {
+  "class": "objectidentity",
+  "name": "hostTopN",
+  "oid": "1.3.6.1.2.1.16.5"
+ },
+ "hostTopNAddress": {
+  "class": "objecttype",
+  "description": "The physical address of this host.",
+  "maxaccess": "read-only",
+  "name": "hostTopNAddress",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.5.2.1.3",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "OCTET STRING"
+  }
+ },
+ "hostTopNControlEntry": {
+  "class": "objecttype",
+  "description": "A set of parameters that control the creation of a report of the top N hosts according to several metrics. For example, an instance of the hostTopNDuration object might be named hostTopNDuration.3",
+  "indices": [
+   {
+    "implied": 0,
+    "module": "RMON-MIB",
+    "object": "hostTopNControlIndex"
+   }
+  ],
+  "maxaccess": "not-accessible",
+  "name": "hostTopNControlEntry",
+  "nodetype": "row",
+  "oid": "1.3.6.1.2.1.16.5.1.1",
+  "status": "current"
+ },
+ "hostTopNControlIndex": {
+  "class": "objecttype",
+  "description": "An index that uniquely identifies an entry in the hostTopNControl table. Each such entry defines one top N report prepared for one interface.",
+  "maxaccess": "read-only",
+  "name": "hostTopNControlIndex",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.5.1.1.1",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 65535,
+      "min": 1
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "hostTopNControlTable": {
+  "class": "objecttype",
+  "description": "A list of top N host control entries.",
+  "maxaccess": "not-accessible",
+  "name": "hostTopNControlTable",
+  "nodetype": "table",
+  "oid": "1.3.6.1.2.1.16.5.1",
+  "status": "current"
+ },
+ "hostTopNDuration": {
+  "class": "objecttype",
+  "default": {
+   "default": {
+    "basetype": "Integer32",
+    "format": "decimal",
+    "value": "0"
+   }
+  },
+  "description": "The number of seconds that this report has collected during the last sampling interval, or if this report is currently being collected, the number of seconds that this report is being collected during this sampling interval. When the associated hostTopNTimeRemaining object is set, this object shall be set by the probe to the same value and shall not be modified until the next time the hostTopNTimeRemaining is set. This value shall be zero if no reports have been requested for this hostTopNControlEntry.",
+  "maxaccess": "read-only",
+  "name": "hostTopNDuration",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.5.1.1.5",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Integer32"
+  },
+  "units": "Seconds"
+ },
+ "hostTopNEntry": {
+  "class": "objecttype",
+  "description": "A set of statistics for a host that is part of a top N report. For example, an instance of the hostTopNRate object might be named hostTopNRate.3.10",
+  "indices": [
+   {
+    "implied": 0,
+    "module": "RMON-MIB",
+    "object": "hostTopNReport"
+   },
+   {
+    "implied": 0,
+    "module": "RMON-MIB",
+    "object": "hostTopNIndex"
+   }
+  ],
+  "maxaccess": "not-accessible",
+  "name": "hostTopNEntry",
+  "nodetype": "row",
+  "oid": "1.3.6.1.2.1.16.5.2.1",
+  "status": "current"
+ },
+ "hostTopNGrantedSize": {
+  "class": "objecttype",
+  "description": "The maximum number of hosts in the top N table. When the associated hostTopNRequestedSize object is created or modified, the probe should set this object as closely to the requested value as is possible for the particular implementation and available resources. The probe must not lower this value except as a result of a set to the associated hostTopNRequestedSize object. Hosts with the highest value of hostTopNRate shall be placed in this table in decreasing order of this rate until there is no more room or until there are no more hosts.",
+  "maxaccess": "read-only",
+  "name": "hostTopNGrantedSize",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.5.1.1.7",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Integer32"
+  }
+ },
+ "hostTopNHostIndex": {
+  "class": "objecttype",
+  "description": "The host table for which a top N report will be prepared on behalf of this entry. The host table identified by a particular value of this index is associated with the same host table as identified by the same value of hostIndex. This object may not be modified if the associated hostTopNStatus object is equal to valid(1).",
+  "maxaccess": "read-create",
+  "name": "hostTopNHostIndex",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.5.1.1.2",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 65535,
+      "min": 1
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "hostTopNIndex": {
+  "class": "objecttype",
+  "description": "An index that uniquely identifies an entry in the hostTopN table among those in the same report. This index is between 1 and N, where N is the number of entries in this table. Increasing values of hostTopNIndex shall be assigned to entries with decreasing values of hostTopNRate until index N is assigned to the entry with the lowest value of hostTopNRate or there are no more hostTopNEntries.",
+  "maxaccess": "read-only",
+  "name": "hostTopNIndex",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.5.2.1.2",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 65535,
+      "min": 1
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "hostTopNOwner": {
+  "class": "objecttype",
+  "description": "The entity that configured this entry and is therefore using the resources assigned to it.",
+  "maxaccess": "read-create",
+  "name": "hostTopNOwner",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.5.1.1.9",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "OwnerString"
+  }
+ },
+ "hostTopNRate": {
+  "class": "objecttype",
+  "description": "The amount of change in the selected variable during this sampling interval. The selected variable is this host's instance of the object selected by hostTopNRateBase.",
+  "maxaccess": "read-only",
+  "name": "hostTopNRate",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.5.2.1.4",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Integer32"
+  }
+ },
+ "hostTopNRateBase": {
+  "class": "objecttype",
+  "description": "The variable for each host that the hostTopNRate variable is based upon. This object may not be modified if the associated hostTopNStatus object is equal to valid(1).",
+  "maxaccess": "read-create",
+  "name": "hostTopNRateBase",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.5.1.1.3",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "enumeration": {
+     "hostTopNInOctets": 3,
+     "hostTopNInPkts": 1,
+     "hostTopNOutBroadcastPkts": 6,
+     "hostTopNOutErrors": 5,
+     "hostTopNOutMulticastPkts": 7,
+     "hostTopNOutOctets": 4,
+     "hostTopNOutPkts": 2
+    }
+   },
+   "type": "INTEGER"
+  }
+ },
+ "hostTopNReport": {
+  "class": "objecttype",
+  "description": "This object identifies the top N report of which this entry is a part. The set of hosts identified by a particular value of this object is part of the same report as identified by the same value of the hostTopNControlIndex object.",
+  "maxaccess": "read-only",
+  "name": "hostTopNReport",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.5.2.1.1",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 65535,
+      "min": 1
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "hostTopNRequestedSize": {
+  "class": "objecttype",
+  "default": {
+   "default": {
+    "basetype": "Integer32",
+    "format": "decimal",
+    "value": "10"
+   }
+  },
+  "description": "The maximum number of hosts requested for the top N table. When this object is created or modified, the probe should set hostTopNGrantedSize as closely to this object as is possible for the particular probe implementation and available resources.",
+  "maxaccess": "read-create",
+  "name": "hostTopNRequestedSize",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.5.1.1.6",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Integer32"
+  }
+ },
+ "hostTopNStartTime": {
+  "class": "objecttype",
+  "description": "The value of sysUpTime when this top N report was last started. In other words, this is the time that the associated hostTopNTimeRemaining object was modified to start the requested report.",
+  "maxaccess": "read-only",
+  "name": "hostTopNStartTime",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.5.1.1.8",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "TimeTicks"
+  }
+ },
+ "hostTopNStatus": {
+  "class": "objecttype",
+  "description": "The status of this hostTopNControl entry. If this object is not equal to valid(1), all associated hostTopNEntries shall be deleted by the agent.",
+  "maxaccess": "read-create",
+  "name": "hostTopNStatus",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.5.1.1.10",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "EntryStatus"
+  }
+ },
+ "hostTopNTable": {
+  "class": "objecttype",
+  "description": "A list of top N host entries.",
+  "maxaccess": "not-accessible",
+  "name": "hostTopNTable",
+  "nodetype": "table",
+  "oid": "1.3.6.1.2.1.16.5.2",
+  "status": "current"
+ },
+ "hostTopNTimeRemaining": {
+  "class": "objecttype",
+  "default": {
+   "default": {
+    "basetype": "Integer32",
+    "format": "decimal",
+    "value": "0"
+   }
+  },
+  "description": "The number of seconds left in the report currently being collected. When this object is modified by the management station, a new collection is started, possibly aborting a currently running report. The new value is used as the requested duration of this report, which is loaded into the associated hostTopNDuration object. When this object is set to a non-zero value, any associated hostTopNEntries shall be made inaccessible by the monitor. While the value of this object is non-zero, it decrements by one per second until it reaches zero. During this time, all associated hostTopNEntries shall remain inaccessible. At the time that this object decrements to zero, the report is made accessible in the hostTopNTable. Thus, the hostTopN table needs to be created only at the end of the collection interval.",
+  "maxaccess": "read-create",
+  "name": "hostTopNTimeRemaining",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.5.1.1.4",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Integer32"
+  },
+  "units": "Seconds"
+ },
+ "hosts": {
+  "class": "objectidentity",
+  "name": "hosts",
+  "oid": "1.3.6.1.2.1.16.4"
+ },
+ "imports": {
+  "SNMPv2-CONF": [
+   "MODULE-COMPLIANCE",
+   "NOTIFICATION-GROUP",
+   "OBJECT-GROUP"
+  ],
+  "SNMPv2-SMI": [
+   "Bits",
+   "Counter32",
+   "Integer32",
+   "IpAddress",
+   "MODULE-IDENTITY",
+   "MibIdentifier",
+   "NOTIFICATION-TYPE",
+   "OBJECT-IDENTITY",
+   "OBJECT-TYPE",
+   "TimeTicks",
+   "Unsigned32",
+   "iso",
+   "mib-2"
+  ],
+  "SNMPv2-TC": [
+   "DisplayString",
+   "PhysAddress",
+   "TEXTUAL-CONVENTION"
+  ],
+  "class": "imports"
+ },
+ "logDescription": {
+  "class": "objecttype",
+  "description": "An implementation dependent description of the event that activated this log entry.",
+  "maxaccess": "read-only",
+  "name": "logDescription",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.9.2.1.4",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "size": [
+     {
+      "max": 255,
+      "min": 0
+     }
+    ]
+   },
+   "type": "DisplayString"
+  }
+ },
+ "logEntry": {
+  "class": "objecttype",
+  "description": "A set of data describing an event that has been logged. For example, an instance of the logDescription object might be named logDescription.6.47",
+  "indices": [
+   {
+    "implied": 0,
+    "module": "RMON-MIB",
+    "object": "logEventIndex"
+   },
+   {
+    "implied": 0,
+    "module": "RMON-MIB",
+    "object": "logIndex"
+   }
+  ],
+  "maxaccess": "not-accessible",
+  "name": "logEntry",
+  "nodetype": "row",
+  "oid": "1.3.6.1.2.1.16.9.2.1",
+  "status": "current"
+ },
+ "logEventIndex": {
+  "class": "objecttype",
+  "description": "The event entry that generated this log entry. The log identified by a particular value of this index is associated with the same eventEntry as identified by the same value of eventIndex.",
+  "maxaccess": "read-only",
+  "name": "logEventIndex",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.9.2.1.1",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 65535,
+      "min": 1
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "logIndex": {
+  "class": "objecttype",
+  "description": "An index that uniquely identifies an entry in the log table amongst those generated by the same eventEntries. These indexes are assigned beginning with 1 and increase by one with each new log entry. The association between values of logIndex and logEntries is fixed for the lifetime of each logEntry. The agent may choose to delete the oldest instances of logEntry as required because of lack of memory. It is an implementation-specific matter as to when this deletion may occur.",
+  "maxaccess": "read-only",
+  "name": "logIndex",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.9.2.1.2",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 2147483647,
+      "min": 1
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "logTable": {
+  "class": "objecttype",
+  "description": "A list of events that have been logged.",
+  "maxaccess": "not-accessible",
+  "name": "logTable",
+  "nodetype": "table",
+  "oid": "1.3.6.1.2.1.16.9.2",
+  "status": "current"
+ },
+ "logTime": {
+  "class": "objecttype",
+  "description": "The value of sysUpTime when this log entry was created.",
+  "maxaccess": "read-only",
+  "name": "logTime",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.9.2.1.3",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "TimeTicks"
+  }
+ },
+ "matrix": {
+  "class": "objectidentity",
+  "name": "matrix",
+  "oid": "1.3.6.1.2.1.16.6"
+ },
+ "matrixControlDataSource": {
+  "class": "objecttype",
+  "description": "This object identifies the source of the data from which this entry creates a traffic matrix. This source can be any interface on this device. In order to identify a particular interface, this object shall identify the instance of the ifIndex object, defined in RFC 2233 [17], for the desired interface. For example, if an entry were to receive data from interface #1, this object would be set to ifIndex.1. The statistics in this group reflect all packets on the local network segment attached to the identified interface. An agent may or may not be able to tell if fundamental changes to the media of the interface have occurred and necessitate an invalidation of this entry. For example, a hot-pluggable ethernet card could be pulled out and replaced by a token-ring card. In such a case, if the agent has such knowledge of the change, it is recommended that it invalidate this entry. This object may not be modified if the associated matrixControlStatus object is equal to valid(1).",
+  "maxaccess": "read-create",
+  "name": "matrixControlDataSource",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.6.1.1.2",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "OBJECT IDENTIFIER"
+  }
+ },
+ "matrixControlEntry": {
+  "class": "objecttype",
+  "description": "Information about a traffic matrix on a particular interface. For example, an instance of the matrixControlLastDeleteTime object might be named matrixControlLastDeleteTime.1",
+  "indices": [
+   {
+    "implied": 0,
+    "module": "RMON-MIB",
+    "object": "matrixControlIndex"
+   }
+  ],
+  "maxaccess": "not-accessible",
+  "name": "matrixControlEntry",
+  "nodetype": "row",
+  "oid": "1.3.6.1.2.1.16.6.1.1",
+  "status": "current"
+ },
+ "matrixControlIndex": {
+  "class": "objecttype",
+  "description": "An index that uniquely identifies an entry in the matrixControl table. Each such entry defines a function that discovers conversations on a particular interface and places statistics about them in the matrixSDTable and the matrixDSTable on behalf of this matrixControlEntry.",
+  "maxaccess": "read-only",
+  "name": "matrixControlIndex",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.6.1.1.1",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 65535,
+      "min": 1
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "matrixControlLastDeleteTime": {
+  "class": "objecttype",
+  "description": "The value of sysUpTime when the last entry was deleted from the portion of the matrixSDTable or matrixDSTable associated with this matrixControlEntry. If no deletions have occurred, this value shall be zero.",
+  "maxaccess": "read-only",
+  "name": "matrixControlLastDeleteTime",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.6.1.1.4",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "TimeTicks"
+  }
+ },
+ "matrixControlOwner": {
+  "class": "objecttype",
+  "description": "The entity that configured this entry and is therefore using the resources assigned to it.",
+  "maxaccess": "read-create",
+  "name": "matrixControlOwner",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.6.1.1.5",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "OwnerString"
+  }
+ },
+ "matrixControlStatus": {
+  "class": "objecttype",
+  "description": "The status of this matrixControl entry. If this object is not equal to valid(1), all associated entries in the matrixSDTable and the matrixDSTable shall be deleted by the agent.",
+  "maxaccess": "read-create",
+  "name": "matrixControlStatus",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.6.1.1.6",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "EntryStatus"
+  }
+ },
+ "matrixControlTable": {
+  "class": "objecttype",
+  "description": "A list of information entries for the traffic matrix on each interface.",
+  "maxaccess": "not-accessible",
+  "name": "matrixControlTable",
+  "nodetype": "table",
+  "oid": "1.3.6.1.2.1.16.6.1",
+  "status": "current"
+ },
+ "matrixControlTableSize": {
+  "class": "objecttype",
+  "description": "The number of matrixSDEntries in the matrixSDTable for this interface. This must also be the value of the number of entries in the matrixDSTable for this interface.",
+  "maxaccess": "read-only",
+  "name": "matrixControlTableSize",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.6.1.1.3",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Integer32"
+  }
+ },
+ "matrixDSDestAddress": {
+  "class": "objecttype",
+  "description": "The destination physical address.",
+  "maxaccess": "read-only",
+  "name": "matrixDSDestAddress",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.6.3.1.2",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "OCTET STRING"
+  }
+ },
+ "matrixDSEntry": {
+  "class": "objecttype",
+  "description": "A collection of statistics for communications between two addresses on a particular interface. For example, an instance of the matrixSDPkts object might be named matrixSDPkts.1.6.8.0.32.10.8.113.6.8.0.32.27.3.176",
+  "indices": [
+   {
+    "implied": 0,
+    "module": "RMON-MIB",
+    "object": "matrixDSIndex"
+   },
+   {
+    "implied": 0,
+    "module": "RMON-MIB",
+    "object": "matrixDSDestAddress"
+   },
+   {
+    "implied": 0,
+    "module": "RMON-MIB",
+    "object": "matrixDSSourceAddress"
+   }
+  ],
+  "maxaccess": "not-accessible",
+  "name": "matrixDSEntry",
+  "nodetype": "row",
+  "oid": "1.3.6.1.2.1.16.6.3.1",
+  "status": "current"
+ },
+ "matrixDSErrors": {
+  "class": "objecttype",
+  "description": "The number of bad packets transmitted from the source address to the destination address.",
+  "maxaccess": "read-only",
+  "name": "matrixDSErrors",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.6.3.1.6",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  },
+  "units": "Packets"
+ },
+ "matrixDSIndex": {
+  "class": "objecttype",
+  "description": "The set of collected matrix statistics of which this entry is a part. The set of matrix statistics identified by a particular value of this index is associated with the same matrixControlEntry as identified by the same value of matrixControlIndex.",
+  "maxaccess": "read-only",
+  "name": "matrixDSIndex",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.6.3.1.3",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 65535,
+      "min": 1
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "matrixDSOctets": {
+  "class": "objecttype",
+  "description": "The number of octets (excluding framing bits but including FCS octets) contained in all packets transmitted from the source address to the destination address.",
+  "maxaccess": "read-only",
+  "name": "matrixDSOctets",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.6.3.1.5",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  },
+  "units": "Octets"
+ },
+ "matrixDSPkts": {
+  "class": "objecttype",
+  "description": "The number of packets transmitted from the source address to the destination address (this number includes bad packets).",
+  "maxaccess": "read-only",
+  "name": "matrixDSPkts",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.6.3.1.4",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  },
+  "units": "Packets"
+ },
+ "matrixDSSourceAddress": {
+  "class": "objecttype",
+  "description": "The source physical address.",
+  "maxaccess": "read-only",
+  "name": "matrixDSSourceAddress",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.6.3.1.1",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "OCTET STRING"
+  }
+ },
+ "matrixDSTable": {
+  "class": "objecttype",
+  "description": "A list of traffic matrix entries indexed by destination and source MAC address.",
+  "maxaccess": "not-accessible",
+  "name": "matrixDSTable",
+  "nodetype": "table",
+  "oid": "1.3.6.1.2.1.16.6.3",
+  "status": "current"
+ },
+ "matrixSDDestAddress": {
+  "class": "objecttype",
+  "description": "The destination physical address.",
+  "maxaccess": "read-only",
+  "name": "matrixSDDestAddress",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.6.2.1.2",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "OCTET STRING"
+  }
+ },
+ "matrixSDEntry": {
+  "class": "objecttype",
+  "description": "A collection of statistics for communications between two addresses on a particular interface. For example, an instance of the matrixSDPkts object might be named matrixSDPkts.1.6.8.0.32.27.3.176.6.8.0.32.10.8.113",
+  "indices": [
+   {
+    "implied": 0,
+    "module": "RMON-MIB",
+    "object": "matrixSDIndex"
+   },
+   {
+    "implied": 0,
+    "module": "RMON-MIB",
+    "object": "matrixSDSourceAddress"
+   },
+   {
+    "implied": 0,
+    "module": "RMON-MIB",
+    "object": "matrixSDDestAddress"
+   }
+  ],
+  "maxaccess": "not-accessible",
+  "name": "matrixSDEntry",
+  "nodetype": "row",
+  "oid": "1.3.6.1.2.1.16.6.2.1",
+  "status": "current"
+ },
+ "matrixSDErrors": {
+  "class": "objecttype",
+  "description": "The number of bad packets transmitted from the source address to the destination address.",
+  "maxaccess": "read-only",
+  "name": "matrixSDErrors",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.6.2.1.6",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  },
+  "units": "Packets"
+ },
+ "matrixSDIndex": {
+  "class": "objecttype",
+  "description": "The set of collected matrix statistics of which this entry is a part. The set of matrix statistics identified by a particular value of this index is associated with the same matrixControlEntry as identified by the same value of matrixControlIndex.",
+  "maxaccess": "read-only",
+  "name": "matrixSDIndex",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.6.2.1.3",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 65535,
+      "min": 1
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "matrixSDOctets": {
+  "class": "objecttype",
+  "description": "The number of octets (excluding framing bits but including FCS octets) contained in all packets transmitted from the source address to the destination address.",
+  "maxaccess": "read-only",
+  "name": "matrixSDOctets",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.6.2.1.5",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  },
+  "units": "Octets"
+ },
+ "matrixSDPkts": {
+  "class": "objecttype",
+  "description": "The number of packets transmitted from the source address to the destination address (this number includes bad packets).",
+  "maxaccess": "read-only",
+  "name": "matrixSDPkts",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.6.2.1.4",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  },
+  "units": "Packets"
+ },
+ "matrixSDSourceAddress": {
+  "class": "objecttype",
+  "description": "The source physical address.",
+  "maxaccess": "read-only",
+  "name": "matrixSDSourceAddress",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.16.6.2.1.1",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "OCTET STRING"
+  }
+ },
+ "matrixSDTable": {
+  "class": "objecttype",
+  "description": "A list of traffic matrix entries indexed by source and destination MAC address.",
+  "maxaccess": "not-accessible",
+  "name": "matrixSDTable",
+  "nodetype": "table",
+  "oid": "1.3.6.1.2.1.16.6.2",
+  "status": "current"
+ },
+ "meta": {
+  "module": "RMON-MIB"
+ },
+ "risingAlarm": {
+  "class": "notificationtype",
+  "description": "The SNMP trap that is generated when an alarm entry crosses its rising threshold and generates an event that is configured for sending SNMP traps.",
+  "name": "risingAlarm",
+  "objects": [
+   {
+    "module": "RMON-MIB",
+    "object": "alarmIndex"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "alarmVariable"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "alarmSampleType"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "alarmValue"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "alarmRisingThreshold"
+   }
+  ],
+  "oid": "1.3.6.1.2.1.16.0.1",
+  "status": "current"
+ },
+ "rmon": {
+  "class": "objectidentity",
+  "name": "rmon",
+  "oid": "1.3.6.1.2.1.16"
+ },
+ "rmonAlarmGroup": {
+  "class": "objectgroup",
+  "description": "The RMON Alarm Group.",
+  "name": "rmonAlarmGroup",
+  "objects": [
+   {
+    "module": "RMON-MIB",
+    "object": "alarmIndex"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "alarmInterval"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "alarmVariable"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "alarmSampleType"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "alarmValue"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "alarmStartupAlarm"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "alarmRisingThreshold"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "alarmFallingThreshold"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "alarmRisingEventIndex"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "alarmFallingEventIndex"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "alarmOwner"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "alarmStatus"
+   }
+  ],
+  "oid": "1.3.6.1.2.1.16.20.10.4",
+  "status": "current"
+ },
+ "rmonCompliance": {
+  "class": "modulecompliance",
+  "description": "The requirements for conformance to the RMON MIB. At least one of the groups in this module must be implemented to conform to the RMON MIB. Implementations of this MIB must also implement the system group of MIB-II [16] and the IF-MIB [17].",
+  "modulecompliance": [
+   {
+    "module": "RMON-MIB",
+    "object": "rmonEtherStatsGroup"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "rmonHistoryControlGroup"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "rmonEthernetHistoryGroup"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "rmonAlarmGroup"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "rmonHostGroup"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "rmonHostTopNGroup"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "rmonMatrixGroup"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "rmonFilterGroup"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "rmonPacketCaptureGroup"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "rmonEventGroup"
+   }
+  ],
+  "name": "rmonCompliance",
+  "oid": "1.3.6.1.2.1.16.20.9.1",
+  "status": "current"
+ },
+ "rmonCompliances": {
+  "class": "objectidentity",
+  "name": "rmonCompliances",
+  "oid": "1.3.6.1.2.1.16.20.9"
+ },
+ "rmonConformance": {
+  "class": "objectidentity",
+  "name": "rmonConformance",
+  "oid": "1.3.6.1.2.1.16.20"
+ },
+ "rmonEtherStatsGroup": {
+  "class": "objectgroup",
+  "description": "The RMON Ethernet Statistics Group.",
+  "name": "rmonEtherStatsGroup",
+  "objects": [
+   {
+    "module": "RMON-MIB",
+    "object": "etherStatsIndex"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "etherStatsDataSource"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "etherStatsDropEvents"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "etherStatsOctets"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "etherStatsPkts"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "etherStatsBroadcastPkts"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "etherStatsMulticastPkts"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "etherStatsCRCAlignErrors"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "etherStatsUndersizePkts"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "etherStatsOversizePkts"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "etherStatsFragments"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "etherStatsJabbers"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "etherStatsCollisions"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "etherStatsPkts64Octets"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "etherStatsPkts65to127Octets"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "etherStatsPkts128to255Octets"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "etherStatsPkts256to511Octets"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "etherStatsPkts512to1023Octets"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "etherStatsPkts1024to1518Octets"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "etherStatsOwner"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "etherStatsStatus"
+   }
+  ],
+  "oid": "1.3.6.1.2.1.16.20.10.1",
+  "status": "current"
+ },
+ "rmonEthernetHistoryGroup": {
+  "class": "objectgroup",
+  "description": "The RMON Ethernet History Group.",
+  "name": "rmonEthernetHistoryGroup",
+  "objects": [
+   {
+    "module": "RMON-MIB",
+    "object": "etherHistoryIndex"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "etherHistorySampleIndex"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "etherHistoryIntervalStart"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "etherHistoryDropEvents"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "etherHistoryOctets"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "etherHistoryPkts"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "etherHistoryBroadcastPkts"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "etherHistoryMulticastPkts"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "etherHistoryCRCAlignErrors"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "etherHistoryUndersizePkts"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "etherHistoryOversizePkts"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "etherHistoryFragments"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "etherHistoryJabbers"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "etherHistoryCollisions"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "etherHistoryUtilization"
+   }
+  ],
+  "oid": "1.3.6.1.2.1.16.20.10.3",
+  "status": "current"
+ },
+ "rmonEventGroup": {
+  "class": "objectgroup",
+  "description": "The RMON Event Group.",
+  "name": "rmonEventGroup",
+  "objects": [
+   {
+    "module": "RMON-MIB",
+    "object": "eventIndex"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "eventDescription"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "eventType"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "eventCommunity"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "eventLastTimeSent"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "eventOwner"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "eventStatus"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "logEventIndex"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "logIndex"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "logTime"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "logDescription"
+   }
+  ],
+  "oid": "1.3.6.1.2.1.16.20.10.10",
+  "status": "current"
+ },
+ "rmonEventsV2": {
+  "class": "objectidentity",
+  "description": "Definition point for RMON notifications.",
+  "name": "rmonEventsV2",
+  "oid": "1.3.6.1.2.1.16.0",
+  "status": "current"
+ },
+ "rmonFilterGroup": {
+  "class": "objectgroup",
+  "description": "The RMON Filter Group.",
+  "name": "rmonFilterGroup",
+  "objects": [
+   {
+    "module": "RMON-MIB",
+    "object": "filterIndex"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "filterChannelIndex"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "filterPktDataOffset"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "filterPktData"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "filterPktDataMask"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "filterPktDataNotMask"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "filterPktStatus"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "filterPktStatusMask"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "filterPktStatusNotMask"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "filterOwner"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "filterStatus"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "channelIndex"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "channelIfIndex"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "channelAcceptType"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "channelDataControl"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "channelTurnOnEventIndex"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "channelTurnOffEventIndex"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "channelEventIndex"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "channelEventStatus"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "channelMatches"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "channelDescription"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "channelOwner"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "channelStatus"
+   }
+  ],
+  "oid": "1.3.6.1.2.1.16.20.10.8",
+  "status": "current"
+ },
+ "rmonGroups": {
+  "class": "objectidentity",
+  "name": "rmonGroups",
+  "oid": "1.3.6.1.2.1.16.20.10"
+ },
+ "rmonHistoryControlGroup": {
+  "class": "objectgroup",
+  "description": "The RMON History Control Group.",
+  "name": "rmonHistoryControlGroup",
+  "objects": [
+   {
+    "module": "RMON-MIB",
+    "object": "historyControlIndex"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "historyControlDataSource"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "historyControlBucketsRequested"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "historyControlBucketsGranted"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "historyControlInterval"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "historyControlOwner"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "historyControlStatus"
+   }
+  ],
+  "oid": "1.3.6.1.2.1.16.20.10.2",
+  "status": "current"
+ },
+ "rmonHostGroup": {
+  "class": "objectgroup",
+  "description": "The RMON Host Group.",
+  "name": "rmonHostGroup",
+  "objects": [
+   {
+    "module": "RMON-MIB",
+    "object": "hostControlIndex"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "hostControlDataSource"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "hostControlTableSize"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "hostControlLastDeleteTime"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "hostControlOwner"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "hostControlStatus"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "hostAddress"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "hostCreationOrder"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "hostIndex"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "hostInPkts"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "hostOutPkts"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "hostInOctets"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "hostOutOctets"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "hostOutErrors"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "hostOutBroadcastPkts"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "hostOutMulticastPkts"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "hostTimeAddress"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "hostTimeCreationOrder"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "hostTimeIndex"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "hostTimeInPkts"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "hostTimeOutPkts"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "hostTimeInOctets"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "hostTimeOutOctets"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "hostTimeOutErrors"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "hostTimeOutBroadcastPkts"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "hostTimeOutMulticastPkts"
+   }
+  ],
+  "oid": "1.3.6.1.2.1.16.20.10.5",
+  "status": "current"
+ },
+ "rmonHostTopNGroup": {
+  "class": "objectgroup",
+  "description": "The RMON Host Top 'N' Group.",
+  "name": "rmonHostTopNGroup",
+  "objects": [
+   {
+    "module": "RMON-MIB",
+    "object": "hostTopNControlIndex"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "hostTopNHostIndex"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "hostTopNRateBase"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "hostTopNTimeRemaining"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "hostTopNDuration"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "hostTopNRequestedSize"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "hostTopNGrantedSize"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "hostTopNStartTime"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "hostTopNOwner"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "hostTopNStatus"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "hostTopNReport"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "hostTopNIndex"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "hostTopNAddress"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "hostTopNRate"
+   }
+  ],
+  "oid": "1.3.6.1.2.1.16.20.10.6",
+  "status": "current"
+ },
+ "rmonMatrixGroup": {
+  "class": "objectgroup",
+  "description": "The RMON Matrix Group.",
+  "name": "rmonMatrixGroup",
+  "objects": [
+   {
+    "module": "RMON-MIB",
+    "object": "matrixControlIndex"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "matrixControlDataSource"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "matrixControlTableSize"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "matrixControlLastDeleteTime"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "matrixControlOwner"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "matrixControlStatus"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "matrixSDSourceAddress"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "matrixSDDestAddress"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "matrixSDIndex"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "matrixSDPkts"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "matrixSDOctets"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "matrixSDErrors"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "matrixDSSourceAddress"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "matrixDSDestAddress"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "matrixDSIndex"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "matrixDSPkts"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "matrixDSOctets"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "matrixDSErrors"
+   }
+  ],
+  "oid": "1.3.6.1.2.1.16.20.10.7",
+  "status": "current"
+ },
+ "rmonMibModule": {
+  "class": "moduleidentity",
+  "contactinfo": "Steve Waldbusser Phone: +1-650-948-6500 Fax: +1-650-745-0671 Email: waldbusser@nextbeacon.com",
+  "description": "Remote network monitoring devices, often called monitors or probes, are instruments that exist for the purpose of managing a network. This MIB defines objects for managing remote network monitoring devices.",
+  "lastupdated": "200005110000Z",
+  "name": "rmonMibModule",
+  "oid": "1.3.6.1.2.1.16.20.8",
+  "organization": "IETF RMON MIB Working Group",
+  "revisions": [
+   {
+    "description": "Reformatted into SMIv2 format. This version published as RFC 2819.",
+    "revision": "2000-05-11 00:00"
+   },
+   {
+    "description": "Bug fixes, clarifications and minor changes based on implementation experience, published as RFC1757 [18]. Two changes were made to object definitions: 1) A new status bit has been defined for the captureBufferPacketStatus object, indicating that the packet order within the capture buffer may not be identical to the packet order as received off the wire. This bit may only be used for packets transmitted by the probe. Older NMS applications can safely ignore this status bit, which might be used by newer agents. 2) The packetMatch trap has been removed. This trap was never actually 'approved' and was not added to this document along with the risingAlarm and fallingAlarm traps. The packetMatch trap could not be throttled, which could cause disruption of normal network traffic under some circumstances. An NMS should configure a risingAlarm threshold on the appropriate channelMatches instance if a trap is desired for a packetMatch event. Note that logging of packetMatch events is still supported--only trap generation for such events has been removed. In addition, several clarifications to individual object definitions have been added to assist agent and NMS implementors: - global definition of 'good packets' and 'bad packets' - more detailed text governing conceptual row creation and modification - instructions for probes relating to interface changes and disruptions - clarification of some ethernet counter definitions - recommended formula for calculating network utilization - clarification of channel and captureBuffer behavior for some unusual conditions - examples of proper instance naming for each table",
+    "revision": "1995-02-01 00:00"
+   },
+   {
+    "description": "The original version of this MIB, published as RFC1271.",
+    "revision": "1991-11-01 00:00"
+   }
+  ]
+ },
+ "rmonNotificationGroup": {
+  "class": "notificationgroup",
+  "description": "The RMON Notification Group.",
+  "name": "rmonNotificationGroup",
+  "objects": [
+   {
+    "module": "RMON-MIB",
+    "object": "risingAlarm"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "fallingAlarm"
+   }
+  ],
+  "oid": "1.3.6.1.2.1.16.20.10.11",
+  "status": "current"
+ },
+ "rmonPacketCaptureGroup": {
+  "class": "objectgroup",
+  "description": "The RMON Packet Capture Group.",
+  "name": "rmonPacketCaptureGroup",
+  "objects": [
+   {
+    "module": "RMON-MIB",
+    "object": "bufferControlIndex"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "bufferControlChannelIndex"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "bufferControlFullStatus"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "bufferControlFullAction"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "bufferControlCaptureSliceSize"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "bufferControlDownloadSliceSize"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "bufferControlDownloadOffset"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "bufferControlMaxOctetsRequested"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "bufferControlMaxOctetsGranted"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "bufferControlCapturedPackets"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "bufferControlTurnOnTime"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "bufferControlOwner"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "bufferControlStatus"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "captureBufferControlIndex"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "captureBufferIndex"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "captureBufferPacketID"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "captureBufferPacketData"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "captureBufferPacketLength"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "captureBufferPacketTime"
+   },
+   {
+    "module": "RMON-MIB",
+    "object": "captureBufferPacketStatus"
+   }
+  ],
+  "oid": "1.3.6.1.2.1.16.20.10.9",
+  "status": "current"
+ },
+ "statistics": {
+  "class": "objectidentity",
+  "name": "statistics",
+  "oid": "1.3.6.1.2.1.16.1"
+ }
+}

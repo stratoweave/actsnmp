@@ -1,0 +1,1408 @@
+{
+ "imports": {
+  "IANA-RTPROTO-MIB": [
+   "IANAipRouteProtocol"
+  ],
+  "IF-MIB": [
+   "InterfaceIndexOrZero"
+  ],
+  "INET-ADDRESS-MIB": [
+   "InetAddress",
+   "InetAddressPrefixLength",
+   "InetAddressType",
+   "InetAutonomousSystemNumber"
+  ],
+  "IP-MIB": [
+   "ip"
+  ],
+  "SNMPv2-CONF": [
+   "MODULE-COMPLIANCE",
+   "NOTIFICATION-GROUP",
+   "OBJECT-GROUP"
+  ],
+  "SNMPv2-SMI": [
+   "Bits",
+   "Counter32",
+   "Gauge32",
+   "Integer32",
+   "IpAddress",
+   "MODULE-IDENTITY",
+   "MibIdentifier",
+   "OBJECT-IDENTITY",
+   "OBJECT-TYPE",
+   "TimeTicks",
+   "Unsigned32",
+   "iso"
+  ],
+  "SNMPv2-TC": [
+   "DisplayString",
+   "PhysAddress",
+   "RowStatus",
+   "TEXTUAL-CONVENTION"
+  ],
+  "class": "imports"
+ },
+ "inetCidrRouteAge": {
+  "class": "objecttype",
+  "description": "The number of seconds since this route was last updated or otherwise determined to be correct. Note that no semantics of 'too old' can be implied, except through knowledge of the routing protocol by which the route was learned.",
+  "maxaccess": "read-only",
+  "name": "inetCidrRouteAge",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.4.24.7.1.10",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Gauge32"
+  }
+ },
+ "inetCidrRouteDest": {
+  "class": "objecttype",
+  "description": "The destination IP address of this route. The type of this address is determined by the value of the inetCidrRouteDestType object. The values for the index objects inetCidrRouteDest and inetCidrRoutePfxLen must be consistent. When the value of inetCidrRouteDest (excluding the zone index, if one is present) is x, then the bitwise logical-AND of x with the value of the mask formed from the corresponding index object inetCidrRoutePfxLen MUST be equal to x. If not, then the index pair is not consistent and an inconsistentName error must be returned on SET or CREATE requests.",
+  "maxaccess": "not-accessible",
+  "name": "inetCidrRouteDest",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.4.24.7.1.2",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "InetAddress"
+  }
+ },
+ "inetCidrRouteDestType": {
+  "class": "objecttype",
+  "description": "The type of the inetCidrRouteDest address, as defined in the InetAddress MIB. Only those address types that may appear in an actual routing table are allowed as values of this object.",
+  "maxaccess": "not-accessible",
+  "name": "inetCidrRouteDestType",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.4.24.7.1.1",
+  "reference": "RFC 4001",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "InetAddressType"
+  }
+ },
+ "inetCidrRouteDiscards": {
+  "class": "objecttype",
+  "description": "The number of valid route entries discarded from the inetCidrRouteTable. Discarded route entries do not appear in the inetCidrRouteTable. One possible reason for discarding an entry would be to free-up buffer space for other route table entries.",
+  "maxaccess": "read-only",
+  "name": "inetCidrRouteDiscards",
+  "nodetype": "scalar",
+  "oid": "1.3.6.1.2.1.4.24.8",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  }
+ },
+ "inetCidrRouteEntry": {
+  "class": "objecttype",
+  "description": "A particular route to a particular destination, under a particular policy (as reflected in the inetCidrRoutePolicy object). Dynamically created rows will survive an agent reboot. Implementers need to be aware that if the total number of elements (octets or sub-identifiers) in inetCidrRouteDest, inetCidrRoutePolicy, and inetCidrRouteNextHop exceeds 111, then OIDs of column instances in this table will have more than 128 sub- identifiers and cannot be accessed using SNMPv1, SNMPv2c, or SNMPv3.",
+  "indices": [
+   {
+    "implied": 0,
+    "module": "IP-FORWARD-MIB",
+    "object": "inetCidrRouteDestType"
+   },
+   {
+    "implied": 0,
+    "module": "IP-FORWARD-MIB",
+    "object": "inetCidrRouteDest"
+   },
+   {
+    "implied": 0,
+    "module": "IP-FORWARD-MIB",
+    "object": "inetCidrRoutePfxLen"
+   },
+   {
+    "implied": 0,
+    "module": "IP-FORWARD-MIB",
+    "object": "inetCidrRoutePolicy"
+   },
+   {
+    "implied": 0,
+    "module": "IP-FORWARD-MIB",
+    "object": "inetCidrRouteNextHopType"
+   },
+   {
+    "implied": 0,
+    "module": "IP-FORWARD-MIB",
+    "object": "inetCidrRouteNextHop"
+   }
+  ],
+  "maxaccess": "not-accessible",
+  "name": "inetCidrRouteEntry",
+  "nodetype": "row",
+  "oid": "1.3.6.1.2.1.4.24.7.1",
+  "status": "current"
+ },
+ "inetCidrRouteIfIndex": {
+  "class": "objecttype",
+  "description": "The ifIndex value that identifies the local interface through which the next hop of this route should be reached. A value of 0 is valid and represents the scenario where no interface is specified.",
+  "maxaccess": "read-create",
+  "name": "inetCidrRouteIfIndex",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.4.24.7.1.7",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "InterfaceIndexOrZero"
+  }
+ },
+ "inetCidrRouteMetric1": {
+  "class": "objecttype",
+  "default": {
+   "default": {
+    "basetype": "Integer32",
+    "format": "decimal",
+    "value": "-1"
+   }
+  },
+  "description": "The primary routing metric for this route. The semantics of this metric are determined by the routing- protocol specified in the route's inetCidrRouteProto value. If this metric is not used, its value should be set to -1.",
+  "maxaccess": "read-create",
+  "name": "inetCidrRouteMetric1",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.4.24.7.1.12",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Integer32"
+  }
+ },
+ "inetCidrRouteMetric2": {
+  "class": "objecttype",
+  "default": {
+   "default": {
+    "basetype": "Integer32",
+    "format": "decimal",
+    "value": "-1"
+   }
+  },
+  "description": "An alternate routing metric for this route. The semantics of this metric are determined by the routing- protocol specified in the route's inetCidrRouteProto value. If this metric is not used, its value should be set to -1.",
+  "maxaccess": "read-create",
+  "name": "inetCidrRouteMetric2",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.4.24.7.1.13",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Integer32"
+  }
+ },
+ "inetCidrRouteMetric3": {
+  "class": "objecttype",
+  "default": {
+   "default": {
+    "basetype": "Integer32",
+    "format": "decimal",
+    "value": "-1"
+   }
+  },
+  "description": "An alternate routing metric for this route. The semantics of this metric are determined by the routing- protocol specified in the route's inetCidrRouteProto value. If this metric is not used, its value should be set to -1.",
+  "maxaccess": "read-create",
+  "name": "inetCidrRouteMetric3",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.4.24.7.1.14",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Integer32"
+  }
+ },
+ "inetCidrRouteMetric4": {
+  "class": "objecttype",
+  "default": {
+   "default": {
+    "basetype": "Integer32",
+    "format": "decimal",
+    "value": "-1"
+   }
+  },
+  "description": "An alternate routing metric for this route. The semantics of this metric are determined by the routing- protocol specified in the route's inetCidrRouteProto value. If this metric is not used, its value should be set to -1.",
+  "maxaccess": "read-create",
+  "name": "inetCidrRouteMetric4",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.4.24.7.1.15",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Integer32"
+  }
+ },
+ "inetCidrRouteMetric5": {
+  "class": "objecttype",
+  "default": {
+   "default": {
+    "basetype": "Integer32",
+    "format": "decimal",
+    "value": "-1"
+   }
+  },
+  "description": "An alternate routing metric for this route. The semantics of this metric are determined by the routing- protocol specified in the route's inetCidrRouteProto value. If this metric is not used, its value should be set to -1.",
+  "maxaccess": "read-create",
+  "name": "inetCidrRouteMetric5",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.4.24.7.1.16",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Integer32"
+  }
+ },
+ "inetCidrRouteNextHop": {
+  "class": "objecttype",
+  "description": "On remote routes, the address of the next system en route. For non-remote routes, a zero length string. The type of this address is determined by the value of the inetCidrRouteNextHopType object.",
+  "maxaccess": "not-accessible",
+  "name": "inetCidrRouteNextHop",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.4.24.7.1.6",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "InetAddress"
+  }
+ },
+ "inetCidrRouteNextHopAS": {
+  "class": "objecttype",
+  "default": {
+   "default": {
+    "basetype": "Integer32",
+    "format": "decimal",
+    "value": "0"
+   }
+  },
+  "description": "The Autonomous System Number of the Next Hop. The semantics of this object are determined by the routing- protocol specified in the route's inetCidrRouteProto value. When this object is unknown or not relevant, its value should be set to zero.",
+  "maxaccess": "read-create",
+  "name": "inetCidrRouteNextHopAS",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.4.24.7.1.11",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "InetAutonomousSystemNumber"
+  }
+ },
+ "inetCidrRouteNextHopType": {
+  "class": "objecttype",
+  "description": "The type of the inetCidrRouteNextHop address, as defined in the InetAddress MIB. Value should be set to unknown(0) for non-remote routes. Only those address types that may appear in an actual routing table are allowed as values of this object.",
+  "maxaccess": "not-accessible",
+  "name": "inetCidrRouteNextHopType",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.4.24.7.1.5",
+  "reference": "RFC 4001",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "InetAddressType"
+  }
+ },
+ "inetCidrRouteNumber": {
+  "class": "objecttype",
+  "description": "The number of current inetCidrRouteTable entries that are not invalid.",
+  "maxaccess": "read-only",
+  "name": "inetCidrRouteNumber",
+  "nodetype": "scalar",
+  "oid": "1.3.6.1.2.1.4.24.6",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Gauge32"
+  }
+ },
+ "inetCidrRoutePfxLen": {
+  "class": "objecttype",
+  "description": "Indicates the number of leading one bits that form the mask to be logical-ANDed with the destination address before being compared to the value in the inetCidrRouteDest field. The values for the index objects inetCidrRouteDest and inetCidrRoutePfxLen must be consistent. When the value of inetCidrRouteDest (excluding the zone index, if one is present) is x, then the bitwise logical-AND of x with the value of the mask formed from the corresponding index object inetCidrRoutePfxLen MUST be equal to x. If not, then the index pair is not consistent and an inconsistentName error must be returned on SET or CREATE requests.",
+  "maxaccess": "not-accessible",
+  "name": "inetCidrRoutePfxLen",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.4.24.7.1.3",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "InetAddressPrefixLength"
+  }
+ },
+ "inetCidrRoutePolicy": {
+  "class": "objecttype",
+  "description": "This object is an opaque object without any defined semantics. Its purpose is to serve as an additional index that may delineate between multiple entries to the same destination. The value { 0 0 } shall be used as the default value for this object.",
+  "maxaccess": "not-accessible",
+  "name": "inetCidrRoutePolicy",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.4.24.7.1.4",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "OBJECT IDENTIFIER"
+  }
+ },
+ "inetCidrRouteProto": {
+  "class": "objecttype",
+  "description": "The routing mechanism via which this route was learned. Inclusion of values for gateway routing protocols is not intended to imply that hosts should support those protocols.",
+  "maxaccess": "read-only",
+  "name": "inetCidrRouteProto",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.4.24.7.1.9",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "IANAipRouteProtocol"
+  }
+ },
+ "inetCidrRouteStatus": {
+  "class": "objecttype",
+  "description": "The row status variable, used according to row installation and removal conventions. A row entry cannot be modified when the status is marked as active(1).",
+  "maxaccess": "read-create",
+  "name": "inetCidrRouteStatus",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.4.24.7.1.17",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "RowStatus"
+  }
+ },
+ "inetCidrRouteTable": {
+  "class": "objecttype",
+  "description": "This entity's IP Routing table.",
+  "maxaccess": "not-accessible",
+  "name": "inetCidrRouteTable",
+  "nodetype": "table",
+  "oid": "1.3.6.1.2.1.4.24.7",
+  "reference": "RFC 1213 Section 6.6, The IP Group",
+  "status": "current"
+ },
+ "inetCidrRouteType": {
+  "class": "objecttype",
+  "description": "The type of route. Note that local(3) refers to a route for which the next hop is the final destination; remote(4) refers to a route for which the next hop is not the final destination. Routes that do not result in traffic forwarding or rejection should not be displayed, even if the implementation keeps them stored internally. reject(2) refers to a route that, if matched, discards the message as unreachable and returns a notification (e.g., ICMP error) to the message sender. This is used in some protocols as a means of correctly aggregating routes. blackhole(5) refers to a route that, if matched, discards the message silently.",
+  "maxaccess": "read-create",
+  "name": "inetCidrRouteType",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.4.24.7.1.8",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "enumeration": {
+     "blackhole": 5,
+     "local": 3,
+     "other": 1,
+     "reject": 2,
+     "remote": 4
+    }
+   },
+   "type": "INTEGER"
+  }
+ },
+ "inetForwardCidrRouteGroup": {
+  "class": "objectgroup",
+  "description": "The IP version-independent CIDR Route Table.",
+  "name": "inetForwardCidrRouteGroup",
+  "objects": [
+   {
+    "module": "IP-FORWARD-MIB",
+    "object": "inetCidrRouteDiscards"
+   },
+   {
+    "module": "IP-FORWARD-MIB",
+    "object": "inetCidrRouteIfIndex"
+   },
+   {
+    "module": "IP-FORWARD-MIB",
+    "object": "inetCidrRouteType"
+   },
+   {
+    "module": "IP-FORWARD-MIB",
+    "object": "inetCidrRouteProto"
+   },
+   {
+    "module": "IP-FORWARD-MIB",
+    "object": "inetCidrRouteAge"
+   },
+   {
+    "module": "IP-FORWARD-MIB",
+    "object": "inetCidrRouteNextHopAS"
+   },
+   {
+    "module": "IP-FORWARD-MIB",
+    "object": "inetCidrRouteMetric1"
+   },
+   {
+    "module": "IP-FORWARD-MIB",
+    "object": "inetCidrRouteMetric2"
+   },
+   {
+    "module": "IP-FORWARD-MIB",
+    "object": "inetCidrRouteMetric3"
+   },
+   {
+    "module": "IP-FORWARD-MIB",
+    "object": "inetCidrRouteMetric4"
+   },
+   {
+    "module": "IP-FORWARD-MIB",
+    "object": "inetCidrRouteMetric5"
+   },
+   {
+    "module": "IP-FORWARD-MIB",
+    "object": "inetCidrRouteStatus"
+   },
+   {
+    "module": "IP-FORWARD-MIB",
+    "object": "inetCidrRouteNumber"
+   }
+  ],
+  "oid": "1.3.6.1.2.1.4.24.5.1.4",
+  "status": "current"
+ },
+ "ipCidrRouteAge": {
+  "class": "objecttype",
+  "default": {
+   "default": {
+    "basetype": "Integer32",
+    "format": "decimal",
+    "value": "0"
+   }
+  },
+  "description": "The number of seconds since this route was last updated or otherwise determined to be correct. Note that no semantics of `too old' can be implied, except through knowledge of the routing protocol by which the route was learned.",
+  "maxaccess": "read-only",
+  "name": "ipCidrRouteAge",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.4.24.4.1.8",
+  "status": "deprecated",
+  "syntax": {
+   "class": "type",
+   "type": "Integer32"
+  }
+ },
+ "ipCidrRouteDest": {
+  "class": "objecttype",
+  "description": "The destination IP address of this route. This object may not take a Multicast (Class D) address value. Any assignment (implicit or otherwise) of an instance of this object to a value x must be rejected if the bitwise logical-AND of x with the value of the corresponding instance of the ipCidrRouteMask object is not equal to x.",
+  "maxaccess": "read-only",
+  "name": "ipCidrRouteDest",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.4.24.4.1.1",
+  "status": "deprecated",
+  "syntax": {
+   "class": "type",
+   "type": "IpAddress"
+  }
+ },
+ "ipCidrRouteEntry": {
+  "class": "objecttype",
+  "description": "A particular route to a particular destination, under a particular policy.",
+  "indices": [
+   {
+    "implied": 0,
+    "module": "IP-FORWARD-MIB",
+    "object": "ipCidrRouteDest"
+   },
+   {
+    "implied": 0,
+    "module": "IP-FORWARD-MIB",
+    "object": "ipCidrRouteMask"
+   },
+   {
+    "implied": 0,
+    "module": "IP-FORWARD-MIB",
+    "object": "ipCidrRouteTos"
+   },
+   {
+    "implied": 0,
+    "module": "IP-FORWARD-MIB",
+    "object": "ipCidrRouteNextHop"
+   }
+  ],
+  "maxaccess": "not-accessible",
+  "name": "ipCidrRouteEntry",
+  "nodetype": "row",
+  "oid": "1.3.6.1.2.1.4.24.4.1",
+  "status": "deprecated"
+ },
+ "ipCidrRouteIfIndex": {
+  "class": "objecttype",
+  "default": {
+   "default": {
+    "basetype": "Integer32",
+    "format": "decimal",
+    "value": "0"
+   }
+  },
+  "description": "The ifIndex value that identifies the local interface through which the next hop of this route should be reached.",
+  "maxaccess": "read-create",
+  "name": "ipCidrRouteIfIndex",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.4.24.4.1.5",
+  "status": "deprecated",
+  "syntax": {
+   "class": "type",
+   "type": "Integer32"
+  }
+ },
+ "ipCidrRouteInfo": {
+  "class": "objecttype",
+  "description": "A reference to MIB definitions specific to the particular routing protocol that is responsible for this route, as determined by the value specified in the route's ipCidrRouteProto value. If this information is not present, its value should be set to the OBJECT IDENTIFIER { 0 0 }, which is a syntactically valid object identifier, and any implementation conforming to ASN.1 and the Basic Encoding Rules must be able to generate and recognize this value.",
+  "maxaccess": "read-create",
+  "name": "ipCidrRouteInfo",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.4.24.4.1.9",
+  "status": "deprecated",
+  "syntax": {
+   "class": "type",
+   "type": "OBJECT IDENTIFIER"
+  }
+ },
+ "ipCidrRouteMask": {
+  "class": "objecttype",
+  "description": "Indicate the mask to be logical-ANDed with the destination address before being compared to the value in the ipCidrRouteDest field. For those systems that do not support arbitrary subnet masks, an agent constructs the value of the ipCidrRouteMask by reference to the IP Address Class. Any assignment (implicit or otherwise) of an instance of this object to a value x must be rejected if the bitwise logical-AND of x with the value of the corresponding instance of the ipCidrRouteDest object is not equal to ipCidrRouteDest.",
+  "maxaccess": "read-only",
+  "name": "ipCidrRouteMask",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.4.24.4.1.2",
+  "status": "deprecated",
+  "syntax": {
+   "class": "type",
+   "type": "IpAddress"
+  }
+ },
+ "ipCidrRouteMetric1": {
+  "class": "objecttype",
+  "default": {
+   "default": {
+    "basetype": "Integer32",
+    "format": "decimal",
+    "value": "-1"
+   }
+  },
+  "description": "The primary routing metric for this route. The semantics of this metric are determined by the routing- protocol specified in the route's ipCidrRouteProto value. If this metric is not used, its value should be set to -1.",
+  "maxaccess": "read-create",
+  "name": "ipCidrRouteMetric1",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.4.24.4.1.11",
+  "status": "deprecated",
+  "syntax": {
+   "class": "type",
+   "type": "Integer32"
+  }
+ },
+ "ipCidrRouteMetric2": {
+  "class": "objecttype",
+  "default": {
+   "default": {
+    "basetype": "Integer32",
+    "format": "decimal",
+    "value": "-1"
+   }
+  },
+  "description": "An alternate routing metric for this route. The semantics of this metric are determined by the routing- protocol specified in the route's ipCidrRouteProto value. If this metric is not used, its value should be set to -1.",
+  "maxaccess": "read-create",
+  "name": "ipCidrRouteMetric2",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.4.24.4.1.12",
+  "status": "deprecated",
+  "syntax": {
+   "class": "type",
+   "type": "Integer32"
+  }
+ },
+ "ipCidrRouteMetric3": {
+  "class": "objecttype",
+  "default": {
+   "default": {
+    "basetype": "Integer32",
+    "format": "decimal",
+    "value": "-1"
+   }
+  },
+  "description": "An alternate routing metric for this route. The semantics of this metric are determined by the routing- protocol specified in the route's ipCidrRouteProto value. If this metric is not used, its value should be set to -1.",
+  "maxaccess": "read-create",
+  "name": "ipCidrRouteMetric3",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.4.24.4.1.13",
+  "status": "deprecated",
+  "syntax": {
+   "class": "type",
+   "type": "Integer32"
+  }
+ },
+ "ipCidrRouteMetric4": {
+  "class": "objecttype",
+  "default": {
+   "default": {
+    "basetype": "Integer32",
+    "format": "decimal",
+    "value": "-1"
+   }
+  },
+  "description": "An alternate routing metric for this route. The semantics of this metric are determined by the routing- protocol specified in the route's ipCidrRouteProto value. If this metric is not used, its value should be set to -1.",
+  "maxaccess": "read-create",
+  "name": "ipCidrRouteMetric4",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.4.24.4.1.14",
+  "status": "deprecated",
+  "syntax": {
+   "class": "type",
+   "type": "Integer32"
+  }
+ },
+ "ipCidrRouteMetric5": {
+  "class": "objecttype",
+  "default": {
+   "default": {
+    "basetype": "Integer32",
+    "format": "decimal",
+    "value": "-1"
+   }
+  },
+  "description": "An alternate routing metric for this route. The semantics of this metric are determined by the routing- protocol specified in the route's ipCidrRouteProto value. If this metric is not used, its value should be set to -1.",
+  "maxaccess": "read-create",
+  "name": "ipCidrRouteMetric5",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.4.24.4.1.15",
+  "status": "deprecated",
+  "syntax": {
+   "class": "type",
+   "type": "Integer32"
+  }
+ },
+ "ipCidrRouteNextHop": {
+  "class": "objecttype",
+  "description": "On remote routes, the address of the next system en route; Otherwise, 0.0.0.0.",
+  "maxaccess": "read-only",
+  "name": "ipCidrRouteNextHop",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.4.24.4.1.4",
+  "status": "deprecated",
+  "syntax": {
+   "class": "type",
+   "type": "IpAddress"
+  }
+ },
+ "ipCidrRouteNextHopAS": {
+  "class": "objecttype",
+  "default": {
+   "default": {
+    "basetype": "Integer32",
+    "format": "decimal",
+    "value": "0"
+   }
+  },
+  "description": "The Autonomous System Number of the Next Hop. The semantics of this object are determined by the routing- protocol specified in the route's ipCidrRouteProto value. When this object is unknown or not relevant, its value should be set to zero.",
+  "maxaccess": "read-create",
+  "name": "ipCidrRouteNextHopAS",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.4.24.4.1.10",
+  "status": "deprecated",
+  "syntax": {
+   "class": "type",
+   "type": "Integer32"
+  }
+ },
+ "ipCidrRouteNumber": {
+  "class": "objecttype",
+  "description": "The number of current ipCidrRouteTable entries that are not invalid. This object is deprecated in favor of inetCidrRouteNumber and the inetCidrRouteTable.",
+  "maxaccess": "read-only",
+  "name": "ipCidrRouteNumber",
+  "nodetype": "scalar",
+  "oid": "1.3.6.1.2.1.4.24.3",
+  "status": "deprecated",
+  "syntax": {
+   "class": "type",
+   "type": "Gauge32"
+  }
+ },
+ "ipCidrRouteProto": {
+  "class": "objecttype",
+  "description": "The routing mechanism via which this route was learned. Inclusion of values for gateway routing protocols is not intended to imply that hosts should support those protocols.",
+  "maxaccess": "read-only",
+  "name": "ipCidrRouteProto",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.4.24.4.1.7",
+  "status": "deprecated",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "enumeration": {
+     "bbnSpfIgp": 12,
+     "bgp": 14,
+     "ciscoEigrp": 16,
+     "ciscoIgrp": 11,
+     "egp": 5,
+     "esIs": 10,
+     "ggp": 6,
+     "hello": 7,
+     "icmp": 4,
+     "idpr": 15,
+     "isIs": 9,
+     "local": 2,
+     "netmgmt": 3,
+     "ospf": 13,
+     "other": 1,
+     "rip": 8
+    }
+   },
+   "type": "INTEGER"
+  }
+ },
+ "ipCidrRouteStatus": {
+  "class": "objecttype",
+  "description": "The row status variable, used according to row installation and removal conventions.",
+  "maxaccess": "read-create",
+  "name": "ipCidrRouteStatus",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.4.24.4.1.16",
+  "status": "deprecated",
+  "syntax": {
+   "class": "type",
+   "type": "RowStatus"
+  }
+ },
+ "ipCidrRouteTable": {
+  "class": "objecttype",
+  "description": "This entity's IP Routing table. This table has been deprecated in favor of the IP version neutral inetCidrRouteTable.",
+  "maxaccess": "not-accessible",
+  "name": "ipCidrRouteTable",
+  "nodetype": "table",
+  "oid": "1.3.6.1.2.1.4.24.4",
+  "reference": "RFC 1213 Section 6.6, The IP Group",
+  "status": "deprecated"
+ },
+ "ipCidrRouteTos": {
+  "class": "objecttype",
+  "description": "The policy specifier is the IP TOS Field. The encoding of IP TOS is as specified by the following convention. Zero indicates the default path if no more specific policy applies. +-----+-----+-----+-----+-----+-----+-----+-----+ | | | | | PRECEDENCE | TYPE OF SERVICE | 0 | | | | | +-----+-----+-----+-----+-----+-----+-----+-----+ IP TOS IP TOS Field Policy Field Policy Contents Code Contents Code 0 0 0 0 ==> 0 0 0 0 1 ==> 2 0 0 1 0 ==> 4 0 0 1 1 ==> 6 0 1 0 0 ==> 8 0 1 0 1 ==> 10 0 1 1 0 ==> 12 0 1 1 1 ==> 14 1 0 0 0 ==> 16 1 0 0 1 ==> 18 1 0 1 0 ==> 20 1 0 1 1 ==> 22 1 1 0 0 ==> 24 1 1 0 1 ==> 26 1 1 1 0 ==> 28 1 1 1 1 ==> 30",
+  "maxaccess": "read-only",
+  "name": "ipCidrRouteTos",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.4.24.4.1.3",
+  "status": "deprecated",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 2147483647,
+      "min": 0
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "ipCidrRouteType": {
+  "class": "objecttype",
+  "description": "The type of route. Note that local(3) refers to a route for which the next hop is the final destination; remote(4) refers to a route for which the next hop is not the final destination. Routes that do not result in traffic forwarding or rejection should not be displayed, even if the implementation keeps them stored internally. reject (2) refers to a route that, if matched, discards the message as unreachable. This is used in some protocols as a means of correctly aggregating routes.",
+  "maxaccess": "read-create",
+  "name": "ipCidrRouteType",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.4.24.4.1.6",
+  "status": "deprecated",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "enumeration": {
+     "local": 3,
+     "other": 1,
+     "reject": 2,
+     "remote": 4
+    }
+   },
+   "type": "INTEGER"
+  }
+ },
+ "ipForward": {
+  "class": "moduleidentity",
+  "contactinfo": "Editor: Brian Haberman Johns Hopkins University - Applied Physics Laboratory Mailstop 17-S442 11100 Johns Hopkins Road Laurel MD, 20723-6099 USA Phone: +1-443-778-1319 Email: brian@innovationslab.net Send comments to <ipv6@ietf.org>",
+  "description": "The MIB module for the management of CIDR multipath IP Routes. Copyright (C) The Internet Society (2006). This version of this MIB module is a part of RFC 4292; see the RFC itself for full legal notices.",
+  "lastupdated": "200602010000Z",
+  "name": "ipForward",
+  "oid": "1.3.6.1.2.1.4.24",
+  "organization": "IETF IPv6 Working Group http://www.ietf.org/html.charters/ipv6-charter.html",
+  "revisions": [
+   {
+    "description": "IPv4/v6 version-independent revision. Minimal changes were made to the original RFC 2096 MIB to allow easy upgrade of existing IPv4 implementations to the version-independent MIB. These changes include: Adding inetCidrRouteDiscards as a replacement for the deprecated ipRoutingDiscards and ipv6DiscardedRoutes objects. Adding a new conformance statement to support the implementation of the IP Forwarding MIB in a read-only mode. The inetCidrRouteTable replaces the IPv4-specific ipCidrRouteTable, its related objects, and related conformance statements. Published as RFC 4292.",
+    "revision": "2006-02-01 00:00"
+   },
+   {
+    "description": "Revised to support CIDR routes. Published as RFC 2096.",
+    "revision": "1996-09-19 00:00"
+   },
+   {
+    "description": "Initial version, published as RFC 1354.",
+    "revision": "1992-07-02 21:56"
+   }
+  ]
+ },
+ "ipForwardAge": {
+  "class": "objecttype",
+  "default": {
+   "default": {
+    "basetype": "Integer32",
+    "format": "decimal",
+    "value": "0"
+   }
+  },
+  "description": "The number of seconds since this route was last updated or otherwise determined to be correct. Note that no semantics of `too old' can be implied except through knowledge of the routing protocol by which the route was learned.",
+  "maxaccess": "read-only",
+  "name": "ipForwardAge",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.4.24.2.1.8",
+  "status": "obsolete",
+  "syntax": {
+   "class": "type",
+   "type": "Integer32"
+  }
+ },
+ "ipForwardCidrRouteGroup": {
+  "class": "objectgroup",
+  "description": "The CIDR Route Table. This group has been deprecated and replaced with inetForwardCidrRouteGroup.",
+  "name": "ipForwardCidrRouteGroup",
+  "objects": [
+   {
+    "module": "IP-FORWARD-MIB",
+    "object": "ipCidrRouteNumber"
+   },
+   {
+    "module": "IP-FORWARD-MIB",
+    "object": "ipCidrRouteDest"
+   },
+   {
+    "module": "IP-FORWARD-MIB",
+    "object": "ipCidrRouteMask"
+   },
+   {
+    "module": "IP-FORWARD-MIB",
+    "object": "ipCidrRouteTos"
+   },
+   {
+    "module": "IP-FORWARD-MIB",
+    "object": "ipCidrRouteNextHop"
+   },
+   {
+    "module": "IP-FORWARD-MIB",
+    "object": "ipCidrRouteIfIndex"
+   },
+   {
+    "module": "IP-FORWARD-MIB",
+    "object": "ipCidrRouteType"
+   },
+   {
+    "module": "IP-FORWARD-MIB",
+    "object": "ipCidrRouteProto"
+   },
+   {
+    "module": "IP-FORWARD-MIB",
+    "object": "ipCidrRouteAge"
+   },
+   {
+    "module": "IP-FORWARD-MIB",
+    "object": "ipCidrRouteInfo"
+   },
+   {
+    "module": "IP-FORWARD-MIB",
+    "object": "ipCidrRouteNextHopAS"
+   },
+   {
+    "module": "IP-FORWARD-MIB",
+    "object": "ipCidrRouteMetric1"
+   },
+   {
+    "module": "IP-FORWARD-MIB",
+    "object": "ipCidrRouteMetric2"
+   },
+   {
+    "module": "IP-FORWARD-MIB",
+    "object": "ipCidrRouteMetric3"
+   },
+   {
+    "module": "IP-FORWARD-MIB",
+    "object": "ipCidrRouteMetric4"
+   },
+   {
+    "module": "IP-FORWARD-MIB",
+    "object": "ipCidrRouteMetric5"
+   },
+   {
+    "module": "IP-FORWARD-MIB",
+    "object": "ipCidrRouteStatus"
+   }
+  ],
+  "oid": "1.3.6.1.2.1.4.24.5.1.3",
+  "status": "deprecated"
+ },
+ "ipForwardCompliance": {
+  "class": "modulecompliance",
+  "description": "The compliance statement for SNMPv2 entities that implement the ipForward MIB. This compliance statement has been deprecated and replaced with ipForwardFullCompliance and ipForwardReadOnlyCompliance.",
+  "modulecompliance": [
+   {
+    "module": "IP-FORWARD-MIB",
+    "object": "ipForwardCidrRouteGroup"
+   }
+  ],
+  "name": "ipForwardCompliance",
+  "oid": "1.3.6.1.2.1.4.24.5.2.1",
+  "status": "deprecated"
+ },
+ "ipForwardCompliances": {
+  "class": "objectidentity",
+  "name": "ipForwardCompliances",
+  "oid": "1.3.6.1.2.1.4.24.5.2"
+ },
+ "ipForwardConformance": {
+  "class": "objectidentity",
+  "name": "ipForwardConformance",
+  "oid": "1.3.6.1.2.1.4.24.5"
+ },
+ "ipForwardDest": {
+  "class": "objecttype",
+  "description": "The destination IP address of this route. An entry with a value of 0.0.0.0 is considered a default route. This object may not take a Multicast (Class D) address value. Any assignment (implicit or otherwise) of an instance of this object to a value x must be rejected if the bitwise logical-AND of x with the value of the corresponding instance of the ipForwardMask object is not equal to x.",
+  "maxaccess": "read-only",
+  "name": "ipForwardDest",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.4.24.2.1.1",
+  "status": "obsolete",
+  "syntax": {
+   "class": "type",
+   "type": "IpAddress"
+  }
+ },
+ "ipForwardEntry": {
+  "class": "objecttype",
+  "description": "A particular route to a particular destination, under a particular policy.",
+  "indices": [
+   {
+    "implied": 0,
+    "module": "IP-FORWARD-MIB",
+    "object": "ipForwardDest"
+   },
+   {
+    "implied": 0,
+    "module": "IP-FORWARD-MIB",
+    "object": "ipForwardProto"
+   },
+   {
+    "implied": 0,
+    "module": "IP-FORWARD-MIB",
+    "object": "ipForwardPolicy"
+   },
+   {
+    "implied": 0,
+    "module": "IP-FORWARD-MIB",
+    "object": "ipForwardNextHop"
+   }
+  ],
+  "maxaccess": "not-accessible",
+  "name": "ipForwardEntry",
+  "nodetype": "row",
+  "oid": "1.3.6.1.2.1.4.24.2.1",
+  "status": "obsolete"
+ },
+ "ipForwardFullCompliance": {
+  "class": "modulecompliance",
+  "description": "When this MIB is implemented for read-create, the implementation can claim full compliance. There are a number of INDEX objects that cannot be represented in the form of OBJECT clauses in SMIv2, but for which there are compliance requirements, expressed in OBJECT clause form in this description: -- OBJECT inetCidrRouteDestType -- SYNTAX InetAddressType (ipv4(1), ipv6(2), -- ipv4z(3), ipv6z(4)) -- DESCRIPTION -- This MIB requires support for global and -- non-global ipv4 and ipv6 addresses. -- -- OBJECT inetCidrRouteDest -- SYNTAX InetAddress (SIZE (4 | 8 | 16 | 20)) -- DESCRIPTION -- This MIB requires support for global and -- non-global IPv4 and IPv6 addresses. -- -- OBJECT inetCidrRouteNextHopType -- SYNTAX InetAddressType (unknown(0), ipv4(1), -- ipv6(2), ipv4z(3) -- ipv6z(4)) -- DESCRIPTION -- This MIB requires support for global and -- non-global ipv4 and ipv6 addresses. -- -- OBJECT inetCidrRouteNextHop -- SYNTAX InetAddress (SIZE (0 | 4 | 8 | 16 | 20)) -- DESCRIPTION -- This MIB requires support for global and -- non-global IPv4 and IPv6 addresses. ",
+  "modulecompliance": [
+   {
+    "module": "IP-FORWARD-MIB",
+    "object": "inetForwardCidrRouteGroup"
+   }
+  ],
+  "name": "ipForwardFullCompliance",
+  "oid": "1.3.6.1.2.1.4.24.5.2.3",
+  "status": "current"
+ },
+ "ipForwardGroups": {
+  "class": "objectidentity",
+  "name": "ipForwardGroups",
+  "oid": "1.3.6.1.2.1.4.24.5.1"
+ },
+ "ipForwardIfIndex": {
+  "class": "objecttype",
+  "default": {
+   "default": {
+    "basetype": "Integer32",
+    "format": "decimal",
+    "value": "0"
+   }
+  },
+  "description": "The ifIndex value that identifies the local interface through which the next hop of this route should be reached.",
+  "maxaccess": "read-create",
+  "name": "ipForwardIfIndex",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.4.24.2.1.5",
+  "status": "obsolete",
+  "syntax": {
+   "class": "type",
+   "type": "Integer32"
+  }
+ },
+ "ipForwardInfo": {
+  "class": "objecttype",
+  "description": "A reference to MIB definitions specific to the particular routing protocol that is responsible for this route, as determined by the value specified in the route's ipForwardProto value. If this information is not present, its value should be set to the OBJECT IDENTIFIER { 0 0 }, which is a syntactically valid object identifier, and any implementation conforming to ASN.1 and the Basic Encoding Rules must be able to generate and recognize this value.",
+  "maxaccess": "read-create",
+  "name": "ipForwardInfo",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.4.24.2.1.9",
+  "status": "obsolete",
+  "syntax": {
+   "class": "type",
+   "type": "OBJECT IDENTIFIER"
+  }
+ },
+ "ipForwardMask": {
+  "class": "objecttype",
+  "default": {
+   "default": {
+    "basetype": "OctetString",
+    "format": "hex",
+    "value": "00000000"
+   }
+  },
+  "description": "Indicate the mask to be logical-ANDed with the destination address before being compared to the value in the ipForwardDest field. For those systems that do not support arbitrary subnet masks, an agent constructs the value of the ipForwardMask by reference to the IP Address Class. Any assignment (implicit or otherwise) of an instance of this object to a value x must be rejected if the bitwise logical-AND of x with the value of the corresponding instance of the ipForwardDest object is not equal to ipForwardDest.",
+  "maxaccess": "read-create",
+  "name": "ipForwardMask",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.4.24.2.1.2",
+  "status": "obsolete",
+  "syntax": {
+   "class": "type",
+   "type": "IpAddress"
+  }
+ },
+ "ipForwardMetric1": {
+  "class": "objecttype",
+  "default": {
+   "default": {
+    "basetype": "Integer32",
+    "format": "decimal",
+    "value": "-1"
+   }
+  },
+  "description": "The primary routing metric for this route. The semantics of this metric are determined by the routing- protocol specified in the route's ipForwardProto value. If this metric is not used, its value should be set to -1.",
+  "maxaccess": "read-create",
+  "name": "ipForwardMetric1",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.4.24.2.1.11",
+  "status": "obsolete",
+  "syntax": {
+   "class": "type",
+   "type": "Integer32"
+  }
+ },
+ "ipForwardMetric2": {
+  "class": "objecttype",
+  "default": {
+   "default": {
+    "basetype": "Integer32",
+    "format": "decimal",
+    "value": "-1"
+   }
+  },
+  "description": "An alternate routing metric for this route. The semantics of this metric are determined by the routing- protocol specified in the route's ipForwardProto value. If this metric is not used, its value should be set to -1.",
+  "maxaccess": "read-create",
+  "name": "ipForwardMetric2",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.4.24.2.1.12",
+  "status": "obsolete",
+  "syntax": {
+   "class": "type",
+   "type": "Integer32"
+  }
+ },
+ "ipForwardMetric3": {
+  "class": "objecttype",
+  "default": {
+   "default": {
+    "basetype": "Integer32",
+    "format": "decimal",
+    "value": "-1"
+   }
+  },
+  "description": "An alternate routing metric for this route. The semantics of this metric are determined by the routing- protocol specified in the route's ipForwardProto value. If this metric is not used, its value should be set to -1.",
+  "maxaccess": "read-create",
+  "name": "ipForwardMetric3",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.4.24.2.1.13",
+  "status": "obsolete",
+  "syntax": {
+   "class": "type",
+   "type": "Integer32"
+  }
+ },
+ "ipForwardMetric4": {
+  "class": "objecttype",
+  "default": {
+   "default": {
+    "basetype": "Integer32",
+    "format": "decimal",
+    "value": "-1"
+   }
+  },
+  "description": "An alternate routing metric for this route. The semantics of this metric are determined by the routing- protocol specified in the route's ipForwardProto value. If this metric is not used, its value should be set to -1.",
+  "maxaccess": "read-create",
+  "name": "ipForwardMetric4",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.4.24.2.1.14",
+  "status": "obsolete",
+  "syntax": {
+   "class": "type",
+   "type": "Integer32"
+  }
+ },
+ "ipForwardMetric5": {
+  "class": "objecttype",
+  "default": {
+   "default": {
+    "basetype": "Integer32",
+    "format": "decimal",
+    "value": "-1"
+   }
+  },
+  "description": "An alternate routing metric for this route. The semantics of this metric are determined by the routing- protocol specified in the route's ipForwardProto value. If this metric is not used, its value should be set to -1.",
+  "maxaccess": "read-create",
+  "name": "ipForwardMetric5",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.4.24.2.1.15",
+  "status": "obsolete",
+  "syntax": {
+   "class": "type",
+   "type": "Integer32"
+  }
+ },
+ "ipForwardMultiPathGroup": {
+  "class": "objectgroup",
+  "description": "IP Multipath Route Table.",
+  "name": "ipForwardMultiPathGroup",
+  "objects": [
+   {
+    "module": "IP-FORWARD-MIB",
+    "object": "ipForwardNumber"
+   },
+   {
+    "module": "IP-FORWARD-MIB",
+    "object": "ipForwardDest"
+   },
+   {
+    "module": "IP-FORWARD-MIB",
+    "object": "ipForwardMask"
+   },
+   {
+    "module": "IP-FORWARD-MIB",
+    "object": "ipForwardPolicy"
+   },
+   {
+    "module": "IP-FORWARD-MIB",
+    "object": "ipForwardNextHop"
+   },
+   {
+    "module": "IP-FORWARD-MIB",
+    "object": "ipForwardIfIndex"
+   },
+   {
+    "module": "IP-FORWARD-MIB",
+    "object": "ipForwardType"
+   },
+   {
+    "module": "IP-FORWARD-MIB",
+    "object": "ipForwardProto"
+   },
+   {
+    "module": "IP-FORWARD-MIB",
+    "object": "ipForwardAge"
+   },
+   {
+    "module": "IP-FORWARD-MIB",
+    "object": "ipForwardInfo"
+   },
+   {
+    "module": "IP-FORWARD-MIB",
+    "object": "ipForwardNextHopAS"
+   },
+   {
+    "module": "IP-FORWARD-MIB",
+    "object": "ipForwardMetric1"
+   },
+   {
+    "module": "IP-FORWARD-MIB",
+    "object": "ipForwardMetric2"
+   },
+   {
+    "module": "IP-FORWARD-MIB",
+    "object": "ipForwardMetric3"
+   },
+   {
+    "module": "IP-FORWARD-MIB",
+    "object": "ipForwardMetric4"
+   },
+   {
+    "module": "IP-FORWARD-MIB",
+    "object": "ipForwardMetric5"
+   }
+  ],
+  "oid": "1.3.6.1.2.1.4.24.5.1.2",
+  "status": "obsolete"
+ },
+ "ipForwardNextHop": {
+  "class": "objecttype",
+  "description": "On remote routes, the address of the next system en route; otherwise, 0.0.0.0.",
+  "maxaccess": "read-only",
+  "name": "ipForwardNextHop",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.4.24.2.1.4",
+  "status": "obsolete",
+  "syntax": {
+   "class": "type",
+   "type": "IpAddress"
+  }
+ },
+ "ipForwardNextHopAS": {
+  "class": "objecttype",
+  "default": {
+   "default": {
+    "basetype": "Integer32",
+    "format": "decimal",
+    "value": "0"
+   }
+  },
+  "description": "The Autonomous System Number of the Next Hop. When this is unknown or not relevant to the protocol indicated by ipForwardProto, zero.",
+  "maxaccess": "read-create",
+  "name": "ipForwardNextHopAS",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.4.24.2.1.10",
+  "status": "obsolete",
+  "syntax": {
+   "class": "type",
+   "type": "Integer32"
+  }
+ },
+ "ipForwardNumber": {
+  "class": "objecttype",
+  "description": "The number of current ipForwardTable entries that are not invalid.",
+  "maxaccess": "read-only",
+  "name": "ipForwardNumber",
+  "nodetype": "scalar",
+  "oid": "1.3.6.1.2.1.4.24.1",
+  "status": "obsolete",
+  "syntax": {
+   "class": "type",
+   "type": "Gauge32"
+  }
+ },
+ "ipForwardOldCompliance": {
+  "class": "modulecompliance",
+  "description": "The compliance statement for SNMP entities that implement the ipForward MIB.",
+  "modulecompliance": [
+   {
+    "module": "IP-FORWARD-MIB",
+    "object": "ipForwardMultiPathGroup"
+   }
+  ],
+  "name": "ipForwardOldCompliance",
+  "oid": "1.3.6.1.2.1.4.24.5.2.2",
+  "status": "obsolete"
+ },
+ "ipForwardPolicy": {
+  "class": "objecttype",
+  "description": "The general set of conditions that would cause the selection of one multipath route (set of next hops for a given destination) is referred to as 'policy'. Unless the mechanism indicated by ipForwardProto specifies otherwise, the policy specifier is the IP TOS Field. The encoding of IP TOS is as specified by the following convention. Zero indicates the default path if no more specific policy applies. +-----+-----+-----+-----+-----+-----+-----+-----+ | | | | | PRECEDENCE | TYPE OF SERVICE | 0 | | | | | +-----+-----+-----+-----+-----+-----+-----+-----+ IP TOS IP TOS Field Policy Field Policy Contents Code Contents Code 0 0 0 0 ==> 0 0 0 0 1 ==> 2 0 0 1 0 ==> 4 0 0 1 1 ==> 6 0 1 0 0 ==> 8 0 1 0 1 ==> 10 0 1 1 0 ==> 12 0 1 1 1 ==> 14 1 0 0 0 ==> 16 1 0 0 1 ==> 18 1 0 1 0 ==> 20 1 0 1 1 ==> 22 1 1 0 0 ==> 24 1 1 0 1 ==> 26 1 1 1 0 ==> 28 1 1 1 1 ==> 30 Protocols defining 'policy' otherwise must either define a set of values that are valid for this object or must implement an integer-instanced policy table for which this object's value acts as an index.",
+  "maxaccess": "read-only",
+  "name": "ipForwardPolicy",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.4.24.2.1.3",
+  "status": "obsolete",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 2147483647,
+      "min": 0
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "ipForwardProto": {
+  "class": "objecttype",
+  "description": "The routing mechanism via which this route was learned. Inclusion of values for gateway routing protocols is not intended to imply that hosts should support those protocols.",
+  "maxaccess": "read-only",
+  "name": "ipForwardProto",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.4.24.2.1.7",
+  "status": "obsolete",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "enumeration": {
+     "bbnSpfIgp": 12,
+     "bgp": 14,
+     "ciscoIgrp": 11,
+     "egp": 5,
+     "es-is": 10,
+     "ggp": 6,
+     "hello": 7,
+     "icmp": 4,
+     "idpr": 15,
+     "is-is": 9,
+     "local": 2,
+     "netmgmt": 3,
+     "ospf": 13,
+     "other": 1,
+     "rip": 8
+    }
+   },
+   "type": "INTEGER"
+  }
+ },
+ "ipForwardReadOnlyCompliance": {
+  "class": "modulecompliance",
+  "description": "When this MIB is implemented without support for read- create (i.e., in read-only mode), the implementation can claim read-only compliance.",
+  "modulecompliance": [
+   {
+    "module": "IP-FORWARD-MIB",
+    "object": "inetForwardCidrRouteGroup"
+   }
+  ],
+  "name": "ipForwardReadOnlyCompliance",
+  "oid": "1.3.6.1.2.1.4.24.5.2.4",
+  "status": "current"
+ },
+ "ipForwardTable": {
+  "class": "objecttype",
+  "description": "This entity's IP Routing table.",
+  "maxaccess": "not-accessible",
+  "name": "ipForwardTable",
+  "nodetype": "table",
+  "oid": "1.3.6.1.2.1.4.24.2",
+  "reference": "RFC 1213 Section 6.6, The IP Group",
+  "status": "obsolete"
+ },
+ "ipForwardType": {
+  "class": "objecttype",
+  "default": {
+   "default": {
+    "basetype": "Integer32",
+    "format": "decimal",
+    "value": "2"
+   }
+  },
+  "description": "The type of route. Note that local(3) refers to a route for which the next hop is the final destination; remote(4) refers to a route for which the next hop is not the final destination. Setting this object to the value invalid(2) has the effect of invalidating the corresponding entry in the ipForwardTable object. That is, it effectively disassociates the destination identified with said entry from the route identified with said entry. It is an implementation-specific matter as to whether the agent removes an invalidated entry from the table. Accordingly, management stations must be prepared to receive tabular information from agents that corresponds to entries not currently in use. Proper interpretation of such entries requires examination of the relevant ipForwardType object.",
+  "maxaccess": "read-create",
+  "name": "ipForwardType",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.4.24.2.1.6",
+  "status": "obsolete",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "enumeration": {
+     "invalid": 2,
+     "local": 3,
+     "other": 1,
+     "remote": 4
+    }
+   },
+   "type": "INTEGER"
+  }
+ },
+ "meta": {
+  "module": "IP-FORWARD-MIB"
+ }
+}

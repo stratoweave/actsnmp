@@ -1,0 +1,23 @@
+# Nokia SR OS MIB bundles: proprietary (Nokia support portal only), so an optional local source.
+# fetch.sh looks for each archive under $MIBLAB_NOKIA_DIR, verifies its sha256 and extracts MIBs/
+# into corpus/src/nokia-sros/<release>/; a missing archive is skipped with a notice.
+# role: flat = the newest release, competes for corpus/flat (source label "nokia");
+#       history = older releases, indexed (instances.tsv, duplicates.tsv) but never chosen for corpus/flat
+#       (source label "nokia-<release>").
+# Licence: never commit the MIB texts, only these paths/hashes and statistics.
+#
+# Inspected, no MIB files:
+#   nokia-sros-15.0.R11-vsr, nokia-sros-16.0.R1-vsr, nokia-sros-16.0.R3-1-vsr, nokia-sros-16.0.R4-1-vsr:
+#     only Nokia-VSR-VM-<rel>.zip (vm/7xxx-i386/sros-vm.qcow2 + .ova); nokia-sros-16.0.R2-vsr is empty.
+#   sros23.10.tar (sha256 c3c462f5c6c7e42bc25f97394a974465d0476d04e9ab4da21e241fcc147fc7cc, 1390289920 bytes):
+#     docker image vr-sros:23.10.R1 (vrnetlab): layers = Debian base, qemu/bridge-utils, launch scripts and
+#     sros-vm-23.10.R1.qcow2, whose FAT file system holds only TiMOS images (timos/*.tim, yang.tim) in a
+#     packed proprietary format (no MIB text, no gzip/zip/xz members); bof.cfg, nvram.dat, syslinux.
+#     So SR OS 23.10 contributes no MIBs; 19.7.R1 is the newest Nokia MIB bundle available locally.
+#   nokia-sros-16.0.R4-vsr/MIBs/ (unpacked) is byte-identical to Nokia-VSR-MIBs-16.0.R4.zip.
+source	release	role	path	sha256	size
+nokia	19.7.R1	flat	nokia-sros-19.7.R1/Nokia-VSR-MIBs-19.7.R1.zip	a6d2414daf860205b1b3102791f3102074a102aaaeb9f4c1589dfef7fa29ebfd	5001490
+nokia-16.0.R5	16.0.R5	history	nokia-sros-16.0.R5/Nokia-VSR-MIBs-16.0.R5.zip	aba13904c25a9e9f30b5dc79ac48d96b748f501b6191c8e68aeaf4b6841a16be	4904649
+nokia-16.0.R4	16.0.R4	history	nokia-sros-16.0.R4-vsr/Nokia-VSR-MIBs-16.0.R4.zip	5b24a0d4e1d583eac8ef817eaf5f950850ac077a941f090e44fc05c4daa4635c	4899497
+nokia-16.0.R3	16.0.R3	history	nokia-sros-16.0.R3-vsr/Nokia-VSR-MIBs-16.0.R3.zip	71913c9975220b44bb686314c16dae3d863cde9323ee1021b3dc667c9ead4e1e	4817963
+nokia-16.0.R2-1	16.0.R2-1	history	nokia-sros-16.0.R2-1-vsr/Nokia-VSR-MIBs-16.0.R2-1.zip	761a21d4b792570f3bf9368aac0d61a45e5af53e0332e6a994ab59cd9cc52f93	4817798

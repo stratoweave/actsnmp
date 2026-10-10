@@ -1,0 +1,105 @@
+# Golden set: curated modules (golden/select.tsv) + their import closure (role dep).
+# tier ietf/netsnmp: text committed in golden/mibs/; ieee/vendor: reference only, the text is
+# corpus/src/<source dir>/<path> (fetch.sh; source dirs: corpus/index/stats.json "sources",
+# e.g. juniper = juniper-official/<release>, nokia = nokia-sros/<release> (pins/*.tsv)),
+# verified by sha256 (of the module text).
+# expected: committed = expected oracle outputs in golden/expected/ (committed: the module and
+# its import closure are ietf/netsnmp tier); local = golden/expected-local/ (not committed,
+# derived from IEEE/vendor texts; golden.sh regenerates it from the corpus).
+module	role	tier	source	path	sha256	expected	why
+HCNUM-TC	core	ietf	ietf	HCNUM-TC	c8d21522e37294169277cab9a9e6e0dae85ce2a106af3e64429ece8f35b6835c	committed	CounterBasedGauge64, ZeroBasedCounter64
+IANAifType-MIB	core	ietf	netsnmp	IANAifType-MIB.txt	ab12e9414b91b401cc427702ef368a9c07dc5ff2f3c964a2897311fd625bbfdf	committed	huge enumeration TC (IANA maintained, revision churn)
+IF-MIB	core	ietf	ietf	IF-MIB	a41d2d0414bd6e1b3249257d0d035ea11554624c525b830f6910195b72b0c297	committed	ifTable + AUGMENTS ifXTable, ifRcvAddressTable (variable-length PhysAddress index), notifications
+INET-ADDRESS-MIB	core	ietf	ietf	INET-ADDRESS-MIB	2cec7722aa39eb8facf105b26e93d0bce4ca9f097638c094b0a4f247c86843dc	committed	InetAddress TCs (index encoding depends on InetAddressType)
+IP-FORWARD-MIB	core	ietf	ietf	IP-FORWARD-MIB	6b55a19e712c0012cd2ac9813c5cddb10c93fdfa01e2e87c2c2fe14c41bd2a04	committed	inetCidrRouteTable: 9-part INDEX incl. OID-valued index
+IP-MIB	core	ietf	ietf	IP-MIB	6a6ec284b2de6f21a4d090927dba474a131c777d1c0b5a80a57fe21a7dd4a3d3	committed	ipAddressTable INDEX {type, InetAddress}, deprecated + current objects
+RFC-1212	core	ietf	pysnmp	RFC1212-MIB	a6880f64d2dc5fe41f7de4b725490083163116dcba6b7e1be8b8515d0a655157	committed	SMIv1 OBJECT-TYPE macro (the real one; empty SMICng-style copies exist)
+RFC-1215	core	ietf	netsnmp	RFC-1215.txt	dbd38e3a42cb0b391e9dafa606a5ee11ff2dcdd4c6781cb42ae1cd6185bcc4e2	committed	SMIv1 TRAP-TYPE macro
+RFC1155-SMI	core	ietf	ietf	RFC1155-SMI	070e8c1cbcb015132d900cfd4f4c946bc14a873c9433483caf2f4ecfa007f72d	committed	SMIv1 base types
+RFC1213-MIB	core	ietf	ietf	RFC1213-MIB	b21ec8c8f5a3169a07a54ad1f023e2fa56e6c38f43459a6e6029131f315a0f5f	committed	MIB-II in SMIv1: mandatory status, ACCESS, DisplayString defined locally
+SNMP-FRAMEWORK-MIB	core	ietf	ietf	SNMP-FRAMEWORK-MIB	0b61ecae73be7eb8e7983f16ab8387f19574b671b9d53967e4058fb73ef7bcbb	committed	SnmpAdminString (255t hint), SnmpEngineID
+SNMPv2-CONF	core	ietf	ietf	SNMPv2-CONF	b3e90ba682e10c76f6de90e65a0013143f0ec531b0ed546b2b8aa5ad5c0001eb	committed	conformance macros
+SNMPv2-MIB	core	ietf	ietf	SNMPv2-MIB	b4f8ef130f580b86d2b6bc890564e46100785f589431df76954e878a7b166e11	committed	system group, snmpTrapOID, notifications
+SNMPv2-SMI	core	ietf	ietf	SNMPv2-SMI	ece2355fc8b6140af702f86d77bd3f7398d80375fc6278c3e30ff3a31b53e0b7	committed	SMIv2 base: macros, base types, OID roots
+SNMPv2-TC	core	ietf	ietf	SNMPv2-TC	c1379575e6a0ad25b2d7da68294153c1fd79750827376f2aa6323d072d73f0b8	committed	SMIv2 textual conventions with DISPLAY-HINTs (DisplayString, PhysAddress, MacAddress, DateAndTime, RowStatus, ...)
+TCP-MIB	core	ietf	ietf	TCP-MIB	513be8f929389f20c6e203598e4b2a4e9b85a45fe6d4b816445bc143eeb2f6c6	committed	tcpConnectionTable with InetAddress/port indexes
+UDP-MIB	core	ietf	ietf	UDP-MIB	cb2ca5e2dfef1b0b8828918e3424af6f9120c654cf10ab882e288f04cc6db374	committed	udpEndpointTable
+BRIDGE-MIB	sample	ietf	ietf	BRIDGE-MIB	1e18de882086fca7be165e367d3b8e141379f5181fcaa3af0efe63f6710440da	committed	dot1dBase/Tp/Stp, MacAddress (fixed size) index
+CISCO-CDP-MIB	sample	vendor	cisco-v2	CISCO-CDP-MIB.my	b2e36548bc12aa2de8365f77750e29a6a5d7a27cf3b9cd6d8e0a83df3bb5ff02	local	CDP cache table (reference only)
+CISCO-PROCESS-MIB	sample	vendor	cisco-v2	CISCO-PROCESS-MIB.my	758af2a1dc93909623a02ef4f37b0b45789fe96c08e88575a52464a5dc761fce	local	CPU tables (reference only)
+CISCO-SMI	sample	vendor	cisco-v2	CISCO-SMI.my	3ea80f8160af50ba77e7309b7f95b4b6edb3ddc57dbe67eb0ee18ae1b56fd332	local	Cisco enterprise root (reference only)
+CISCO-TC	sample	vendor	cisco-v2	CISCO-TC.my	c22a2d9d370eb06e5d40b4184a264d2aa7691049e0ee7f8b761b32a50ae4097f	local	Cisco TCs (reference only)
+CISCO-VTP-MIB	sample	vendor	cisco-v2	CISCO-VTP-MIB.my	23fdfcd7f167f6a198ecd8b437c419e25ab6995136c2c87503062707ca995a2e	local	VTP / VLAN tables (reference only)
+DISMAN-EVENT-MIB	sample	ietf	ietf	DISMAN-EVENT-MIB	cfd3844be03da97b2082d6b433f55d157f70f632bd3bdb269d60e4732c550c8a	committed	complex tables, OID-valued objects, many DEFVALs
+ENTITY-MIB	sample	ietf	ietf	ENTITY-MIB	e56b77653a23171405dbae2431ed3f411dbe311e6ce1222cfd4cffd29dfe2e0c	committed	entPhysicalTable, PhysicalIndex, AutonomousType
+ENTITY-SENSOR-MIB	sample	ietf	ietf	ENTITY-SENSOR-MIB	4c30fcfd4db3e06f72aee32f7a71fd63264c37ef1e4d50fb74efa9b69eff9cff	committed	sensor value/scale/precision TCs
+HOST-RESOURCES-MIB	sample	ietf	ietf	HOST-RESOURCES-MIB	0406b893dcfacc370a1ae04ccfe6ffdecb15f93e3377a1a5ded2bbde5d944165	committed	hrStorage/hrDevice/hrSWRun tables, DateAndTime, KBytes
+IEEE8021-BRIDGE-MIB	sample	ieee	librenms	IEEE8021-BRIDGE-MIB	4a779f8ad3788c2ac35d3dc3cde7e96c36e33925dd810afda9b85e105571cbc6	local	IEEE 802.1 bridge (reference only)
+IEEE8021-Q-BRIDGE-MIB	sample	ieee	librenms	IEEE8021-Q-BRIDGE-MIB	e3abe373d3595ab08dd805dd334d230e46c5ee0718a2577f7e25a7aa5b1be35e	local	IEEE 802.1Q VLANs (reference only)
+IEEE8021-TC-MIB	sample	ieee	cisco-v2	IEEE8021-TC-MIB.my	ba77cc85da878b6fd15b2d6bdee3b83b41636a6a7536be1f8fb5657af4a1c5b3	local	IEEE 802.1 TCs (reference only)
+JUNIPER-DOM-MIB	sample	vendor	juniper	JuniperMibs/mib-jnx-dom.txt	79aa8c29a1bd88215e3b4cde6fbadb93e79c8f5b31cacad9d54754a56df9044f	local	optics DOM sensor tables (official Junos bundle, reference only)
+JUNIPER-IF-MIB	sample	vendor	juniper	JuniperMibs/mib-jnx-if-extensions.txt	55cba3c53debc6baa7002da4143fd9a3ec84f12afd03ea40219e09c0f3a933c1	local	ifJnxTable AUGMENTS-like extension of ifTable (official Junos bundle, reference only)
+JUNIPER-JSYSMON-MIB	sample	vendor	juniper-evo	jnx-jsysmon.txt	8f06c583ef949ae4d3658b1945eed456af6a964fcd0f2068fd0b1624fff0ae23	local	only in the Junos OS Evolved bundle (reference only)
+JUNIPER-MIB	sample	vendor	juniper	JuniperMibs/mib-jnx-chassis.txt	27188dc67e75d7dff2046c7baff25ad1b061616d5cbd6719c3929cedd3ae0e42	local	jnxBoxAnatomy (official Junos bundle, reference only)
+JUNIPER-SMI	sample	vendor	librenms	juniper/JUNIPER-SMI	be8d2a7ff1a022c40de146f0659fa689b17600f5bb16377387bf21a755e7a14e	local	Juniper enterprise root (reference only); corpus/flat has LibreNMS's copy (index.py OVERRIDES): the official Junos 26.2R1.7 copy uses TEXTUAL-CONVENTION and Opaque without IMPORTS, which pysmi rejects together with every Juniper module, while net-snmp accepts it
+LLDP-MIB	sample	ieee	cisco-v2	LLDP-MIB.my	f0dac7bac08b6d632d2f2363aba8acf106ee7cf83c15f14823489390c31d6769	local	IEEE 802.1AB-2005 LLDP (reference only)
+LLDP-V2-MIB	sample	ieee	librenms	LLDP-V2-MIB	9d37374c4b6b2767f3f02cf6a6b715bf47340ad17edd6d9322cfcba3f92b324e	local	IEEE 802.1AB-2009 LLDP v2 (reference only)
+MPLS-MIB	sample	vendor	juniper	JuniperMibs/mib-jnx-mpls.txt	4fe08f6c3a005c138029c2d686ee6e596b83acf916b32f35db31c719de1e3654	local	Juniper-owned module with a generic name under jnxMibs (official precedence via JUNIPER-SMI import; reference only)
+NET-SNMP-MIB	sample	netsnmp	netsnmp	NET-SNMP-MIB.txt	b0460053145ec563a026ccc7e792ab9ebb370c6aab3d57a9f95f3964cdd9d399	committed	net-snmp enterprise root (BSD licence)
+NET-SNMP-TC	sample	netsnmp	netsnmp	NET-SNMP-TC.txt	bf111deffcc7c36262d2e47ff8fd7d49eee8a3f1bdad6236367660da6854a233	committed	net-snmp TCs
+Q-BRIDGE-MIB	sample	ietf	ietf	Q-BRIDGE-MIB	7cd2eac2dc24efc7c46d24aa153940ea442cc0d022c0c6776bd2f5f94976abc6	committed	VLAN tables, PortList bitmaps, TimeFilter index
+RMON2-MIB	sample	ietf	ietf	RMON2-MIB	47085f78ea861710853d79a22cbd7be2305c3e25ce9fd3ca693f492142fe33d3	committed	imports the SMIv1 TOKEN-RING-RMON-MIB (mixed SMIv1/SMIv2 closure)
+SNMP-TARGET-MIB	sample	ietf	ietf	SNMP-TARGET-MIB	58551454d6f89f7d63a240505fee761550e7dc21ff4d3a77f6544066e58c5ff5	committed	snmpTargetAddrTable: IMPLIED SnmpAdminString index, TAddress
+SNMP-USER-BASED-SM-MIB	sample	ietf	ietf	SNMP-USER-BASED-SM-MIB	018e45be2956eae9129e3d93d183e37ef34c079dbe02557956606d2402dc75be	committed	usmUserTable: IMPLIED-free OCTET STRING + SnmpAdminString index, KeyChange
+SNMP-VIEW-BASED-ACM-MIB	sample	ietf	ietf	SNMP-VIEW-BASED-ACM-MIB	602ad67a3074135a6be3666059263db64d257dd655f827b138f7ba8a36eb2f54	committed	vacmViewTreeFamilyTable: OID-valued index
+TIMETRA-CHASSIS-MIB	sample	vendor	nokia	TIMETRA-CHASSIS-MIB.mib	7af70e4f819c66e30cd7a2355f020188cfafedc296d3c91900ff05cbd6dd9ac7	local	large real-world vendor module (~1 MB, many tables; official SR OS bundle, reference only)
+TIMETRA-GLOBAL-MIB	sample	vendor	nokia	TIMETRA-GLOBAL-MIB.mib	3188162f2d39804c611884c77c271fbbfef8cb27b086eee5a8e560843be75abf	local	Nokia SR OS enterprise root (official SR OS 19.7.R1 bundle, reference only)
+TIMETRA-TC-MIB	sample	vendor	nokia	TIMETRA-TC-MIB.mib	755b91cf2235c63d71b956b1125392546bec7c3d412f08d7444c756123ce1ad9	local	Nokia SR OS textual conventions (official bundle, reference only)
+UCD-SNMP-MIB	sample	netsnmp	netsnmp	UCD-SNMP-MIB.txt	7ee1e98fc2554475bf2c8fb11885e6eb8a54c2d55dc492bd9226723de26ff9fd	committed	UCD tables (laTable, dskTable, ...)
+A4400-RTM-MIB	quirk	vendor	librenms	alcatel/A4400-RTM-MIB	68f930849be14575bb132ee4f3461956fd9078a2bcc99a47cf873b8b6b0a7089	local	trailing comma in SEQUENCE, enum list mixing commas and spaces, uppercase enum labels
+ADMIN-MASTER-MIB	quirk	vendor	librenms	fs/ADMIN-MASTER-MIB	268eb7dbaa8d9936f391f6593c4131545d94fa401568b9b91d5789a9a4499051	local	duplicate definition of a symbol (pysmi fails it and 19 modules importing it)
+AH_TRAP_MIB	quirk	vendor	librenms	aerohive/AH_TRAP_MIB	73592261bc536e83c998cae9e851ab672b71ff9bdca49f50b54e824688db91e1	local	underscores in the module name (net-snmp and smilint cannot even locate it)
+ALVARION-DOT11-WLAN-TST-MIB	quirk	vendor	librenms	alvarion/ALVARION-DOT11-WLAN-TST-MIB	ff41e28f4d58e498c069a40fa5e78d9e1b2e556fbfe4cea028a795cda2887951	local	SMIv1 vendor: underscores in enum labels, imports the non-existent module name RFC1212 (alias of RFC-1212)
+APRISAXE-TC-4RF	quirk	vendor	librenms	4rf/APRISAXE-TC-4RF	30b0df11e12a73a08ae54d7ba6163a98e19466dbf6578944846d6b823db569bd	local	hex strings ('E0'h) as enumeration values
+ARRIS-D5-DTI-EXT-MIB	quirk	vendor	librenms	arris/d5/ARRIS-D5-DTI-EXT-MIB	5bf43052b4b8231588d56da3250d5f5faa9ee8672c73ead37d76ddd8b1132656	local	DEFVAL { FALSE } (TruthValue written as ASN.1 BOOLEAN)
+AT-DOS-MIB	quirk	vendor	librenms	allied/AT-DOS-MIB	b7e816ac178faabe697427cf9411ddca89a97126f7b3609a5147056813155069	local	'/' inside an enumeration label
+AVICI-SMI	quirk	vendor	pysnmp	AVICI-SMI	acb59978d3de008734f00d3bfef05120e9489323dbf1f1ea4c60703e7689f17f	local	invalid LAST-UPDATED/REVISION timestamps (pysmi strict-only failure, net-snmp error)
+BIANCA-BRICK-OSPF-STAT-MIB	quirk	vendor	pysnmp	BIANCA-BRICK-OSPF-ERR-MIB	78928cfb2366c1fa8e747814cb1b75539110dcfde0369f6050f4d6989cea8f77	local	cut out of a file holding two modules (BIANCA-BRICK-OSPF-ERR-MIB)
+CIENA-TC	quirk	vendor	librenms	ciena/CIENA-TC	a2835fe0d0f92972d1136763d5f1f60fe0ab631e4d4e7d732fa933e76736b38b	local	TEXTUAL-CONVENTION and current status without importing the macros (SMIv1/SMIv2 mix), malformed assignment
+CISCO-TELEPRESENCE-EXCHANGE-SYSTEM-CAPABILITY	quirk	vendor	cisco-v2	CISCO-TELEPRESENCE-EXCHANGE-SYSTEM-CAPABILITY.my	06691b66190486be658687a3c493077e9d72933ada3c81e9fcad0df4b04e219a	local	AGENT-CAPABILITIES that crashes libsmi's smilint
+CONEL-STATUS-MIB	quirk	vendor	librenms	icr-os/CONEL-STATUS-MIB	8c57bc166f084eda587edf08fe392994ecd6d688ec1097fb1aec2d41b2d18ae9	local	named numbers on Integer32 (not INTEGER)
+EXELTECH-XFERSW	quirk	vendor	librenms	exeltech/EXELTECH-XFRESW	aadcaa36399d82e5b3eaccb00690dc152cf474f8c35052fe30508cab933f9397	local	capitalised object descriptors; file name (EXELTECH-XFRESW) != module name
+GMPLS-TC-MIB	quirk	ietf	pysnmp	GMPLS-TC-MIB	b49a38d55a5d9d9ef72be6ba87478e457d2b7bcfc0e5fd54cc10dab77c6c8e99	committed	Internet-Draft text with page headers/footers inside the module
+HIKVISION-MIB	quirk	vendor	librenms	hikvision/HIKVISION-MIB	520bf4b20b00b16a0181f1ec59da03c43b308f9e6a08a28e08b43979b345a0e5	local	SEQUENCE OF <lowercase entry>, Latin-1 bytes, SMIv1 mixed with SNMPv2-SMI imports
+HPOV-NNM-MIB	quirk	vendor	librenms	alcatel/HPOV-NNM-MIB	351c68a18c2caac87d9c4f6e1843f1bd9372fa309493e7e2387addf06f5d6a8b	local	trailing comma in IMPORTS
+IANA-MAU-MIB	quirk	ietf	iana	IANA-MAU-MIB	90e7fbbab65942fac1f804cda297552ccf435f04e26ff681e6e82d9b254ce9fa	committed	'--' comments closed by a second '--' with text after it (ASN.1 vs. common comment rules)
+IBM-MIB	quirk	vendor	librenms	ibm/IBM-MIB	3b5604a8ec04050e81e22180710d89e26996e228ebd485b875f527a67943acdb	local	stray ';' (SMIv1)
+IBM-NetFinity-Text-Alert-MIB	quirk	vendor	librenms	ibm/IBM-NetFinity-Text-Alert-MIB	96521f5145bdb0eb5ebb07b889761e8ad6d45a4b238db174f51022bfc4ddade8	local	DOS ^Z (0x1a) after END, imports RFC1212/RFC1215 aliases
+MP-TRAP	quirk	vendor	pysnmp	MP-TRAP	0b41337147db7cfea1117ce16f3f29c303d81efccfbd8c606c8e17079fb79875	local	TRAP-TYPE with ENTERPRISE { ... } in braces
+RUGGEDCOM-TRAPS-MIB	quirk	vendor	librenms	ros/RUGGEDCOM-TRAPS-MIB	99b810406e32832bde6fbb7c97667afe1b9b23f208cb38776d3f1e8d94fc9d51	local	quoted strings as enumeration labels, imports a module that is not in any corpus
+SHIVA-L2F-MIB	quirk	vendor	pysnmp	SHIVA-L2F-MIB	f9b1335dc5bfed2301c6f52537597a8d849effff091a395c216b0e023471f7ae	local	imports a symbol (l2f) that its source module does not define: OID parents unresolved
+SNMPv2-PDU	quirk	ietf	ietf	SNMPv2-PDU	5bc415b006a4ed28930488b28518aa1dd809e57a7478a59fb4d8c180de9cf516	committed	not SMI at all: ASN.1 PDU definitions (IMPLICIT TAGS) among the RFC MIBs
+TCPIPX-MIB	quirk	ietf	ietf	TCPIPX-MIB	fc4201e702eabbdeda46cf14e7ff78f30eee9ac016d4c239bf8395abc925b111	committed	IETF SMIv1 module with a missing comma in a list
+TPLINK-SYSINFO-MIB	quirk	vendor	librenms	tplink/TPLINK-SYSINFO-MIB	872fbd2afc3d25bd22e5f9ce1413dc9f75c0636d2285b96053b96f7893202191	local	enumeration labels starting with a digit
+XYLAN-BASE-MIB	quirk	vendor	pysnmp	XYLAN-BASE-MIB	e4086a9227b53e3045ac2759342eb11b358326d9f1ffaeb7ed497498d3bc7566	local	stray ';' after the IMPORTS-less SMIv1 header (pysmi fails it and 47 dependents)
+A4400-CPU-MIB	dep	vendor	librenms	alcatel/A4400-CPU-MIB	d7d041f07ca8cf0d4f2c2091c0022d8a5b9c30d430835ceee6241ffd58b93162	local	imported by A4400-RTM-MIB
+AH-SMI-MIB	dep	vendor	librenms	aerohive/AH-SMI-MIB	cb5bc01b4f6a52741f598a8bbef042f420cba776cbbcac4b21abe6c2961eb1b2	local	imported by AH_TRAP_MIB
+ARRIS-MIB	dep	vendor	librenms	arris/ARRIS-MIB	1e7bf395764e4c2100fc0c540672c34133fd0d24ac4a7057def442e8e097e06c	local	imported by ARRIS-D5-DTI-EXT-MIB
+AT-SMI-MIB	dep	vendor	librenms	allied/AT-SMI-MIB	3cf489c4af21677bdaae3a806e2b031742147143c9948df1038ede619313b96b	local	imported by AT-DOS-MIB
+IANA-ADDRESS-FAMILY-NUMBERS-MIB	dep	ietf	netsnmp	IANA-ADDRESS-FAMILY-NUMBERS-MIB.txt	801a32eb53519658d74cb133b07935d693980af27d2450ce9217b8ab9b06b2d0	committed	imported by LLDP-MIB
+IANA-ENTITY-MIB	dep	ietf	librenms	IANA-ENTITY-MIB	a314f355c54a1d7b38c68d46d5e74bfc283e66564c6f2371780790da51d9f116	committed	imported by ENTITY-MIB
+IANA-RTPROTO-MIB	dep	ietf	iana	IANA-RTPROTO-MIB	5fdc3ac623387c706ed5636e5d5c4e7351743cb85503899b2ec52b1665cb2bcd	committed	imported by IP-FORWARD-MIB
+LLDP-V2-TC-MIB	dep	ieee	librenms	LLDP-V2-TC-MIB	a37ea0a3025f13fe94ec8c157ec304c34891f57d8bcb7582780a343893441c62	local	imported by LLDP-V2-MIB
+MIB-4RF	dep	vendor	librenms	4rf/MIB-4RF	51a370026d541b2c5ac0c935c50d544767daa491741de381ec046545c28ddfad	local	imported by APRISAXE-TC-4RF
+MMPF-MIB	dep	vendor	pysnmp	MMPF-MIB	3eb4c699ee93efee29eaf02ce3affc647934662c3df080b83519a82e15b4f5c9	local	imported by MP-TRAP
+P-BRIDGE-MIB	dep	ietf	ietf	P-BRIDGE-MIB	37ec2958d6d75c634b97a6d1083e00c0069b98f9e4d66da89c445a9d24d28a56	committed	imported by Q-BRIDGE-MIB
+RFC1158-MIB	dep	vendor	librenms	bintec/RFC1158-MIB	81c352bd2b333794057f40121864b60e9890582127ac80f8ceadb32d94bc963d	local	imported by SHIVA-MIB
+RFC1253-MIB	dep	ietf	pysnmp	RFC1253-MIB	ddb73a63a78e51be425b2dbc08a361effc406a31794abfca7a7aa19d18a081d3	committed	imported by MMPF-MIB
+RFC1271-MIB	dep	ietf	librenms	RFC1271-MIB	ba04a5788aa04670e976d84d2e4ffc95b017bafdb10fee8646c57d97f0b2e483	committed	imported by TOKEN-RING-RMON-MIB
+RMON-MIB	dep	ietf	ietf	RMON-MIB	dcb729079c88a3aa5e8bb4ab2890c388337794e0da95c6867bb69e45ff30c936	committed	imported by RMON2-MIB
+RUGGEDCOM-MIB	dep	vendor	librenms	ros/RUGGEDCOM-MIB	41d507c85703fa8c900ae831495e51bb3eb0d3f41d832b3eb0abe8c34bb2e4bf	local	imported by RUGGEDCOM-TRAPS-MIB
+RUGGEDCOM-SYS-INFO-MIB	dep	vendor	librenms	ros/RUGGEDCOM-SYS-INFO-MIB	de593897919214acc00fbd8a970115fa6ae7cd3a0d9906b966406a581ae67dca	local	imported by RUGGEDCOM-TRAPS-MIB
+SHIVA-MIB	dep	vendor	pysnmp	SHIVA-MIB	d510e645bb33537d65095bc5b5d0e5f4e1b9191b2568ed36964cb09c715e7af3	local	imported by SHIVA-L2F-MIB
+TOKEN-RING-RMON-MIB	dep	ietf	ietf	TOKEN-RING-RMON-MIB	a14e6d8fd4cf07ef21f59ea2a3d8943819fec1894f6074db1ddd511b7eddc262	committed	imported by RMON2-MIB
+TPLINK-MIB	dep	vendor	librenms	tplink/TPLINK-MIB	2976db0a7155c2ee8382847081919b1ece2a76d7632fa212559f7946970b8810	local	imported by TPLINK-SYSINFO-MIB
+UUID-TC-MIB	dep	ietf	ietf	UUID-TC-MIB	f3ffd3b9a2e60bdaa8c0b630b2f1d4ea0f20d9bd49a9abe99ea685787b9456d2	committed	imported by ENTITY-MIB

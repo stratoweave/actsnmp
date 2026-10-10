@@ -1,0 +1,79 @@
+# Curated golden modules (golden.sh adds their import closure as role "dep").
+# role: core = SMI base + the modules everything imports, sample = representative
+# standard/vendor modules, quirk = real-world modules that exercise a parser quirk.
+module	role	why
+SNMPv2-SMI	core	SMIv2 base: macros, base types, OID roots
+SNMPv2-TC	core	SMIv2 textual conventions with DISPLAY-HINTs (DisplayString, PhysAddress, MacAddress, DateAndTime, RowStatus, ...)
+SNMPv2-CONF	core	conformance macros
+SNMPv2-MIB	core	system group, snmpTrapOID, notifications
+RFC1155-SMI	core	SMIv1 base types
+RFC-1212	core	SMIv1 OBJECT-TYPE macro (the real one; empty SMICng-style copies exist)
+RFC-1215	core	SMIv1 TRAP-TYPE macro
+RFC1213-MIB	core	MIB-II in SMIv1: mandatory status, ACCESS, DisplayString defined locally
+IANAifType-MIB	core	huge enumeration TC (IANA maintained, revision churn)
+IF-MIB	core	ifTable + AUGMENTS ifXTable, ifRcvAddressTable (variable-length PhysAddress index), notifications
+INET-ADDRESS-MIB	core	InetAddress TCs (index encoding depends on InetAddressType)
+IP-MIB	core	ipAddressTable INDEX {type, InetAddress}, deprecated + current objects
+IP-FORWARD-MIB	core	inetCidrRouteTable: 9-part INDEX incl. OID-valued index
+TCP-MIB	core	tcpConnectionTable with InetAddress/port indexes
+UDP-MIB	core	udpEndpointTable
+SNMP-FRAMEWORK-MIB	core	SnmpAdminString (255t hint), SnmpEngineID
+HCNUM-TC	core	CounterBasedGauge64, ZeroBasedCounter64
+ENTITY-MIB	sample	entPhysicalTable, PhysicalIndex, AutonomousType
+ENTITY-SENSOR-MIB	sample	sensor value/scale/precision TCs
+HOST-RESOURCES-MIB	sample	hrStorage/hrDevice/hrSWRun tables, DateAndTime, KBytes
+BRIDGE-MIB	sample	dot1dBase/Tp/Stp, MacAddress (fixed size) index
+Q-BRIDGE-MIB	sample	VLAN tables, PortList bitmaps, TimeFilter index
+LLDP-MIB	sample	IEEE 802.1AB-2005 LLDP (reference only)
+LLDP-V2-MIB	sample	IEEE 802.1AB-2009 LLDP v2 (reference only)
+IEEE8021-TC-MIB	sample	IEEE 802.1 TCs (reference only)
+IEEE8021-BRIDGE-MIB	sample	IEEE 802.1 bridge (reference only)
+IEEE8021-Q-BRIDGE-MIB	sample	IEEE 802.1Q VLANs (reference only)
+SNMP-USER-BASED-SM-MIB	sample	usmUserTable: IMPLIED-free OCTET STRING + SnmpAdminString index, KeyChange
+SNMP-TARGET-MIB	sample	snmpTargetAddrTable: IMPLIED SnmpAdminString index, TAddress
+SNMP-VIEW-BASED-ACM-MIB	sample	vacmViewTreeFamilyTable: OID-valued index
+DISMAN-EVENT-MIB	sample	complex tables, OID-valued objects, many DEFVALs
+RMON2-MIB	sample	imports the SMIv1 TOKEN-RING-RMON-MIB (mixed SMIv1/SMIv2 closure)
+NET-SNMP-MIB	sample	net-snmp enterprise root (BSD licence)
+NET-SNMP-TC	sample	net-snmp TCs
+UCD-SNMP-MIB	sample	UCD tables (laTable, dskTable, ...)
+CISCO-SMI	sample	Cisco enterprise root (reference only)
+CISCO-TC	sample	Cisco TCs (reference only)
+CISCO-CDP-MIB	sample	CDP cache table (reference only)
+CISCO-VTP-MIB	sample	VTP / VLAN tables (reference only)
+CISCO-PROCESS-MIB	sample	CPU tables (reference only)
+JUNIPER-MIB	sample	jnxBoxAnatomy (official Junos bundle, reference only)
+JUNIPER-IF-MIB	sample	ifJnxTable AUGMENTS-like extension of ifTable (official Junos bundle, reference only)
+JUNIPER-DOM-MIB	sample	optics DOM sensor tables (official Junos bundle, reference only)
+MPLS-MIB	sample	Juniper-owned module with a generic name under jnxMibs (official precedence via JUNIPER-SMI import; reference only)
+JUNIPER-JSYSMON-MIB	sample	only in the Junos OS Evolved bundle (reference only)
+JUNIPER-SMI	sample	Juniper enterprise root (reference only); corpus/flat has LibreNMS's copy (index.py OVERRIDES): the official Junos 26.2R1.7 copy uses TEXTUAL-CONVENTION and Opaque without IMPORTS, which pysmi rejects together with every Juniper module, while net-snmp accepts it
+TIMETRA-GLOBAL-MIB	sample	Nokia SR OS enterprise root (official SR OS 19.7.R1 bundle, reference only)
+TIMETRA-TC-MIB	sample	Nokia SR OS textual conventions (official bundle, reference only)
+TIMETRA-CHASSIS-MIB	sample	large real-world vendor module (~1 MB, many tables; official SR OS bundle, reference only)
+ALVARION-DOT11-WLAN-TST-MIB	quirk	SMIv1 vendor: underscores in enum labels, imports the non-existent module name RFC1212 (alias of RFC-1212)
+AH_TRAP_MIB	quirk	underscores in the module name (net-snmp and smilint cannot even locate it)
+HIKVISION-MIB	quirk	SEQUENCE OF <lowercase entry>, Latin-1 bytes, SMIv1 mixed with SNMPv2-SMI imports
+IBM-NetFinity-Text-Alert-MIB	quirk	DOS ^Z (0x1a) after END, imports RFC1212/RFC1215 aliases
+CONEL-STATUS-MIB	quirk	named numbers on Integer32 (not INTEGER)
+ARRIS-D5-DTI-EXT-MIB	quirk	DEFVAL { FALSE } (TruthValue written as ASN.1 BOOLEAN)
+APRISAXE-TC-4RF	quirk	hex strings ('E0'h) as enumeration values
+A4400-RTM-MIB	quirk	trailing comma in SEQUENCE, enum list mixing commas and spaces, uppercase enum labels
+HPOV-NNM-MIB	quirk	trailing comma in IMPORTS
+CIENA-TC	quirk	TEXTUAL-CONVENTION and current status without importing the macros (SMIv1/SMIv2 mix), malformed assignment
+RUGGEDCOM-TRAPS-MIB	quirk	quoted strings as enumeration labels, imports a module that is not in any corpus
+IBM-MIB	quirk	stray ';' (SMIv1)
+TPLINK-SYSINFO-MIB	quirk	enumeration labels starting with a digit
+EXELTECH-XFERSW	quirk	capitalised object descriptors; file name (EXELTECH-XFRESW) != module name
+AT-DOS-MIB	quirk	'/' inside an enumeration label
+BIANCA-BRICK-OSPF-STAT-MIB	quirk	cut out of a file holding two modules (BIANCA-BRICK-OSPF-ERR-MIB)
+GMPLS-TC-MIB	quirk	Internet-Draft text with page headers/footers inside the module
+IANA-MAU-MIB	quirk	'--' comments closed by a second '--' with text after it (ASN.1 vs. common comment rules)
+TCPIPX-MIB	quirk	IETF SMIv1 module with a missing comma in a list
+SNMPv2-PDU	quirk	not SMI at all: ASN.1 PDU definitions (IMPLICIT TAGS) among the RFC MIBs
+CISCO-TELEPRESENCE-EXCHANGE-SYSTEM-CAPABILITY	quirk	AGENT-CAPABILITIES that crashes libsmi's smilint
+SHIVA-L2F-MIB	quirk	imports a symbol (l2f) that its source module does not define: OID parents unresolved
+MP-TRAP	quirk	TRAP-TYPE with ENTERPRISE { ... } in braces
+ADMIN-MASTER-MIB	quirk	duplicate definition of a symbol (pysmi fails it and 19 modules importing it)
+AVICI-SMI	quirk	invalid LAST-UPDATED/REVISION timestamps (pysmi strict-only failure, net-snmp error)
+XYLAN-BASE-MIB	quirk	stray ';' after the IMPORTS-less SMIv1 header (pysmi fails it and 47 dependents)

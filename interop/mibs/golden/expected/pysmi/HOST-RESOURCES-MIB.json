@@ -1,0 +1,1837 @@
+{
+ "InternationalDisplayString": {
+  "class": "textualconvention",
+  "description": "This data type is used to model textual information in some character set. A network management station should use a local algorithm to determine which character set is in use and how it should be displayed. Note that this character set may be encoded with more than one octet per symbol, but will most often be NVT ASCII. When a size clause is specified for an object of this type, the size refers to the length in octets, not the number of symbols.",
+  "name": "InternationalDisplayString",
+  "status": "current",
+  "type": {
+   "class": "type",
+   "tcbase": false,
+   "type": "OCTET STRING"
+  }
+ },
+ "KBytes": {
+  "class": "textualconvention",
+  "description": "Storage size, expressed in units of 1024 bytes.",
+  "name": "KBytes",
+  "status": "current",
+  "type": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 2147483647,
+      "min": 0
+     }
+    ]
+   },
+   "tcbase": false,
+   "type": "Integer32"
+  }
+ },
+ "ProductID": {
+  "class": "textualconvention",
+  "description": "This textual convention is intended to identify the manufacturer, model, and version of a specific hardware or software product. It is suggested that these OBJECT IDENTIFIERs are allocated such that all products from a particular manufacturer are registered under a subtree distinct to that manufacturer. In addition, all versions of a product should be registered under a subtree distinct to that product. With this strategy, a management station may uniquely determine the manufacturer and/or model of a product whose productID is unknown to the management station. Objects of this type may be useful for inventory purposes or for automatically detecting incompatibilities or version mismatches between various hardware and software components on a system. For example, the product ID for the ACME 4860 66MHz clock doubled processor might be: enterprises.acme.acmeProcessors.a4860DX2.MHz66 A software product might be registered as: enterprises.acme.acmeOperatingSystems.acmeDOS.six(6).one(1) ",
+  "name": "ProductID",
+  "status": "current",
+  "type": {
+   "class": "type",
+   "tcbase": false,
+   "type": "OBJECT IDENTIFIER"
+  }
+ },
+ "host": {
+  "class": "objectidentity",
+  "name": "host",
+  "oid": "1.3.6.1.2.1.25"
+ },
+ "hostResourcesMibModule": {
+  "class": "moduleidentity",
+  "contactinfo": "Steve Waldbusser Postal: Lucent Technologies, Inc. 1213 Innsbruck Dr. Sunnyvale, CA 94089 USA Phone: 650-318-1251 Fax: 650-318-1633 Email: waldbusser@lucent.com In addition, the Host Resources MIB mailing list is dedicated to discussion of this MIB. To join the mailing list, send a request message to hostmib-request@andrew.cmu.edu. The mailing list address is hostmib@andrew.cmu.edu.",
+  "description": "This MIB is for use in managing host systems. The term `host' is construed to mean any computer that communicates with other similar computers attached to the internet and that is directly used by one or more human beings. Although this MIB does not necessarily apply to devices whose primary function is communications services (e.g., terminal servers, routers, bridges, monitoring equipment), such relevance is not explicitly precluded. This MIB instruments attributes common to all internet hosts including, for example, both personal computers and systems that run variants of Unix.",
+  "lastupdated": "200003060000Z",
+  "name": "hostResourcesMibModule",
+  "oid": "1.3.6.1.2.1.25.7.1",
+  "organization": "IETF Host Resources MIB Working Group",
+  "revisions": [
+   {
+    "description": "Clarifications and bug fixes based on implementation experience. This revision was also reformatted in the SMIv2 format. The revisions made were: New RFC document standards: Added Copyright notice, updated introduction to SNMP Framework, updated references section, added reference to RFC 2119, and added a meaningful Security Considerations section. New IANA considerations section for registration of new types Conversion to new SMIv2 syntax for the following types and macros: Counter32, Integer32, Gauge32, MODULE-IDENTITY, OBJECT-TYPE, TEXTUAL-CONVENTION, OBJECT-IDENTITY, MODULE-COMPLIANCE, OBJECT-GROUP Used new Textual Conventions: TruthValue, DateAndTime, AutonomousType, InterfaceIndexOrZero Fixed typo in hrPrinterStatus. Added missing error bits to hrPrinterDetectedErrorState and clarified confusion resulting from suggested mappings to hrPrinterStatus. Clarified that size of objects of type InternationalDisplayString is number of octets, not number of encoded symbols. Clarified the use of the following objects based on implementation experience: hrSystemInitialLoadDevice, hrSystemInitialLoadParameters, hrMemorySize, hrStorageSize, hrStorageAllocationFailures, hrDeviceErrors, hrProcessorLoad, hrNetworkIfIndex, hrDiskStorageCapacity, hrSWRunStatus, hrSWRunPerfCPU, and hrSWInstalledDate. Clarified implementation technique for hrSWInstalledTable. Used new AUGMENTS clause for hrSWRunPerfTable. Added Internationalization Considerations section. This revision published as RFC2790.",
+    "revision": "2000-03-06 00:00"
+   },
+   {
+    "description": "The original version of this MIB, published as RFC1514.",
+    "revision": "1999-10-20 22:00"
+   }
+  ]
+ },
+ "hrDevice": {
+  "class": "objectidentity",
+  "name": "hrDevice",
+  "oid": "1.3.6.1.2.1.25.3"
+ },
+ "hrDeviceDescr": {
+  "class": "objecttype",
+  "description": "A textual description of this device, including the device's manufacturer and revision, and optionally, its serial number.",
+  "maxaccess": "read-only",
+  "name": "hrDeviceDescr",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.25.3.2.1.3",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "size": [
+     {
+      "max": 64,
+      "min": 0
+     }
+    ]
+   },
+   "type": "DisplayString"
+  }
+ },
+ "hrDeviceEntry": {
+  "class": "objecttype",
+  "description": "A (conceptual) entry for one device contained by the host. As an example, an instance of the hrDeviceType object might be named hrDeviceType.3",
+  "indices": [
+   {
+    "implied": 0,
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrDeviceIndex"
+   }
+  ],
+  "maxaccess": "not-accessible",
+  "name": "hrDeviceEntry",
+  "nodetype": "row",
+  "oid": "1.3.6.1.2.1.25.3.2.1",
+  "status": "current"
+ },
+ "hrDeviceErrors": {
+  "class": "objecttype",
+  "description": "The number of errors detected on this device. It should be noted that as this object has a SYNTAX of Counter32, that it does not have a defined initial value. However, it is recommended that this object be initialized to zero, even though management stations must not depend on such an initialization.",
+  "maxaccess": "read-only",
+  "name": "hrDeviceErrors",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.25.3.2.1.6",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  }
+ },
+ "hrDeviceGroup": {
+  "class": "objectgroup",
+  "description": "The Host Resources Device Group.",
+  "name": "hrDeviceGroup",
+  "objects": [
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrDeviceIndex"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrDeviceType"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrDeviceDescr"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrDeviceID"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrDeviceStatus"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrDeviceErrors"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrProcessorFrwID"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrProcessorLoad"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrNetworkIfIndex"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrPrinterStatus"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrPrinterDetectedErrorState"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrDiskStorageAccess"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrDiskStorageMedia"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrDiskStorageRemoveble"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrDiskStorageCapacity"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrPartitionIndex"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrPartitionLabel"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrPartitionID"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrPartitionSize"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrPartitionFSIndex"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrFSIndex"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrFSMountPoint"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrFSRemoteMountPoint"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrFSType"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrFSAccess"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrFSBootable"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrFSStorageIndex"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrFSLastFullBackupDate"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrFSLastPartialBackupDate"
+   }
+  ],
+  "oid": "1.3.6.1.2.1.25.7.3.3",
+  "status": "current"
+ },
+ "hrDeviceID": {
+  "class": "objecttype",
+  "description": "The product ID for this device.",
+  "maxaccess": "read-only",
+  "name": "hrDeviceID",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.25.3.2.1.4",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "ProductID"
+  }
+ },
+ "hrDeviceIndex": {
+  "class": "objecttype",
+  "description": "A unique value for each device contained by the host. The value for each device must remain constant at least from one re-initialization of the agent to the next re-initialization.",
+  "maxaccess": "read-only",
+  "name": "hrDeviceIndex",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.25.3.2.1.1",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 2147483647,
+      "min": 1
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "hrDeviceStatus": {
+  "class": "objecttype",
+  "description": "The current operational state of the device described by this row of the table. A value unknown(1) indicates that the current state of the device is unknown. running(2) indicates that the device is up and running and that no unusual error conditions are known. The warning(3) state indicates that agent has been informed of an unusual error condition by the operational software (e.g., a disk device driver) but that the device is still 'operational'. An example would be a high number of soft errors on a disk. A value of testing(4), indicates that the device is not available for use because it is in the testing state. The state of down(5) is used only when the agent has been informed that the device is not available for any use.",
+  "maxaccess": "read-only",
+  "name": "hrDeviceStatus",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.25.3.2.1.5",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "enumeration": {
+     "down": 5,
+     "running": 2,
+     "testing": 4,
+     "unknown": 1,
+     "warning": 3
+    }
+   },
+   "type": "INTEGER"
+  }
+ },
+ "hrDeviceTable": {
+  "class": "objecttype",
+  "description": "The (conceptual) table of devices contained by the host.",
+  "maxaccess": "not-accessible",
+  "name": "hrDeviceTable",
+  "nodetype": "table",
+  "oid": "1.3.6.1.2.1.25.3.2",
+  "status": "current"
+ },
+ "hrDeviceType": {
+  "class": "objecttype",
+  "description": "An indication of the type of device. If this value is `hrDeviceProcessor { hrDeviceTypes 3 }' then an entry exists in the hrProcessorTable which corresponds to this device. If this value is `hrDeviceNetwork { hrDeviceTypes 4 }', then an entry exists in the hrNetworkTable which corresponds to this device. If this value is `hrDevicePrinter { hrDeviceTypes 5 }', then an entry exists in the hrPrinterTable which corresponds to this device. If this value is `hrDeviceDiskStorage { hrDeviceTypes 6 }', then an entry exists in the hrDiskStorageTable which corresponds to this device.",
+  "maxaccess": "read-only",
+  "name": "hrDeviceType",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.25.3.2.1.2",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "AutonomousType"
+  }
+ },
+ "hrDeviceTypes": {
+  "class": "objectidentity",
+  "name": "hrDeviceTypes",
+  "oid": "1.3.6.1.2.1.25.3.1"
+ },
+ "hrDiskStorageAccess": {
+  "class": "objecttype",
+  "description": "An indication if this long-term storage device is readable and writable or only readable. This should reflect the media type, any write-protect mechanism, and any device configuration that affects the entire device.",
+  "maxaccess": "read-only",
+  "name": "hrDiskStorageAccess",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.25.3.6.1.1",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "enumeration": {
+     "readOnly": 2,
+     "readWrite": 1
+    }
+   },
+   "type": "INTEGER"
+  }
+ },
+ "hrDiskStorageCapacity": {
+  "class": "objecttype",
+  "description": "The total size for this long-term storage device. If the media is removable and is currently removed, this value should be zero.",
+  "maxaccess": "read-only",
+  "name": "hrDiskStorageCapacity",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.25.3.6.1.4",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "KBytes"
+  },
+  "units": "KBytes"
+ },
+ "hrDiskStorageEntry": {
+  "class": "objecttype",
+  "description": "A (conceptual) entry for one long-term storage device contained by the host. The hrDeviceIndex in the index represents the entry in the hrDeviceTable that corresponds to the hrDiskStorageEntry. As an example, an instance of the hrDiskStorageCapacity object might be named hrDiskStorageCapacity.3",
+  "indices": [
+   {
+    "implied": 0,
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrDeviceIndex"
+   }
+  ],
+  "maxaccess": "not-accessible",
+  "name": "hrDiskStorageEntry",
+  "nodetype": "row",
+  "oid": "1.3.6.1.2.1.25.3.6.1",
+  "status": "current"
+ },
+ "hrDiskStorageMedia": {
+  "class": "objecttype",
+  "description": "An indication of the type of media used in this long- term storage device.",
+  "maxaccess": "read-only",
+  "name": "hrDiskStorageMedia",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.25.3.6.1.2",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "enumeration": {
+     "floppyDisk": 4,
+     "hardDisk": 3,
+     "opticalDiskROM": 5,
+     "opticalDiskRW": 7,
+     "opticalDiskWORM": 6,
+     "other": 1,
+     "ramDisk": 8,
+     "unknown": 2
+    }
+   },
+   "type": "INTEGER"
+  }
+ },
+ "hrDiskStorageRemoveble": {
+  "class": "objecttype",
+  "description": "Denotes whether or not the disk media may be removed from the drive.",
+  "maxaccess": "read-only",
+  "name": "hrDiskStorageRemoveble",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.25.3.6.1.3",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "TruthValue"
+  }
+ },
+ "hrDiskStorageTable": {
+  "class": "objecttype",
+  "description": "The (conceptual) table of long-term storage devices contained by the host. In particular, disk devices accessed remotely over a network are not included here. Note that this table is potentially sparse: a (conceptual) entry exists only if the correspondent value of the hrDeviceType object is `hrDeviceDiskStorage'.",
+  "maxaccess": "not-accessible",
+  "name": "hrDiskStorageTable",
+  "nodetype": "table",
+  "oid": "1.3.6.1.2.1.25.3.6",
+  "status": "current"
+ },
+ "hrFSAccess": {
+  "class": "objecttype",
+  "description": "An indication if this file system is logically configured by the operating system to be readable and writable or only readable. This does not represent any local access-control policy, except one that is applied to the file system as a whole.",
+  "maxaccess": "read-only",
+  "name": "hrFSAccess",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.25.3.8.1.5",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "enumeration": {
+     "readOnly": 2,
+     "readWrite": 1
+    }
+   },
+   "type": "INTEGER"
+  }
+ },
+ "hrFSBootable": {
+  "class": "objecttype",
+  "description": "A flag indicating whether this file system is bootable.",
+  "maxaccess": "read-only",
+  "name": "hrFSBootable",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.25.3.8.1.6",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "TruthValue"
+  }
+ },
+ "hrFSEntry": {
+  "class": "objecttype",
+  "description": "A (conceptual) entry for one file system local to this host or remotely mounted from a file server. File systems that are in only one user's environment on a multi-user system will not be included in this table. As an example of how objects in this table are named, an instance of the hrFSMountPoint object might be named hrFSMountPoint.3",
+  "indices": [
+   {
+    "implied": 0,
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrFSIndex"
+   }
+  ],
+  "maxaccess": "not-accessible",
+  "name": "hrFSEntry",
+  "nodetype": "row",
+  "oid": "1.3.6.1.2.1.25.3.8.1",
+  "status": "current"
+ },
+ "hrFSIndex": {
+  "class": "objecttype",
+  "description": "A unique value for each file system local to this host. The value for each file system must remain constant at least from one re-initialization of the agent to the next re-initialization.",
+  "maxaccess": "read-only",
+  "name": "hrFSIndex",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.25.3.8.1.1",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 2147483647,
+      "min": 1
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "hrFSLastFullBackupDate": {
+  "class": "objecttype",
+  "description": "The last date at which this complete file system was copied to another storage device for backup. This information is useful for ensuring that backups are being performed regularly. If this information is not known, then this variable shall have the value corresponding to January 1, year 0000, 00:00:00.0, which is encoded as (hex)'00 00 01 01 00 00 00 00'.",
+  "maxaccess": "read-write",
+  "name": "hrFSLastFullBackupDate",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.25.3.8.1.8",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "DateAndTime"
+  }
+ },
+ "hrFSLastPartialBackupDate": {
+  "class": "objecttype",
+  "description": "The last date at which a portion of this file system was copied to another storage device for backup. This information is useful for ensuring that backups are being performed regularly. If this information is not known, then this variable shall have the value corresponding to January 1, year 0000, 00:00:00.0, which is encoded as (hex)'00 00 01 01 00 00 00 00'.",
+  "maxaccess": "read-write",
+  "name": "hrFSLastPartialBackupDate",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.25.3.8.1.9",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "DateAndTime"
+  }
+ },
+ "hrFSMountPoint": {
+  "class": "objecttype",
+  "description": "The path name of the root of this file system.",
+  "maxaccess": "read-only",
+  "name": "hrFSMountPoint",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.25.3.8.1.2",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "size": [
+     {
+      "max": 128,
+      "min": 0
+     }
+    ]
+   },
+   "type": "InternationalDisplayString"
+  }
+ },
+ "hrFSRemoteMountPoint": {
+  "class": "objecttype",
+  "description": "A description of the name and/or address of the server that this file system is mounted from. This may also include parameters such as the mount point on the remote file system. If this is not a remote file system, this string should have a length of zero.",
+  "maxaccess": "read-only",
+  "name": "hrFSRemoteMountPoint",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.25.3.8.1.3",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "size": [
+     {
+      "max": 128,
+      "min": 0
+     }
+    ]
+   },
+   "type": "InternationalDisplayString"
+  }
+ },
+ "hrFSStorageIndex": {
+  "class": "objecttype",
+  "description": "The index of the hrStorageEntry that represents information about this file system. If there is no such information available, then this value shall be zero. The relevant storage entry will be useful in tracking the percent usage of this file system and diagnosing errors that may occur when it runs out of space.",
+  "maxaccess": "read-only",
+  "name": "hrFSStorageIndex",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.25.3.8.1.7",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 2147483647,
+      "min": 0
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "hrFSTable": {
+  "class": "objecttype",
+  "description": "The (conceptual) table of file systems local to this host or remotely mounted from a file server. File systems that are in only one user's environment on a multi-user system will not be included in this table.",
+  "maxaccess": "not-accessible",
+  "name": "hrFSTable",
+  "nodetype": "table",
+  "oid": "1.3.6.1.2.1.25.3.8",
+  "status": "current"
+ },
+ "hrFSType": {
+  "class": "objecttype",
+  "description": "The value of this object identifies the type of this file system.",
+  "maxaccess": "read-only",
+  "name": "hrFSType",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.25.3.8.1.4",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "AutonomousType"
+  }
+ },
+ "hrFSTypes": {
+  "class": "objectidentity",
+  "name": "hrFSTypes",
+  "oid": "1.3.6.1.2.1.25.3.9"
+ },
+ "hrMIBAdminInfo": {
+  "class": "objectidentity",
+  "name": "hrMIBAdminInfo",
+  "oid": "1.3.6.1.2.1.25.7"
+ },
+ "hrMIBCompliance": {
+  "class": "modulecompliance",
+  "description": "The requirements for conformance to the Host Resources MIB.",
+  "modulecompliance": [
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrSystemGroup"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrStorageGroup"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrDeviceGroup"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrSWRunGroup"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrSWRunPerfGroup"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrSWInstalledGroup"
+   }
+  ],
+  "name": "hrMIBCompliance",
+  "oid": "1.3.6.1.2.1.25.7.2.1",
+  "status": "current"
+ },
+ "hrMIBCompliances": {
+  "class": "objectidentity",
+  "name": "hrMIBCompliances",
+  "oid": "1.3.6.1.2.1.25.7.2"
+ },
+ "hrMIBGroups": {
+  "class": "objectidentity",
+  "name": "hrMIBGroups",
+  "oid": "1.3.6.1.2.1.25.7.3"
+ },
+ "hrMemorySize": {
+  "class": "objecttype",
+  "description": "The amount of physical read-write main memory, typically RAM, contained by the host.",
+  "maxaccess": "read-only",
+  "name": "hrMemorySize",
+  "nodetype": "scalar",
+  "oid": "1.3.6.1.2.1.25.2.2",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "KBytes"
+  },
+  "units": "KBytes"
+ },
+ "hrNetworkEntry": {
+  "class": "objecttype",
+  "description": "A (conceptual) entry for one network device contained by the host. The hrDeviceIndex in the index represents the entry in the hrDeviceTable that corresponds to the hrNetworkEntry. As an example of how objects in this table are named, an instance of the hrNetworkIfIndex object might be named hrNetworkIfIndex.3",
+  "indices": [
+   {
+    "implied": 0,
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrDeviceIndex"
+   }
+  ],
+  "maxaccess": "not-accessible",
+  "name": "hrNetworkEntry",
+  "nodetype": "row",
+  "oid": "1.3.6.1.2.1.25.3.4.1",
+  "status": "current"
+ },
+ "hrNetworkIfIndex": {
+  "class": "objecttype",
+  "description": "The value of ifIndex which corresponds to this network device. If this device is not represented in the ifTable, then this value shall be zero.",
+  "maxaccess": "read-only",
+  "name": "hrNetworkIfIndex",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.25.3.4.1.1",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "InterfaceIndexOrZero"
+  }
+ },
+ "hrNetworkTable": {
+  "class": "objecttype",
+  "description": "The (conceptual) table of network devices contained by the host. Note that this table is potentially sparse: a (conceptual) entry exists only if the correspondent value of the hrDeviceType object is `hrDeviceNetwork'.",
+  "maxaccess": "not-accessible",
+  "name": "hrNetworkTable",
+  "nodetype": "table",
+  "oid": "1.3.6.1.2.1.25.3.4",
+  "status": "current"
+ },
+ "hrPartitionEntry": {
+  "class": "objecttype",
+  "description": "A (conceptual) entry for one partition. The hrDeviceIndex in the index represents the entry in the hrDeviceTable that corresponds to the hrPartitionEntry. As an example of how objects in this table are named, an instance of the hrPartitionSize object might be named hrPartitionSize.3.1",
+  "indices": [
+   {
+    "implied": 0,
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrDeviceIndex"
+   },
+   {
+    "implied": 0,
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrPartitionIndex"
+   }
+  ],
+  "maxaccess": "not-accessible",
+  "name": "hrPartitionEntry",
+  "nodetype": "row",
+  "oid": "1.3.6.1.2.1.25.3.7.1",
+  "status": "current"
+ },
+ "hrPartitionFSIndex": {
+  "class": "objecttype",
+  "description": "The index of the file system mounted on this partition. If no file system is mounted on this partition, then this value shall be zero. Note that multiple partitions may point to one file system, denoting that that file system resides on those partitions. Multiple file systems may not reside on one partition.",
+  "maxaccess": "read-only",
+  "name": "hrPartitionFSIndex",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.25.3.7.1.5",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 2147483647,
+      "min": 0
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "hrPartitionID": {
+  "class": "objecttype",
+  "description": "A descriptor which uniquely represents this partition to the responsible operating system. On some systems, this might take on a binary representation.",
+  "maxaccess": "read-only",
+  "name": "hrPartitionID",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.25.3.7.1.3",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "OCTET STRING"
+  }
+ },
+ "hrPartitionIndex": {
+  "class": "objecttype",
+  "description": "A unique value for each partition on this long-term storage device. The value for each long-term storage device must remain constant at least from one re- initialization of the agent to the next re- initialization.",
+  "maxaccess": "read-only",
+  "name": "hrPartitionIndex",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.25.3.7.1.1",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 2147483647,
+      "min": 1
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "hrPartitionLabel": {
+  "class": "objecttype",
+  "description": "A textual description of this partition.",
+  "maxaccess": "read-only",
+  "name": "hrPartitionLabel",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.25.3.7.1.2",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "size": [
+     {
+      "max": 128,
+      "min": 0
+     }
+    ]
+   },
+   "type": "InternationalDisplayString"
+  }
+ },
+ "hrPartitionSize": {
+  "class": "objecttype",
+  "description": "The size of this partition.",
+  "maxaccess": "read-only",
+  "name": "hrPartitionSize",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.25.3.7.1.4",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "KBytes"
+  },
+  "units": "KBytes"
+ },
+ "hrPartitionTable": {
+  "class": "objecttype",
+  "description": "The (conceptual) table of partitions for long-term storage devices contained by the host. In particular, partitions accessed remotely over a network are not included here.",
+  "maxaccess": "not-accessible",
+  "name": "hrPartitionTable",
+  "nodetype": "table",
+  "oid": "1.3.6.1.2.1.25.3.7",
+  "status": "current"
+ },
+ "hrPrinterDetectedErrorState": {
+  "class": "objecttype",
+  "description": "This object represents any error conditions detected by the printer. The error conditions are encoded as bits in an octet string, with the following definitions: Condition Bit # lowPaper 0 noPaper 1 lowToner 2 noToner 3 doorOpen 4 jammed 5 offline 6 serviceRequested 7 inputTrayMissing 8 outputTrayMissing 9 markerSupplyMissing 10 outputNearFull 11 outputFull 12 inputTrayEmpty 13 overduePreventMaint 14 Bits are numbered starting with the most significant bit of the first byte being bit 0, the least significant bit of the first byte being bit 7, the most significant bit of the second byte being bit 8, and so on. A one bit encodes that the condition was detected, while a zero bit encodes that the condition was not detected. This object is useful for alerting an operator to specific warning or error conditions that may occur, especially those requiring human intervention.",
+  "maxaccess": "read-only",
+  "name": "hrPrinterDetectedErrorState",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.25.3.5.1.2",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "OCTET STRING"
+  }
+ },
+ "hrPrinterEntry": {
+  "class": "objecttype",
+  "description": "A (conceptual) entry for one printer local to the host. The hrDeviceIndex in the index represents the entry in the hrDeviceTable that corresponds to the hrPrinterEntry. As an example of how objects in this table are named, an instance of the hrPrinterStatus object might be named hrPrinterStatus.3",
+  "indices": [
+   {
+    "implied": 0,
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrDeviceIndex"
+   }
+  ],
+  "maxaccess": "not-accessible",
+  "name": "hrPrinterEntry",
+  "nodetype": "row",
+  "oid": "1.3.6.1.2.1.25.3.5.1",
+  "status": "current"
+ },
+ "hrPrinterStatus": {
+  "class": "objecttype",
+  "description": "The current status of this printer device.",
+  "maxaccess": "read-only",
+  "name": "hrPrinterStatus",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.25.3.5.1.1",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "enumeration": {
+     "idle": 3,
+     "other": 1,
+     "printing": 4,
+     "unknown": 2,
+     "warmup": 5
+    }
+   },
+   "type": "INTEGER"
+  }
+ },
+ "hrPrinterTable": {
+  "class": "objecttype",
+  "description": "The (conceptual) table of printers local to the host. Note that this table is potentially sparse: a (conceptual) entry exists only if the correspondent value of the hrDeviceType object is `hrDevicePrinter'.",
+  "maxaccess": "not-accessible",
+  "name": "hrPrinterTable",
+  "nodetype": "table",
+  "oid": "1.3.6.1.2.1.25.3.5",
+  "status": "current"
+ },
+ "hrProcessorEntry": {
+  "class": "objecttype",
+  "description": "A (conceptual) entry for one processor contained by the host. The hrDeviceIndex in the index represents the entry in the hrDeviceTable that corresponds to the hrProcessorEntry. As an example of how objects in this table are named, an instance of the hrProcessorFrwID object might be named hrProcessorFrwID.3",
+  "indices": [
+   {
+    "implied": 0,
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrDeviceIndex"
+   }
+  ],
+  "maxaccess": "not-accessible",
+  "name": "hrProcessorEntry",
+  "nodetype": "row",
+  "oid": "1.3.6.1.2.1.25.3.3.1",
+  "status": "current"
+ },
+ "hrProcessorFrwID": {
+  "class": "objecttype",
+  "description": "The product ID of the firmware associated with the processor.",
+  "maxaccess": "read-only",
+  "name": "hrProcessorFrwID",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.25.3.3.1.1",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "ProductID"
+  }
+ },
+ "hrProcessorLoad": {
+  "class": "objecttype",
+  "description": "The average, over the last minute, of the percentage of time that this processor was not idle. Implementations may approximate this one minute smoothing period if necessary.",
+  "maxaccess": "read-only",
+  "name": "hrProcessorLoad",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.25.3.3.1.2",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 100,
+      "min": 0
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "hrProcessorTable": {
+  "class": "objecttype",
+  "description": "The (conceptual) table of processors contained by the host. Note that this table is potentially sparse: a (conceptual) entry exists only if the correspondent value of the hrDeviceType object is `hrDeviceProcessor'.",
+  "maxaccess": "not-accessible",
+  "name": "hrProcessorTable",
+  "nodetype": "table",
+  "oid": "1.3.6.1.2.1.25.3.3",
+  "status": "current"
+ },
+ "hrSWInstalled": {
+  "class": "objectidentity",
+  "name": "hrSWInstalled",
+  "oid": "1.3.6.1.2.1.25.6"
+ },
+ "hrSWInstalledDate": {
+  "class": "objecttype",
+  "description": "The last-modification date of this application as it would appear in a directory listing. If this information is not known, then this variable shall have the value corresponding to January 1, year 0000, 00:00:00.0, which is encoded as (hex)'00 00 01 01 00 00 00 00'.",
+  "maxaccess": "read-only",
+  "name": "hrSWInstalledDate",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.25.6.3.1.5",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "DateAndTime"
+  }
+ },
+ "hrSWInstalledEntry": {
+  "class": "objecttype",
+  "description": "A (conceptual) entry for a piece of software installed on this host. As an example of how objects in this table are named, an instance of the hrSWInstalledName object might be named hrSWInstalledName.96",
+  "indices": [
+   {
+    "implied": 0,
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrSWInstalledIndex"
+   }
+  ],
+  "maxaccess": "not-accessible",
+  "name": "hrSWInstalledEntry",
+  "nodetype": "row",
+  "oid": "1.3.6.1.2.1.25.6.3.1",
+  "status": "current"
+ },
+ "hrSWInstalledGroup": {
+  "class": "objectgroup",
+  "description": "The Host Resources Installed Software Group.",
+  "name": "hrSWInstalledGroup",
+  "objects": [
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrSWInstalledLastChange"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrSWInstalledLastUpdateTime"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrSWInstalledIndex"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrSWInstalledName"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrSWInstalledID"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrSWInstalledType"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrSWInstalledDate"
+   }
+  ],
+  "oid": "1.3.6.1.2.1.25.7.3.6",
+  "status": "current"
+ },
+ "hrSWInstalledID": {
+  "class": "objecttype",
+  "description": "The product ID of this installed piece of software.",
+  "maxaccess": "read-only",
+  "name": "hrSWInstalledID",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.25.6.3.1.3",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "ProductID"
+  }
+ },
+ "hrSWInstalledIndex": {
+  "class": "objecttype",
+  "description": "A unique value for each piece of software installed on the host. This value shall be in the range from 1 to the number of pieces of software installed on the host.",
+  "maxaccess": "read-only",
+  "name": "hrSWInstalledIndex",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.25.6.3.1.1",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 2147483647,
+      "min": 1
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "hrSWInstalledLastChange": {
+  "class": "objecttype",
+  "description": "The value of sysUpTime when an entry in the hrSWInstalledTable was last added, renamed, or deleted. Because this table is likely to contain many entries, polling of this object allows a management station to determine when re-downloading of the table might be useful.",
+  "maxaccess": "read-only",
+  "name": "hrSWInstalledLastChange",
+  "nodetype": "scalar",
+  "oid": "1.3.6.1.2.1.25.6.1",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "TimeTicks"
+  }
+ },
+ "hrSWInstalledLastUpdateTime": {
+  "class": "objecttype",
+  "description": "The value of sysUpTime when the hrSWInstalledTable was last completely updated. Because caching of this data will be a popular implementation strategy, retrieval of this object allows a management station to obtain a guarantee that no data in this table is older than the indicated time.",
+  "maxaccess": "read-only",
+  "name": "hrSWInstalledLastUpdateTime",
+  "nodetype": "scalar",
+  "oid": "1.3.6.1.2.1.25.6.2",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "TimeTicks"
+  }
+ },
+ "hrSWInstalledName": {
+  "class": "objecttype",
+  "description": "A textual description of this installed piece of software, including the manufacturer, revision, the name by which it is commonly known, and optionally, its serial number.",
+  "maxaccess": "read-only",
+  "name": "hrSWInstalledName",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.25.6.3.1.2",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "size": [
+     {
+      "max": 64,
+      "min": 0
+     }
+    ]
+   },
+   "type": "InternationalDisplayString"
+  }
+ },
+ "hrSWInstalledTable": {
+  "class": "objecttype",
+  "description": "The (conceptual) table of software installed on this host.",
+  "maxaccess": "not-accessible",
+  "name": "hrSWInstalledTable",
+  "nodetype": "table",
+  "oid": "1.3.6.1.2.1.25.6.3",
+  "status": "current"
+ },
+ "hrSWInstalledType": {
+  "class": "objecttype",
+  "description": "The type of this software.",
+  "maxaccess": "read-only",
+  "name": "hrSWInstalledType",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.25.6.3.1.4",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "enumeration": {
+     "application": 4,
+     "deviceDriver": 3,
+     "operatingSystem": 2,
+     "unknown": 1
+    }
+   },
+   "type": "INTEGER"
+  }
+ },
+ "hrSWOSIndex": {
+  "class": "objecttype",
+  "description": "The value of the hrSWRunIndex for the hrSWRunEntry that represents the primary operating system running on this host. This object is useful for quickly and uniquely identifying that primary operating system.",
+  "maxaccess": "read-only",
+  "name": "hrSWOSIndex",
+  "nodetype": "scalar",
+  "oid": "1.3.6.1.2.1.25.4.1",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 2147483647,
+      "min": 1
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "hrSWRun": {
+  "class": "objectidentity",
+  "name": "hrSWRun",
+  "oid": "1.3.6.1.2.1.25.4"
+ },
+ "hrSWRunEntry": {
+  "class": "objecttype",
+  "description": "A (conceptual) entry for one piece of software running on the host Note that because the installed software table only contains information for software stored locally on this host, not every piece of running software will be found in the installed software table. This is true of software that was loaded and run from a non-local source, such as a network-mounted file system. As an example of how objects in this table are named, an instance of the hrSWRunName object might be named hrSWRunName.1287",
+  "indices": [
+   {
+    "implied": 0,
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrSWRunIndex"
+   }
+  ],
+  "maxaccess": "not-accessible",
+  "name": "hrSWRunEntry",
+  "nodetype": "row",
+  "oid": "1.3.6.1.2.1.25.4.2.1",
+  "status": "current"
+ },
+ "hrSWRunGroup": {
+  "class": "objectgroup",
+  "description": "The Host Resources Running Software Group.",
+  "name": "hrSWRunGroup",
+  "objects": [
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrSWOSIndex"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrSWRunIndex"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrSWRunName"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrSWRunID"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrSWRunPath"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrSWRunParameters"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrSWRunType"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrSWRunStatus"
+   }
+  ],
+  "oid": "1.3.6.1.2.1.25.7.3.4",
+  "status": "current"
+ },
+ "hrSWRunID": {
+  "class": "objecttype",
+  "description": "The product ID of this running piece of software.",
+  "maxaccess": "read-only",
+  "name": "hrSWRunID",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.25.4.2.1.3",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "ProductID"
+  }
+ },
+ "hrSWRunIndex": {
+  "class": "objecttype",
+  "description": "A unique value for each piece of software running on the host. Wherever possible, this should be the system's native, unique identification number.",
+  "maxaccess": "read-only",
+  "name": "hrSWRunIndex",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.25.4.2.1.1",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 2147483647,
+      "min": 1
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "hrSWRunName": {
+  "class": "objecttype",
+  "description": "A textual description of this running piece of software, including the manufacturer, revision, and the name by which it is commonly known. If this software was installed locally, this should be the same string as used in the corresponding hrSWInstalledName.",
+  "maxaccess": "read-only",
+  "name": "hrSWRunName",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.25.4.2.1.2",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "size": [
+     {
+      "max": 64,
+      "min": 0
+     }
+    ]
+   },
+   "type": "InternationalDisplayString"
+  }
+ },
+ "hrSWRunParameters": {
+  "class": "objecttype",
+  "description": "A description of the parameters supplied to this software when it was initially loaded.",
+  "maxaccess": "read-only",
+  "name": "hrSWRunParameters",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.25.4.2.1.5",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "size": [
+     {
+      "max": 128,
+      "min": 0
+     }
+    ]
+   },
+   "type": "InternationalDisplayString"
+  }
+ },
+ "hrSWRunPath": {
+  "class": "objecttype",
+  "description": "A description of the location on long-term storage (e.g. a disk drive) from which this software was loaded.",
+  "maxaccess": "read-only",
+  "name": "hrSWRunPath",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.25.4.2.1.4",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "size": [
+     {
+      "max": 128,
+      "min": 0
+     }
+    ]
+   },
+   "type": "InternationalDisplayString"
+  }
+ },
+ "hrSWRunPerf": {
+  "class": "objectidentity",
+  "name": "hrSWRunPerf",
+  "oid": "1.3.6.1.2.1.25.5"
+ },
+ "hrSWRunPerfCPU": {
+  "class": "objecttype",
+  "description": "The number of centi-seconds of the total system's CPU resources consumed by this process. Note that on a multi-processor system, this value may increment by more than one centi-second in one centi-second of real (wall clock) time.",
+  "maxaccess": "read-only",
+  "name": "hrSWRunPerfCPU",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.25.5.1.1.1",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 2147483647,
+      "min": 0
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "hrSWRunPerfEntry": {
+  "augmention": {
+   "module": "HOST-RESOURCES-MIB",
+   "name": "hrSWRunPerfEntry",
+   "object": "hrSWRunEntry"
+  },
+  "class": "objecttype",
+  "description": "A (conceptual) entry containing software performance metrics. As an example, an instance of the hrSWRunPerfCPU object might be named hrSWRunPerfCPU.1287",
+  "maxaccess": "not-accessible",
+  "name": "hrSWRunPerfEntry",
+  "nodetype": "row",
+  "oid": "1.3.6.1.2.1.25.5.1.1",
+  "status": "current"
+ },
+ "hrSWRunPerfGroup": {
+  "class": "objectgroup",
+  "description": "The Host Resources Running Software Performance Group.",
+  "name": "hrSWRunPerfGroup",
+  "objects": [
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrSWRunPerfCPU"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrSWRunPerfMem"
+   }
+  ],
+  "oid": "1.3.6.1.2.1.25.7.3.5",
+  "status": "current"
+ },
+ "hrSWRunPerfMem": {
+  "class": "objecttype",
+  "description": "The total amount of real system memory allocated to this process.",
+  "maxaccess": "read-only",
+  "name": "hrSWRunPerfMem",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.25.5.1.1.2",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "KBytes"
+  },
+  "units": "KBytes"
+ },
+ "hrSWRunPerfTable": {
+  "class": "objecttype",
+  "description": "The (conceptual) table of running software performance metrics.",
+  "maxaccess": "not-accessible",
+  "name": "hrSWRunPerfTable",
+  "nodetype": "table",
+  "oid": "1.3.6.1.2.1.25.5.1",
+  "status": "current"
+ },
+ "hrSWRunStatus": {
+  "class": "objecttype",
+  "description": "The status of this running piece of software. Setting this value to invalid(4) shall cause this software to stop running and to be unloaded. Sets to other values are not valid.",
+  "maxaccess": "read-write",
+  "name": "hrSWRunStatus",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.25.4.2.1.7",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "enumeration": {
+     "invalid": 4,
+     "notRunnable": 3,
+     "runnable": 2,
+     "running": 1
+    }
+   },
+   "type": "INTEGER"
+  }
+ },
+ "hrSWRunTable": {
+  "class": "objecttype",
+  "description": "The (conceptual) table of software running on the host.",
+  "maxaccess": "not-accessible",
+  "name": "hrSWRunTable",
+  "nodetype": "table",
+  "oid": "1.3.6.1.2.1.25.4.2",
+  "status": "current"
+ },
+ "hrSWRunType": {
+  "class": "objecttype",
+  "description": "The type of this software.",
+  "maxaccess": "read-only",
+  "name": "hrSWRunType",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.25.4.2.1.6",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "enumeration": {
+     "application": 4,
+     "deviceDriver": 3,
+     "operatingSystem": 2,
+     "unknown": 1
+    }
+   },
+   "type": "INTEGER"
+  }
+ },
+ "hrStorage": {
+  "class": "objectidentity",
+  "name": "hrStorage",
+  "oid": "1.3.6.1.2.1.25.2"
+ },
+ "hrStorageAllocationFailures": {
+  "class": "objecttype",
+  "description": "The number of requests for storage represented by this entry that could not be honored due to not enough storage. It should be noted that as this object has a SYNTAX of Counter32, that it does not have a defined initial value. However, it is recommended that this object be initialized to zero, even though management stations must not depend on such an initialization.",
+  "maxaccess": "read-only",
+  "name": "hrStorageAllocationFailures",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.25.2.3.1.7",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  }
+ },
+ "hrStorageAllocationUnits": {
+  "class": "objecttype",
+  "description": "The size, in bytes, of the data objects allocated from this pool. If this entry is monitoring sectors, blocks, buffers, or packets, for example, this number will commonly be greater than one. Otherwise this number will typically be one.",
+  "maxaccess": "read-only",
+  "name": "hrStorageAllocationUnits",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.25.2.3.1.4",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 2147483647,
+      "min": 1
+     }
+    ]
+   },
+   "type": "Integer32"
+  },
+  "units": "Bytes"
+ },
+ "hrStorageDescr": {
+  "class": "objecttype",
+  "description": "A description of the type and instance of the storage described by this entry.",
+  "maxaccess": "read-only",
+  "name": "hrStorageDescr",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.25.2.3.1.3",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "DisplayString"
+  }
+ },
+ "hrStorageEntry": {
+  "class": "objecttype",
+  "description": "A (conceptual) entry for one logical storage area on the host. As an example, an instance of the hrStorageType object might be named hrStorageType.3",
+  "indices": [
+   {
+    "implied": 0,
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrStorageIndex"
+   }
+  ],
+  "maxaccess": "not-accessible",
+  "name": "hrStorageEntry",
+  "nodetype": "row",
+  "oid": "1.3.6.1.2.1.25.2.3.1",
+  "status": "current"
+ },
+ "hrStorageGroup": {
+  "class": "objectgroup",
+  "description": "The Host Resources Storage Group.",
+  "name": "hrStorageGroup",
+  "objects": [
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrMemorySize"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrStorageIndex"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrStorageType"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrStorageDescr"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrStorageAllocationUnits"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrStorageSize"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrStorageUsed"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrStorageAllocationFailures"
+   }
+  ],
+  "oid": "1.3.6.1.2.1.25.7.3.2",
+  "status": "current"
+ },
+ "hrStorageIndex": {
+  "class": "objecttype",
+  "description": "A unique value for each logical storage area contained by the host.",
+  "maxaccess": "read-only",
+  "name": "hrStorageIndex",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.25.2.3.1.1",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 2147483647,
+      "min": 1
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "hrStorageSize": {
+  "class": "objecttype",
+  "description": "The size of the storage represented by this entry, in units of hrStorageAllocationUnits. This object is writable to allow remote configuration of the size of the storage area in those cases where such an operation makes sense and is possible on the underlying system. For example, the amount of main memory allocated to a buffer pool might be modified or the amount of disk space allocated to virtual memory might be modified.",
+  "maxaccess": "read-write",
+  "name": "hrStorageSize",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.25.2.3.1.5",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 2147483647,
+      "min": 0
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "hrStorageTable": {
+  "class": "objecttype",
+  "description": "The (conceptual) table of logical storage areas on the host. An entry shall be placed in the storage table for each logical area of storage that is allocated and has fixed resource limits. The amount of storage represented in an entity is the amount actually usable by the requesting entity, and excludes loss due to formatting or file system reference information. These entries are associated with logical storage areas, as might be seen by an application, rather than physical storage entities which are typically seen by an operating system. Storage such as tapes and floppies without file systems on them are typically not allocated in chunks by the operating system to requesting applications, and therefore shouldn't appear in this table. Examples of valid storage for this table include disk partitions, file systems, ram (for some architectures this is further segmented into regular memory, extended memory, and so on), backing store for virtual memory (`swap space'). This table is intended to be a useful diagnostic for `out of memory' and `out of buffers' types of failures. In addition, it can be a useful performance monitoring tool for tracking memory, disk, or buffer usage.",
+  "maxaccess": "not-accessible",
+  "name": "hrStorageTable",
+  "nodetype": "table",
+  "oid": "1.3.6.1.2.1.25.2.3",
+  "status": "current"
+ },
+ "hrStorageType": {
+  "class": "objecttype",
+  "description": "The type of storage represented by this entry.",
+  "maxaccess": "read-only",
+  "name": "hrStorageType",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.25.2.3.1.2",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "AutonomousType"
+  }
+ },
+ "hrStorageTypes": {
+  "class": "objectidentity",
+  "name": "hrStorageTypes",
+  "oid": "1.3.6.1.2.1.25.2.1"
+ },
+ "hrStorageUsed": {
+  "class": "objecttype",
+  "description": "The amount of the storage represented by this entry that is allocated, in units of hrStorageAllocationUnits.",
+  "maxaccess": "read-only",
+  "name": "hrStorageUsed",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.25.2.3.1.6",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 2147483647,
+      "min": 0
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "hrSystem": {
+  "class": "objectidentity",
+  "name": "hrSystem",
+  "oid": "1.3.6.1.2.1.25.1"
+ },
+ "hrSystemDate": {
+  "class": "objecttype",
+  "description": "The host's notion of the local date and time of day.",
+  "maxaccess": "read-write",
+  "name": "hrSystemDate",
+  "nodetype": "scalar",
+  "oid": "1.3.6.1.2.1.25.1.2",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "DateAndTime"
+  }
+ },
+ "hrSystemGroup": {
+  "class": "objectgroup",
+  "description": "The Host Resources System Group.",
+  "name": "hrSystemGroup",
+  "objects": [
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrSystemUptime"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrSystemDate"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrSystemInitialLoadDevice"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrSystemInitialLoadParameters"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrSystemNumUsers"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrSystemProcesses"
+   },
+   {
+    "module": "HOST-RESOURCES-MIB",
+    "object": "hrSystemMaxProcesses"
+   }
+  ],
+  "oid": "1.3.6.1.2.1.25.7.3.1",
+  "status": "current"
+ },
+ "hrSystemInitialLoadDevice": {
+  "class": "objecttype",
+  "description": "The index of the hrDeviceEntry for the device from which this host is configured to load its initial operating system configuration (i.e., which operating system code and/or boot parameters). Note that writing to this object just changes the configuration that will be used the next time the operating system is loaded and does not actually cause the reload to occur.",
+  "maxaccess": "read-write",
+  "name": "hrSystemInitialLoadDevice",
+  "nodetype": "scalar",
+  "oid": "1.3.6.1.2.1.25.1.3",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 2147483647,
+      "min": 1
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "hrSystemInitialLoadParameters": {
+  "class": "objecttype",
+  "description": "This object contains the parameters (e.g. a pathname and parameter) supplied to the load device when requesting the initial operating system configuration from that device. Note that writing to this object just changes the configuration that will be used the next time the operating system is loaded and does not actually cause the reload to occur.",
+  "maxaccess": "read-write",
+  "name": "hrSystemInitialLoadParameters",
+  "nodetype": "scalar",
+  "oid": "1.3.6.1.2.1.25.1.4",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "size": [
+     {
+      "max": 128,
+      "min": 0
+     }
+    ]
+   },
+   "type": "InternationalDisplayString"
+  }
+ },
+ "hrSystemMaxProcesses": {
+  "class": "objecttype",
+  "description": "The maximum number of process contexts this system can support. If there is no fixed maximum, the value should be zero. On systems that have a fixed maximum, this object can help diagnose failures that occur when this maximum is reached.",
+  "maxaccess": "read-only",
+  "name": "hrSystemMaxProcesses",
+  "nodetype": "scalar",
+  "oid": "1.3.6.1.2.1.25.1.7",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 2147483647,
+      "min": 0
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "hrSystemNumUsers": {
+  "class": "objecttype",
+  "description": "The number of user sessions for which this host is storing state information. A session is a collection of processes requiring a single act of user authentication and possibly subject to collective job control.",
+  "maxaccess": "read-only",
+  "name": "hrSystemNumUsers",
+  "nodetype": "scalar",
+  "oid": "1.3.6.1.2.1.25.1.5",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Gauge32"
+  }
+ },
+ "hrSystemProcesses": {
+  "class": "objecttype",
+  "description": "The number of process contexts currently loaded or running on this system.",
+  "maxaccess": "read-only",
+  "name": "hrSystemProcesses",
+  "nodetype": "scalar",
+  "oid": "1.3.6.1.2.1.25.1.6",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Gauge32"
+  }
+ },
+ "hrSystemUptime": {
+  "class": "objecttype",
+  "description": "The amount of time since this host was last initialized. Note that this is different from sysUpTime in the SNMPv2-MIB [RFC1907] because sysUpTime is the uptime of the network management portion of the system.",
+  "maxaccess": "read-only",
+  "name": "hrSystemUptime",
+  "nodetype": "scalar",
+  "oid": "1.3.6.1.2.1.25.1.1",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "TimeTicks"
+  }
+ },
+ "imports": {
+  "IF-MIB": [
+   "InterfaceIndexOrZero"
+  ],
+  "SNMPv2-CONF": [
+   "MODULE-COMPLIANCE",
+   "NOTIFICATION-GROUP",
+   "OBJECT-GROUP"
+  ],
+  "SNMPv2-SMI": [
+   "Bits",
+   "Counter32",
+   "Gauge32",
+   "Integer32",
+   "IpAddress",
+   "MODULE-IDENTITY",
+   "MibIdentifier",
+   "OBJECT-IDENTITY",
+   "OBJECT-TYPE",
+   "TimeTicks",
+   "Unsigned32",
+   "iso",
+   "mib-2"
+  ],
+  "SNMPv2-TC": [
+   "AutonomousType",
+   "DateAndTime",
+   "DisplayString",
+   "PhysAddress",
+   "TEXTUAL-CONVENTION",
+   "TruthValue"
+  ],
+  "class": "imports"
+ },
+ "meta": {
+  "module": "HOST-RESOURCES-MIB"
+ }
+}

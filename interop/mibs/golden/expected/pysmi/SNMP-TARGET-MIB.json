@@ -1,0 +1,607 @@
+{
+ "SnmpTagList": {
+  "class": "textualconvention",
+  "description": "An octet string containing a list of tag values. Tag values are preferably in human-readable form. To facilitate internationalization, this information is represented using the ISO/IEC IS 10646-1 character set, encoded as an octet string using the UTF-8 character encoding scheme described in RFC 2279. Since additional code points are added by amendments to the 10646 standard from time to time, implementations must be prepared to encounter any code point from 0x00000000 to 0x7fffffff. The use of control codes should be avoided, except as described below. For code points not directly supported by user interface hardware or software, an alternative means of entry and display, such as hexadecimal, may be provided. For information encoded in 7-bit US-ASCII, the UTF-8 representation is identical to the US-ASCII encoding. An object of this type contains a list of tag values which are used to select a set of entries in a table. A tag value is an arbitrary string of octets, but may not contain a delimiter character. Delimiter characters are defined to be one of the following: - An ASCII space character (0x20). - An ASCII TAB character (0x09). - An ASCII carriage return (CR) character (0x0D). - An ASCII line feed (LF) character (0x0A). Delimiter characters are used to separate tag values in a tag list. Only a single delimiter character may occur between two tag values. A tag value may not have a zero length. These constraints imply certain restrictions on the contents of this object: - There cannot be a leading or trailing delimiter character. - There cannot be multiple adjacent delimiter characters. Some examples of valid tag lists are: - '' -- an empty list - 'acme' -- list of one tag - 'host router bridge' -- list of several tags Note that although a tag value may not have a length of zero, an empty string is still valid. This indicates an empty list (i.e. there are no tag values in the list). The use of the tag list to select table entries is application and MIB specific. Typically, an application will provide one or more tag values, and any entry which contains some combination of these tag values will be selected.",
+  "displayhint": "255t",
+  "name": "SnmpTagList",
+  "status": "current",
+  "type": {
+   "class": "type",
+   "constraints": {
+    "size": [
+     {
+      "max": 255,
+      "min": 0
+     }
+    ]
+   },
+   "tcbase": false,
+   "type": "OCTET STRING"
+  }
+ },
+ "SnmpTagValue": {
+  "class": "textualconvention",
+  "description": "An octet string containing a tag value. Tag values are preferably in human-readable form. To facilitate internationalization, this information is represented using the ISO/IEC IS 10646-1 character set, encoded as an octet string using the UTF-8 character encoding scheme described in RFC 2279. Since additional code points are added by amendments to the 10646 standard from time to time, implementations must be prepared to encounter any code point from 0x00000000 to 0x7fffffff. The use of control codes should be avoided, and certain control codes are not allowed as described below. For code points not directly supported by user interface hardware or software, an alternative means of entry and display, such as hexadecimal, may be provided. For information encoded in 7-bit US-ASCII, the UTF-8 representation is identical to the US-ASCII encoding. Note that when this TC is used for an object that is used or envisioned to be used as an index, then a SIZE restriction must be specified so that the number of sub-identifiers for any object instance does not exceed the limit of 128, as defined by [RFC1905]. An object of this type contains a single tag value which is used to select a set of entries in a table. A tag value is an arbitrary string of octets, but may not contain a delimiter character. Delimiter characters are defined to be one of the following: - An ASCII space character (0x20). - An ASCII TAB character (0x09). - An ASCII carriage return (CR) character (0x0D). - An ASCII line feed (LF) character (0x0A). Delimiter characters are used to separate tag values in a tag list. An object of this type may only contain a single tag value, and so delimiter characters are not allowed in a value of this type. Note that a tag value of 0 length means that no tag is defined. In other words, a tag value of 0 length would never match anything in a tag list, and would never select any table entries. Some examples of valid tag values are: - 'acme' - 'router' - 'host' The use of a tag value to select table entries is application and MIB specific.",
+  "displayhint": "255t",
+  "name": "SnmpTagValue",
+  "status": "current",
+  "type": {
+   "class": "type",
+   "constraints": {
+    "size": [
+     {
+      "max": 255,
+      "min": 0
+     }
+    ]
+   },
+   "tcbase": false,
+   "type": "OCTET STRING"
+  }
+ },
+ "imports": {
+  "SNMP-FRAMEWORK-MIB": [
+   "SnmpAdminString",
+   "SnmpMessageProcessingModel",
+   "SnmpSecurityLevel",
+   "SnmpSecurityModel"
+  ],
+  "SNMPv2-CONF": [
+   "MODULE-COMPLIANCE",
+   "NOTIFICATION-GROUP",
+   "OBJECT-GROUP"
+  ],
+  "SNMPv2-SMI": [
+   "Bits",
+   "Counter32",
+   "Integer32",
+   "IpAddress",
+   "MODULE-IDENTITY",
+   "MibIdentifier",
+   "OBJECT-IDENTITY",
+   "OBJECT-TYPE",
+   "TimeTicks",
+   "Unsigned32",
+   "iso",
+   "snmpModules"
+  ],
+  "SNMPv2-TC": [
+   "DisplayString",
+   "PhysAddress",
+   "RowStatus",
+   "StorageType",
+   "TAddress",
+   "TDomain",
+   "TEXTUAL-CONVENTION",
+   "TestAndIncr",
+   "TimeInterval"
+  ],
+  "class": "imports"
+ },
+ "meta": {
+  "module": "SNMP-TARGET-MIB"
+ },
+ "snmpTargetAddrEntry": {
+  "class": "objecttype",
+  "description": "A transport address to be used in the generation of SNMP operations. Entries in the snmpTargetAddrTable are created and deleted using the snmpTargetAddrRowStatus object.",
+  "indices": [
+   {
+    "implied": 1,
+    "module": "SNMP-TARGET-MIB",
+    "object": "snmpTargetAddrName"
+   }
+  ],
+  "maxaccess": "not-accessible",
+  "name": "snmpTargetAddrEntry",
+  "nodetype": "row",
+  "oid": "1.3.6.1.6.3.12.1.2.1",
+  "status": "current"
+ },
+ "snmpTargetAddrName": {
+  "class": "objecttype",
+  "description": "The locally arbitrary, but unique identifier associated with this snmpTargetAddrEntry.",
+  "maxaccess": "not-accessible",
+  "name": "snmpTargetAddrName",
+  "nodetype": "column",
+  "oid": "1.3.6.1.6.3.12.1.2.1.1",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "size": [
+     {
+      "max": 32,
+      "min": 1
+     }
+    ]
+   },
+   "type": "SnmpAdminString"
+  }
+ },
+ "snmpTargetAddrParams": {
+  "class": "objecttype",
+  "description": "The value of this object identifies an entry in the snmpTargetParamsTable. The identified entry contains SNMP parameters to be used when generating messages to be sent to this transport address.",
+  "maxaccess": "read-create",
+  "name": "snmpTargetAddrParams",
+  "nodetype": "column",
+  "oid": "1.3.6.1.6.3.12.1.2.1.7",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "size": [
+     {
+      "max": 32,
+      "min": 1
+     }
+    ]
+   },
+   "type": "SnmpAdminString"
+  }
+ },
+ "snmpTargetAddrRetryCount": {
+  "class": "objecttype",
+  "default": {
+   "default": {
+    "basetype": "Integer32",
+    "format": "decimal",
+    "value": "3"
+   }
+  },
+  "description": "This object specifies a default number of retries to be attempted when a response is not received for a generated message. An application may provide its own retry count, in which case the value of this object is ignored.",
+  "maxaccess": "read-create",
+  "name": "snmpTargetAddrRetryCount",
+  "nodetype": "column",
+  "oid": "1.3.6.1.6.3.12.1.2.1.5",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 255,
+      "min": 0
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "snmpTargetAddrRowStatus": {
+  "class": "objecttype",
+  "description": "The status of this conceptual row. To create a row in this table, a manager must set this object to either createAndGo(4) or createAndWait(5). Until instances of all corresponding columns are appropriately configured, the value of the corresponding instance of the snmpTargetAddrRowStatus column is 'notReady'. In particular, a newly created row cannot be made active until the corresponding instances of snmpTargetAddrTDomain, snmpTargetAddrTAddress, and snmpTargetAddrParams have all been set. The following objects may not be modified while the value of this object is active(1): - snmpTargetAddrTDomain - snmpTargetAddrTAddress An attempt to set these objects while the value of snmpTargetAddrRowStatus is active(1) will result in an inconsistentValue error.",
+  "maxaccess": "read-create",
+  "name": "snmpTargetAddrRowStatus",
+  "nodetype": "column",
+  "oid": "1.3.6.1.6.3.12.1.2.1.9",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "RowStatus"
+  }
+ },
+ "snmpTargetAddrStorageType": {
+  "class": "objecttype",
+  "default": {
+   "default": {
+    "basetype": "Integer32",
+    "format": "decimal",
+    "value": "3"
+   }
+  },
+  "description": "The storage type for this conceptual row. Conceptual rows having the value 'permanent' need not allow write-access to any columnar objects in the row.",
+  "maxaccess": "read-create",
+  "name": "snmpTargetAddrStorageType",
+  "nodetype": "column",
+  "oid": "1.3.6.1.6.3.12.1.2.1.8",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "StorageType"
+  }
+ },
+ "snmpTargetAddrTAddress": {
+  "class": "objecttype",
+  "description": "This object contains a transport address. The format of this address depends on the value of the snmpTargetAddrTDomain object.",
+  "maxaccess": "read-create",
+  "name": "snmpTargetAddrTAddress",
+  "nodetype": "column",
+  "oid": "1.3.6.1.6.3.12.1.2.1.3",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "TAddress"
+  }
+ },
+ "snmpTargetAddrTDomain": {
+  "class": "objecttype",
+  "description": "This object indicates the transport type of the address contained in the snmpTargetAddrTAddress object.",
+  "maxaccess": "read-create",
+  "name": "snmpTargetAddrTDomain",
+  "nodetype": "column",
+  "oid": "1.3.6.1.6.3.12.1.2.1.2",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "TDomain"
+  }
+ },
+ "snmpTargetAddrTable": {
+  "class": "objecttype",
+  "description": "A table of transport addresses to be used in the generation of SNMP messages.",
+  "maxaccess": "not-accessible",
+  "name": "snmpTargetAddrTable",
+  "nodetype": "table",
+  "oid": "1.3.6.1.6.3.12.1.2",
+  "status": "current"
+ },
+ "snmpTargetAddrTagList": {
+  "class": "objecttype",
+  "default": {
+   "default": {
+    "basetype": "OctetString",
+    "format": "string",
+    "value": ""
+   }
+  },
+  "description": "This object contains a list of tag values which are used to select target addresses for a particular operation.",
+  "maxaccess": "read-create",
+  "name": "snmpTargetAddrTagList",
+  "nodetype": "column",
+  "oid": "1.3.6.1.6.3.12.1.2.1.6",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "SnmpTagList"
+  }
+ },
+ "snmpTargetAddrTimeout": {
+  "class": "objecttype",
+  "default": {
+   "default": {
+    "basetype": "Integer32",
+    "format": "decimal",
+    "value": "1500"
+   }
+  },
+  "description": "This object should reflect the expected maximum round trip time for communicating with the transport address defined by this row. When a message is sent to this address, and a response (if one is expected) is not received within this time period, an implementation may assume that the response will not be delivered. Note that the time interval that an application waits for a response may actually be derived from the value of this object. The method for deriving the actual time interval is implementation dependent. One such method is to derive the expected round trip time based on a particular retransmission algorithm and on the number of timeouts which have occurred. The type of message may also be considered when deriving expected round trip times for retransmissions. For example, if a message is being sent with a securityLevel that indicates both authentication and privacy, the derived value may be increased to compensate for extra processing time spent during authentication and encryption processing.",
+  "maxaccess": "read-create",
+  "name": "snmpTargetAddrTimeout",
+  "nodetype": "column",
+  "oid": "1.3.6.1.6.3.12.1.2.1.4",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "TimeInterval"
+  }
+ },
+ "snmpTargetBasicGroup": {
+  "class": "objectgroup",
+  "description": "A collection of objects providing basic remote configuration of management targets.",
+  "name": "snmpTargetBasicGroup",
+  "objects": [
+   {
+    "module": "SNMP-TARGET-MIB",
+    "object": "snmpTargetSpinLock"
+   },
+   {
+    "module": "SNMP-TARGET-MIB",
+    "object": "snmpTargetAddrTDomain"
+   },
+   {
+    "module": "SNMP-TARGET-MIB",
+    "object": "snmpTargetAddrTAddress"
+   },
+   {
+    "module": "SNMP-TARGET-MIB",
+    "object": "snmpTargetAddrTagList"
+   },
+   {
+    "module": "SNMP-TARGET-MIB",
+    "object": "snmpTargetAddrParams"
+   },
+   {
+    "module": "SNMP-TARGET-MIB",
+    "object": "snmpTargetAddrStorageType"
+   },
+   {
+    "module": "SNMP-TARGET-MIB",
+    "object": "snmpTargetAddrRowStatus"
+   },
+   {
+    "module": "SNMP-TARGET-MIB",
+    "object": "snmpTargetParamsMPModel"
+   },
+   {
+    "module": "SNMP-TARGET-MIB",
+    "object": "snmpTargetParamsSecurityModel"
+   },
+   {
+    "module": "SNMP-TARGET-MIB",
+    "object": "snmpTargetParamsSecurityName"
+   },
+   {
+    "module": "SNMP-TARGET-MIB",
+    "object": "snmpTargetParamsSecurityLevel"
+   },
+   {
+    "module": "SNMP-TARGET-MIB",
+    "object": "snmpTargetParamsStorageType"
+   },
+   {
+    "module": "SNMP-TARGET-MIB",
+    "object": "snmpTargetParamsRowStatus"
+   }
+  ],
+  "oid": "1.3.6.1.6.3.12.3.2.1",
+  "status": "current"
+ },
+ "snmpTargetCommandResponderCompliance": {
+  "class": "modulecompliance",
+  "description": "The compliance statement for SNMP entities which include a command responder application.",
+  "modulecompliance": [
+   {
+    "module": "SNMP-TARGET-MIB",
+    "object": "snmpTargetCommandResponderGroup"
+   }
+  ],
+  "name": "snmpTargetCommandResponderCompliance",
+  "oid": "1.3.6.1.6.3.12.3.1.1",
+  "status": "current"
+ },
+ "snmpTargetCommandResponderGroup": {
+  "class": "objectgroup",
+  "description": "A collection of objects required for command responder applications, used for counting error conditions.",
+  "name": "snmpTargetCommandResponderGroup",
+  "objects": [
+   {
+    "module": "SNMP-TARGET-MIB",
+    "object": "snmpUnavailableContexts"
+   },
+   {
+    "module": "SNMP-TARGET-MIB",
+    "object": "snmpUnknownContexts"
+   }
+  ],
+  "oid": "1.3.6.1.6.3.12.3.2.3",
+  "status": "current"
+ },
+ "snmpTargetCompliances": {
+  "class": "objectidentity",
+  "name": "snmpTargetCompliances",
+  "oid": "1.3.6.1.6.3.12.3.1"
+ },
+ "snmpTargetConformance": {
+  "class": "objectidentity",
+  "name": "snmpTargetConformance",
+  "oid": "1.3.6.1.6.3.12.3"
+ },
+ "snmpTargetGroups": {
+  "class": "objectidentity",
+  "name": "snmpTargetGroups",
+  "oid": "1.3.6.1.6.3.12.3.2"
+ },
+ "snmpTargetMIB": {
+  "class": "moduleidentity",
+  "contactinfo": "WG-email: snmpv3@lists.tislabs.com Subscribe: majordomo@lists.tislabs.com In message body: subscribe snmpv3 Co-Chair: Russ Mundy Network Associates Laboratories Postal: 15204 Omega Drive, Suite 300 Rockville, MD 20850-4601 USA EMail: mundy@tislabs.com Phone: +1 301-947-7107 Co-Chair: David Harrington Enterasys Networks Postal: 35 Industrial Way P. O. Box 5004 Rochester, New Hampshire 03866-5005 USA EMail: dbh@enterasys.com Phone: +1 603-337-2614 Co-editor: David B. Levi Nortel Networks Postal: 3505 Kesterwood Drive Knoxville, Tennessee 37918 EMail: dlevi@nortelnetworks.com Phone: +1 865 686 0432 Co-editor: Paul Meyer Secure Computing Corporation Postal: 2675 Long Lake Road Roseville, Minnesota 55113 EMail: paul_meyer@securecomputing.com Phone: +1 651 628 1592 Co-editor: Bob Stewart Retired",
+  "description": "This MIB module defines MIB objects which provide mechanisms to remotely configure the parameters used by an SNMP entity for the generation of SNMP messages. Copyright (C) The Internet Society (2002). This version of this MIB module is part of RFC 3413; see the RFC itself for full legal notices. ",
+  "lastupdated": "200210140000Z",
+  "name": "snmpTargetMIB",
+  "oid": "1.3.6.1.6.3.12",
+  "organization": "IETF SNMPv3 Working Group",
+  "revisions": [
+   {
+    "description": "Fixed DISPLAY-HINTS for UTF-8 strings, fixed hex value of LF characters, clarified meaning of zero length tag values, improved tag list examples. Published as RFC 3413.",
+    "revision": "2002-10-14 00:00"
+   },
+   {
+    "description": "Clarifications, published as RFC 2573.",
+    "revision": "1998-08-04 00:00"
+   },
+   {
+    "description": "The initial revision, published as RFC2273.",
+    "revision": "1997-07-14 00:00"
+   }
+  ]
+ },
+ "snmpTargetObjects": {
+  "class": "objectidentity",
+  "name": "snmpTargetObjects",
+  "oid": "1.3.6.1.6.3.12.1"
+ },
+ "snmpTargetParamsEntry": {
+  "class": "objecttype",
+  "description": "A set of SNMP target information. Entries in the snmpTargetParamsTable are created and deleted using the snmpTargetParamsRowStatus object.",
+  "indices": [
+   {
+    "implied": 1,
+    "module": "SNMP-TARGET-MIB",
+    "object": "snmpTargetParamsName"
+   }
+  ],
+  "maxaccess": "not-accessible",
+  "name": "snmpTargetParamsEntry",
+  "nodetype": "row",
+  "oid": "1.3.6.1.6.3.12.1.3.1",
+  "status": "current"
+ },
+ "snmpTargetParamsMPModel": {
+  "class": "objecttype",
+  "description": "The Message Processing Model to be used when generating SNMP messages using this entry.",
+  "maxaccess": "read-create",
+  "name": "snmpTargetParamsMPModel",
+  "nodetype": "column",
+  "oid": "1.3.6.1.6.3.12.1.3.1.2",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "SnmpMessageProcessingModel"
+  }
+ },
+ "snmpTargetParamsName": {
+  "class": "objecttype",
+  "description": "The locally arbitrary, but unique identifier associated with this snmpTargetParamsEntry.",
+  "maxaccess": "not-accessible",
+  "name": "snmpTargetParamsName",
+  "nodetype": "column",
+  "oid": "1.3.6.1.6.3.12.1.3.1.1",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "size": [
+     {
+      "max": 32,
+      "min": 1
+     }
+    ]
+   },
+   "type": "SnmpAdminString"
+  }
+ },
+ "snmpTargetParamsRowStatus": {
+  "class": "objecttype",
+  "description": "The status of this conceptual row. To create a row in this table, a manager must set this object to either createAndGo(4) or createAndWait(5). Until instances of all corresponding columns are appropriately configured, the value of the corresponding instance of the snmpTargetParamsRowStatus column is 'notReady'. In particular, a newly created row cannot be made active until the corresponding snmpTargetParamsMPModel, snmpTargetParamsSecurityModel, snmpTargetParamsSecurityName, and snmpTargetParamsSecurityLevel have all been set. The following objects may not be modified while the value of this object is active(1): - snmpTargetParamsMPModel - snmpTargetParamsSecurityModel - snmpTargetParamsSecurityName - snmpTargetParamsSecurityLevel An attempt to set these objects while the value of snmpTargetParamsRowStatus is active(1) will result in an inconsistentValue error.",
+  "maxaccess": "read-create",
+  "name": "snmpTargetParamsRowStatus",
+  "nodetype": "column",
+  "oid": "1.3.6.1.6.3.12.1.3.1.7",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "RowStatus"
+  }
+ },
+ "snmpTargetParamsSecurityLevel": {
+  "class": "objecttype",
+  "description": "The Level of Security to be used when generating SNMP messages using this entry.",
+  "maxaccess": "read-create",
+  "name": "snmpTargetParamsSecurityLevel",
+  "nodetype": "column",
+  "oid": "1.3.6.1.6.3.12.1.3.1.5",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "SnmpSecurityLevel"
+  }
+ },
+ "snmpTargetParamsSecurityModel": {
+  "class": "objecttype",
+  "description": "The Security Model to be used when generating SNMP messages using this entry. An implementation may choose to return an inconsistentValue error if an attempt is made to set this variable to a value for a security model which the implementation does not support.",
+  "maxaccess": "read-create",
+  "name": "snmpTargetParamsSecurityModel",
+  "nodetype": "column",
+  "oid": "1.3.6.1.6.3.12.1.3.1.3",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 2147483647,
+      "min": 1
+     }
+    ]
+   },
+   "type": "SnmpSecurityModel"
+  }
+ },
+ "snmpTargetParamsSecurityName": {
+  "class": "objecttype",
+  "description": "The securityName which identifies the Principal on whose behalf SNMP messages will be generated using this entry.",
+  "maxaccess": "read-create",
+  "name": "snmpTargetParamsSecurityName",
+  "nodetype": "column",
+  "oid": "1.3.6.1.6.3.12.1.3.1.4",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "SnmpAdminString"
+  }
+ },
+ "snmpTargetParamsStorageType": {
+  "class": "objecttype",
+  "default": {
+   "default": {
+    "basetype": "Integer32",
+    "format": "decimal",
+    "value": "3"
+   }
+  },
+  "description": "The storage type for this conceptual row. Conceptual rows having the value 'permanent' need not allow write-access to any columnar objects in the row.",
+  "maxaccess": "read-create",
+  "name": "snmpTargetParamsStorageType",
+  "nodetype": "column",
+  "oid": "1.3.6.1.6.3.12.1.3.1.6",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "StorageType"
+  }
+ },
+ "snmpTargetParamsTable": {
+  "class": "objecttype",
+  "description": "A table of SNMP target information to be used in the generation of SNMP messages.",
+  "maxaccess": "not-accessible",
+  "name": "snmpTargetParamsTable",
+  "nodetype": "table",
+  "oid": "1.3.6.1.6.3.12.1.3",
+  "status": "current"
+ },
+ "snmpTargetResponseGroup": {
+  "class": "objectgroup",
+  "description": "A collection of objects providing remote configuration of management targets for applications which generate SNMP messages for which a response message would be expected.",
+  "name": "snmpTargetResponseGroup",
+  "objects": [
+   {
+    "module": "SNMP-TARGET-MIB",
+    "object": "snmpTargetAddrTimeout"
+   },
+   {
+    "module": "SNMP-TARGET-MIB",
+    "object": "snmpTargetAddrRetryCount"
+   }
+  ],
+  "oid": "1.3.6.1.6.3.12.3.2.2",
+  "status": "current"
+ },
+ "snmpTargetSpinLock": {
+  "class": "objecttype",
+  "description": "This object is used to facilitate modification of table entries in the SNMP-TARGET-MIB module by multiple managers. In particular, it is useful when modifying the value of the snmpTargetAddrTagList object. The procedure for modifying the snmpTargetAddrTagList object is as follows: 1. Retrieve the value of snmpTargetSpinLock and of snmpTargetAddrTagList. 2. Generate a new value for snmpTargetAddrTagList. 3. Set the value of snmpTargetSpinLock to the retrieved value, and the value of snmpTargetAddrTagList to the new value. If the set fails for the snmpTargetSpinLock object, go back to step 1.",
+  "maxaccess": "read-write",
+  "name": "snmpTargetSpinLock",
+  "nodetype": "scalar",
+  "oid": "1.3.6.1.6.3.12.1.1",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "TestAndIncr"
+  }
+ },
+ "snmpUnavailableContexts": {
+  "class": "objecttype",
+  "description": "The total number of packets received by the SNMP engine which were dropped because the context contained in the message was unavailable.",
+  "maxaccess": "read-only",
+  "name": "snmpUnavailableContexts",
+  "nodetype": "scalar",
+  "oid": "1.3.6.1.6.3.12.1.4",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  }
+ },
+ "snmpUnknownContexts": {
+  "class": "objecttype",
+  "description": "The total number of packets received by the SNMP engine which were dropped because the context contained in the message was unknown.",
+  "maxaccess": "read-only",
+  "name": "snmpUnknownContexts",
+  "nodetype": "scalar",
+  "oid": "1.3.6.1.6.3.12.1.5",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  }
+ }
+}

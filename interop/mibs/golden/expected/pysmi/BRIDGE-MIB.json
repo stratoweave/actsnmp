@@ -1,0 +1,1534 @@
+{
+ "BridgeId": {
+  "class": "textualconvention",
+  "description": "The Bridge-Identifier, as used in the Spanning Tree Protocol, to uniquely identify a bridge. Its first two octets (in network byte order) contain a priority value, and its last 6 octets contain the MAC address used to refer to a bridge in a unique fashion (typically, the numerically smallest MAC address of all ports on the bridge).",
+  "name": "BridgeId",
+  "status": "current",
+  "type": {
+   "class": "type",
+   "constraints": {
+    "fixed": 8,
+    "size": [
+     {
+      "max": 8,
+      "min": 8
+     }
+    ]
+   },
+   "tcbase": false,
+   "type": "OCTET STRING"
+  }
+ },
+ "Timeout": {
+  "class": "textualconvention",
+  "description": "A Spanning Tree Protocol (STP) timer in units of 1/100 seconds. Several objects in this MIB module represent values of timers used by the Spanning Tree Protocol. In this MIB, these timers have values in units of hundredths of a second (i.e., 1/100 secs). These timers, when stored in a Spanning Tree Protocol's BPDU, are in units of 1/256 seconds. Note, however, that 802.1D-1998 specifies a settable granularity of no more than one second for these timers. To avoid ambiguity, a conversion algorithm is defined below for converting between the different units, which ensures a timer's value is not distorted by multiple conversions. To convert a Timeout value into a value in units of 1/256 seconds, the following algorithm should be used: b = floor( (n * 256) / 100) where: floor = quotient [ignore remainder] n is the value in 1/100 second units b is the value in 1/256 second units To convert the value from 1/256 second units back to 1/100 seconds, the following algorithm should be used: n = ceiling( (b * 100) / 256) where: ceiling = quotient [if remainder is 0], or quotient + 1 [if remainder is nonzero] n is the value in 1/100 second units b is the value in 1/256 second units Note: it is important that the arithmetic operations are done in the order specified (i.e., multiply first, divide second).",
+  "displayhint": "d",
+  "name": "Timeout",
+  "status": "current",
+  "type": {
+   "class": "type",
+   "tcbase": false,
+   "type": "Integer32"
+  }
+ },
+ "bridgeCompliance1493": {
+  "class": "modulecompliance",
+  "description": "The compliance statement for device support of bridging services, as per RFC1493.",
+  "modulecompliance": [
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dBaseBridgeGroup"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dBasePortGroup"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dStpBridgeGroup"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dStpPortGroup"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dTpBridgeGroup"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dTpFdbGroup"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dTpGroup"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dStaticGroup"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dNotificationGroup"
+   }
+  ],
+  "name": "bridgeCompliance1493",
+  "oid": "1.3.6.1.2.1.17.8.2.1",
+  "status": "current"
+ },
+ "bridgeCompliance4188": {
+  "class": "modulecompliance",
+  "description": "The compliance statement for device support of bridging services. This supports 32-bit Path Cost values and the more restricted bridge and port priorities, as per IEEE 802.1t. Full support for the 802.1D management objects requires that the SNMPv2-MIB [RFC3418] objects sysDescr, and sysUpTime, as well as the IF-MIB [RFC2863] objects ifIndex, ifType, ifDescr, ifPhysAddress, and ifLastChange are implemented.",
+  "modulecompliance": [
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dBaseBridgeGroup"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dBasePortGroup"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dStpBridgeGroup"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dStpPortGroup2"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dStpPortGroup3"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dTpBridgeGroup"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dTpFdbGroup"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dTpGroup"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dStaticGroup"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dNotificationGroup"
+   }
+  ],
+  "name": "bridgeCompliance4188",
+  "oid": "1.3.6.1.2.1.17.8.2.2",
+  "status": "current"
+ },
+ "dot1dBase": {
+  "class": "objectidentity",
+  "name": "dot1dBase",
+  "oid": "1.3.6.1.2.1.17.1"
+ },
+ "dot1dBaseBridgeAddress": {
+  "class": "objecttype",
+  "description": "The MAC address used by this bridge when it must be referred to in a unique fashion. It is recommended that this be the numerically smallest MAC address of all ports that belong to this bridge. However, it is only required to be unique. When concatenated with dot1dStpPriority, a unique BridgeIdentifier is formed, which is used in the Spanning Tree Protocol.",
+  "maxaccess": "read-only",
+  "name": "dot1dBaseBridgeAddress",
+  "nodetype": "scalar",
+  "oid": "1.3.6.1.2.1.17.1.1",
+  "reference": "IEEE 802.1D-1998: clauses 14.4.1.1.3 and 7.12.5",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "MacAddress"
+  }
+ },
+ "dot1dBaseBridgeGroup": {
+  "class": "objectgroup",
+  "description": "Bridge level information for this device.",
+  "name": "dot1dBaseBridgeGroup",
+  "objects": [
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dBaseBridgeAddress"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dBaseNumPorts"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dBaseType"
+   }
+  ],
+  "oid": "1.3.6.1.2.1.17.8.1.1",
+  "status": "current"
+ },
+ "dot1dBaseNumPorts": {
+  "class": "objecttype",
+  "description": "The number of ports controlled by this bridging entity.",
+  "maxaccess": "read-only",
+  "name": "dot1dBaseNumPorts",
+  "nodetype": "scalar",
+  "oid": "1.3.6.1.2.1.17.1.2",
+  "reference": "IEEE 802.1D-1998: clause 14.4.1.1.3",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Integer32"
+  },
+  "units": "ports"
+ },
+ "dot1dBasePort": {
+  "class": "objecttype",
+  "description": "The port number of the port for which this entry contains bridge management information.",
+  "maxaccess": "read-only",
+  "name": "dot1dBasePort",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.17.1.4.1.1",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 65535,
+      "min": 1
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "dot1dBasePortCircuit": {
+  "class": "objecttype",
+  "description": "For a port that (potentially) has the same value of dot1dBasePortIfIndex as another port on the same bridge. This object contains the name of an object instance unique to this port. For example, in the case where multiple ports correspond one-to-one with multiple X.25 virtual circuits, this value might identify an (e.g., the first) object instance associated with the X.25 virtual circuit corresponding to this port. For a port which has a unique value of dot1dBasePortIfIndex, this object can have the value { 0 0 }.",
+  "maxaccess": "read-only",
+  "name": "dot1dBasePortCircuit",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.17.1.4.1.3",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "OBJECT IDENTIFIER"
+  }
+ },
+ "dot1dBasePortDelayExceededDiscards": {
+  "class": "objecttype",
+  "description": "The number of frames discarded by this port due to excessive transit delay through the bridge. It is incremented by both transparent and source route bridges.",
+  "maxaccess": "read-only",
+  "name": "dot1dBasePortDelayExceededDiscards",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.17.1.4.1.4",
+  "reference": "IEEE 802.1D-1998: clause 14.6.1.1.3",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  }
+ },
+ "dot1dBasePortEntry": {
+  "class": "objecttype",
+  "description": "A list of information for each port of the bridge.",
+  "indices": [
+   {
+    "implied": 0,
+    "module": "BRIDGE-MIB",
+    "object": "dot1dBasePort"
+   }
+  ],
+  "maxaccess": "not-accessible",
+  "name": "dot1dBasePortEntry",
+  "nodetype": "row",
+  "oid": "1.3.6.1.2.1.17.1.4.1",
+  "reference": "IEEE 802.1D-1998: clause 14.4.2, 14.6.1",
+  "status": "current"
+ },
+ "dot1dBasePortGroup": {
+  "class": "objectgroup",
+  "description": "Information for each port on this device.",
+  "name": "dot1dBasePortGroup",
+  "objects": [
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dBasePort"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dBasePortIfIndex"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dBasePortCircuit"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dBasePortDelayExceededDiscards"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dBasePortMtuExceededDiscards"
+   }
+  ],
+  "oid": "1.3.6.1.2.1.17.8.1.2",
+  "status": "current"
+ },
+ "dot1dBasePortIfIndex": {
+  "class": "objecttype",
+  "description": "The value of the instance of the ifIndex object, defined in IF-MIB, for the interface corresponding to this port.",
+  "maxaccess": "read-only",
+  "name": "dot1dBasePortIfIndex",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.17.1.4.1.2",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "InterfaceIndex"
+  }
+ },
+ "dot1dBasePortMtuExceededDiscards": {
+  "class": "objecttype",
+  "description": "The number of frames discarded by this port due to an excessive size. It is incremented by both transparent and source route bridges.",
+  "maxaccess": "read-only",
+  "name": "dot1dBasePortMtuExceededDiscards",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.17.1.4.1.5",
+  "reference": "IEEE 802.1D-1998: clause 14.6.1.1.3",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  }
+ },
+ "dot1dBasePortTable": {
+  "class": "objecttype",
+  "description": "A table that contains generic information about every port that is associated with this bridge. Transparent, source-route, and srt ports are included.",
+  "maxaccess": "not-accessible",
+  "name": "dot1dBasePortTable",
+  "nodetype": "table",
+  "oid": "1.3.6.1.2.1.17.1.4",
+  "status": "current"
+ },
+ "dot1dBaseType": {
+  "class": "objecttype",
+  "description": "Indicates what type of bridging this bridge can perform. If a bridge is actually performing a certain type of bridging, this will be indicated by entries in the port table for the given type.",
+  "maxaccess": "read-only",
+  "name": "dot1dBaseType",
+  "nodetype": "scalar",
+  "oid": "1.3.6.1.2.1.17.1.3",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "enumeration": {
+     "sourceroute-only": 3,
+     "srt": 4,
+     "transparent-only": 2,
+     "unknown": 1
+    }
+   },
+   "type": "INTEGER"
+  }
+ },
+ "dot1dBridge": {
+  "class": "moduleidentity",
+  "contactinfo": "Email: bridge-mib@ietf.org K.C. Norseth (Editor) L-3 Communications Tel: +1 801-594-2809 Email: kenyon.c.norseth@L-3com.com Postal: 640 N. 2200 West. Salt Lake City, Utah 84116-0850 Les Bell (Editor) 3Com Europe Limited Phone: +44 1442 438025 Email: elbell@ntlworld.com Postal: 3Com Centre, Boundary Way Hemel Hempstead Herts. HP2 7YU UK Send comments to <bridge-mib@ietf.org>",
+  "description": "The Bridge MIB module for managing devices that support IEEE 802.1D. Copyright (C) The Internet Society (2005). This version of this MIB module is part of RFC 4188; see the RFC itself for full legal notices.",
+  "lastupdated": "200509190000Z",
+  "name": "dot1dBridge",
+  "oid": "1.3.6.1.2.1.17",
+  "organization": "IETF Bridge MIB Working Group",
+  "revisions": [
+   {
+    "description": "Third revision, published as part of RFC 4188. The MIB module has been converted to SMIv2 format. Conformance statements have been added and some description and reference clauses have been updated. The object dot1dStpPortPathCost32 was added to support IEEE 802.1t and the permissible values of dot1dStpPriority and dot1dStpPortPriority have been clarified for bridges supporting IEEE 802.1t or IEEE 802.1w. The interpretation of dot1dStpTimeSinceTopologyChange has been clarified for bridges supporting the Rapid Spanning Tree Protocol (RSTP).",
+    "revision": "2005-09-19 00:00"
+   },
+   {
+    "description": "Second revision, published as part of RFC 1493.",
+    "revision": "1993-07-31 00:00"
+   },
+   {
+    "description": "Initial revision, published as part of RFC 1286.",
+    "revision": "1991-12-31 00:00"
+   }
+  ]
+ },
+ "dot1dCompliances": {
+  "class": "objectidentity",
+  "name": "dot1dCompliances",
+  "oid": "1.3.6.1.2.1.17.8.2"
+ },
+ "dot1dConformance": {
+  "class": "objectidentity",
+  "name": "dot1dConformance",
+  "oid": "1.3.6.1.2.1.17.8"
+ },
+ "dot1dGroups": {
+  "class": "objectidentity",
+  "name": "dot1dGroups",
+  "oid": "1.3.6.1.2.1.17.8.1"
+ },
+ "dot1dNotificationGroup": {
+  "class": "notificationgroup",
+  "description": "Group of objects describing notifications (traps).",
+  "name": "dot1dNotificationGroup",
+  "objects": [
+   {
+    "module": "BRIDGE-MIB",
+    "object": "newRoot"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "topologyChange"
+   }
+  ],
+  "oid": "1.3.6.1.2.1.17.8.1.11",
+  "status": "current"
+ },
+ "dot1dNotifications": {
+  "class": "objectidentity",
+  "name": "dot1dNotifications",
+  "oid": "1.3.6.1.2.1.17.0"
+ },
+ "dot1dSr": {
+  "class": "objectidentity",
+  "name": "dot1dSr",
+  "oid": "1.3.6.1.2.1.17.3"
+ },
+ "dot1dStatic": {
+  "class": "objectidentity",
+  "name": "dot1dStatic",
+  "oid": "1.3.6.1.2.1.17.5"
+ },
+ "dot1dStaticAddress": {
+  "class": "objecttype",
+  "description": "The destination MAC address in a frame to which this entry's filtering information applies. This object can take the value of a unicast address, a group address, or the broadcast address.",
+  "maxaccess": "read-create",
+  "name": "dot1dStaticAddress",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.17.5.1.1.1",
+  "reference": "IEEE 802.1D-1998: clause 7.9.1, 7.9.2",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "MacAddress"
+  }
+ },
+ "dot1dStaticAllowedToGoTo": {
+  "class": "objecttype",
+  "description": "The set of ports to which frames received from a specific port and destined for a specific MAC address, are allowed to be forwarded. Each octet within the value of this object specifies a set of eight ports, with the first octet specifying ports 1 through 8, the second octet specifying ports 9 through 16, etc. Within each octet, the most significant bit represents the lowest numbered port, and the least significant bit represents the highest numbered port. Thus, each port of the bridge is represented by a single bit within the value of this object. If that bit has a value of '1', then that port is included in the set of ports; the port is not included if its bit has a value of '0'. (Note that the setting of the bit corresponding to the port from which a frame is received is irrelevant.) The default value of this object is a string of ones of appropriate length. The value of this object may exceed the required minimum maximum message size of some SNMP transport (484 bytes, in the case of SNMP over UDP, see RFC 3417, section 3.2). SNMP engines on bridges supporting a large number of ports must support appropriate maximum message sizes.",
+  "maxaccess": "read-create",
+  "name": "dot1dStaticAllowedToGoTo",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.17.5.1.1.3",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "size": [
+     {
+      "max": 512,
+      "min": 0
+     }
+    ]
+   },
+   "type": "OCTET STRING"
+  }
+ },
+ "dot1dStaticEntry": {
+  "class": "objecttype",
+  "description": "Filtering information configured into the bridge by (local or network) management specifying the set of ports to which frames received from a specific port and containing a specific destination address are allowed to be forwarded.",
+  "indices": [
+   {
+    "implied": 0,
+    "module": "BRIDGE-MIB",
+    "object": "dot1dStaticAddress"
+   },
+   {
+    "implied": 0,
+    "module": "BRIDGE-MIB",
+    "object": "dot1dStaticReceivePort"
+   }
+  ],
+  "maxaccess": "not-accessible",
+  "name": "dot1dStaticEntry",
+  "nodetype": "row",
+  "oid": "1.3.6.1.2.1.17.5.1.1",
+  "reference": "IEEE 802.1D-1998: clause 14.7.2",
+  "status": "current"
+ },
+ "dot1dStaticGroup": {
+  "class": "objectgroup",
+  "description": "Static Filtering Database information for each port of the Bridge.",
+  "name": "dot1dStaticGroup",
+  "objects": [
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dStaticAddress"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dStaticReceivePort"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dStaticAllowedToGoTo"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dStaticStatus"
+   }
+  ],
+  "oid": "1.3.6.1.2.1.17.8.1.10",
+  "status": "current"
+ },
+ "dot1dStaticReceivePort": {
+  "class": "objecttype",
+  "description": "Either the value '0', or the port number of the port from which a frame must be received in order for this entry's filtering information to apply. A value of zero indicates that this entry applies on all ports of the bridge for which there is no other applicable entry.",
+  "maxaccess": "read-create",
+  "name": "dot1dStaticReceivePort",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.17.5.1.1.2",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 65535,
+      "min": 0
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "dot1dStaticStatus": {
+  "class": "objecttype",
+  "description": "This object indicates the status of this entry. The default value is permanent(3). other(1) - this entry is currently in use but the conditions under which it will remain so are different from each of the following values. invalid(2) - writing this value to the object removes the corresponding entry. permanent(3) - this entry is currently in use and will remain so after the next reset of the bridge. deleteOnReset(4) - this entry is currently in use and will remain so until the next reset of the bridge. deleteOnTimeout(5) - this entry is currently in use and will remain so until it is aged out.",
+  "maxaccess": "read-create",
+  "name": "dot1dStaticStatus",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.17.5.1.1.4",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "enumeration": {
+     "deleteOnReset": 4,
+     "deleteOnTimeout": 5,
+     "invalid": 2,
+     "other": 1,
+     "permanent": 3
+    }
+   },
+   "type": "INTEGER"
+  }
+ },
+ "dot1dStaticTable": {
+  "class": "objecttype",
+  "description": "A table containing filtering information configured into the bridge by (local or network) management specifying the set of ports to which frames received from specific ports and containing specific destination addresses are allowed to be forwarded. The value of zero in this table, as the port number from which frames with a specific destination address are received, is used to specify all ports for which there is no specific entry in this table for that particular destination address. Entries are valid for unicast and for group/broadcast addresses.",
+  "maxaccess": "not-accessible",
+  "name": "dot1dStaticTable",
+  "nodetype": "table",
+  "oid": "1.3.6.1.2.1.17.5.1",
+  "reference": "IEEE 802.1D-1998: clause 14.7.2",
+  "status": "current"
+ },
+ "dot1dStp": {
+  "class": "objectidentity",
+  "name": "dot1dStp",
+  "oid": "1.3.6.1.2.1.17.2"
+ },
+ "dot1dStpBridgeForwardDelay": {
+  "class": "objecttype",
+  "description": "The value that all bridges use for ForwardDelay when this bridge is acting as the root. Note that 802.1D-1998 specifies that the range for this parameter is related to the value of dot1dStpBridgeMaxAge. The granularity of this timer is specified by 802.1D-1998 to be 1 second. An agent may return a badValue error if a set is attempted to a value that is not a whole number of seconds.",
+  "maxaccess": "read-write",
+  "name": "dot1dStpBridgeForwardDelay",
+  "nodetype": "scalar",
+  "oid": "1.3.6.1.2.1.17.2.14",
+  "reference": "IEEE 802.1D-1998: clause 8.5.3.10",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 3000,
+      "min": 400
+     }
+    ]
+   },
+   "type": "Timeout"
+  },
+  "units": "centi-seconds"
+ },
+ "dot1dStpBridgeGroup": {
+  "class": "objectgroup",
+  "description": "Bridge level Spanning Tree data for this device.",
+  "name": "dot1dStpBridgeGroup",
+  "objects": [
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dStpProtocolSpecification"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dStpPriority"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dStpTimeSinceTopologyChange"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dStpTopChanges"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dStpDesignatedRoot"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dStpRootCost"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dStpRootPort"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dStpMaxAge"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dStpHelloTime"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dStpHoldTime"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dStpForwardDelay"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dStpBridgeMaxAge"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dStpBridgeHelloTime"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dStpBridgeForwardDelay"
+   }
+  ],
+  "oid": "1.3.6.1.2.1.17.8.1.3",
+  "status": "current"
+ },
+ "dot1dStpBridgeHelloTime": {
+  "class": "objecttype",
+  "description": "The value that all bridges use for HelloTime when this bridge is acting as the root. The granularity of this timer is specified by 802.1D-1998 to be 1 second. An agent may return a badValue error if a set is attempted to a value that is not a whole number of seconds.",
+  "maxaccess": "read-write",
+  "name": "dot1dStpBridgeHelloTime",
+  "nodetype": "scalar",
+  "oid": "1.3.6.1.2.1.17.2.13",
+  "reference": "IEEE 802.1D-1998: clause 8.5.3.9",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 1000,
+      "min": 100
+     }
+    ]
+   },
+   "type": "Timeout"
+  },
+  "units": "centi-seconds"
+ },
+ "dot1dStpBridgeMaxAge": {
+  "class": "objecttype",
+  "description": "The value that all bridges use for MaxAge when this bridge is acting as the root. Note that 802.1D-1998 specifies that the range for this parameter is related to the value of dot1dStpBridgeHelloTime. The granularity of this timer is specified by 802.1D-1998 to be 1 second. An agent may return a badValue error if a set is attempted to a value that is not a whole number of seconds.",
+  "maxaccess": "read-write",
+  "name": "dot1dStpBridgeMaxAge",
+  "nodetype": "scalar",
+  "oid": "1.3.6.1.2.1.17.2.12",
+  "reference": "IEEE 802.1D-1998: clause 8.5.3.8",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 4000,
+      "min": 600
+     }
+    ]
+   },
+   "type": "Timeout"
+  },
+  "units": "centi-seconds"
+ },
+ "dot1dStpDesignatedRoot": {
+  "class": "objecttype",
+  "description": "The bridge identifier of the root of the spanning tree, as determined by the Spanning Tree Protocol, as executed by this node. This value is used as the Root Identifier parameter in all Configuration Bridge PDUs originated by this node.",
+  "maxaccess": "read-only",
+  "name": "dot1dStpDesignatedRoot",
+  "nodetype": "scalar",
+  "oid": "1.3.6.1.2.1.17.2.5",
+  "reference": "IEEE 802.1D-1998: clause 8.5.3.1",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "BridgeId"
+  }
+ },
+ "dot1dStpForwardDelay": {
+  "class": "objecttype",
+  "description": "This time value, measured in units of hundredths of a second, controls how fast a port changes its spanning state when moving towards the Forwarding state. The value determines how long the port stays in each of the Listening and Learning states, which precede the Forwarding state. This value is also used when a topology change has been detected and is underway, to age all dynamic entries in the Forwarding Database. [Note that this value is the one that this bridge is currently using, in contrast to dot1dStpBridgeForwardDelay, which is the value that this bridge and all others would start using if/when this bridge were to become the root.]",
+  "maxaccess": "read-only",
+  "name": "dot1dStpForwardDelay",
+  "nodetype": "scalar",
+  "oid": "1.3.6.1.2.1.17.2.11",
+  "reference": "IEEE 802.1D-1998: clause 8.5.3.6",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Timeout"
+  },
+  "units": "centi-seconds"
+ },
+ "dot1dStpHelloTime": {
+  "class": "objecttype",
+  "description": "The amount of time between the transmission of Configuration bridge PDUs by this node on any port when it is the root of the spanning tree, or trying to become so, in units of hundredths of a second. This is the actual value that this bridge is currently using.",
+  "maxaccess": "read-only",
+  "name": "dot1dStpHelloTime",
+  "nodetype": "scalar",
+  "oid": "1.3.6.1.2.1.17.2.9",
+  "reference": "IEEE 802.1D-1998: clause 8.5.3.5",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Timeout"
+  },
+  "units": "centi-seconds"
+ },
+ "dot1dStpHoldTime": {
+  "class": "objecttype",
+  "description": "This time value determines the interval length during which no more than two Configuration bridge PDUs shall be transmitted by this node, in units of hundredths of a second.",
+  "maxaccess": "read-only",
+  "name": "dot1dStpHoldTime",
+  "nodetype": "scalar",
+  "oid": "1.3.6.1.2.1.17.2.10",
+  "reference": "IEEE 802.1D-1998: clause 8.5.3.14",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Integer32"
+  },
+  "units": "centi-seconds"
+ },
+ "dot1dStpMaxAge": {
+  "class": "objecttype",
+  "description": "The maximum age of Spanning Tree Protocol information learned from the network on any port before it is discarded, in units of hundredths of a second. This is the actual value that this bridge is currently using.",
+  "maxaccess": "read-only",
+  "name": "dot1dStpMaxAge",
+  "nodetype": "scalar",
+  "oid": "1.3.6.1.2.1.17.2.8",
+  "reference": "IEEE 802.1D-1998: clause 8.5.3.4",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Timeout"
+  },
+  "units": "centi-seconds"
+ },
+ "dot1dStpPort": {
+  "class": "objecttype",
+  "description": "The port number of the port for which this entry contains Spanning Tree Protocol management information.",
+  "maxaccess": "read-only",
+  "name": "dot1dStpPort",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.17.2.15.1.1",
+  "reference": "IEEE 802.1D-1998: clause 14.8.2.1.2",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 65535,
+      "min": 1
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "dot1dStpPortDesignatedBridge": {
+  "class": "objecttype",
+  "description": "The Bridge Identifier of the bridge that this port considers to be the Designated Bridge for this port's segment.",
+  "maxaccess": "read-only",
+  "name": "dot1dStpPortDesignatedBridge",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.17.2.15.1.8",
+  "reference": "IEEE 802.1D-1998: clause 8.5.5.6",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "BridgeId"
+  }
+ },
+ "dot1dStpPortDesignatedCost": {
+  "class": "objecttype",
+  "description": "The path cost of the Designated Port of the segment connected to this port. This value is compared to the Root Path Cost field in received bridge PDUs.",
+  "maxaccess": "read-only",
+  "name": "dot1dStpPortDesignatedCost",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.17.2.15.1.7",
+  "reference": "IEEE 802.1D-1998: clause 8.5.5.5",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Integer32"
+  }
+ },
+ "dot1dStpPortDesignatedPort": {
+  "class": "objecttype",
+  "description": "The Port Identifier of the port on the Designated Bridge for this port's segment.",
+  "maxaccess": "read-only",
+  "name": "dot1dStpPortDesignatedPort",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.17.2.15.1.9",
+  "reference": "IEEE 802.1D-1998: clause 8.5.5.7",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "fixed": 2,
+    "size": [
+     {
+      "max": 2,
+      "min": 2
+     }
+    ]
+   },
+   "type": "OCTET STRING"
+  }
+ },
+ "dot1dStpPortDesignatedRoot": {
+  "class": "objecttype",
+  "description": "The unique Bridge Identifier of the Bridge recorded as the Root in the Configuration BPDUs transmitted by the Designated Bridge for the segment to which the port is attached.",
+  "maxaccess": "read-only",
+  "name": "dot1dStpPortDesignatedRoot",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.17.2.15.1.6",
+  "reference": "IEEE 802.1D-1998: clause 8.5.5.4",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "BridgeId"
+  }
+ },
+ "dot1dStpPortEnable": {
+  "class": "objecttype",
+  "description": "The enabled/disabled status of the port.",
+  "maxaccess": "read-write",
+  "name": "dot1dStpPortEnable",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.17.2.15.1.4",
+  "reference": "IEEE 802.1D-1998: clause 8.5.5.2",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "enumeration": {
+     "disabled": 2,
+     "enabled": 1
+    }
+   },
+   "type": "INTEGER"
+  }
+ },
+ "dot1dStpPortEntry": {
+  "class": "objecttype",
+  "description": "A list of information maintained by every port about the Spanning Tree Protocol state for that port.",
+  "indices": [
+   {
+    "implied": 0,
+    "module": "BRIDGE-MIB",
+    "object": "dot1dStpPort"
+   }
+  ],
+  "maxaccess": "not-accessible",
+  "name": "dot1dStpPortEntry",
+  "nodetype": "row",
+  "oid": "1.3.6.1.2.1.17.2.15.1",
+  "status": "current"
+ },
+ "dot1dStpPortForwardTransitions": {
+  "class": "objecttype",
+  "description": "The number of times this port has transitioned from the Learning state to the Forwarding state.",
+  "maxaccess": "read-only",
+  "name": "dot1dStpPortForwardTransitions",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.17.2.15.1.10",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  }
+ },
+ "dot1dStpPortGroup": {
+  "class": "objectgroup",
+  "description": "Spanning Tree data for each port on this device.",
+  "name": "dot1dStpPortGroup",
+  "objects": [
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dStpPort"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dStpPortPriority"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dStpPortState"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dStpPortEnable"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dStpPortPathCost"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dStpPortDesignatedRoot"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dStpPortDesignatedCost"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dStpPortDesignatedBridge"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dStpPortDesignatedPort"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dStpPortForwardTransitions"
+   }
+  ],
+  "oid": "1.3.6.1.2.1.17.8.1.4",
+  "status": "current"
+ },
+ "dot1dStpPortGroup2": {
+  "class": "objectgroup",
+  "description": "Spanning Tree data for each port on this device.",
+  "name": "dot1dStpPortGroup2",
+  "objects": [
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dStpPort"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dStpPortPriority"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dStpPortState"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dStpPortEnable"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dStpPortDesignatedRoot"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dStpPortDesignatedCost"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dStpPortDesignatedBridge"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dStpPortDesignatedPort"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dStpPortForwardTransitions"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dStpPortPathCost32"
+   }
+  ],
+  "oid": "1.3.6.1.2.1.17.8.1.5",
+  "status": "current"
+ },
+ "dot1dStpPortGroup3": {
+  "class": "objectgroup",
+  "description": "Spanning Tree data for devices supporting 32-bit path costs.",
+  "name": "dot1dStpPortGroup3",
+  "objects": [
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dStpPortPathCost32"
+   }
+  ],
+  "oid": "1.3.6.1.2.1.17.8.1.6",
+  "status": "current"
+ },
+ "dot1dStpPortPathCost": {
+  "class": "objecttype",
+  "description": "The contribution of this port to the path cost of paths towards the spanning tree root which include this port. 802.1D-1998 recommends that the default value of this parameter be in inverse proportion to the speed of the attached LAN. New implementations should support dot1dStpPortPathCost32. If the port path costs exceeds the maximum value of this object then this object should report the maximum value, namely 65535. Applications should try to read the dot1dStpPortPathCost32 object if this object reports the maximum value.",
+  "maxaccess": "read-write",
+  "name": "dot1dStpPortPathCost",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.17.2.15.1.5",
+  "reference": "IEEE 802.1D-1998: clause 8.5.5.3",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 65535,
+      "min": 1
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "dot1dStpPortPathCost32": {
+  "class": "objecttype",
+  "description": "The contribution of this port to the path cost of paths towards the spanning tree root which include this port. 802.1D-1998 recommends that the default value of this parameter be in inverse proportion to the speed of the attached LAN. This object replaces dot1dStpPortPathCost to support IEEE 802.1t.",
+  "maxaccess": "read-write",
+  "name": "dot1dStpPortPathCost32",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.17.2.15.1.11",
+  "reference": "IEEE 802.1t clause 8.10.2, Table 8-5.",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 200000000,
+      "min": 1
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "dot1dStpPortPriority": {
+  "class": "objecttype",
+  "description": "The value of the priority field that is contained in the first (in network byte order) octet of the (2 octet long) Port ID. The other octet of the Port ID is given by the value of dot1dStpPort. On bridges supporting IEEE 802.1t or IEEE 802.1w, permissible values are 0-240, in steps of 16.",
+  "maxaccess": "read-write",
+  "name": "dot1dStpPortPriority",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.17.2.15.1.2",
+  "reference": "IEEE 802.1D-1998 clause 8.10.2, Table 8-4, IEEE 802.1t clause 8.10.2, Table 8-4, clause 14.3.",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 255,
+      "min": 0
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "dot1dStpPortState": {
+  "class": "objecttype",
+  "description": "The port's current state, as defined by application of the Spanning Tree Protocol. This state controls what action a port takes on reception of a frame. If the bridge has detected a port that is malfunctioning, it will place that port into the broken(6) state. For ports that are disabled (see dot1dStpPortEnable), this object will have a value of disabled(1).",
+  "maxaccess": "read-only",
+  "name": "dot1dStpPortState",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.17.2.15.1.3",
+  "reference": "IEEE 802.1D-1998: clause 8.5.5.2",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "enumeration": {
+     "blocking": 2,
+     "broken": 6,
+     "disabled": 1,
+     "forwarding": 5,
+     "learning": 4,
+     "listening": 3
+    }
+   },
+   "type": "INTEGER"
+  }
+ },
+ "dot1dStpPortTable": {
+  "class": "objecttype",
+  "description": "A table that contains port-specific information for the Spanning Tree Protocol.",
+  "maxaccess": "not-accessible",
+  "name": "dot1dStpPortTable",
+  "nodetype": "table",
+  "oid": "1.3.6.1.2.1.17.2.15",
+  "status": "current"
+ },
+ "dot1dStpPriority": {
+  "class": "objecttype",
+  "description": "The value of the write-able portion of the Bridge ID (i.e., the first two octets of the (8 octet long) Bridge ID). The other (last) 6 octets of the Bridge ID are given by the value of dot1dBaseBridgeAddress. On bridges supporting IEEE 802.1t or IEEE 802.1w, permissible values are 0-61440, in steps of 4096.",
+  "maxaccess": "read-write",
+  "name": "dot1dStpPriority",
+  "nodetype": "scalar",
+  "oid": "1.3.6.1.2.1.17.2.2",
+  "reference": "IEEE 802.1D-1998 clause 8.10.2, Table 8-4, IEEE 802.1t clause 8.10.2, Table 8-4, clause 14.3.",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 65535,
+      "min": 0
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "dot1dStpProtocolSpecification": {
+  "class": "objecttype",
+  "description": "An indication of what version of the Spanning Tree Protocol is being run. The value 'decLb100(2)' indicates the DEC LANbridge 100 Spanning Tree protocol. IEEE 802.1D implementations will return 'ieee8021d(3)'. If future versions of the IEEE Spanning Tree Protocol that are incompatible with the current version are released a new value will be defined.",
+  "maxaccess": "read-only",
+  "name": "dot1dStpProtocolSpecification",
+  "nodetype": "scalar",
+  "oid": "1.3.6.1.2.1.17.2.1",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "enumeration": {
+     "decLb100": 2,
+     "ieee8021d": 3,
+     "unknown": 1
+    }
+   },
+   "type": "INTEGER"
+  }
+ },
+ "dot1dStpRootCost": {
+  "class": "objecttype",
+  "description": "The cost of the path to the root as seen from this bridge.",
+  "maxaccess": "read-only",
+  "name": "dot1dStpRootCost",
+  "nodetype": "scalar",
+  "oid": "1.3.6.1.2.1.17.2.6",
+  "reference": "IEEE 802.1D-1998: clause 8.5.3.2",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Integer32"
+  }
+ },
+ "dot1dStpRootPort": {
+  "class": "objecttype",
+  "description": "The port number of the port that offers the lowest cost path from this bridge to the root bridge.",
+  "maxaccess": "read-only",
+  "name": "dot1dStpRootPort",
+  "nodetype": "scalar",
+  "oid": "1.3.6.1.2.1.17.2.7",
+  "reference": "IEEE 802.1D-1998: clause 8.5.3.3",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Integer32"
+  }
+ },
+ "dot1dStpTimeSinceTopologyChange": {
+  "class": "objecttype",
+  "description": "The time (in hundredths of a second) since the last time a topology change was detected by the bridge entity. For RSTP, this reports the time since the tcWhile timer for any port on this Bridge was nonzero.",
+  "maxaccess": "read-only",
+  "name": "dot1dStpTimeSinceTopologyChange",
+  "nodetype": "scalar",
+  "oid": "1.3.6.1.2.1.17.2.3",
+  "reference": "IEEE 802.1D-1998 clause 14.8.1.1., IEEE 802.1w clause 14.8.1.1.",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "TimeTicks"
+  },
+  "units": "centi-seconds"
+ },
+ "dot1dStpTopChanges": {
+  "class": "objecttype",
+  "description": "The total number of topology changes detected by this bridge since the management entity was last reset or initialized.",
+  "maxaccess": "read-only",
+  "name": "dot1dStpTopChanges",
+  "nodetype": "scalar",
+  "oid": "1.3.6.1.2.1.17.2.4",
+  "reference": "IEEE 802.1D-1998 clause 14.8.1.1.",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  }
+ },
+ "dot1dTp": {
+  "class": "objectidentity",
+  "name": "dot1dTp",
+  "oid": "1.3.6.1.2.1.17.4"
+ },
+ "dot1dTpAgingTime": {
+  "class": "objecttype",
+  "description": "The timeout period in seconds for aging out dynamically-learned forwarding information. 802.1D-1998 recommends a default of 300 seconds.",
+  "maxaccess": "read-write",
+  "name": "dot1dTpAgingTime",
+  "nodetype": "scalar",
+  "oid": "1.3.6.1.2.1.17.4.2",
+  "reference": "IEEE 802.1D-1998: clause 14.7.1.1.3",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 1000000,
+      "min": 10
+     }
+    ]
+   },
+   "type": "Integer32"
+  },
+  "units": "seconds"
+ },
+ "dot1dTpBridgeGroup": {
+  "class": "objectgroup",
+  "description": "Bridge level Transparent Bridging data.",
+  "name": "dot1dTpBridgeGroup",
+  "objects": [
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dTpLearnedEntryDiscards"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dTpAgingTime"
+   }
+  ],
+  "oid": "1.3.6.1.2.1.17.8.1.7",
+  "status": "current"
+ },
+ "dot1dTpFdbAddress": {
+  "class": "objecttype",
+  "description": "A unicast MAC address for which the bridge has forwarding and/or filtering information.",
+  "maxaccess": "read-only",
+  "name": "dot1dTpFdbAddress",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.17.4.3.1.1",
+  "reference": "IEEE 802.1D-1998: clause 7.9.1, 7.9.2",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "MacAddress"
+  }
+ },
+ "dot1dTpFdbEntry": {
+  "class": "objecttype",
+  "description": "Information about a specific unicast MAC address for which the bridge has some forwarding and/or filtering information.",
+  "indices": [
+   {
+    "implied": 0,
+    "module": "BRIDGE-MIB",
+    "object": "dot1dTpFdbAddress"
+   }
+  ],
+  "maxaccess": "not-accessible",
+  "name": "dot1dTpFdbEntry",
+  "nodetype": "row",
+  "oid": "1.3.6.1.2.1.17.4.3.1",
+  "status": "current"
+ },
+ "dot1dTpFdbGroup": {
+  "class": "objectgroup",
+  "description": "Filtering Database information for the Bridge.",
+  "name": "dot1dTpFdbGroup",
+  "objects": [
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dTpFdbAddress"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dTpFdbPort"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dTpFdbStatus"
+   }
+  ],
+  "oid": "1.3.6.1.2.1.17.8.1.8",
+  "status": "current"
+ },
+ "dot1dTpFdbPort": {
+  "class": "objecttype",
+  "description": "Either the value '0', or the port number of the port on which a frame having a source address equal to the value of the corresponding instance of dot1dTpFdbAddress has been seen. A value of '0' indicates that the port number has not been learned, but that the bridge does have some forwarding/filtering information about this address (e.g., in the dot1dStaticTable). Implementors are encouraged to assign the port value to this object whenever it is learned, even for addresses for which the corresponding value of dot1dTpFdbStatus is not learned(3).",
+  "maxaccess": "read-only",
+  "name": "dot1dTpFdbPort",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.17.4.3.1.2",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Integer32"
+  }
+ },
+ "dot1dTpFdbStatus": {
+  "class": "objecttype",
+  "description": "The status of this entry. The meanings of the values are: other(1) - none of the following. This would include the case where some other MIB object (not the corresponding instance of dot1dTpFdbPort, nor an entry in the dot1dStaticTable) is being used to determine if and how frames addressed to the value of the corresponding instance of dot1dTpFdbAddress are being forwarded. invalid(2) - this entry is no longer valid (e.g., it was learned but has since aged out), but has not yet been flushed from the table. learned(3) - the value of the corresponding instance of dot1dTpFdbPort was learned, and is being used. self(4) - the value of the corresponding instance of dot1dTpFdbAddress represents one of the bridge's addresses. The corresponding instance of dot1dTpFdbPort indicates which of the bridge's ports has this address. mgmt(5) - the value of the corresponding instance of dot1dTpFdbAddress is also the value of an existing instance of dot1dStaticAddress.",
+  "maxaccess": "read-only",
+  "name": "dot1dTpFdbStatus",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.17.4.3.1.3",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "enumeration": {
+     "invalid": 2,
+     "learned": 3,
+     "mgmt": 5,
+     "other": 1,
+     "self": 4
+    }
+   },
+   "type": "INTEGER"
+  }
+ },
+ "dot1dTpFdbTable": {
+  "class": "objecttype",
+  "description": "A table that contains information about unicast entries for which the bridge has forwarding and/or filtering information. This information is used by the transparent bridging function in determining how to propagate a received frame.",
+  "maxaccess": "not-accessible",
+  "name": "dot1dTpFdbTable",
+  "nodetype": "table",
+  "oid": "1.3.6.1.2.1.17.4.3",
+  "status": "current"
+ },
+ "dot1dTpGroup": {
+  "class": "objectgroup",
+  "description": "Dynamic Filtering Database information for each port of the Bridge.",
+  "name": "dot1dTpGroup",
+  "objects": [
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dTpPort"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dTpPortMaxInfo"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dTpPortInFrames"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dTpPortOutFrames"
+   },
+   {
+    "module": "BRIDGE-MIB",
+    "object": "dot1dTpPortInDiscards"
+   }
+  ],
+  "oid": "1.3.6.1.2.1.17.8.1.9",
+  "status": "current"
+ },
+ "dot1dTpLearnedEntryDiscards": {
+  "class": "objecttype",
+  "description": "The total number of Forwarding Database entries that have been or would have been learned, but have been discarded due to a lack of storage space in the Forwarding Database. If this counter is increasing, it indicates that the Forwarding Database is regularly becoming full (a condition that has unpleasant performance effects on the subnetwork). If this counter has a significant value but is not presently increasing, it indicates that the problem has been occurring but is not persistent.",
+  "maxaccess": "read-only",
+  "name": "dot1dTpLearnedEntryDiscards",
+  "nodetype": "scalar",
+  "oid": "1.3.6.1.2.1.17.4.1",
+  "reference": "IEEE 802.1D-1998: clause 14.7.1.1.3",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  }
+ },
+ "dot1dTpPort": {
+  "class": "objecttype",
+  "description": "The port number of the port for which this entry contains Transparent bridging management information.",
+  "maxaccess": "read-only",
+  "name": "dot1dTpPort",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.17.4.4.1.1",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 65535,
+      "min": 1
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "dot1dTpPortEntry": {
+  "class": "objecttype",
+  "description": "A list of information for each port of a transparent bridge.",
+  "indices": [
+   {
+    "implied": 0,
+    "module": "BRIDGE-MIB",
+    "object": "dot1dTpPort"
+   }
+  ],
+  "maxaccess": "not-accessible",
+  "name": "dot1dTpPortEntry",
+  "nodetype": "row",
+  "oid": "1.3.6.1.2.1.17.4.4.1",
+  "status": "current"
+ },
+ "dot1dTpPortInDiscards": {
+  "class": "objecttype",
+  "description": "Count of received valid frames that were discarded (i.e., filtered) by the Forwarding Process.",
+  "maxaccess": "read-only",
+  "name": "dot1dTpPortInDiscards",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.17.4.4.1.5",
+  "reference": "IEEE 802.1D-1998: clause 14.6.1.1.3",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  },
+  "units": "frames"
+ },
+ "dot1dTpPortInFrames": {
+  "class": "objecttype",
+  "description": "The number of frames that have been received by this port from its segment. Note that a frame received on the interface corresponding to this port is only counted by this object if and only if it is for a protocol being processed by the local bridging function, including bridge management frames.",
+  "maxaccess": "read-only",
+  "name": "dot1dTpPortInFrames",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.17.4.4.1.3",
+  "reference": "IEEE 802.1D-1998: clause 14.6.1.1.3",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  },
+  "units": "frames"
+ },
+ "dot1dTpPortMaxInfo": {
+  "class": "objecttype",
+  "description": "The maximum size of the INFO (non-MAC) field that this port will receive or transmit.",
+  "maxaccess": "read-only",
+  "name": "dot1dTpPortMaxInfo",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.17.4.4.1.2",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Integer32"
+  },
+  "units": "bytes"
+ },
+ "dot1dTpPortOutFrames": {
+  "class": "objecttype",
+  "description": "The number of frames that have been transmitted by this port to its segment. Note that a frame transmitted on the interface corresponding to this port is only counted by this object if and only if it is for a protocol being processed by the local bridging function, including bridge management frames.",
+  "maxaccess": "read-only",
+  "name": "dot1dTpPortOutFrames",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.17.4.4.1.4",
+  "reference": "IEEE 802.1D-1998: clause 14.6.1.1.3",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  },
+  "units": "frames"
+ },
+ "dot1dTpPortTable": {
+  "class": "objecttype",
+  "description": "A table that contains information about every port that is associated with this transparent bridge.",
+  "maxaccess": "not-accessible",
+  "name": "dot1dTpPortTable",
+  "nodetype": "table",
+  "oid": "1.3.6.1.2.1.17.4.4",
+  "status": "current"
+ },
+ "imports": {
+  "IF-MIB": [
+   "InterfaceIndex"
+  ],
+  "SNMPv2-CONF": [
+   "MODULE-COMPLIANCE",
+   "NOTIFICATION-GROUP",
+   "OBJECT-GROUP"
+  ],
+  "SNMPv2-SMI": [
+   "Bits",
+   "Counter32",
+   "Integer32",
+   "IpAddress",
+   "MODULE-IDENTITY",
+   "MibIdentifier",
+   "NOTIFICATION-TYPE",
+   "OBJECT-IDENTITY",
+   "OBJECT-TYPE",
+   "TimeTicks",
+   "Unsigned32",
+   "iso",
+   "mib-2"
+  ],
+  "SNMPv2-TC": [
+   "DisplayString",
+   "MacAddress",
+   "PhysAddress",
+   "TEXTUAL-CONVENTION"
+  ],
+  "class": "imports"
+ },
+ "meta": {
+  "module": "BRIDGE-MIB"
+ },
+ "newRoot": {
+  "class": "notificationtype",
+  "description": "The newRoot trap indicates that the sending agent has become the new root of the Spanning Tree; the trap is sent by a bridge soon after its election as the new root, e.g., upon expiration of the Topology Change Timer, immediately subsequent to its election. Implementation of this trap is optional.",
+  "name": "newRoot",
+  "oid": "1.3.6.1.2.1.17.0.1",
+  "status": "current"
+ },
+ "topologyChange": {
+  "class": "notificationtype",
+  "description": "A topologyChange trap is sent by a bridge when any of its configured ports transitions from the Learning state to the Forwarding state, or from the Forwarding state to the Blocking state. The trap is not sent if a newRoot trap is sent for the same transition. Implementation of this trap is optional.",
+  "name": "topologyChange",
+  "oid": "1.3.6.1.2.1.17.0.2",
+  "status": "current"
+ }
+}

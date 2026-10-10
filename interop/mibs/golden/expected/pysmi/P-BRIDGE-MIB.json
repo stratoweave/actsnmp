@@ -1,0 +1,1108 @@
+{
+ "EnabledStatus": {
+  "class": "textualconvention",
+  "description": "A simple status value for the object.",
+  "name": "EnabledStatus",
+  "status": "current",
+  "type": {
+   "class": "type",
+   "constraints": {
+    "enumeration": {
+     "disabled": 2,
+     "enabled": 1
+    }
+   },
+   "tcbase": false,
+   "type": "INTEGER"
+  }
+ },
+ "dot1dDeviceCapabilities": {
+  "class": "objecttype",
+  "description": "Indicates the optional parts of IEEE 802.1D and 802.1Q that are implemented by this device and are manageable through this MIB. Capabilities that are allowed on a per-port basis are indicated in dot1dPortCapabilities. dot1dExtendedFilteringServices(0), -- can perform filtering of -- individual multicast addresses -- controlled by GMRP. dot1dTrafficClasses(1), -- can map user priority to -- multiple traffic classes. dot1qStaticEntryIndividualPort(2), -- dot1qStaticUnicastReceivePort & -- dot1qStaticMulticastReceivePort -- can represent non-zero entries. dot1qIVLCapable(3), -- Independent VLAN Learning (IVL). dot1qSVLCapable(4), -- Shared VLAN Learning (SVL). dot1qHybridCapable(5), -- both IVL & SVL simultaneously. dot1qConfigurablePvidTagging(6), -- whether the implementation -- supports the ability to -- override the default PVID -- setting and its egress status -- (VLAN-Tagged or Untagged) on -- each port. dot1dLocalVlanCapable(7) -- can support multiple local -- bridges, outside of the scope -- of 802.1Q defined VLANs.",
+  "maxaccess": "read-only",
+  "name": "dot1dDeviceCapabilities",
+  "nodetype": "scalar",
+  "oid": "1.3.6.1.2.1.17.6.1.1.1",
+  "reference": "ISO/IEC 15802-3 Section 5.2, IEEE 802.1Q/D11 Section 5.2, 12.10.1.1.3/b/2",
+  "status": "current",
+  "syntax": {
+   "bits": {
+    "dot1dExtendedFilteringServices": 0,
+    "dot1dLocalVlanCapable": 7,
+    "dot1dTrafficClasses": 1,
+    "dot1qConfigurablePvidTagging": 6,
+    "dot1qHybridCapable": 5,
+    "dot1qIVLCapable": 3,
+    "dot1qSVLCapable": 4,
+    "dot1qStaticEntryIndividualPort": 2
+   },
+   "class": "type",
+   "type": "Bits"
+  }
+ },
+ "dot1dExtBase": {
+  "class": "objectidentity",
+  "name": "dot1dExtBase",
+  "oid": "1.3.6.1.2.1.17.6.1.1"
+ },
+ "dot1dGarp": {
+  "class": "objectidentity",
+  "name": "dot1dGarp",
+  "oid": "1.3.6.1.2.1.17.6.1.3"
+ },
+ "dot1dGmrp": {
+  "class": "objectidentity",
+  "name": "dot1dGmrp",
+  "oid": "1.3.6.1.2.1.17.6.1.4"
+ },
+ "dot1dGmrpStatus": {
+  "class": "objecttype",
+  "default": {
+   "default": {
+    "basetype": "Integer32",
+    "format": "decimal",
+    "value": "1"
+   }
+  },
+  "description": "The administrative status requested by management for GMRP. The value enabled(1) indicates that GMRP should be enabled on this device, in all VLANs, on all ports for which it has not been specifically disabled. When disabled(2), GMRP is disabled, in all VLANs and on all ports, and all GMRP packets will be forwarded transparently. This object affects both Applicant and Registrar state machines. A transition from disabled(2) to enabled(1) will cause a reset of all GMRP state machines on all ports. The value of this object MUST be retained across reinitializations of the management system.",
+  "maxaccess": "read-write",
+  "name": "dot1dGmrpStatus",
+  "nodetype": "scalar",
+  "oid": "1.3.6.1.2.1.17.6.1.1.3",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "EnabledStatus"
+  }
+ },
+ "dot1dPortCapabilities": {
+  "class": "objecttype",
+  "description": "Indicates the parts of IEEE 802.1D and 802.1Q that are optional on a per-port basis, that are implemented by this device, and that are manageable through this MIB. dot1qDot1qTagging(0), -- supports 802.1Q VLAN tagging of -- frames and GVRP. dot1qConfigurableAcceptableFrameTypes(1), -- allows modified values of -- dot1qPortAcceptableFrameTypes. dot1qIngressFiltering(2) -- supports the discarding of any -- frame received on a Port whose -- VLAN classification does not -- include that Port in its Member -- set.",
+  "maxaccess": "read-only",
+  "name": "dot1dPortCapabilities",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.17.6.1.1.4.1.1",
+  "reference": "ISO/IEC 15802-3 Section 5.2, IEEE 802.1Q/D11 Section 5.2",
+  "status": "current",
+  "syntax": {
+   "bits": {
+    "dot1qConfigurableAcceptableFrameTypes": 1,
+    "dot1qDot1qTagging": 0,
+    "dot1qIngressFiltering": 2
+   },
+   "class": "type",
+   "type": "Bits"
+  }
+ },
+ "dot1dPortCapabilitiesEntry": {
+  "augmention": {
+   "module": "P-BRIDGE-MIB",
+   "name": "dot1dPortCapabilitiesEntry",
+   "object": "dot1dBasePortEntry"
+  },
+  "class": "objecttype",
+  "description": "A set of capabilities information about this port indexed by dot1dBasePort.",
+  "maxaccess": "not-accessible",
+  "name": "dot1dPortCapabilitiesEntry",
+  "nodetype": "row",
+  "oid": "1.3.6.1.2.1.17.6.1.1.4.1",
+  "status": "current"
+ },
+ "dot1dPortCapabilitiesTable": {
+  "class": "objecttype",
+  "description": "A table that contains capabilities information about every port that is associated with this bridge.",
+  "maxaccess": "not-accessible",
+  "name": "dot1dPortCapabilitiesTable",
+  "nodetype": "table",
+  "oid": "1.3.6.1.2.1.17.6.1.1.4",
+  "status": "current"
+ },
+ "dot1dPortDefaultUserPriority": {
+  "class": "objecttype",
+  "description": "The default ingress User Priority for this port. This only has effect on media, such as Ethernet, that do not support native User Priority. The value of this object MUST be retained across reinitializations of the management system.",
+  "maxaccess": "read-write",
+  "name": "dot1dPortDefaultUserPriority",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.17.6.1.2.1.1.1",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 7,
+      "min": 0
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "dot1dPortGarpEntry": {
+  "augmention": {
+   "module": "P-BRIDGE-MIB",
+   "name": "dot1dPortGarpEntry",
+   "object": "dot1dBasePortEntry"
+  },
+  "class": "objecttype",
+  "description": "GARP control information for a bridge port.",
+  "maxaccess": "not-accessible",
+  "name": "dot1dPortGarpEntry",
+  "nodetype": "row",
+  "oid": "1.3.6.1.2.1.17.6.1.3.1.1",
+  "status": "current"
+ },
+ "dot1dPortGarpJoinTime": {
+  "class": "objecttype",
+  "default": {
+   "default": {
+    "basetype": "Integer32",
+    "format": "decimal",
+    "value": "20"
+   }
+  },
+  "description": "The GARP Join time, in centiseconds. The value of this object MUST be retained across reinitializations of the management system.",
+  "maxaccess": "read-write",
+  "name": "dot1dPortGarpJoinTime",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.17.6.1.3.1.1.1",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "TimeInterval"
+  }
+ },
+ "dot1dPortGarpLeaveAllTime": {
+  "class": "objecttype",
+  "default": {
+   "default": {
+    "basetype": "Integer32",
+    "format": "decimal",
+    "value": "1000"
+   }
+  },
+  "description": "The GARP LeaveAll time, in centiseconds. The value of this object MUST be retained across reinitializations of the management system.",
+  "maxaccess": "read-write",
+  "name": "dot1dPortGarpLeaveAllTime",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.17.6.1.3.1.1.3",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "TimeInterval"
+  }
+ },
+ "dot1dPortGarpLeaveTime": {
+  "class": "objecttype",
+  "default": {
+   "default": {
+    "basetype": "Integer32",
+    "format": "decimal",
+    "value": "60"
+   }
+  },
+  "description": "The GARP Leave time, in centiseconds. The value of this object MUST be retained across reinitializations of the management system.",
+  "maxaccess": "read-write",
+  "name": "dot1dPortGarpLeaveTime",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.17.6.1.3.1.1.2",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "TimeInterval"
+  }
+ },
+ "dot1dPortGarpTable": {
+  "class": "objecttype",
+  "description": "A table of GARP control information about every bridge port. This is indexed by dot1dBasePort.",
+  "maxaccess": "not-accessible",
+  "name": "dot1dPortGarpTable",
+  "nodetype": "table",
+  "oid": "1.3.6.1.2.1.17.6.1.3.1",
+  "status": "current"
+ },
+ "dot1dPortGmrpEntry": {
+  "augmention": {
+   "module": "P-BRIDGE-MIB",
+   "name": "dot1dPortGmrpEntry",
+   "object": "dot1dBasePortEntry"
+  },
+  "class": "objecttype",
+  "description": "GMRP control and status information for a bridge port.",
+  "maxaccess": "not-accessible",
+  "name": "dot1dPortGmrpEntry",
+  "nodetype": "row",
+  "oid": "1.3.6.1.2.1.17.6.1.4.1.1",
+  "status": "current"
+ },
+ "dot1dPortGmrpFailedRegistrations": {
+  "class": "objecttype",
+  "description": "The total number of failed GMRP registrations, for any reason, in all VLANs, on this port.",
+  "maxaccess": "read-only",
+  "name": "dot1dPortGmrpFailedRegistrations",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.17.6.1.4.1.1.2",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  }
+ },
+ "dot1dPortGmrpLastPduOrigin": {
+  "class": "objecttype",
+  "description": "The Source MAC Address of the last GMRP message received on this port.",
+  "maxaccess": "read-only",
+  "name": "dot1dPortGmrpLastPduOrigin",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.17.6.1.4.1.1.3",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "MacAddress"
+  }
+ },
+ "dot1dPortGmrpStatus": {
+  "class": "objecttype",
+  "default": {
+   "default": {
+    "basetype": "Integer32",
+    "format": "decimal",
+    "value": "1"
+   }
+  },
+  "description": "The administrative state of GMRP operation on this port. The value enabled(1) indicates that GMRP is enabled on this port in all VLANs as long as dot1dGmrpStatus is also enabled(1). A value of disabled(2) indicates that GMRP is disabled on this port in all VLANs: any GMRP packets received will be silently discarded, and no GMRP registrations will be propagated from other ports. Setting this to a value of enabled(1) will be stored by the agent but will only take effect on the GMRP protocol operation if dot1dGmrpStatus also indicates the value enabled(1). This object affects all GMRP Applicant and Registrar state machines on this port. A transition from disabled(2) to enabled(1) will cause a reset of all GMRP state machines on this port. The value of this object MUST be retained across reinitializations of the management system.",
+  "maxaccess": "read-write",
+  "name": "dot1dPortGmrpStatus",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.17.6.1.4.1.1.1",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "EnabledStatus"
+  }
+ },
+ "dot1dPortGmrpTable": {
+  "class": "objecttype",
+  "description": "A table of GMRP control and status information about every bridge port. Augments the dot1dBasePortTable.",
+  "maxaccess": "not-accessible",
+  "name": "dot1dPortGmrpTable",
+  "nodetype": "table",
+  "oid": "1.3.6.1.2.1.17.6.1.4.1",
+  "status": "current"
+ },
+ "dot1dPortNumTrafficClasses": {
+  "class": "objecttype",
+  "description": "The number of egress traffic classes supported on this port. This object may optionally be read-only. The value of this object MUST be retained across reinitializations of the management system.",
+  "maxaccess": "read-write",
+  "name": "dot1dPortNumTrafficClasses",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.17.6.1.2.1.1.2",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 8,
+      "min": 1
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "dot1dPortOutboundAccessPriority": {
+  "class": "objecttype",
+  "description": "The Outbound Access Priority the received frame is mapped to.",
+  "maxaccess": "read-only",
+  "name": "dot1dPortOutboundAccessPriority",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.17.6.1.2.4.1.1",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 7,
+      "min": 0
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "dot1dPortOutboundAccessPriorityEntry": {
+  "class": "objecttype",
+  "description": "Regenerated User Priority to Outbound Access Priority mapping.",
+  "indices": [
+   {
+    "implied": 0,
+    "module": "BRIDGE-MIB",
+    "object": "dot1dBasePort"
+   },
+   {
+    "implied": 0,
+    "module": "P-BRIDGE-MIB",
+    "object": "dot1dRegenUserPriority"
+   }
+  ],
+  "maxaccess": "not-accessible",
+  "name": "dot1dPortOutboundAccessPriorityEntry",
+  "nodetype": "row",
+  "oid": "1.3.6.1.2.1.17.6.1.2.4.1",
+  "status": "current"
+ },
+ "dot1dPortOutboundAccessPriorityTable": {
+  "class": "objecttype",
+  "description": "A table mapping Regenerated User Priority to Outbound Access Priority. This is a fixed mapping for all port types, with two options for 802.5 Token Ring.",
+  "maxaccess": "not-accessible",
+  "name": "dot1dPortOutboundAccessPriorityTable",
+  "nodetype": "table",
+  "oid": "1.3.6.1.2.1.17.6.1.2.4",
+  "reference": "ISO/IEC 15802-3 Table 7-3",
+  "status": "current"
+ },
+ "dot1dPortPriorityEntry": {
+  "augmention": {
+   "module": "P-BRIDGE-MIB",
+   "name": "dot1dPortPriorityEntry",
+   "object": "dot1dBasePortEntry"
+  },
+  "class": "objecttype",
+  "description": "A list of Default User Priorities for each port of a transparent bridge. This is indexed by dot1dBasePort.",
+  "maxaccess": "not-accessible",
+  "name": "dot1dPortPriorityEntry",
+  "nodetype": "row",
+  "oid": "1.3.6.1.2.1.17.6.1.2.1.1",
+  "status": "current"
+ },
+ "dot1dPortPriorityTable": {
+  "class": "objecttype",
+  "description": "A table that contains information about every port that is associated with this transparent bridge.",
+  "maxaccess": "not-accessible",
+  "name": "dot1dPortPriorityTable",
+  "nodetype": "table",
+  "oid": "1.3.6.1.2.1.17.6.1.2.1",
+  "status": "current"
+ },
+ "dot1dPortRestrictedGroupRegistration": {
+  "class": "objecttype",
+  "default": {
+   "default": {
+    "basetype": "Integer32",
+    "format": "decimal",
+    "value": "2"
+   }
+  },
+  "description": "The state of Restricted Group Registration on this port. If the value of this control is true(1), then creation of a new dynamic entry is permitted only if there is a Static Filtering Entry for the VLAN concerned, in which the Registrar Administrative Control value is Normal Registration. The value of this object MUST be retained across reinitializations of the management system.",
+  "maxaccess": "read-write",
+  "name": "dot1dPortRestrictedGroupRegistration",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.17.6.1.4.1.1.4",
+  "reference": "IEEE 802.1t clause 10.3.2.3, 14.10.1.3.",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "TruthValue"
+  }
+ },
+ "dot1dPriority": {
+  "class": "objectidentity",
+  "name": "dot1dPriority",
+  "oid": "1.3.6.1.2.1.17.6.1.2"
+ },
+ "dot1dRegenUserPriority": {
+  "class": "objecttype",
+  "description": "The Regenerated User Priority that the incoming User Priority is mapped to for this port. The value of this object MUST be retained across reinitializations of the management system.",
+  "maxaccess": "read-write",
+  "name": "dot1dRegenUserPriority",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.17.6.1.2.2.1.2",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 7,
+      "min": 0
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "dot1dTpHCPortEntry": {
+  "class": "objecttype",
+  "description": "Statistics information for each high-capacity port of a transparent bridge.",
+  "indices": [
+   {
+    "implied": 0,
+    "module": "BRIDGE-MIB",
+    "object": "dot1dTpPort"
+   }
+  ],
+  "maxaccess": "not-accessible",
+  "name": "dot1dTpHCPortEntry",
+  "nodetype": "row",
+  "oid": "1.3.6.1.2.1.17.4.5.1",
+  "status": "current"
+ },
+ "dot1dTpHCPortInDiscards": {
+  "class": "objecttype",
+  "description": "Count of valid frames that have been received by this port from its segment that were discarded (i.e., filtered) by the Forwarding Process.",
+  "maxaccess": "read-only",
+  "name": "dot1dTpHCPortInDiscards",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.17.4.5.1.3",
+  "reference": "ISO/IEC 15802-3 Section 14.6.1.1.3",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter64"
+  }
+ },
+ "dot1dTpHCPortInFrames": {
+  "class": "objecttype",
+  "description": "The number of frames that have been received by this port from its segment. Note that a frame received on the interface corresponding to this port is only counted by this object if and only if it is for a protocol being processed by the local bridging function, including bridge management frames.",
+  "maxaccess": "read-only",
+  "name": "dot1dTpHCPortInFrames",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.17.4.5.1.1",
+  "reference": "ISO/IEC 15802-3 Section 14.6.1.1.3",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter64"
+  }
+ },
+ "dot1dTpHCPortOutFrames": {
+  "class": "objecttype",
+  "description": "The number of frames that have been transmitted by this port to its segment. Note that a frame transmitted on the interface corresponding to this port is only counted by this object if and only if it is for a protocol being processed by the local bridging function, including bridge management frames.",
+  "maxaccess": "read-only",
+  "name": "dot1dTpHCPortOutFrames",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.17.4.5.1.2",
+  "reference": "ISO/IEC 15802-3 Section 14.6.1.1.3",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter64"
+  }
+ },
+ "dot1dTpHCPortTable": {
+  "class": "objecttype",
+  "description": "A table that contains information about every high- capacity port that is associated with this transparent bridge.",
+  "maxaccess": "not-accessible",
+  "name": "dot1dTpHCPortTable",
+  "nodetype": "table",
+  "oid": "1.3.6.1.2.1.17.4.5",
+  "status": "current"
+ },
+ "dot1dTpPortInOverflowDiscards": {
+  "class": "objecttype",
+  "description": "The number of times the associated dot1dTpPortInDiscards counter has overflowed.",
+  "maxaccess": "read-only",
+  "name": "dot1dTpPortInOverflowDiscards",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.17.4.6.1.3",
+  "reference": "ISO/IEC 15802-3 Section 14.6.1.1.3",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  }
+ },
+ "dot1dTpPortInOverflowFrames": {
+  "class": "objecttype",
+  "description": "The number of times the associated dot1dTpPortInFrames counter has overflowed.",
+  "maxaccess": "read-only",
+  "name": "dot1dTpPortInOverflowFrames",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.17.4.6.1.1",
+  "reference": "ISO/IEC 15802-3 Section 14.6.1.1.3",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  }
+ },
+ "dot1dTpPortOutOverflowFrames": {
+  "class": "objecttype",
+  "description": "The number of times the associated dot1dTpPortOutFrames counter has overflowed.",
+  "maxaccess": "read-only",
+  "name": "dot1dTpPortOutOverflowFrames",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.17.4.6.1.2",
+  "reference": "ISO/IEC 15802-3 Section 14.6.1.1.3",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "Counter32"
+  }
+ },
+ "dot1dTpPortOverflowEntry": {
+  "class": "objecttype",
+  "description": "The most significant bits of statistics counters for a high- capacity interface of a transparent bridge. Each object is associated with a corresponding object in dot1dTpPortTable that indicates the least significant bits of the counter.",
+  "indices": [
+   {
+    "implied": 0,
+    "module": "BRIDGE-MIB",
+    "object": "dot1dTpPort"
+   }
+  ],
+  "maxaccess": "not-accessible",
+  "name": "dot1dTpPortOverflowEntry",
+  "nodetype": "row",
+  "oid": "1.3.6.1.2.1.17.4.6.1",
+  "status": "current"
+ },
+ "dot1dTpPortOverflowTable": {
+  "class": "objecttype",
+  "description": "A table that contains the most-significant bits of statistics counters for ports that are associated with this transparent bridge that are on high-capacity interfaces, as defined in the conformance clauses for this table. This table is provided as a way to read 64-bit counters for agents that support only SNMPv1. Note that the reporting of most-significant and least-significant counter bits separately runs the risk of missing an overflow of the lower bits in the interval between sampling. The manager must be aware of this possibility, even within the same varbindlist, when interpreting the results of a request or asynchronous notification.",
+  "maxaccess": "not-accessible",
+  "name": "dot1dTpPortOverflowTable",
+  "nodetype": "table",
+  "oid": "1.3.6.1.2.1.17.4.6",
+  "status": "current"
+ },
+ "dot1dTrafficClass": {
+  "class": "objecttype",
+  "description": "The Traffic Class the received frame is mapped to. The value of this object MUST be retained across reinitializations of the management system.",
+  "maxaccess": "read-write",
+  "name": "dot1dTrafficClass",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.17.6.1.2.3.1.2",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 7,
+      "min": 0
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "dot1dTrafficClassEntry": {
+  "class": "objecttype",
+  "description": "User Priority to Traffic Class mapping.",
+  "indices": [
+   {
+    "implied": 0,
+    "module": "BRIDGE-MIB",
+    "object": "dot1dBasePort"
+   },
+   {
+    "implied": 0,
+    "module": "P-BRIDGE-MIB",
+    "object": "dot1dTrafficClassPriority"
+   }
+  ],
+  "maxaccess": "not-accessible",
+  "name": "dot1dTrafficClassEntry",
+  "nodetype": "row",
+  "oid": "1.3.6.1.2.1.17.6.1.2.3.1",
+  "status": "current"
+ },
+ "dot1dTrafficClassPriority": {
+  "class": "objecttype",
+  "description": "The Priority value determined for the received frame. This value is equivalent to the priority indicated in the tagged frame received, or one of the evaluated priorities, determined according to the media-type. For untagged frames received from Ethernet media, this value is equal to the dot1dPortDefaultUserPriority value for the ingress port. For untagged frames received from non-Ethernet media, this value is equal to the dot1dRegenUserPriority value for the ingress port and media-specific user priority.",
+  "maxaccess": "not-accessible",
+  "name": "dot1dTrafficClassPriority",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.17.6.1.2.3.1.1",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 7,
+      "min": 0
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "dot1dTrafficClassTable": {
+  "class": "objecttype",
+  "description": "A table mapping evaluated User Priority to Traffic Class, for forwarding by the bridge. Traffic class is a number in the range (0..(dot1dPortNumTrafficClasses-1)).",
+  "maxaccess": "not-accessible",
+  "name": "dot1dTrafficClassTable",
+  "nodetype": "table",
+  "oid": "1.3.6.1.2.1.17.6.1.2.3",
+  "reference": "ISO/IEC 15802-3 Table 7-2",
+  "status": "current"
+ },
+ "dot1dTrafficClassesEnabled": {
+  "class": "objecttype",
+  "default": {
+   "default": {
+    "basetype": "Integer32",
+    "format": "decimal",
+    "value": "1"
+   }
+  },
+  "description": "The value true(1) indicates that Traffic Classes are enabled on this bridge. When false(2), the bridge operates with a single priority level for all traffic. The value of this object MUST be retained across reinitializations of the management system.",
+  "maxaccess": "read-write",
+  "name": "dot1dTrafficClassesEnabled",
+  "nodetype": "scalar",
+  "oid": "1.3.6.1.2.1.17.6.1.1.2",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "type": "TruthValue"
+  }
+ },
+ "dot1dUserPriority": {
+  "class": "objecttype",
+  "description": "The User Priority for a frame received on this port.",
+  "maxaccess": "not-accessible",
+  "name": "dot1dUserPriority",
+  "nodetype": "column",
+  "oid": "1.3.6.1.2.1.17.6.1.2.2.1.1",
+  "status": "current",
+  "syntax": {
+   "class": "type",
+   "constraints": {
+    "range": [
+     {
+      "max": 7,
+      "min": 0
+     }
+    ]
+   },
+   "type": "Integer32"
+  }
+ },
+ "dot1dUserPriorityRegenEntry": {
+  "class": "objecttype",
+  "description": "A mapping of incoming User Priority to a Regenerated User Priority.",
+  "indices": [
+   {
+    "implied": 0,
+    "module": "BRIDGE-MIB",
+    "object": "dot1dBasePort"
+   },
+   {
+    "implied": 0,
+    "module": "P-BRIDGE-MIB",
+    "object": "dot1dUserPriority"
+   }
+  ],
+  "maxaccess": "not-accessible",
+  "name": "dot1dUserPriorityRegenEntry",
+  "nodetype": "row",
+  "oid": "1.3.6.1.2.1.17.6.1.2.2.1",
+  "status": "current"
+ },
+ "dot1dUserPriorityRegenTable": {
+  "class": "objecttype",
+  "description": "A list of Regenerated User Priorities for each received User Priority on each port of a bridge. The Regenerated User Priority value may be used to index the Traffic Class Table for each input port. This only has effect on media that support native User Priority. The default values for Regenerated User Priorities are the same as the User Priorities.",
+  "maxaccess": "not-accessible",
+  "name": "dot1dUserPriorityRegenTable",
+  "nodetype": "table",
+  "oid": "1.3.6.1.2.1.17.6.1.2.2",
+  "reference": "ISO/IEC 15802-3 Section 6.4",
+  "status": "current"
+ },
+ "imports": {
+  "BRIDGE-MIB": [
+   "dot1dBasePort",
+   "dot1dBasePortEntry",
+   "dot1dBridge",
+   "dot1dTp",
+   "dot1dTpPort"
+  ],
+  "SNMPv2-CONF": [
+   "MODULE-COMPLIANCE",
+   "NOTIFICATION-GROUP",
+   "OBJECT-GROUP"
+  ],
+  "SNMPv2-SMI": [
+   "Bits",
+   "Counter32",
+   "Counter64",
+   "Integer32",
+   "IpAddress",
+   "MODULE-IDENTITY",
+   "MibIdentifier",
+   "OBJECT-IDENTITY",
+   "OBJECT-TYPE",
+   "TimeTicks",
+   "Unsigned32",
+   "iso"
+  ],
+  "SNMPv2-TC": [
+   "DisplayString",
+   "MacAddress",
+   "PhysAddress",
+   "TEXTUAL-CONVENTION",
+   "TimeInterval",
+   "TruthValue"
+  ],
+  "class": "imports"
+ },
+ "meta": {
+  "module": "P-BRIDGE-MIB"
+ },
+ "pBridgeAccessPriorityGroup": {
+  "class": "objectgroup",
+  "description": "A collection of objects defining the media-dependent outbound access level for each priority.",
+  "name": "pBridgeAccessPriorityGroup",
+  "objects": [
+   {
+    "module": "P-BRIDGE-MIB",
+    "object": "dot1dPortOutboundAccessPriority"
+   }
+  ],
+  "oid": "1.3.6.1.2.1.17.6.2.1.7",
+  "status": "current"
+ },
+ "pBridgeCompliance": {
+  "class": "modulecompliance",
+  "description": "The compliance statement for device support of Priority and Multicast Filtering extended bridging services.",
+  "modulecompliance": [
+   {
+    "module": "P-BRIDGE-MIB",
+    "object": "pBridgeExtCapGroup"
+   },
+   {
+    "module": "P-BRIDGE-MIB",
+    "object": "pBridgeDeviceGmrpGroup"
+   },
+   {
+    "module": "P-BRIDGE-MIB",
+    "object": "pBridgeDevicePriorityGroup"
+   },
+   {
+    "module": "P-BRIDGE-MIB",
+    "object": "pBridgeDefaultPriorityGroup"
+   },
+   {
+    "module": "P-BRIDGE-MIB",
+    "object": "pBridgeRegenPriorityGroup"
+   },
+   {
+    "module": "P-BRIDGE-MIB",
+    "object": "pBridgePriorityGroup"
+   },
+   {
+    "module": "P-BRIDGE-MIB",
+    "object": "pBridgeAccessPriorityGroup"
+   },
+   {
+    "module": "P-BRIDGE-MIB",
+    "object": "pBridgePortGarpGroup"
+   },
+   {
+    "module": "P-BRIDGE-MIB",
+    "object": "pBridgePortGmrpGroup"
+   },
+   {
+    "module": "P-BRIDGE-MIB",
+    "object": "pBridgeHCPortGroup"
+   },
+   {
+    "module": "P-BRIDGE-MIB",
+    "object": "pBridgePortOverflowGroup"
+   }
+  ],
+  "name": "pBridgeCompliance",
+  "oid": "1.3.6.1.2.1.17.6.2.2.1",
+  "status": "deprecated"
+ },
+ "pBridgeCompliance2": {
+  "class": "modulecompliance",
+  "description": "The compliance statement for device support of Priority and Multicast Filtering extended bridging services.",
+  "modulecompliance": [
+   {
+    "module": "P-BRIDGE-MIB",
+    "object": "pBridgeExtCapGroup"
+   },
+   {
+    "module": "P-BRIDGE-MIB",
+    "object": "pBridgeDeviceGmrpGroup"
+   },
+   {
+    "module": "P-BRIDGE-MIB",
+    "object": "pBridgeDevicePriorityGroup"
+   },
+   {
+    "module": "P-BRIDGE-MIB",
+    "object": "pBridgeDefaultPriorityGroup"
+   },
+   {
+    "module": "P-BRIDGE-MIB",
+    "object": "pBridgeRegenPriorityGroup"
+   },
+   {
+    "module": "P-BRIDGE-MIB",
+    "object": "pBridgePriorityGroup"
+   },
+   {
+    "module": "P-BRIDGE-MIB",
+    "object": "pBridgeAccessPriorityGroup"
+   },
+   {
+    "module": "P-BRIDGE-MIB",
+    "object": "pBridgePortGarpGroup"
+   },
+   {
+    "module": "P-BRIDGE-MIB",
+    "object": "pBridgePortGmrpGroup2"
+   },
+   {
+    "module": "P-BRIDGE-MIB",
+    "object": "pBridgeHCPortGroup"
+   },
+   {
+    "module": "P-BRIDGE-MIB",
+    "object": "pBridgePortOverflowGroup"
+   }
+  ],
+  "name": "pBridgeCompliance2",
+  "oid": "1.3.6.1.2.1.17.6.2.2.2",
+  "status": "current"
+ },
+ "pBridgeCompliances": {
+  "class": "objectidentity",
+  "name": "pBridgeCompliances",
+  "oid": "1.3.6.1.2.1.17.6.2.2"
+ },
+ "pBridgeConformance": {
+  "class": "objectidentity",
+  "name": "pBridgeConformance",
+  "oid": "1.3.6.1.2.1.17.6.2"
+ },
+ "pBridgeDefaultPriorityGroup": {
+  "class": "objectgroup",
+  "description": "A collection of objects defining the User Priority applicable to each port for media that do not support native User Priority.",
+  "name": "pBridgeDefaultPriorityGroup",
+  "objects": [
+   {
+    "module": "P-BRIDGE-MIB",
+    "object": "dot1dPortDefaultUserPriority"
+   }
+  ],
+  "oid": "1.3.6.1.2.1.17.6.2.1.4",
+  "status": "current"
+ },
+ "pBridgeDeviceGmrpGroup": {
+  "class": "objectgroup",
+  "description": "A collection of objects providing device-level control for the Multicast Filtering extended bridge services.",
+  "name": "pBridgeDeviceGmrpGroup",
+  "objects": [
+   {
+    "module": "P-BRIDGE-MIB",
+    "object": "dot1dGmrpStatus"
+   }
+  ],
+  "oid": "1.3.6.1.2.1.17.6.2.1.2",
+  "status": "current"
+ },
+ "pBridgeDevicePriorityGroup": {
+  "class": "objectgroup",
+  "description": "A collection of objects providing device-level control for the Priority services.",
+  "name": "pBridgeDevicePriorityGroup",
+  "objects": [
+   {
+    "module": "P-BRIDGE-MIB",
+    "object": "dot1dTrafficClassesEnabled"
+   }
+  ],
+  "oid": "1.3.6.1.2.1.17.6.2.1.3",
+  "status": "current"
+ },
+ "pBridgeExtCapGroup": {
+  "class": "objectgroup",
+  "description": "A collection of objects indicating the optional capabilities of the device.",
+  "name": "pBridgeExtCapGroup",
+  "objects": [
+   {
+    "module": "P-BRIDGE-MIB",
+    "object": "dot1dDeviceCapabilities"
+   },
+   {
+    "module": "P-BRIDGE-MIB",
+    "object": "dot1dPortCapabilities"
+   }
+  ],
+  "oid": "1.3.6.1.2.1.17.6.2.1.1",
+  "status": "current"
+ },
+ "pBridgeGroups": {
+  "class": "objectidentity",
+  "name": "pBridgeGroups",
+  "oid": "1.3.6.1.2.1.17.6.2.1"
+ },
+ "pBridgeHCPortGroup": {
+  "class": "objectgroup",
+  "description": "A collection of objects providing 64-bit statistics counters for high-capacity bridge ports.",
+  "name": "pBridgeHCPortGroup",
+  "objects": [
+   {
+    "module": "P-BRIDGE-MIB",
+    "object": "dot1dTpHCPortInFrames"
+   },
+   {
+    "module": "P-BRIDGE-MIB",
+    "object": "dot1dTpHCPortOutFrames"
+   },
+   {
+    "module": "P-BRIDGE-MIB",
+    "object": "dot1dTpHCPortInDiscards"
+   }
+  ],
+  "oid": "1.3.6.1.2.1.17.6.2.1.10",
+  "status": "current"
+ },
+ "pBridgeMIB": {
+  "class": "moduleidentity",
+  "contactinfo": "Email: bridge-mib@ietf.org ietfmibs@ops.ietf.org David Levi Postal: Nortel Networks 4655 Great America Parkway Santa Clara, CA 95054 USA Phone: +1 865 686 0432 Email: dlevi@nortel.com David Harrington Postal: Effective Software 50 Harding Rd. Portsmouth, NH 03801 USA Phone: +1 603 436 8634 Email: ietfdbh@comcast.net Les Bell Postal: Hemel Hempstead, Herts. HP2 7YU UK Email: elbell@ntlworld.com Vivian Ngai Email: vivian_ngai@acm.org Andrew Smith Postal: Beijing Harbour Networks Jiuling Building 21 North Xisanhuan Ave. Beijing, 100089 PRC Fax: +1 415 345 1827 Email: ah_smith@acm.org Paul Langille Postal: Newbridge Networks 5 Corporate Drive Andover, MA 01810 USA Phone: +1 978 691 4665 Email: langille@newbridge.com Anil Rijhsinghani Postal: Accton Technology Corporation 5 Mount Royal Ave Marlboro, MA 01752 USA Phone: Email: anil@accton.com Keith McCloghrie Postal: Cisco Systems, Inc. 170 West Tasman Drive San Jose, CA 95134-1706 USA Phone: +1 408 526 5260 Email: kzm@cisco.com",
+  "description": "The Bridge MIB Extension module for managing Priority and Multicast Filtering, defined by IEEE 802.1D-1998, including Restricted Group Registration defined by IEEE 802.1t-2001. Copyright (C) The Internet Society (2006). This version of this MIB module is part of RFC 4363; See the RFC itself for full legal notices.",
+  "lastupdated": "200601090000Z",
+  "name": "pBridgeMIB",
+  "oid": "1.3.6.1.2.1.17.6",
+  "organization": "IETF Bridge MIB Working Group",
+  "revisions": [
+   {
+    "description": "Added dot1dPortRestrictedGroupRegistration. Deprecated pBridgePortGmrpGroup and pBridgeCompliance and added pBridgePortGmrpGroup2 and pBridgeCompliance2.",
+    "revision": "2006-01-09 00:00"
+   },
+   {
+    "description": "The Bridge MIB Extension module for managing Priority and Multicast Filtering, defined by IEEE 802.1D-1998. Initial version, published as RFC 2674.",
+    "revision": "1999-08-25 00:00"
+   }
+  ]
+ },
+ "pBridgeMIBObjects": {
+  "class": "objectidentity",
+  "name": "pBridgeMIBObjects",
+  "oid": "1.3.6.1.2.1.17.6.1"
+ },
+ "pBridgePortGarpGroup": {
+  "class": "objectgroup",
+  "description": "A collection of objects providing port level control and status information for GARP operation.",
+  "name": "pBridgePortGarpGroup",
+  "objects": [
+   {
+    "module": "P-BRIDGE-MIB",
+    "object": "dot1dPortGarpJoinTime"
+   },
+   {
+    "module": "P-BRIDGE-MIB",
+    "object": "dot1dPortGarpLeaveTime"
+   },
+   {
+    "module": "P-BRIDGE-MIB",
+    "object": "dot1dPortGarpLeaveAllTime"
+   }
+  ],
+  "oid": "1.3.6.1.2.1.17.6.2.1.8",
+  "status": "current"
+ },
+ "pBridgePortGmrpGroup": {
+  "class": "objectgroup",
+  "description": "A collection of objects providing port level control and status information for GMRP operation.",
+  "name": "pBridgePortGmrpGroup",
+  "objects": [
+   {
+    "module": "P-BRIDGE-MIB",
+    "object": "dot1dPortGmrpStatus"
+   },
+   {
+    "module": "P-BRIDGE-MIB",
+    "object": "dot1dPortGmrpFailedRegistrations"
+   },
+   {
+    "module": "P-BRIDGE-MIB",
+    "object": "dot1dPortGmrpLastPduOrigin"
+   }
+  ],
+  "oid": "1.3.6.1.2.1.17.6.2.1.9",
+  "status": "deprecated"
+ },
+ "pBridgePortGmrpGroup2": {
+  "class": "objectgroup",
+  "description": "A collection of objects providing port level control and status information for GMRP operation.",
+  "name": "pBridgePortGmrpGroup2",
+  "objects": [
+   {
+    "module": "P-BRIDGE-MIB",
+    "object": "dot1dPortGmrpStatus"
+   },
+   {
+    "module": "P-BRIDGE-MIB",
+    "object": "dot1dPortGmrpFailedRegistrations"
+   },
+   {
+    "module": "P-BRIDGE-MIB",
+    "object": "dot1dPortGmrpLastPduOrigin"
+   },
+   {
+    "module": "P-BRIDGE-MIB",
+    "object": "dot1dPortRestrictedGroupRegistration"
+   }
+  ],
+  "oid": "1.3.6.1.2.1.17.6.2.1.12",
+  "status": "current"
+ },
+ "pBridgePortOverflowGroup": {
+  "class": "objectgroup",
+  "description": "A collection of objects providing overflow statistics counters for high-capacity bridge ports.",
+  "name": "pBridgePortOverflowGroup",
+  "objects": [
+   {
+    "module": "P-BRIDGE-MIB",
+    "object": "dot1dTpPortInOverflowFrames"
+   },
+   {
+    "module": "P-BRIDGE-MIB",
+    "object": "dot1dTpPortOutOverflowFrames"
+   },
+   {
+    "module": "P-BRIDGE-MIB",
+    "object": "dot1dTpPortInOverflowDiscards"
+   }
+  ],
+  "oid": "1.3.6.1.2.1.17.6.2.1.11",
+  "status": "current"
+ },
+ "pBridgePriorityGroup": {
+  "class": "objectgroup",
+  "description": "A collection of objects defining the traffic classes within a bridge for each evaluated User Priority.",
+  "name": "pBridgePriorityGroup",
+  "objects": [
+   {
+    "module": "P-BRIDGE-MIB",
+    "object": "dot1dPortNumTrafficClasses"
+   },
+   {
+    "module": "P-BRIDGE-MIB",
+    "object": "dot1dTrafficClass"
+   }
+  ],
+  "oid": "1.3.6.1.2.1.17.6.2.1.6",
+  "status": "current"
+ },
+ "pBridgeRegenPriorityGroup": {
+  "class": "objectgroup",
+  "description": "A collection of objects defining the User Priorities applicable to each port for media that support native User Priority.",
+  "name": "pBridgeRegenPriorityGroup",
+  "objects": [
+   {
+    "module": "P-BRIDGE-MIB",
+    "object": "dot1dRegenUserPriority"
+   }
+  ],
+  "oid": "1.3.6.1.2.1.17.6.2.1.5",
+  "status": "current"
+ }
+}
