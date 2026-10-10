@@ -1,0 +1,13 @@
+#!/bin/sh
+# Entry point of the actsnmp-snmpsim container: snmpsim command responder.
+set -eu
+CACHE=/tmp/snmpsim-cache
+rm -rf "$CACHE"
+mkdir -p "$CACHE"
+exec /opt/venv/bin/snmpsim-command-responder \
+    --args-from-file=/opt/actsnmp/config/snmpsim.args \
+    --variation-modules-dir=/opt/actsnmp/snmpsim/variation \
+    --cache-dir="$CACHE" \
+    --logging-method=stdout \
+    --log-level="${SNMPSIM_LOG_LEVEL:-error}" \
+    "$@"

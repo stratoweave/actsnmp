@@ -1,0 +1,10 @@
+#!/bin/sh
+# Entry point of the actsnmp-snmpd container: net-snmp agent in the foreground,
+# logging to stdout.  Persistent state lives in a fresh directory, i.e. every
+# container start begins with engineBoots=1 and the documented initial values.
+set -eu
+export SNMP_PERSISTENT_DIR="${SNMP_PERSISTENT_DIR:-/tmp/snmpd-persist}"
+rm -rf "$SNMP_PERSISTENT_DIR"
+mkdir -p "$SNMP_PERSISTENT_DIR"
+# -I -smux: SMUX would try to bind the privileged tcp/199 port
+exec /usr/sbin/snmpd -f -Lo -C -c /opt/actsnmp/config/snmpd.conf -I -smux -p /tmp/snmpd.pid "$@"

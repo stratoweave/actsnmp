@@ -1,0 +1,8 @@
+#!/bin/sh
+# Entry point of the actsnmp-snmptrapd container: net-snmp trap/inform receiver,
+# every received notification is printed to stdout (docker logs actsnmp-snmptrapd).
+set -eu
+export SNMP_PERSISTENT_DIR="${SNMP_PERSISTENT_DIR:-/tmp/snmptrapd-persist}"
+rm -rf "$SNMP_PERSISTENT_DIR"
+mkdir -p "$SNMP_PERSISTENT_DIR"
+exec /usr/sbin/snmptrapd -f -Lo -On -C -c /opt/actsnmp/config/snmptrapd.conf "$@"
