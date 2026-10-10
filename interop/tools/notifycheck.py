@@ -51,7 +51,10 @@ import actsnmp_dataset as ds  # noqa: E402
 import snmptrapd2canon as t2c  # noqa: E402
 
 PYNOTIFY = ["/opt/venv/bin/python3", "/opt/actsnmp/pysnmp_notify.py"]
+# the container's config, else the repo's interop/config (host-side --commands/--expected)
 CONFIG = "/opt/actsnmp/config"
+if not os.path.isdir(CONFIG):
+    CONFIG = os.path.join(HERE, "..", "config")
 AUTHPASS = "authpass123"
 PRIVPASS = "privpass123"
 # fixed authoritative engine IDs of the v3 TRAP senders (snmptrapd has users

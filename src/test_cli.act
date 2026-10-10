@@ -1,0 +1,625 @@
+"""In-process tests of the actsnmp CLI against a real Agent and NotificationReceiver over MemNet
+
+The expected texts and exit codes are net-snmp's (see
+interop/expected/pathological-netsnmp.txt). The env tests compare whole
+walks with the net-snmp output recorded in interop/expected/netsnmp/, byte
+for byte.
+"""
+
+import testing
+
+import actsnmp
+import agent
+import ber
+import cliopts
+import errors
+import mibview
+import notify
+import pdu
+import security
+from actsnmp import Command, TrapPrinter
+from agent import Agent, AgentConfig, Faults
+from client import Client
+from cliopts import CliOptions
+from mibview import MibView, WriteRule
+from notify import Notification
+from oid import Oid
+from receiver import NotificationReceiver, ReceiverConfig
+from security import Usm
+from transport import MemNet
+from values import Counter64, Integer, IpAddress, ObjectIdentifier, OctetString, Opaque, VarBind
+from testutil import h, read_text
+
+AGENT = "10.0.0.1"
+MANAGER = "10.0.0.2"
+RECEIVER = "10.0.0.9"
+AGENT_ENGINE = "80001f88806532652d6167656e74"
+RECEIVER_ENGINE = "80001f8880616374736e6d7072"
+
+EP = ".1.3.6.1.4.1.8072.9999.1"
+SYS_DESCR = Oid([1, 3, 6, 1, 2, 1, 1, 1, 0])
+LAST = Oid([1, 3, 6, 1, 6, 3, 99, 1, 0])
+TIMEOUT_V2 = "Timeout: No Response from "
+NO_SUCH_NAME = "Reason: (noSuchName) There is no such variable name in this MIB.\n"
+END_OF_MIB_VIEW = " = No more variables left in this MIB View (It is past the end of the MIB tree)\n"
+NO_SUCH_OBJECT = " = No Such Object available on this agent at this OID\n"
+
+USERS: list[str] = [
+    "u_noauth\tnoAuthNoPriv\t-\t-\t-\t-\t-\t-\tyes\tyes",
+    "u_md5\tauthNoPriv\tMD5\t-\tMD5\t-\tauthpass123\t-\tyes\tyes",
+    "u_sha_aes\tauthPriv\tSHA\tAES\tSHA\tAES\tauthpass123\tprivpass123\tyes\tyes",
+    "u_md5_aes256c\tauthPriv\tMD5\tAES-256-C\tMD5\tAES256\tauthpass123\tprivpass123\tyes\tyes",
+]
+
+def e(arcs: list[int]) -> Oid:
+    """An OID below 1.3.6.1.4.1.8072.9999.1"""
+    return Oid([1, 3, 6, 1, 4, 1, 8072, 9999, 1] + arcs)
+
+def make_view() -> MibView:
+    """Scalars of several types, a 3x3 table (E.10.1.c.i = c*100+i), two writable scalars and a last variable"""
+    vbs = [VarBind(SYS_DESCR, OctetString(b"actsnmp test agent")),
+           VarBind(e([1, 1, 0]), Integer(42)),
+           VarBind(e([2, 1, 0]), OctetString(b"hello")),
+           VarBind(e([3, 1, 0]), Counter64(18446744073709551615)),
+           VarBind(e([4, 1, 0]), IpAddress(b"\xc0\x00\x02\x01")),
+           VarBind(e([5, 1, 0]), Opaque(b"\x9f\x78\x04\x3f\x80\x00\x00")),
+           VarBind(e([20, 1, 0]), Integer(0)),
+           VarBind(e([20, 2, 0]), OctetString(b"abc")),
+           VarBind(LAST, Integer(7))]
+    for c in range(1, 4):
+        for i in range(1, 4):
+            vbs.append(VarBind(e([10, 1, c, i]), Integer(c * 100 + i)))
+    return MibView(vbs)
+
+def make_config() -> AgentConfig:
+    rules = [WriteRule(e([20, 1]), [ber.TAG_INTEGER], 0, 100), WriteRule(e([20, 2]), [ber.TAG_OCTET_STRING], 0, 16)]
+    return AgentConfig({"public": False, "private": True}, security.load_users_tsv("\n".join(USERS)).users,
+                       h(AGENT_ENGINE), 3, rules)
+
+def table_lines(cols: list[int], rows: list[int], row_major: bool) -> str:
+    """Output lines of the test table, in column order (a walk) or row order (table)"""
+    out: list[str] = []
+    if row_major:
+        for i in rows:
+            for c in cols:
+                out.append(EP + ".10.1.%d.%d = INTEGER: %d\n" % (c, i, c * 100 + i))
+    else:
+        for c in cols:
+            for i in rows:
+                out.append(EP + ".10.1.%d.%d = INTEGER: %d\n" % (c, i, c * 100 + i))
+    return "".join(out)
+
+
+# The harness #######################################################################################
+
+class Result(object):
+    """What a command wrote and its exit code"""
+    out: str
+    err: str
+    code: int
+
+    def __init__(self, out: str, err: str, code: int):
+        self.out = out
+        self.err = err
+        self.code = code
+
+actor Capture(report: action(Result) -> None):
+    """The out, err and done callbacks of one command; report() once with everything"""
+    var _out: list[str] = []
+    var _err: list[str] = []
+    var _done = False
+
+    def out(s: str) -> None:
+        _out.append(s)
+
+    def err(s: str) -> None:
+        _err.append(s)
+
+    def done(code: int) -> None:
+        if not _done:
+            _done = True
+            report(Result("".join(_out), "".join(_err), code))
+
+class Step(object):
+    """A command line (without "actsnmp") and what it must write: exactly, or as a prefix of out and err"""
+    args: list[str]
+    out: str
+    err: str
+    code: int
+    exact: bool
+
+    def __init__(self, args: list[str], out: str, err: str, code: int, exact: bool=True):
+        self.args = args
+        self.out = out
+        self.err = err
+        self.code = code
+        self.exact = exact
+
+proc def run_cli(mn: MemNet, port: int, args: list[str], report: action(Result) -> None) -> None:
+    """Run one client command over MemNet from MANAGER:port; parse errors are reported as exit code 1"""
+    cap = Capture(report)
+    try:
+        o = cliopts.parse(["actsnmp"] + args)
+        sec = actsnmp.security_of(o)
+        c = actsnmp.new_client(None, o, sec, mn.client(MANAGER, port, o.address, o.port))
+        Command(o, c, cap.out, cap.err, cap.done)
+    except cliopts.CliError as x:
+        cap.err(x.error_message + "\n")
+        cap.done(1)
+    except ValueError as x:
+        cap.err(x.error_message + "\n")
+        cap.done(1)
+
+def _mismatch(s: Step, r: Result) -> ?str:
+    ok = r.code == s.code
+    if s.exact:
+        ok = ok and r.out == s.out and r.err == s.err
+    else:
+        ok = ok and r.out.startswith(s.out) and r.err.startswith(s.err)
+    if ok:
+        return None
+    return ("actsnmp " + " ".join(s.args) + "\n  expected exit %d, out %r, err %r\n  got      exit %d, out %r, err %r"
+            % (s.code, s.out, s.err, r.code, r.out, r.err))
+
+actor Script(mn: MemNet, steps: list[Step], first_port: int, report: action(list[str]) -> None):
+    """Runs steps one after the other and reports the mismatches (empty: all passed)"""
+    var _i = 0
+    var _failures: list[str] = []
+
+    def _step_done(r: Result) -> None:
+        m = _mismatch(steps[_i], r)
+        if m is not None:
+            _failures.append(m)
+        _i += 1
+        _next()
+
+    proc def _next() -> None:
+        if _i >= len(steps):
+            report(_failures)
+        else:
+            run_cli(mn, first_port + _i, steps[_i].args, _step_done)
+
+    _next()
+
+proc def finish(t: testing.AsyncT, failures: list[str]) -> None:
+    if len(failures) == 0:
+        t.success()
+    else:
+        t.failure(AssertionError("%d step(s) failed:\n" % len(failures) + "\n".join(failures)))
+
+
+# Requests ##########################################################################################
+
+def request_steps() -> list[Step]:
+    pub = ["-v2c", "-c", "public", AGENT]
+    v1 = ["-v1", "-c", "public", AGENT]
+    return [
+        # get: values of several types and both exceptions (exit 0)
+        Step(["get"] + pub + ["1.3.6.1.2.1.1.1.0", EP + ".1.1.0", EP + ".3.1.0", EP + ".4.1.0", EP + ".5.1.0",
+                              EP + ".1.1.1", EP + ".99.0"],
+             ".1.3.6.1.2.1.1.1.0 = STRING: \"actsnmp test agent\"\n" + EP + ".1.1.0 = INTEGER: 42\n"
+             + EP + ".3.1.0 = Counter64: 18446744073709551615\n" + EP + ".4.1.0 = IpAddress: 192.0.2.1\n"
+             + EP + ".5.1.0 = Opaque: Float: 1.000000\n"
+             + EP + ".1.1.1 = No Such Instance currently exists at this OID\n" + EP + ".99.0" + NO_SUCH_OBJECT, "", 0),
+        # get without the leading dot, -O flags
+        Step(["get", "-Oqv"] + pub + ["1.3.6.1.4.1.8072.9999.1.1.1.0"], "42\n", "", 0),
+        Step(["get", "-OQ"] + pub + [EP + ".2.1.0"], EP + ".2.1.0 = \"hello\"\n", "", 0),
+        Step(["get", "--canon"] + pub + [EP + ".2.1.0", EP + ".5.1.0"],
+             EP + ".2.1.0 = STRING: \"hello\"\n" + EP + ".5.1.0 = Opaque: 9F 78 04 3F 80 00 00\n", "", 0),
+        # SNMPv1 noSuchName: snmpget prints the error, drops the varbind and asks again (exit 2)
+        Step(["get"] + v1 + [EP + ".1.1.0", EP + ".99.0", EP + ".2.1.0"],
+             EP + ".1.1.0 = INTEGER: 42\n" + EP + ".2.1.0 = STRING: \"hello\"\n",
+             "Error in packet\n" + NO_SUCH_NAME + "Failed object: " + EP + ".99.0\n\n", 2),
+        Step(["get", "-Cf"] + v1 + [EP + ".1.1.0", EP + ".99.0", EP + ".2.1.0"], "",
+             "Error in packet\n" + NO_SUCH_NAME + "Failed object: " + EP + ".99.0\n\n", 2),
+        # SNMPv1 Counter64 is hidden: noSuchName for the only varbind, nothing to retry
+        Step(["get"] + v1 + [EP + ".3.1.0"], "", "Error in packet\n" + NO_SUCH_NAME + "Failed object: " + EP
+             + ".3.1.0\n\n", 2),
+        # getnext
+        Step(["getnext"] + pub + [EP + ".1.1.0", EP + ".10.1.1"],
+             EP + ".2.1.0 = STRING: \"hello\"\n" + EP + ".10.1.1.1 = INTEGER: 101\n", "", 0),
+        Step(["getnext"] + pub + [LAST.dotted()], LAST.dotted() + END_OF_MIB_VIEW, "", 0),
+        Step(["getnext"] + v1 + [LAST.dotted()], "",
+             "Error in packet.\n" + NO_SUCH_NAME + "Failed object: " + LAST.dotted() + "\n\n", 2),
+        # bulkget: one non-repeater, two columns, two repetitions
+        Step(["bulkget", "-Cn1", "-Cr2"] + pub + [EP + ".1.1.0", EP + ".10.1.1", EP + ".10.1.2"],
+             EP + ".2.1.0 = STRING: \"hello\"\n" + EP + ".10.1.1.1 = INTEGER: 101\n" + EP + ".10.1.2.1 = INTEGER: 201\n"
+             + EP + ".10.1.1.2 = INTEGER: 102\n" + EP + ".10.1.2.2 = INTEGER: 202\n", "", 0),
+        Step(["bulkget", "-C", "r1"] + pub + [EP + ".10.1.3"], EP + ".10.1.3.1 = INTEGER: 301\n", "", 0),
+        Step(["bulkget"] + v1 + [EP + ".10.1.3"], "", "snmpbulkget: Cannot send V2 PDU on V1 session\n", 1),
+        # set: success, noAccess (read-only community), notWritable, wrongType, -Cq
+        Step(["set", "-v2c", "-c", "private", AGENT, EP + ".20.1.0", "i", "55", EP + ".20.2.0", "s", "xyz"],
+             EP + ".20.1.0 = INTEGER: 55\n" + EP + ".20.2.0 = STRING: \"xyz\"\n", "", 0),
+        Step(["set"] + pub + [EP + ".20.1.0", "i", "1"], "",
+             "Error in packet.\nReason: noAccess\nFailed object: " + EP + ".20.1.0\n\n", 2),
+        Step(["set", "-v2c", "-c", "private", AGENT, EP + ".1.1.0", "i", "1"], "",
+             "Error in packet.\nReason: notWritable (That object does not support modification)\nFailed object: "
+             + EP + ".1.1.0\n\n", 2),
+        Step(["set", "-v2c", "-c", "private", AGENT, EP + ".20.1.0", "i", "5", EP + ".20.2.0", "i", "1"], "",
+             "Error in packet.\nReason: wrongType (The set datatype does not match the data type the agent expects)\n"
+             + "Failed object: " + EP + ".20.2.0\n\n", 2),
+        Step(["set", "-Cq", "-v2c", "-c", "private", AGENT, EP + ".20.1.0", "i", "-0"], "", "", 0),
+        Step(["get"] + pub + [EP + ".20.1.0", EP + ".20.2.0"],
+             EP + ".20.1.0 = INTEGER: 0\n" + EP + ".20.2.0 = STRING: \"xyz\"\n", "", 0),
+        Step(["set", "-v1", "-c", "private", AGENT, EP + ".1.1.0", "i", "1"], "",
+             "Error in packet.\n" + NO_SUCH_NAME + "Failed object: " + EP + ".1.1.0\n\n", 2),
+        # SNMPv3
+        Step(["get", "-v3", "-l", "authPriv", "-u", "u_sha_aes", "-a", "SHA", "-A", "authpass123", "-x", "AES", "-X",
+              "privpass123", AGENT, EP + ".2.1.0"], EP + ".2.1.0 = STRING: \"hello\"\n", "", 0),
+        Step(["getnext", "-v3", "-l", "authNoPriv", "-u", "u_md5", "-A", "authpass123", AGENT, EP + ".2.1.0"],
+             EP + ".3.1.0 = Counter64: 18446744073709551615\n", "", 0),
+        Step(["get", "-v3", "-u", "u_noauth", "-e", AGENT_ENGINE, AGENT, EP + ".1.1.0"], EP + ".1.1.0 = INTEGER: 42\n",
+             "", 0),
+        Step(["get", "-v3", "-l", "noAuthNoPriv", "-u", "nobody", AGENT, EP + ".2.1.0"], "",
+             "snmpget: Unknown user name\n", 1),
+        Step(["get", "-v3", "-l", "authNoPriv", "-u", "u_md5", "-A", "wrongpass123", AGENT, EP + ".2.1.0"], "",
+             "snmpget: Authentication failure (incorrect password, community or key)\n", 1),
+        # timeouts: snmpget and snmpgetnext with a period, the others without
+        Step(["get", "-t", "0.2", "-r", "1", "-v2c", "-c", "public", "10.0.0.5:1161", EP + ".1.1.0"], "",
+             TIMEOUT_V2 + "10.0.0.5:1161.\n", 1),
+        Step(["getnext", "-t", "0.2", "-r", "0", "-v2c", "-c", "public", "udp:10.0.0.5", EP + ".1.1.0"], "",
+             TIMEOUT_V2 + "udp:10.0.0.5.\n", 1),
+        Step(["set", "-t", "0.2", "-r", "0", "-v2c", "-c", "public", "10.0.0.5", EP + ".1.1.0", "i", "1"], "",
+             TIMEOUT_V2 + "10.0.0.5\n", 1),
+        Step(["bulkget", "-t", "0.2", "-r", "0", "-v2c", "-c", "public", "10.0.0.5", EP + ".1.1.0"], "",
+             TIMEOUT_V2 + "10.0.0.5\n", 1),
+        Step(["walk", "-t", "0.2", "-r", "0", "-v2c", "-c", "public", "10.0.0.5", EP], "", TIMEOUT_V2 + "10.0.0.5\n", 1),
+        # wrong community: snmpd drops the request, so it is a timeout
+        Step(["get", "-t", "0.2", "-r", "0", "-v2c", "-c", "nobody", AGENT, EP + ".1.1.0"], "",
+             TIMEOUT_V2 + AGENT + ".\n", 1),
+    ]
+
+actor _test_requests(t: testing.AsyncT):
+    """get, getnext, bulkget and set (v1, v2c, v3): stdout, stderr and exit codes as net-snmp's tools"""
+    t.timeout(60.0)
+    mn = MemNet()
+    ag = Agent(mn.server(AGENT, 161), make_view(), make_config(), None)
+
+    def done(failures: list[str]) -> None:
+        finish(t, failures)
+
+    Script(mn, request_steps(), 41000, done)
+
+
+# Walks and tables ##################################################################################
+
+def walk_steps() -> list[Step]:
+    pub = ["-v2c", "-c", "public", AGENT]
+    v1 = ["-v1", "-c", "public", AGENT]
+    all_rows = table_lines([1, 2, 3], [1, 2, 3], False)
+    return [
+        Step(["walk"] + pub + [EP + ".10"], all_rows, "", 0),
+        Step(["walk"] + v1 + [EP + ".10"], all_rows, "", 0),
+        Step(["bulkwalk"] + pub + [EP + ".10"], all_rows, "", 0),
+        Step(["bulkwalk", "-Cr2"] + pub + [EP + ".10"], all_rows, "", 0),
+        Step(["bulkwalk", "-Cr1", "-Cp"] + pub + [EP + ".10.1.2"], table_lines([2], [1, 2, 3], False)
+             + "Variables found: 3\n", "", 0),
+        # the end of the MIB: snmpwalk prints the endOfMibView varbind; SNMPv1 prints "End of MIB"
+        Step(["walk"] + pub + [".1.3.6.1.6.3.99"], LAST.dotted() + " = INTEGER: 7\n" + LAST.dotted() + END_OF_MIB_VIEW,
+             "", 0),
+        Step(["bulkwalk"] + pub + [".1.3.6.1.6.3.99"],
+             LAST.dotted() + " = INTEGER: 7\n" + LAST.dotted() + END_OF_MIB_VIEW, "", 0),
+        Step(["walk"] + v1 + [".1.3.6.1.6.3.99"], LAST.dotted() + " = INTEGER: 7\nEnd of MIB\n", "", 0),
+        # an empty subtree: GET of the root (also for a scalar instance), not with -CI
+        Step(["walk"] + pub + [EP + ".15"], EP + ".15" + NO_SUCH_OBJECT, "", 0),
+        Step(["walk", "-CI"] + pub + [EP + ".15"], "", "", 0),
+        Step(["walk"] + pub + [EP + ".1.1.0"], EP + ".1.1.0 = INTEGER: 42\n", "", 0),
+        Step(["bulkwalk"] + pub + [EP + ".1.1.0"], EP + ".1.1.0 = INTEGER: 42\n", "", 0),
+        Step(["walk", "-Cp"] + pub + [EP + ".15"], EP + ".15" + NO_SUCH_OBJECT + "Variables found: 0\n", "", 0),
+        # -Ci: GET the root first; -CE: end OID
+        Step(["walk", "-Ci"] + pub + [EP + ".4"], EP + ".4" + NO_SUCH_OBJECT + EP + ".4.1.0 = IpAddress: 192.0.2.1\n",
+             "", 0),
+        Step(["walk", "-CE", EP + ".10.1.1.3"] + pub + [EP + ".10"], table_lines([1], [1, 2], False), "", 0),
+        Step(["walk", "-CpE" + EP + ".10.1.2"] + pub + [EP + ".10"], table_lines([1], [1, 2, 3], False)
+             + "Variables found: 3\n", "", 0),
+        Step(["walk", "-Cp", "--canon"] + pub + [EP + ".4"], EP + ".4.1.0 = IpAddress: 192.0.2.1\nVariables found: 1\n",
+             "", 0),
+        # table: lock-step columns, rows in index order
+        Step(["table"] + pub + [EP + ".10.1.1", EP + ".10.1.3"], table_lines([1, 3], [1, 2, 3], True), "", 0),
+        Step(["table", "-Cr1"] + v1 + [EP + ".10.1.1", EP + ".10.1.2", EP + ".10.1.3"],
+             table_lines([1, 2, 3], [1, 2, 3], True), "", 0),
+        Step(["table"] + pub + [EP + ".10.1.3", EP + ".10.1.9"], table_lines([3], [1, 2, 3], True), "", 0),
+        Step(["table", "--canon", "-v3", "-l", "authPriv", "-u", "u_sha_aes", "-a", "SHA", "-A", "authpass123", "-x",
+              "AES", "-X", "privpass123", AGENT, EP + ".10.1.2", EP + ".10.1.1"], table_lines([2, 1], [1, 2, 3], True),
+             "", 0),
+        # columns the Client refuses: one inside another
+        Step(["table"] + pub + [EP + ".10.1", EP + ".10.1.1"], "", "snmptable: ", 1, False),
+    ]
+
+actor _test_walks(t: testing.AsyncT):
+    """walk, bulkwalk and table as snmpwalk and snmpbulkwalk print them"""
+    t.timeout(60.0)
+    mn = MemNet()
+    ag = Agent(mn.server(AGENT, 161), make_view(), make_config(), None)
+
+    def done(failures: list[str]) -> None:
+        finish(t, failures)
+
+    Script(mn, walk_steps(), 42000, done)
+
+actor _test_walk_faults(t: testing.AsyncT):
+    """A walk that meets a non-increasing OID (exit 1) or an error-status (exit 2), as net-snmp reports them"""
+    t.timeout(60.0)
+    mn = MemNet()
+    bad = Agent(mn.server(AGENT, 161), make_view(), make_config(), None, Faults(non_increasing_at=e([10, 1, 1, 3])))
+    err_agent = Agent(mn.server("10.0.0.3", 161), make_view(), make_config(), None,
+                      Faults(error_at=e([10, 1, 2, 2]), error_status=pdu.GEN_ERR))
+    pub = ["-v2c", "-c", "public", AGENT]
+    steps = [
+        Step(["walk"] + pub + [EP + ".10"],
+             table_lines([1], [1, 2], False) + EP + ".10.1.1.2 = INTEGER: 103\n",
+             "Error: OID not increasing: " + EP + ".10.1.1.2\n >= " + EP + ".10.1.1.2\n\n", 1),
+        Step(["bulkwalk", "-Cr3"] + pub + [EP + ".10"], table_lines([1], [1, 2], False) + EP + ".10.1.1.2 = INTEGER: 103\n",
+             "Error: OID not increasing: " + EP + ".10.1.1.2\n >= " + EP + ".10.1.1.2\n\n", 1, False),
+        Step(["walk", "-v2c", "-c", "public", "10.0.0.3", EP + ".10"],
+             table_lines([1], [1, 2, 3], False) + table_lines([2], [1, 2], False),
+             "Error in packet.\nReason: (genError) A general failure occured\nFailed object: " + EP + ".10.1.2.2\n\n", 2),
+        # table (Client.get_table): the rows found before the error, then the error
+        Step(["table"] + pub + [EP + ".10.1.1"], "",
+             "Error: OID not increasing: " + EP + ".10.1.1.2\n >= " + EP + ".10.1.1.2\n\n", 1, False),
+        Step(["table", "-Cr1", "-v2c", "-c", "public", "10.0.0.3", EP + ".10.1.2"], table_lines([2], [1, 2], True),
+             "Error in packet.\nReason: (genError) A general failure occured\nFailed object: " + EP + ".10.1.2.2\n\n", 2),
+        # GETBULK from 10.1.2.2 (the last OID of the first response) names the faulty OID
+        Step(["bulkwalk", "-Cr5", "-v2c", "-c", "public", "10.0.0.3", EP + ".10"],
+             table_lines([1], [1, 2, 3], False) + table_lines([2], [1, 2], False),
+             "Error in packet.\nReason: (genError) A general failure occured\nFailed object: " + EP + ".10.1.2.2\n\n", 2),
+    ]
+
+    def done(failures: list[str]) -> None:
+        finish(t, failures)
+
+    Script(mn, steps, 43000, done)
+
+
+# Notifications ######################################################################################
+
+actor Blocks(want: int, report: action(str) -> None):
+    """Collects trapd output; report(text) once it holds want END lines"""
+    var _parts: list[str] = []
+    var _ends = 0
+    var _reported = False
+
+    def out(s: str) -> None:
+        _parts.append(s)
+        _ends += s.count("END\n")
+        if not _reported and _ends >= want:
+            _reported = True
+            report("".join(_parts))
+
+def trap_steps() -> list[Step]:
+    v3 = ["-v3", "-l", "authPriv", "-u", "u_md5_aes256c", "-a", "MD5", "-A", "authpass123", "-x", "AES-256-C", "-X",
+          "privpass123"]
+    return [
+        Step(["trap", "-v1", "-c", "public", RECEIVER, ".1.3.6.1.4.1.8072.9999", "192.0.2.1", "6", "42", "12345",
+              EP + ".1.1.0", "i", "0"], "", "", 0),
+        Step(["trap", "-v2c", "-c", "public", RECEIVER, "4294967295", ".1.3.6.1.4.1.8072.9999.3.0.13",
+              EP + ".1.18.0", "i", "2147483647", EP + ".1.19.0", "i", "-2147483648", EP + ".2.2.0", "s", "",
+              EP + ".2.5.0", "s", "say \"hi\" \\ back", EP + ".2.6.0", "x", "7461620a", EP + ".3.1.0", "o", ".0.0",
+              EP + ".4.4.0", "a", "255.255.255.255", EP + ".5.5.0", "c", "4294967295", EP + ".6.4.0", "u", "4294967295",
+              EP + ".7.3.0", "t", "8640000", EP + ".8.7.0", "C", "18446744073709551615", EP + ".9.2.0", "F", "1.0",
+              EP + ".9.3.0", "I", "42", EP + ".9.4.0", "D", "-2.5", EP + ".9.5.0", "U", "18446744073709551615",
+              EP + ".9.1.0", "q", "DEADBEEF", EP + ".2.7.0", "d", "1.2.250", EP + ".2.8.0", "b", "0 9 15",
+              EP + ".2.9.0", "n", "ignored"], "", "", 0),
+        Step(["inform", "-v2c", "-c", "public", "-r", "0", "-t", "5", RECEIVER, "123", ".1.3.6.1.4.1.8072.9999.3.0.14"],
+             "", "", 0),
+        Step(["trap", "-Ci", "-v2c", "-c", "public", RECEIVER, "1", ".1.3.6.1.4.1.8072.9999.3.0.15"], "", "", 0),
+        Step(["trap"] + v3 + ["-e", "0x8000000001020304", RECEIVER, "3000002", ".1.3.6.1.4.1.8072.9999.3.0.16",
+                              EP + ".1.1.0", "i", "1"], "", "", 0),
+        Step(["inform"] + v3 + ["-r", "0", "-t", "5", RECEIVER, "3001002", ".1.3.6.1.4.1.8072.9999.3.0.17"], "", "",
+             0),
+        Step(["trap", "-v2c", "-c", "public", RECEIVER, "", ".1.3.6.1.6.3.1.1.5.1"], "", "", 0),
+        # refused before anything is sent
+        Step(["inform", "-v1", "-c", "public", RECEIVER, "1", ".1.3"], "", "Cannot send INFORM as SNMPv1 PDU\n", 1),
+        Step(["inform", "-v2c", "-c", "public", "-r", "0", "-t", "0.2", "10.0.0.5", "1", ".1.3"], "",
+             "snmpinform: Timeout\n", 1),
+    ]
+
+EXPECTED_BLOCKS = """NOTIFICATION v1 TRAP community="public" enterprise=.1.3.6.1.4.1.8072.9999 agent=192.0.2.1 generic=6 specific=42 uptime=12345 trapoid=.1.3.6.1.4.1.8072.9999.0.42
+.1.3.6.1.4.1.8072.9999.1.1.1.0 = INTEGER: 0
+END
+NOTIFICATION v2c TRAP2 community="public" uptime=4294967295 trapoid=.1.3.6.1.4.1.8072.9999.3.0.13
+.1.3.6.1.4.1.8072.9999.1.1.18.0 = INTEGER: 2147483647
+.1.3.6.1.4.1.8072.9999.1.1.19.0 = INTEGER: -2147483648
+.1.3.6.1.4.1.8072.9999.1.2.2.0 = STRING: ""
+.1.3.6.1.4.1.8072.9999.1.2.5.0 = STRING: "say \\"hi\\" \\\\ back"
+.1.3.6.1.4.1.8072.9999.1.2.6.0 = Hex-STRING: 74 61 62 0A
+.1.3.6.1.4.1.8072.9999.1.3.1.0 = OID: .0.0
+.1.3.6.1.4.1.8072.9999.1.4.4.0 = IpAddress: 255.255.255.255
+.1.3.6.1.4.1.8072.9999.1.5.5.0 = Counter32: 4294967295
+.1.3.6.1.4.1.8072.9999.1.6.4.0 = Gauge32: 4294967295
+.1.3.6.1.4.1.8072.9999.1.7.3.0 = Timeticks: 8640000
+.1.3.6.1.4.1.8072.9999.1.8.7.0 = Counter64: 18446744073709551615
+.1.3.6.1.4.1.8072.9999.1.9.2.0 = Opaque: 9F 78 04 3F 80 00 00
+.1.3.6.1.4.1.8072.9999.1.9.3.0 = Opaque: 9F 7A 01 2A
+.1.3.6.1.4.1.8072.9999.1.9.4.0 = Opaque: 9F 79 08 C0 04 00 00 00 00 00 00
+.1.3.6.1.4.1.8072.9999.1.9.5.0 = Opaque: 9F 7B 09 00 FF FF FF FF FF FF FF FF
+.1.3.6.1.4.1.8072.9999.1.9.1.0 = Opaque: DE AD BE EF
+.1.3.6.1.4.1.8072.9999.1.2.7.0 = Hex-STRING: 01 02 FA
+.1.3.6.1.4.1.8072.9999.1.2.8.0 = Hex-STRING: 80 41
+.1.3.6.1.4.1.8072.9999.1.2.9.0 = NULL
+END
+NOTIFICATION v2c INFORM community="public" uptime=123 trapoid=.1.3.6.1.4.1.8072.9999.3.0.14
+END
+NOTIFICATION v2c INFORM community="public" uptime=1 trapoid=.1.3.6.1.4.1.8072.9999.3.0.15
+END
+NOTIFICATION v3 TRAP2 user="u_md5_aes256c" level=authPriv context="" uptime=3000002 trapoid=.1.3.6.1.4.1.8072.9999.3.0.16
+.1.3.6.1.4.1.8072.9999.1.1.1.0 = INTEGER: 1
+END
+NOTIFICATION v3 INFORM user="u_md5_aes256c" level=authPriv context="" uptime=3001002 trapoid=.1.3.6.1.4.1.8072.9999.3.0.17
+END
+"""
+
+actor _test_notifications(t: testing.AsyncT):
+    """trap and inform (snmptrap/snmpinform syntax, every type letter) to a receiver printed by trapd --canon"""
+    t.timeout(60.0)
+    mn = MemNet()
+    var _failures: ?list[str] = None
+    var _text: ?str = None
+
+    proc def _check() -> None:
+        failures = _failures
+        text = _text
+        if failures is not None and text is not None:
+            got = text
+            # the last block (sysUpTime from the Client's clock) only needs its header and END
+            last = got.rfind("NOTIFICATION v2c TRAP2 community=\"public\" uptime=")
+            tail = got[last:] if last >= 0 else ""
+            got = got[:last] if last >= 0 else got
+            f = list(failures)
+            if got != EXPECTED_BLOCKS:
+                f.append("trapd output differs:\n" + got)
+            if not (tail.endswith(" trapoid=.1.3.6.1.6.3.1.1.5.1\nEND\n")):
+                f.append("last block: " + repr(tail))
+            finish(t, f)
+
+    def _steps_done(failures: list[str]) -> None:
+        _failures = failures
+        _check()
+
+    def _blocks(text: str) -> None:
+        _text = text
+        _check()
+
+    trapd = cliopts.parse(["actsnmp", "trapd", "--canon"])
+    blocks = Blocks(7, _blocks)
+    printer = TrapPrinter(trapd, blocks.out)
+    config = ReceiverConfig(["public"], security.load_users_tsv("\n".join(USERS)).users, [], h(RECEIVER_ENGINE), 1)
+    rcv = NotificationReceiver(mn.server(RECEIVER, 162), config, printer.on_notification, None)
+    Script(mn, trap_steps(), 44000, _steps_done)
+
+def _test_trapd_text() -> None:
+    """trapd without --canon: the canonical header plus the source, net-snmp varbinds, no snmpTrapCommunity.0"""
+    t = pdu.TrapV1Pdu(Oid([1, 3, 6, 1, 4, 1, 8072, 9999]), b"\xc0\x00\x02\x01", 6, 42, 12345,
+                      [VarBind(e([2, 1, 0]), OctetString(b"a\x00"))])
+    n = notify.notification_from_v1(t, b"public", "10.0.0.2", 40000)
+    plain = cliopts.parse(["actsnmp", "trapd"])
+    testing.assertEqual(actsnmp.notification_text(plain, n),
+                        "NOTIFICATION v1 TRAP from=10.0.0.2:40000 community=\"public\" enterprise=.1.3.6.1.4.1.8072.9999"
+                        + " agent=192.0.2.1 generic=6 specific=42 uptime=12345 trapoid=.1.3.6.1.4.1.8072.9999.0.42\n"
+                        + EP + ".2.1.0 = Hex-STRING: 61 00 \nEND\n")
+    canon = cliopts.parse(["actsnmp", "trapd", "--canon"])
+    testing.assertEqual(actsnmp.notification_text(canon, n),
+                        "NOTIFICATION v1 TRAP community=\"public\" enterprise=.1.3.6.1.4.1.8072.9999 agent=192.0.2.1"
+                        + " generic=6 specific=42 uptime=12345 trapoid=.1.3.6.1.4.1.8072.9999.0.42\n"
+                        + EP + ".2.1.0 = Hex-STRING: 61 00\nEND\n")
+
+
+# Helpers ###########################################################################################
+
+def _test_error_texts() -> None:
+    """net-snmp's error-status lines: snmpget without the period, Failed object only for a non-zero index"""
+    e1 = errors.ErrorStatusError(pdu.GEN_ERR, 0)
+    testing.assertEqual(actsnmp.error_status_text(False, e1), "Error in packet\nReason: (genError) A general failure occured\n")
+    e2 = errors.ErrorStatusError(pdu.NOT_WRITABLE, 2, [1, 3, 6])
+    testing.assertEqual(actsnmp.error_status_text(True, e2),
+                        "Error in packet.\nReason: notWritable (That object does not support modification)\n"
+                        + "Failed object: .1.3.6\n\n")
+    e3 = errors.ErrorStatusError(99, 1)
+    testing.assertEqual(actsnmp.error_status_text(True, e3), "Error in packet.\nReason: Unknown Error\nFailed object: \n\n")
+    testing.assertEqual(actsnmp.oid_not_increasing(Oid([1, 3, 2]), Oid([1, 3, 1])),
+                        "Error: OID not increasing: .1.3.2\n >= .1.3.1\n\n")
+
+def _test_tool_names() -> None:
+    names = ["snmpget", "snmpgetnext", "snmpbulkget", "snmpwalk", "snmpbulkwalk", "snmpset", "snmptable"]
+    cmds = ["get", "getnext", "bulkget", "walk", "bulkwalk", "set", "table"]
+    for i in range(len(cmds)):
+        o = cliopts.parse(["actsnmp", cmds[i], "-v2c", "-c", "x", "h", "1.3" if cmds[i] != "set" else "1.3"]
+                          + (["i", "1"] if cmds[i] == "set" else []))
+        testing.assertEqual(actsnmp.tool_name(o), names[i])
+    testing.assertEqual(actsnmp.tool_name(cliopts.parse(["actsnmp", "trap", "-v2c", "-c", "x", "h", "", "1.3"])),
+                        "snmptrap")
+    testing.assertEqual(actsnmp.tool_name(cliopts.parse(["actsnmp", "trap", "-Ci", "-v2c", "-c", "x", "h", "", "1.3"])),
+                        "snmpinform")
+
+def _test_request_options() -> None:
+    """-t and -r map to a fixed timeout per attempt; nothing is split or fixed by the Client"""
+    o = cliopts.parse(["actsnmp", "get", "-t", "2.5", "-r", "0", "-v2c", "-c", "x", "h", "1.3"])
+    r = actsnmp.request_options(o)
+    testing.assertEqual(r.timeout, 2.5)
+    testing.assertEqual(r.retries, 0)
+    testing.assertEqual(r.attempt_timeout(3), 2.5)
+    testing.assertEqual(r.max_oids_per_request, 0)
+    testing.assertFalse(r.v1_fix_errors)
+
+def _test_agent_communities() -> None:
+    a = cliopts.parse(["actsnmp", "agent"])
+    testing.assertEqual(actsnmp.agent_communities(a), {"public": False, "private": True})
+    b = cliopts.parse(["actsnmp", "agent", "-c", "ro", "-w", "rw", "-c", "ro2"])
+    testing.assertEqual(actsnmp.agent_communities(b), {"ro": False, "ro2": False, "rw": True})
+    d = cliopts.parse(["actsnmp", "trapd"])
+    testing.assertEqual(actsnmp.trapd_config(d, None).communities, ["public"])
+    d2 = cliopts.parse(["actsnmp", "trapd", "-c", "a", "-c", "b"])
+    testing.assertEqual(actsnmp.trapd_config(d2, None).communities, ["a", "b"])
+
+
+# The lab dataset (env tests) #######################################################################
+
+def sorted_lines(text: str) -> str:
+    """The lines of text in sorted order (each followed by a newline)"""
+    lines = text.split("\n")
+    if len(lines) > 0 and lines[len(lines) - 1] == "":
+        lines = lines[:len(lines) - 1]
+    return "".join([line + "\n" for line in sorted(lines)])
+
+actor LabWalk(t: testing.EnvT, args: list[str], expected_file: str, sort_lines: bool):
+    """Serve the lab dataset as `actsnmp agent` does and compare one CLI walk with a recorded file
+
+    sort_lines compares the sorted lines (a table printed in row order
+    against a recorded walk in column order).
+    """
+    mn = MemNet()
+    o = cliopts.parse(["actsnmp", "agent"])
+    config = actsnmp.agent_config(o, read_text(t, cliopts.LAB_WRITE_RULES), read_text(t, cliopts.LAB_USERS))
+    view = mibview.load_snmprec(read_text(t, cliopts.LAB_SNMPREC))
+    expected_text = read_text(t, expected_file)
+    expected = sorted_lines(expected_text) if sort_lines else expected_text
+    ag = Agent(mn.server(AGENT, 161), view, config, None)
+
+    def _done(r: Result) -> None:
+        out = sorted_lines(r.out) if sort_lines else r.out
+        if r.code == 0 and r.err == "" and out == expected:
+            t.success()
+        else:
+            n = 0
+            got = out.split("\n")
+            want = expected.split("\n")
+            while n < len(got) and n < len(want) and got[n] == want[n]:
+                n += 1
+            t.failure(AssertionError("exit %d, err %r; first difference at line %d: got %r, expected %r"
+                                     % (r.code, r.err, n + 1, got[n] if n < len(got) else "<end>",
+                                        want[n] if n < len(want) else "<end>")))
+
+    run_cli(mn, 45000, args, _done)
+
+actor _test_lab_bulkwalk(t: testing.EnvT):
+    """bulkwalk -v2c of the lab dataset equals interop/expected/netsnmp/snmpd-dataset.On.txt (snmpbulkwalk -On)"""
+    t.timeout(120.0)
+    LabWalk(t, ["bulkwalk", "-v2c", "-c", "public", AGENT, ".1.3.6.1.4.1.8072.9999.1"],
+            "interop/expected/netsnmp/snmpd-dataset.On.txt", False)
+
+actor _test_lab_walk_v1(t: testing.EnvT):
+    """walk -v1 of the lab dataset equals interop/expected/netsnmp/snmpd-dataset-v1.On.txt (snmpwalk -v1 -On)"""
+    t.timeout(120.0)
+    LabWalk(t, ["walk", "-v1", "-c", "public", AGENT, ".1.3.6.1.4.1.8072.9999.1"],
+            "interop/expected/netsnmp/snmpd-dataset-v1.On.txt", False)
+
+actor _test_lab_bulkwalk_hex(t: testing.EnvT):
+    """bulkwalk -Ox --hexOutputLength=0 (v3 authPriv) equals interop/expected/netsnmp/snmpd-dataset.On-Ox.txt"""
+    t.timeout(120.0)
+    LabWalk(t, ["bulkwalk", "-v3", "-l", "authPriv", "-u", "u_sha_aes", "-a", "SHA", "-A", "authpass123", "-x", "AES",
+                "-X", "privpass123", "-Ox", "--hexOutputLength=0", AGENT, ".1.3.6.1.4.1.8072.9999.1"],
+            "interop/expected/netsnmp/snmpd-dataset.On-Ox.txt", False)
+
+actor _test_lab_table(t: testing.EnvT):
+    """table --canon of B.10 (300 rows, sparse column 7; v2c) has exactly the lines of interop/expected/canon/table.txt"""
+    t.timeout(120.0)
+    LabWalk(t, ["table", "--canon", "-v2c", "-c", "public", AGENT]
+               + [".1.3.6.1.4.1.8072.9999.1.10.1.%d" % c for c in range(1, 8)],
+            "interop/expected/canon/table.txt", True)
+
+actor _test_lab_table_v1(t: testing.EnvT):
+    """table --canon -v1 (GETNEXT) of the string-indexed B.11 has exactly the lines of interop/expected/canon/strtable.txt"""
+    t.timeout(120.0)
+    LabWalk(t, ["table", "--canon", "-v1", "-c", "public", AGENT, ".1.3.6.1.4.1.8072.9999.1.11.1.1",
+                ".1.3.6.1.4.1.8072.9999.1.11.1.2", ".1.3.6.1.4.1.8072.9999.1.11.1.3"],
+            "interop/expected/canon/strtable.txt", True)

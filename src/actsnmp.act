@@ -1,0 +1,703 @@
+"""actsnmp: the net-snmp-compatible SNMP command line tool
+
+    actsnmp get|getnext|bulkget|walk|bulkwalk|set|table [OPTIONS] AGENT ...
+    actsnmp trap|inform [OPTIONS] AGENT ...
+    actsnmp agent|trapd [OPTIONS]
+
+The client commands behave like net-snmp's snmpget, snmpgetnext,
+snmpbulkget, snmpwalk, snmpbulkwalk, snmpset, snmptrap and snmpinform run
+with `-m '' -On` (no MIBs, numeric OIDs): the same options (cliopts), the
+same stdout and stderr text and the same exit codes:
+
+  * 0: success, including exception values in the output and snmpwalk's
+    "End of MIB";
+  * 1: a timeout ("Timeout: No Response from AGENT." for get and getnext,
+    without the period for the others), "Error: OID not increasing", a
+    local error (bad arguments, a transport or SNMPv3 failure, printed as
+    "<net-snmp tool>: <reason>");
+  * 2: an error-status in a response, printed on stderr as "Error in
+    packet" (get) or "Error in packet." (the others), "Reason: <net-snmp's
+    text>" and "Failed object: <OID>" plus an empty line when the
+    error-index names a varbind.
+
+get and getnext drop the failed varbind and ask again after an
+error-status, as net-snmp does (-Cf turns that off). walk follows snmpwalk
+(GETNEXT; prints the exception value that ends the walk; "End of MIB" for
+SNMPv1's noSuchName; a GET of the root when the subtree printed nothing,
+unless -CI; -Ci, -Cp, -Ct, -CE, -Cc) and bulkwalk snmpbulkwalk (GETBULK
+-Cn/-Cr, default 0/10; the subtree is a prefix test; the increasing check
+compares with the last OID of the previous response, so a looping agent
+gives one error line per varbind, as net-snmp prints them). Walk output is
+written per response, so huge walks are not buffered. With -Cc, where
+net-snmp would loop forever, a repeated OID ends the walk with an error.
+table fetches its column OIDs with Client.get_table (lock-step GETBULK,
+GETNEXT on SNMPv1; -Cr max-repetitions, -Cc no increasing check) and
+prints the rows in index order, each row's varbinds in column order.
+
+Output is fmt.netsnmp_varbind with the -O options and --hexOutputLength,
+or fmt.canon_varbind with --canon.
+
+agent serves an snmprec file (the lab dataset by default) with the
+lab's write rules and users until SIGTERM or SIGINT; trapd prints every
+notification it receives as a block: fmt.canon_notification with
+--canon (the format of interop/expected/notify/), otherwise the same
+header with the source address and the varbinds in net-snmp style.
+
+The command logic is in actors that take the parsed options, a Client and
+output callbacks (Command, TrapPrinter, AgentServer, TrapdServer), so the
+tests (test_cli) run it in-process over transport.MemNet.
+"""
+
+import file
+import net
+import time
+
+import cliopts
+import errors
+import fmt
+import message
+import mibview
+import pdu
+import security
+from agent import Agent, AgentConfig
+from client import Client, EngineInfo, Options, Response, Table, error_response
+from cliopts import CliError, CliOptions
+from mibview import MibView
+from notify import Notification
+from oid import Oid
+from receiver import NotificationReceiver, ReceiverConfig
+from security import Community, Security, Usm
+from transport import ServerTransport, Transport, udp_server_transport
+from values import VarBind, is_exception
+
+VERSION = "0.1.0-dev"
+
+# Seconds a trap command waits after handing its datagram to the transport before it exits
+TRAP_LINGER = 0.3
+
+# net-snmp's texts for the SNMPv3 Reports that end a request (snmp_api_errstring)
+_REPORT_TEXTS: dict[str, str] = {
+    "usmStatsUnknownUserNames": "Unknown user name",
+    "usmStatsWrongDigests": "Authentication failure (incorrect password, community or key)",
+    "usmStatsUnsupportedSecLevels": "Unsupported security level",
+    "usmStatsNotInTimeWindows": "Not in time window",
+    "usmStatsUnknownEngineIDs": "Unknown engine ID",
+    "usmStatsDecryptionErrors": "Decryption error",
+    "snmpUnknownSecurityModels": "Unknown security model in message",
+}
+
+
+# Helpers shared by the commands #####################################################################
+
+def tool_name(o: CliOptions) -> str:
+    """The net-snmp tool a command imitates, for its messages ("snmpget", "snmpinform", ...)"""
+    if o.command == "trap" or o.command == "inform":
+        return "snmpinform" if o.inform else "snmptrap"
+    if o.command == "agent":
+        return "snmpd"
+    if o.command == "trapd":
+        return "snmptrapd"
+    return "snmp" + o.command
+
+def varbind_text(o: CliOptions, vb: VarBind) -> str:
+    """One output line without its newline: net-snmp style with the -O options, or canonical with --canon"""
+    if o.canon:
+        return fmt.canon_varbind(vb)
+    return fmt.netsnmp_varbind(vb, o.output)
+
+def lines_text(o: CliOptions, vbs: list[VarBind]) -> str:
+    """varbind_text of every varbind, each followed by a newline"""
+    return "".join([varbind_text(o, vb) + "\n" for vb in vbs])
+
+def request_options(o: CliOptions) -> Options:
+    """Client Options for net-snmp behaviour: -t/-r, a fixed timeout per attempt, nothing split or fixed by the Client
+
+    max_oids_per_request 0 sends every OID in one PDU, as net-snmp does, and
+    v1_fix_errors False leaves SNMPv1's noSuchName to the command (net-snmp's
+    PDU fixing in get/getnext, "End of MIB" in walks).
+    """
+    return Options(timeout=o.timeout, retries=o.retries, backoff=1.0,
+                   max_timeout=o.timeout, max_oids_per_request=0,
+                   max_repetitions=o.max_repetitions, v1_fix_errors=False)
+
+def security_of(o: CliOptions) -> Security:
+    """The Community or Usm of the command line
+
+    Derives the SNMPv3 master keys, so call it once per process. Raises
+    ValueError for credentials the library rejects.
+    """
+    if o.version == message.SNMP_V3:
+        return Usm.from_passwords(o.user, o.auth_protocol, o.auth_password, o.priv_protocol, o.priv_password,
+                                  o.context, o.context_engine_id)
+    community = o.community
+    return Community(community if community is not None else "", o.version)
+
+def failed_object(r: ?Response, e: errors.ErrorStatusError) -> str:
+    """The text after "Failed object: ": the OID error-index points at in the response, "" if there is none"""
+    if r is not None:
+        if e.index >= 1 and e.index <= len(r.varbinds):
+            return r.varbinds[e.index - 1].oid.dotted()
+        return ""
+    arcs = e.oid
+    if arcs is not None:
+        return Oid(arcs).dotted()
+    return ""
+
+def error_status_text(period: bool, e: errors.ErrorStatusError) -> str:
+    """net-snmp's stderr text for an error-status, with the final newline
+
+    period adds the period every tool but snmpget prints after "Error in
+    packet". A non-zero error-index adds a "Failed object: <OID>" line and
+    an empty line.
+    """
+    text = "Error in packet" + ("." if period else "") + "\nReason: " + pdu.error_status_text(e.status) + "\n"
+    if e.index != 0:
+        return text + "Failed object: " + failed_object(error_response(e), e) + "\n\n"
+    return text
+
+def failure_text(o: CliOptions, e: errors.SnmpError, period: bool) -> str:
+    """The stderr text of a request that failed without an error-status (with the final newline)
+
+    A timeout is net-snmp's "Timeout: No Response from <agent>." (period:
+    snmpget and snmpgetnext), anything else "<tool>: <reason>", with
+    net-snmp's texts for SNMPv3 Reports.
+    """
+    if isinstance(e, errors.TimeoutError):
+        return "Timeout: No Response from " + o.peer + ("." if period else "") + "\n"
+    if isinstance(e, errors.ReportError):
+        t = _REPORT_TEXTS.get(e.name)
+        if t is not None:
+            return tool_name(o) + ": " + t + "\n"
+    return tool_name(o) + ": " + e.error_message + "\n"
+
+def oid_not_increasing(previous: Oid, received: Oid) -> str:
+    """net-snmp's walk error for a received OID that is not greater than the previous one"""
+    return "Error: OID not increasing: " + previous.dotted() + "\n >= " + received.dotted() + "\n\n"
+
+def walk_end(o: CliOptions) -> ?Oid:
+    """snmpwalk's end of the walk: -CE, else the root with its last arc + 1 (None: no upper bound)"""
+    e = o.end_oid
+    if e is not None:
+        return e
+    return o.oids[0].next_sibling()
+
+def notification_text(o: CliOptions, n: Notification) -> str:
+    """What trapd prints for one notification, with the final newline
+
+    With --canon this is fmt.canon_notification(n). Otherwise the header
+    gets `from=ADDRESS:PORT` after the PDU type and the varbinds are printed
+    in net-snmp style. An SNMPv1 trap shows its original varbinds, without
+    the snmpTrapCommunity.0 that RFC 3584 translation adds.
+    """
+    block = fmt.canon_notification(n)
+    if o.canon:
+        return block + "\n"
+    first = block.split("\n")[0]
+    words = first.split(" ")
+    head = " ".join(words[:3]) + " from=" + n.source_address + ":%d" % n.source_port
+    if len(words) > 3:
+        head += " " + " ".join(words[3:])
+    v1 = n.v1
+    vbs = v1.varbinds if v1 is not None else n.varbinds
+    return head + "\n" + "".join([fmt.netsnmp_varbind(vb, o.output) + "\n" for vb in vbs]) + "END\n"
+
+def agent_communities(o: CliOptions) -> dict[str, bool]:
+    """agent -c (read-only) and -w (read-write) communities; without either the lab's public (ro) and private (rw)"""
+    if len(o.communities) == 0 and len(o.rw_communities) == 0:
+        return {"public": False, "private": True}
+    d: dict[str, bool] = {}
+    for c in o.communities:
+        d[c] = False
+    for c in o.rw_communities:
+        d[c] = True
+    return d
+
+def agent_config(o: CliOptions, rules_text: str, users_text: ?str) -> AgentConfig:
+    """The AgentConfig of `actsnmp agent`; raises ValueError for invalid files"""
+    users: list[Usm] = []
+    read_only: list[str] = []
+    if users_text is not None:
+        u = security.load_users_tsv(users_text)
+        users = u.users
+        read_only = u.read_only
+    return AgentConfig(agent_communities(o), users, o.server_engine_id, 1, mibview.load_write_rules(rules_text),
+                       read_only_users=read_only)
+
+def trapd_config(o: CliOptions, users_text: ?str) -> ReceiverConfig:
+    """The ReceiverConfig of `actsnmp trapd`: -c communities (default public), the users file, any trap sender engine"""
+    communities = o.communities if len(o.communities) > 0 else ["public"]
+    users: list[Usm] = []
+    if users_text is not None:
+        users = security.load_users_tsv(users_text).users
+    return ReceiverConfig(communities, users, [], o.server_engine_id, 1)
+
+
+def table_text(o: CliOptions, t: Table) -> str:
+    """The lines of `table`: the rows in index order, each row's values in the order of the columns"""
+    out: list[str] = []
+    for row in t.rows:
+        for col in t.columns:
+            v = row.values.get(col.arcs[len(col.arcs) - 1])
+            if v is not None:
+                out.append(varbind_text(o, VarBind(col.child(row.index), v)) + "\n")
+    return "".join(out)
+
+def table_options(o: CliOptions) -> Options:
+    """request_options for Client.get_table: -Cr is its max-repetitions, -Cc turns the increasing check off"""
+    return request_options(o).with_(check_increasing=not o.dont_check)
+
+
+# The client commands ################################################################################
+
+actor Command(o: CliOptions, c: Client, out: action(str) -> None, err: action(str) -> None,
+              done: action(int) -> None):
+    """Runs one client command (get ... inform) with Client c
+
+    out and err receive stdout and stderr text as whole lines, in output
+    order. done is called once with the exit code. The caller owns c and
+    closes it.
+    """
+    _opts = request_options(o)
+    _tool = tool_name(o)
+    _start = time.monotonic()
+    _end: ?Oid = walk_end(o) if (o.command == "walk" and len(o.oids) > 0) else None
+    _root: Oid = o.oids[0] if len(o.oids) > 0 else Oid([])
+    var _oids: list[Oid] = o.oids
+    var _exit = 0
+    var _finished = False
+    var _name: Oid = o.oids[0] if len(o.oids) > 0 else Oid([])
+    var _count = 0
+    var _seen: set[bytes] = set()
+
+    proc def _finish(code: int) -> None:
+        if not _finished:
+            _finished = True
+            done(code)
+
+    proc def _fail(e: errors.SnmpError, period: bool) -> None:
+        err(failure_text(o, e, period))
+        _finish(1)
+
+    # get and getnext ---------------------------------------------------------------------------------
+
+    proc def _send_get() -> None:
+        if o.command == "get":
+            c.get(_on_get, _oids, _opts)
+        else:
+            c.get_next(_on_get, _oids, _opts)
+
+    def _on_get(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        if e is not None:
+            if isinstance(e, errors.ErrorStatusError):
+                err(error_status_text(o.command != "get", e))
+                _exit = 2
+                # net-snmp's snmp_fix_pdu: drop the failed varbind and ask again for the rest
+                if not o.dont_fix and e.index >= 1 and e.index <= len(_oids) and len(_oids) > 1:
+                    _oids = _oids[:e.index - 1] + _oids[e.index:]
+                    _send_get()
+                else:
+                    _finish(2)
+            else:
+                _fail(e, True)
+            return
+        if r is not None:
+            out(lines_text(o, r.varbinds))
+        _finish(_exit)
+
+    # bulkget and set ---------------------------------------------------------------------------------
+
+    def _on_simple(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        if e is not None:
+            if isinstance(e, errors.ErrorStatusError):
+                err(error_status_text(True, e))
+                _finish(2)
+            else:
+                _fail(e, False)
+            return
+        if r is not None and not o.quiet:
+            out(lines_text(o, r.varbinds))
+        _finish(0)
+
+    # walk and bulkwalk -------------------------------------------------------------------------------
+
+    proc def _walk_report() -> None:
+        if o.print_count:
+            out("Variables found: %d\n" % _count)
+        if o.print_time:
+            err("Total traversal time = %f seconds\n" % time.monotonic().since(_start).to_float())
+        _finish(_exit)
+
+    def _on_fallback(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        # snmp_get_and_print: prints the varbinds of a successful answer and ignores everything else
+        if e is None and r is not None:
+            out(lines_text(o, r.varbinds))
+        _walk_report()
+
+    proc def _walk_done(success: bool) -> None:
+        if _count == 0 and success and not o.dont_get_requested:
+            c.get(_on_fallback, [_root], _opts)
+        else:
+            _walk_report()
+
+    proc def _walk_next() -> None:
+        if o.command == "bulkwalk":
+            c.get_bulk(_on_walk, [_name], o.non_repeaters, o.max_repetitions, _opts)
+        else:
+            c.get_next(_on_walk, [_name], _opts)
+
+    proc def _repeated(vb: VarBind) -> bool:
+        # with -Cc only: a repeated OID would make net-snmp loop forever; stop instead
+        if not o.dont_check:
+            return False
+        k = vb.oid.key()
+        if k in _seen:
+            return True
+        _seen.add(k)
+        return False
+
+    proc def _walk_response(vbs: list[VarBind]) -> bool:
+        # The varbinds of one response, as snmpwalk/snmpbulkwalk process them; True to go on
+        bulk = o.command == "bulkwalk"
+        running = True
+        buf: list[str] = []
+        n = len(vbs)
+        for j in range(n):
+            vb = vbs[j]
+            if bulk:
+                if not vb.oid.startswith(_root):
+                    running = False
+                    continue
+            else:
+                end = _end
+                if end is not None and not (vb.oid < end):
+                    running = False
+                    continue
+            _count += 1
+            buf.append(varbind_text(o, vb) + "\n")
+            if is_exception(vb.value):
+                running = False
+                continue
+            if not o.dont_check and not (_name < vb.oid):
+                out("".join(buf))
+                buf = []
+                err(oid_not_increasing(_name, vb.oid))
+                running = False
+                _exit = 1
+            elif _repeated(vb):
+                out("".join(buf))
+                buf = []
+                err("Error: OID repeated (the agent loops): " + vb.oid.dotted() + "\n")
+                running = False
+                _exit = 1
+            if not bulk or j == n - 1:
+                _name = vb.oid
+        if len(buf) > 0:
+            out("".join(buf))
+        return running
+
+    def _on_walk(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        if e is not None:
+            if isinstance(e, errors.ErrorStatusError):
+                if e.status == pdu.NO_SUCH_NAME:
+                    out("End of MIB\n")
+                else:
+                    err(error_status_text(True, e))
+                    _exit = 2
+                _walk_done(True)
+            else:
+                err(failure_text(o, e, False))
+                _exit = 1
+                _walk_done(False)
+            return
+        if r is not None:
+            if len(r.varbinds) == 0:
+                err(_tool + ": the agent returned no variables (no progress)\n")
+                _exit = 1
+                _walk_done(False)
+            elif _walk_response(r.varbinds):
+                _walk_next()
+            else:
+                _walk_done(True)
+
+    def _on_include(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        if e is None and r is not None:
+            out(lines_text(o, r.varbinds))
+        _walk_next()
+
+    # table -------------------------------------------------------------------------------------------
+
+    def _on_table(cl: Client, tbl: ?Table, e: ?errors.SnmpError) -> None:
+        # Client.get_table: the rows found (also before an error), then the error as net-snmp's walks print it
+        if tbl is not None:
+            out(table_text(o, tbl))
+        if e is not None:
+            if isinstance(e, errors.ErrorStatusError):
+                err(error_status_text(True, e))
+                _finish(2)
+            elif isinstance(e, errors.OidNotIncreasingError):
+                err(oid_not_increasing(Oid(e.previous), Oid(e.received)))
+                _finish(1)
+            else:
+                _fail(e, False)
+            return
+        _finish(0)
+
+    # trap and inform ---------------------------------------------------------------------------------
+
+    def _on_trap(cl: Client, e: ?errors.SnmpError) -> None:
+        if e is not None:
+            _fail(e, False)
+            return
+        _finish(0)
+
+    def _on_inform(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        # snmpinform does not look at the error-status of the acknowledgement
+        if e is not None:
+            if isinstance(e, errors.TimeoutError):
+                err(_tool + ": Timeout\n")
+                _finish(1)
+            elif not isinstance(e, errors.ErrorStatusError):
+                _fail(e, False)
+            else:
+                _finish(0)
+            return
+        _finish(0)
+
+    # dispatch ----------------------------------------------------------------------------------------
+
+    proc def _run() -> None:
+        cmd = o.command
+        v1 = o.version == message.SNMP_V1
+        if cmd == "get" or cmd == "getnext":
+            _send_get()
+        elif cmd == "bulkget":
+            if v1:
+                err(_tool + ": Cannot send V2 PDU on V1 session\n")
+                _finish(1)
+            else:
+                c.get_bulk(_on_simple, o.oids, o.non_repeaters, o.max_repetitions, _opts)
+        elif cmd == "set":
+            c.set(_on_simple, o.varbinds, _opts)
+        elif cmd == "walk" or cmd == "bulkwalk":
+            if cmd == "bulkwalk" and v1:
+                err(_tool + ": Cannot send V2 PDU on V1 session\n")
+                _finish(1)
+            elif o.include_requested:
+                c.get(_on_include, [_root], _opts)
+            else:
+                _walk_next()
+        elif cmd == "table":
+            c.get_table(_on_table, o.oids, table_options(o))
+        elif cmd == "trap" and not o.inform:
+            if v1:
+                c.trap_v1(_on_trap, o.enterprise, o.agent_addr, o.generic, o.specific, o.varbinds, o.uptime)
+            else:
+                c.trap(_on_trap, o.trap_oid, o.varbinds, o.uptime)
+        elif cmd == "trap" or cmd == "inform":
+            if v1:
+                err("Cannot send INFORM as SNMPv1 PDU\n")
+                _finish(1)
+            else:
+                c.inform(_on_inform, o.trap_oid, o.varbinds, o.uptime, _opts)
+        else:
+            err("actsnmp: " + cmd + " is not a client command\n")
+            _finish(1)
+
+    _run()
+
+
+# trapd and agent #####################################################################################
+
+actor TrapPrinter(o: CliOptions, out: action(str) -> None):
+    """Writes notification_text of every notification a NotificationReceiver delivers"""
+    def on_notification(r: NotificationReceiver, n: Notification) -> None:
+        out(notification_text(o, n))
+
+
+actor AgentServer(cap: net.UDPListenCap, o: CliOptions, view: MibView, config: AgentConfig,
+                  err: action(str) -> None, done: action(int) -> None):
+    """Listens on o.bind_address and o.listen_port (UDP) and serves view with an Agent until the process ends"""
+    var _agent: ?Agent = None
+
+    def _ready(t: ServerTransport, error: ?str) -> None:
+        if error is not None:
+            err("actsnmp agent: cannot listen on " + o.bind_address + ":%d: " % o.listen_port + error + "\n")
+            done(1)
+            return
+        _agent = Agent(t, view, config, None)
+        err("actsnmp agent: serving on " + o.bind_address + ":%d (engine ID 0x" % t.local_port()
+            + config.engine_id.hex() + ")\n")
+
+    udp_server_transport(cap, o.bind_address, o.listen_port, _ready)
+
+
+actor TrapdServer(cap: net.UDPListenCap, o: CliOptions, config: ReceiverConfig, out: action(str) -> None,
+                  err: action(str) -> None, done: action(int) -> None):
+    """Listens on o.bind_address and o.listen_port (UDP) and prints every notification until the process ends"""
+    var _receiver: ?NotificationReceiver = None
+    _printer = TrapPrinter(o, out)
+
+    def _ready(t: ServerTransport, error: ?str) -> None:
+        if error is not None:
+            err("actsnmp trapd: cannot listen on " + o.bind_address + ":%d: " % o.listen_port + error + "\n")
+            done(1)
+            return
+        _receiver = NotificationReceiver(t, config, _printer.on_notification, None)
+        err("actsnmp trapd: listening on " + o.bind_address + ":%d (engine ID 0x" % t.local_port()
+            + config.engine_id.hex() + ")\n")
+
+    udp_server_transport(cap, o.bind_address, o.listen_port, _ready)
+
+
+# main ################################################################################################
+
+def _parse(argv: list[str]) -> (?CliOptions, str, bool):
+    # The options, or the error text and whether the usage text follows it
+    try:
+        return (cliopts.parse(argv), "", False)
+    except CliError as e:
+        return (None, e.error_message, e.usage)
+
+def _load_agent(o: CliOptions, rec: str, rules: str, users: ?str) -> (?MibView, ?AgentConfig, str):
+    # The view and configuration of `agent`, or the error text
+    try:
+        return (mibview.load_snmprec(rec), agent_config(o, rules, users), "")
+    except ValueError as e:
+        return (None, None, e.error_message)
+
+def _load_trapd(o: CliOptions, users: ?str) -> (?ReceiverConfig, str):
+    try:
+        return (trapd_config(o, users), "")
+    except ValueError as e:
+        return (None, e.error_message)
+
+def _load_security(o: CliOptions) -> (?Security, str):
+    try:
+        return (security_of(o), "")
+    except ValueError as e:
+        return (None, e.error_message)
+
+def _command_of(argv: list[str]) -> str:
+    return argv[1] if len(argv) > 1 and argv[1] in cliopts.COMMANDS else ""
+
+proc def new_client(cap: ?net.UDPConnectCap, o: CliOptions, sec: Security, tr: ?Transport=None) -> Client:
+    """The Client of a client command
+
+    -e is our own engine ID for an SNMPv3 trap and the peer's engine ID,
+    which skips discovery, for every other command. tr replaces the UDP
+    socket in tests.
+    """
+    engine: ?EngineInfo = None
+    local_id: ?bytes = None
+    eid = o.engine_id
+    if eid is not None:
+        if o.command == "trap" and not o.inform:
+            local_id = eid
+        else:
+            engine = EngineInfo(eid, 0, 0, 0.0)
+    return Client(cap, o.address, sec, None, port=o.port, opts=request_options(o), transport=tr, engine=engine,
+                  local_engine_id=local_id, local_engine_boots=o.boots)
+
+actor main(env):
+    var _trap = False
+    var _flush_out = False
+
+    def write_out(s: str) -> None:
+        print(s, end="", flush=_flush_out)
+
+    def write_err(s: str) -> None:
+        print("", end="", flush=True)
+        print(s, end="", err=True, flush=True)
+
+    def finish(code: int) -> None:
+        if _trap:
+            after TRAP_LINGER: env.exit(code)
+        else:
+            env.exit(code)
+
+    proc def _read(path: str) -> ?str:
+        try:
+            f = file.ReadFile(file.ReadFileCap(file.FileCap(env.cap)), path)
+            data = f.read()
+            f.close()
+            return data.decode()
+        except Exception:
+            return None
+
+    proc def _usage_error(msg: str, usage: bool) -> None:
+        if msg != "":
+            write_err(msg + "\n")
+        if usage:
+            write_err(cliopts.usage(_command_of(env.argv)) + "\n")
+        env.exit(1)
+
+    proc def _serve_agent(o: CliOptions) -> None:
+        rec = _read(o.snmprec)
+        rules = _read(o.write_rules)
+        users = _read(o.users)
+        if users is None and o.users_given:
+            _usage_error("actsnmp agent: cannot read the users file " + o.users, False)
+        elif rec is None:
+            _usage_error("actsnmp agent: cannot read the snmprec file " + o.snmprec, False)
+        elif rules is None:
+            _usage_error("actsnmp agent: cannot read the write rules " + o.write_rules, False)
+        if rec is not None:
+            if rules is not None:
+                if users is not None or not o.users_given:
+                    r = _load_agent(o, rec, rules, users)
+                    view = r.0
+                    config = r.1
+                    if view is not None:
+                        if config is not None:
+                            lcap = net.UDPListenCap(net.UDPCap(net.NetCap(env.cap)))
+                            AgentServer(lcap, o, view, config, write_err, finish)
+                            return
+                    _usage_error("actsnmp agent: " + r.2, False)
+
+    proc def _serve_trapd(o: CliOptions) -> None:
+        users = _read(o.users)
+        if users is None and o.users_given:
+            _usage_error("actsnmp trapd: cannot read the users file " + o.users, False)
+            return
+        r = _load_trapd(o, users)
+        config = r.0
+        if config is not None:
+            _flush_out = True
+            lcap = net.UDPListenCap(net.UDPCap(net.NetCap(env.cap)))
+            TrapdServer(lcap, o, config, write_out, write_err, finish)
+        else:
+            _usage_error("actsnmp trapd: " + r.1, False)
+
+    proc def _start(o: CliOptions) -> None:
+        if o.show_version:
+            write_out("actsnmp version: " + VERSION + "\n")
+            env.exit(0)
+            return
+        if o.help:
+            write_err(cliopts.usage(o.command) + "\n")
+            env.exit(1)
+            return
+        if o.command == "agent":
+            _serve_agent(o)
+            return
+        if o.command == "trapd":
+            _serve_trapd(o)
+            return
+        r = _load_security(o)
+        sec = r.0
+        if sec is not None:
+            _trap = o.command == "trap" and not o.inform
+            ccap = net.UDPConnectCap(net.UDPCap(net.NetCap(env.cap)))
+            Command(o, new_client(ccap, o, sec), write_out, write_err, finish)
+        else:
+            _usage_error(tool_name(o) + ": " + r.1, False)
+
+    proc def _main() -> None:
+        r = _parse(env.argv)
+        parsed = r.0
+        if parsed is not None:
+            _start(parsed)
+        else:
+            _usage_error(r.1, r.2)
+
+    _main()

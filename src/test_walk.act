@@ -1,0 +1,1080 @@
+"""Tests for walks and tables: Client.walk, walk_stream and get_table
+
+The real Client walks the real Agent (agent.act) over a transport.MemNet;
+a few cases need an agent misbehaving in a way Faults cannot express and
+use a scripted responder instead. Covered:
+
+  * GETNEXT walks (SNMPv1, and use_bulk=False) and GETBULK walks (SNMPv2c
+    and SNMPv3), subtree ends, endOfMibView, SNMPv1 noSuchName, the GET of
+    an empty walk's root;
+  * strictly increasing OIDs, also within one GETBULK response, with the
+    partial result (Faults.non_increasing_at), and the loop guard of
+    check_increasing=False;
+  * GETBULK responses cut anywhere (Faults.truncate_bulk), the empty
+    response that makes no progress, adaptive bulk on tooBig
+    (Faults.too_big_over) and on timeouts (NetFaults), and what the Client
+    remembers of it;
+  * retries in the middle of a walk, error statuses, max_walk_varbinds,
+    cancel() and close() with exactly-once callbacks, walk_stream batches,
+    invalid arguments;
+  * get_table: lock-step columns, sparse columns, rows merged by index,
+    truncated mid-row responses, parallel column groups
+    (max_oids_per_request) within max_in_flight, SNMPv1 tables;
+  * env tests over the lab dataset (interop/dataset/actsnmp.snmprec): full
+    walks for SNMPv1, v2c and v3, GETNEXT and GETBULK, equal to
+    interop/expected/canon/dataset.txt (SNMPv1: dataset-v1.txt) in
+    fmt.canon_varbind form, the 300-row table with its sparse column 7, the
+    string-indexed table and the 2000-row table against their expected
+    files, and the time of a 6000-varbind GETBULK walk (logged; run with
+    --fast --show-log to see it).
+
+Every walk reports through a Sink, which counts its callbacks: the checks
+run QUIET seconds after the last expected callback, so a second callback
+would be seen. MemNet delivery depends only on message order; timers enter
+only in the retry and timeout cases, with generous margins.
+"""
+
+import logging
+import testing
+import time
+
+import errors
+import fmt
+import message
+import pdu
+import usm
+from agent import Agent, AgentConfig, Faults
+from client import Client, EngineInfo, Options, Response, Row, Table
+from mibview import MibView, load_snmprec
+from oid import Oid
+from pdu import Pdu
+from security import Community, Security, Usm
+from transport import MemNet, NetFaults
+from values import Counter64, EndOfMibView, Integer, NoSuchObject, OctetString, VarBind
+from testutil import outcome, read_text, report, report_env
+
+AGENT = "10.0.0.1"
+MANAGER = "10.0.0.2"
+
+# Seconds to wait after the last expected callback, to see that nothing more arrives
+QUIET = 0.2
+
+# No retries, a generous timeout: MemNet loses nothing unless a test says so
+OPTS = Options(timeout=2.0, retries=0)
+
+# The lab dataset base B (interop/README.md, "Dataset")
+BASE = Oid([1, 3, 6, 1, 4, 1, 8072, 9999, 1])
+SYS_DESCR = Oid([1, 3, 6, 1, 2, 1, 1, 1, 0])
+# snmpEngineID.0: the first object after B (the agent serves its own value there)
+AFTER_B = Oid([1, 3, 6, 1, 6, 3, 10, 2, 1, 1, 0])
+
+
+def b(arcs: list[int]) -> Oid:
+    """An OID below B"""
+    return Oid(BASE.arcs + arcs)
+
+def big(i: int) -> OctetString:
+    return OctetString(("%04d" % i).encode() * 12)
+
+def small_view() -> MibView:
+    """23 scalars B.1.n.0, a 3-column table B.2.1.c.i (column 3 only for even i, column 2 Counter64),
+    a scalar B.3.0, 60 large strings B.5.n.0, and objects before and after B"""
+    vbs = [VarBind(SYS_DESCR, OctetString(b"walk test agent")), VarBind(AFTER_B, OctetString(b"after"))]
+    for n in range(1, 24):
+        vbs.append(VarBind(b([1, n, 0]), Integer(n)))
+    for i in range(1, 11):
+        vbs.append(VarBind(b([2, 1, 1, i]), Integer(100 + i)))
+        vbs.append(VarBind(b([2, 1, 2, i]), Counter64(u64(1000 + i))))
+        if i % 2 == 0:
+            vbs.append(VarBind(b([2, 1, 3, i]), OctetString(("row%d" % i).encode())))
+    vbs.append(VarBind(b([3, 0]), Integer(3)))
+    for n in range(1, 61):
+        vbs.append(VarBind(b([5, n, 0]), big(n)))
+    return MibView(vbs)
+
+def scalars() -> list[VarBind]:
+    return [VarBind(b([1, n, 0]), Integer(n)) for n in range(1, 24)]
+
+def shaaes() -> Usm:
+    return Usm.from_passwords("u_sha_aes", usm.AUTH_SHA1, "authpass123", usm.PRIV_AES128, "privpass123")
+
+def config() -> AgentConfig:
+    return AgentConfig({"public": False}, [shaaes()])
+
+def client(mn: MemNet, sec: Security, port: int, opts: Options=OPTS) -> Client:
+    return Client(None, AGENT, sec, None, opts=opts, transport=mn.client(MANAGER, port, AGENT, 161))
+
+def v1() -> Community:
+    return Community("public", message.SNMP_V1)
+
+def v2c() -> Community:
+    return Community("public")
+
+
+# Results ###########################################################################################
+
+class Got(object):
+    """What the callbacks of one walk delivered: varbinds (walk_stream: all batches), the table,
+    the count (walk_stream: on_done's), the batch sizes and the error"""
+    vbs: list[VarBind]
+    table: ?Table
+    count: int
+    batches: list[int]
+    e: ?errors.SnmpError
+
+    def __init__(self, vbs: list[VarBind], table: ?Table, count: int, batches: list[int], e: ?errors.SnmpError):
+        self.vbs = vbs
+        self.table = table
+        self.count = count
+        self.batches = batches
+        self.e = e
+
+def describe(g: Got) -> str:
+    e = g.e
+    return "%d varbinds, " % len(g.vbs) + ("error " + str(e) if e is not None else "no error")
+
+def ok(g: Got, what: str) -> list[VarBind]:
+    """The varbinds of a walk that ended without an error"""
+    e = g.e
+    if e is not None:
+        raise AssertionError(what + ": unexpected error " + str(e))
+    return g.vbs
+
+def table_of(g: Got, what: str) -> Table:
+    e = g.e
+    if e is not None:
+        raise AssertionError(what + ": unexpected error " + str(e))
+    t = g.table
+    if t is not None:
+        return t
+    raise AssertionError(what + ": no table")
+
+def not_increasing(g: Got, what: str) -> (list[int], list[int]):
+    e = g.e
+    if isinstance(e, errors.OidNotIncreasingError):
+        return (e.previous, e.received)
+    raise AssertionError(what + ": expected OidNotIncreasingError, got " + describe(g))
+
+def failed_with(g: Got, what: str) -> errors.SnmpError:
+    e = g.e
+    if e is not None:
+        return e
+    raise AssertionError(what + ": expected an error, got " + describe(g))
+
+def is_cancelled(e: errors.SnmpError) -> bool:
+    return isinstance(e, errors.CancelledError)
+
+def canon(vbs: list[VarBind]) -> str:
+    """vbs in the lab's canonical format, one line each, as the expected files have them"""
+    return "".join([fmt.canon_varbind(vb) + "\n" for vb in vbs])
+
+def table_varbinds(t: Table) -> list[VarBind]:
+    """The table's values in walk order: column after column, rows by index"""
+    out: list[VarBind] = []
+    for c in t.columns:
+        n = c.arcs[len(c.arcs) - 1]
+        for r in t.rows:
+            v = r.values.get(n)
+            if v is not None:
+                out.append(VarBind(c.child(r.index), v))
+    return out
+
+def clip(s: str) -> str:
+    return s if len(s) <= 200 else s[:200] + "..."
+
+def assert_same_lines(got: str, want: str, what: str) -> None:
+    """Fail with the first differing line (comparing whole files would print megabytes)"""
+    g = got.split("\n")
+    w = want.split("\n")
+    n = len(g) if len(g) < len(w) else len(w)
+    for i in range(n):
+        if g[i] != w[i]:
+            testing.error("%s, line %d:\n got  %s\n want %s" % (what, i + 1, clip(repr(g[i])), clip(repr(w[i]))))
+    if len(g) != len(w):
+        testing.error("%s: %d lines, expected %d" % (what, len(g), len(w)))
+
+def bulk_reps(history: list[Pdu]) -> list[int]:
+    """The max-repetitions of the GETBULK requests among history"""
+    return [p.max_repetitions() for p in history if p.pdu_type == pdu.GETBULK]
+
+def requests_sent(datagrams: list[bytes]) -> list[Pdu]:
+    """The request PDUs among datagrams: SNMPv1/v2c, and SNMPv3 without privacy"""
+    out: list[Pdu] = []
+    for d in datagrams:
+        c, m = message.decode(d)
+        if c is not None:
+            p = c.pdu
+            if p is not None:
+                if p.pdu_type != pdu.RESPONSE:
+                    out.append(p)
+        elif m is not None:
+            sp = m.scoped
+            if sp is not None:
+                if sp.pdu.pdu_type != pdu.RESPONSE and sp.pdu.pdu_type != pdu.REPORT:
+                    out.append(sp.pdu)
+    return out
+
+
+actor Sink(label: str, report_to: action(str, Got) -> None):
+    """The callbacks of one walk, walk_stream or get_table; each callback reports to report_to"""
+    var batches: list[int] = []
+    var streamed: list[VarBind] = []
+
+    def walk_cb(c: Client, vbs: list[VarBind], e: ?errors.SnmpError) -> None:
+        report_to(label, Got(vbs, None, len(vbs), [], e))
+
+    def table_cb(c: Client, t: ?Table, e: ?errors.SnmpError) -> None:
+        report_to(label, Got([], t, 0, [], e))
+
+    def on_batch(c: Client, vbs: list[VarBind]) -> None:
+        batches.append(len(vbs))
+        streamed.extend(vbs)
+
+    def on_done(c: Client, count: int, e: ?errors.SnmpError) -> None:
+        report_to(label, Got(streamed, None, count, batches, e))
+
+
+actor Harness(t: testing.AsyncT, want: int, verify: proc(dict[str, Got]) -> None):
+    """Collects the results of want walks by label; QUIET seconds after the last one it checks that
+    every callback came exactly once and runs verify"""
+    var results: dict[str, Got] = {}
+    var calls = 0
+    var armed = False
+
+    def finish() -> None:
+        def check() -> None:
+            testing.assertEqual(calls, want, "callbacks (exactly once per walk)")
+            verify(results)
+        report(t, outcome(check))
+
+    def got(label: str, g: Got) -> None:
+        results[label] = g
+        calls += 1
+        if calls >= want and not armed:
+            armed = True
+            after now QUIET: finish()
+
+
+# Row and Table ######################################################################################
+
+def _test_row_and_table_repr() -> None:
+    r = Row([2, 5], {3: Integer(30), 1: Integer(10)})
+    testing.assertEqual(repr(r), "Row(index=2.5, values=[1: Integer(10), 3: Integer(30)])", "columns in order")
+    t = Table([b([2, 1, 1]), b([2, 1, 3])], [r])
+    testing.assertEqual(repr(t), "Table(columns=[.1.3.6.1.4.1.8072.9999.1.2.1.1, .1.3.6.1.4.1.8072.9999.1.2.1.3], "
+                        + "rows=[Row(index=2.5, values=[1: Integer(10), 3: Integer(30)])])")
+    testing.assertEqual(str(t), repr(t))
+    testing.assertEqual(table_varbinds(t), [VarBind(b([2, 1, 1, 2, 5]), Integer(10)),
+                                            VarBind(b([2, 1, 3, 2, 5]), Integer(30))])
+
+
+# GETNEXT and GETBULK walks ##########################################################################
+
+def check_basic_walks(r: dict[str, Got]) -> None:
+    want = scalars()
+    testing.assertEqual(ok(r["getnext"], "getnext walk"), want, "GETNEXT walk of B.1")
+    testing.assertEqual(ok(r["bulk"], "bulk walk"), want, "GETBULK walk of B.1")
+    testing.assertEqual(ok(r["v1"], "v1 walk"), want, "SNMPv1 walk of B.1 (GETNEXT)")
+    testing.assertEqual(ok(r["v3 getnext"], "v3 getnext walk"), want, "SNMPv3 GETNEXT walk")
+    testing.assertEqual(ok(r["v3 bulk"], "v3 bulk walk"), want, "SNMPv3 GETBULK walk")
+    s = r["stream"]
+    testing.assertEqual(ok(s, "walk_stream"), want, "walk_stream varbinds")
+    testing.assertEqual(s.batches, [10, 10, 3], "one batch per GETBULK response (max_repetitions 10)")
+    testing.assertEqual(s.count, 23)
+    s1 = r["stream getnext"]
+    testing.assertEqual(s1.batches, [1] * 23, "one batch per GETNEXT response")
+    testing.assertEqual(s1.count, 23)
+    sparse = [VarBind(b([2, 1, 3, i]), OctetString(("row%d" % i).encode())) for i in range(2, 11, 2)]
+    testing.assertEqual(ok(r["sparse"], "column walk"), sparse, "a column of a sparse table")
+    testing.assertEqual(len(ok(r["v1 counter64"], "v1 Counter64 column")), 0, "SNMPv1 skips Counter64: no values")
+    testing.assertEqual(ok(r["enterprises"], "walk of enterprises"), small_view().varbinds(Oid([1, 3, 6, 1, 4])),
+                        "a walk over several subtrees")
+
+actor _test_walks(t: testing.AsyncT):
+    """GETNEXT and GETBULK walks for SNMPv1, v2c and v3, walk_stream batches, a sparse column, several subtrees"""
+    t.timeout(30.0)
+    mn = MemNet()
+    agent = Agent(mn.server(AGENT, 161), small_view(), config(), None)
+    h = Harness(t, 10, check_basic_walks)
+    c2 = client(mn, v2c(), 40001)
+    c1 = client(mn, v1(), 40002)
+    c3 = client(mn, shaaes(), 40003)
+    c2.walk(Sink("getnext", h.got).walk_cb, b([1]), OPTS.with_(use_bulk=False))
+    c2.walk(Sink("bulk", h.got).walk_cb, b([1]))
+    s = Sink("stream", h.got)
+    c2.walk_stream(s.on_batch, s.on_done, b([1]), OPTS.with_(max_repetitions=10))
+    s1 = Sink("stream getnext", h.got)
+    c2.walk_stream(s1.on_batch, s1.on_done, b([1]), OPTS.with_(use_bulk=False))
+    c2.walk(Sink("sparse", h.got).walk_cb, b([2, 1, 3]), OPTS.with_(max_repetitions=3))
+    c2.walk(Sink("enterprises", h.got).walk_cb, Oid([1, 3, 6, 1, 4]))
+    c1.walk(Sink("v1", h.got).walk_cb, b([1]))
+    c1.walk(Sink("v1 counter64", h.got).walk_cb, b([2, 1, 2]), OPTS.with_(get_root_if_empty=False))
+    c3.walk(Sink("v3 getnext", h.got).walk_cb, b([1]), OPTS.with_(use_bulk=False))
+    c3.walk(Sink("v3 bulk", h.got).walk_cb, b([1]), OPTS.with_(max_repetitions=7))
+
+
+def check_end_of_view(r: dict[str, Got]) -> None:
+    tail = [VarBind(Oid([2, 7, n]), Integer(n)) for n in range(1, 6)]
+    testing.assertEqual(ok(r["getnext"], "getnext"), tail, "GETNEXT walk ends at endOfMibView")
+    testing.assertEqual(ok(r["bulk"], "bulk"), tail, "GETBULK walk ends at endOfMibView")
+    testing.assertEqual(ok(r["v1"], "v1"), tail, "SNMPv1 walk ends at noSuchName")
+    testing.assertEqual(ok(r["past the end"], "past the end"), [], "nothing past the end: the GET gives noSuchObject")
+    testing.assertEqual(ok(r["v1 past the end"], "v1 past the end"), [], "SNMPv1: noSuchName, then noSuchName")
+
+actor _test_walk_end_of_mib_view(t: testing.AsyncT):
+    """A walk to the end of the view ends at endOfMibView (SNMPv1: noSuchName) without an error"""
+    t.timeout(30.0)
+    mn = MemNet()
+    view = MibView([VarBind(Oid([2, 7, n]), Integer(n)) for n in range(1, 6)] + [VarBind(SYS_DESCR, Integer(0))])
+    agent = Agent(mn.server(AGENT, 161), view, config(), None)
+    h = Harness(t, 5, check_end_of_view)
+    c2 = client(mn, v2c(), 40001)
+    c1 = client(mn, v1(), 40002)
+    c2.walk(Sink("getnext", h.got).walk_cb, Oid([2, 7]), OPTS.with_(use_bulk=False))
+    c2.walk(Sink("bulk", h.got).walk_cb, Oid([2, 7]))
+    c1.walk(Sink("v1", h.got).walk_cb, Oid([2, 7]))
+    c2.walk(Sink("past the end", h.got).walk_cb, Oid([2, 999]))
+    c1.walk(Sink("v1 past the end", h.got).walk_cb, Oid([2, 999]))
+
+
+def check_root_get(r: dict[str, Got]) -> None:
+    scalar = [VarBind(b([3, 0]), Integer(3))]
+    testing.assertEqual(ok(r["scalar"], "scalar"), scalar, "walking a scalar instance GETs it")
+    testing.assertEqual(r["scalar stream"].batches, [1], "the root's varbind as the only batch")
+    testing.assertEqual(ok(r["scalar stream"], "scalar stream"), scalar)
+    testing.assertEqual(ok(r["scalar bulk"], "scalar bulk"), scalar)
+    testing.assertEqual(ok(r["v1 scalar"], "v1 scalar"), scalar)
+    testing.assertEqual(ok(r["no fallback"], "no fallback"), [], "get_root_if_empty=False")
+    testing.assertEqual(ok(r["missing"], "missing"), [], "noSuchObject is not returned")
+    testing.assertEqual(ok(r["v1 missing"], "v1 missing"), [], "SNMPv1 noSuchName is not returned")
+    s = r["missing stream"]
+    testing.assertEqual((ok(s, "missing stream"), s.count, s.batches), ([], 0, []), "no batch at all")
+
+actor _test_walk_empty_subtree_gets_root(t: testing.AsyncT):
+    """An empty walk GETs its root: a scalar instance is returned, an exception is not"""
+    t.timeout(30.0)
+    mn = MemNet()
+    agent = Agent(mn.server(AGENT, 161), small_view(), config(), None)
+    h = Harness(t, 8, check_root_get)
+    c2 = client(mn, v2c(), 40001)
+    c1 = client(mn, v1(), 40002)
+    c2.walk(Sink("scalar", h.got).walk_cb, b([3, 0]), OPTS.with_(use_bulk=False))
+    s = Sink("scalar stream", h.got)
+    c2.walk_stream(s.on_batch, s.on_done, b([3, 0]))
+    c2.walk(Sink("scalar bulk", h.got).walk_cb, b([3, 0]))
+    c1.walk(Sink("v1 scalar", h.got).walk_cb, b([3, 0]))
+    c2.walk(Sink("no fallback", h.got).walk_cb, b([3, 0]), OPTS.with_(get_root_if_empty=False))
+    c2.walk(Sink("missing", h.got).walk_cb, b([4]))
+    c1.walk(Sink("v1 missing", h.got).walk_cb, b([4]))
+    s2 = Sink("missing stream", h.got)
+    c2.walk_stream(s2.on_batch, s2.on_done, b([4]))
+
+
+# Ordering, loops and agent faults ##################################################################
+
+def check_non_increasing(r: dict[str, Got]) -> None:
+    before = scalars()[:11]
+    eleven = b([1, 11, 0]).arcs
+    for label in ["getnext", "bulk", "v1", "unchecked getnext", "unchecked bulk"]:
+        testing.assertEqual(r[label].vbs, before, label + ": the partial result")
+        testing.assertEqual(not_increasing(r[label], label), (eleven, eleven), label + ": the error")
+    s = r["stream"]
+    testing.assertEqual((s.vbs, s.count, s.batches), (before, 11, [5, 5, 1]),
+                        "walk_stream delivers the varbinds before the error, then on_done")
+    not_increasing(s, "stream")
+    # check_increasing=False accepts the root itself as an answer once; the loop guard stops the repeat
+    testing.assertEqual(not_increasing(r["root"], "root"), (eleven, eleven), "checked: the root as an answer")
+    testing.assertEqual(r["root"].vbs, [])
+    testing.assertEqual(r["unchecked root"].vbs, [VarBind(b([1, 11, 0]), Integer(12))],
+                        "unchecked: the root as an answer, once")
+    testing.assertEqual(not_increasing(r["unchecked root"], "unchecked root"), (eleven, eleven))
+
+actor _test_walk_not_increasing(t: testing.AsyncT):
+    """Faults.non_increasing_at: OidNotIncreasingError with the partial result, also within one GETBULK response;
+    check_increasing=False ends the loop with the loop guard"""
+    t.timeout(30.0)
+    mn = MemNet()
+    agent = Agent(mn.server(AGENT, 161), small_view(), config(), None, Faults(non_increasing_at=b([1, 12, 0])))
+    h = Harness(t, 9, check_non_increasing)
+    c2 = client(mn, v2c(), 40001)
+    c1 = client(mn, v1(), 40002)
+    unchecked = OPTS.with_(check_increasing=False)
+    c2.walk(Sink("getnext", h.got).walk_cb, b([1]), OPTS.with_(use_bulk=False))
+    c2.walk(Sink("bulk", h.got).walk_cb, b([1]))
+    c1.walk(Sink("v1", h.got).walk_cb, b([1]))
+    s = Sink("stream", h.got)
+    c2.walk_stream(s.on_batch, s.on_done, b([1]), OPTS.with_(max_repetitions=5))
+    c2.walk(Sink("unchecked getnext", h.got).walk_cb, b([1]), unchecked.with_(use_bulk=False))
+    c2.walk(Sink("unchecked bulk", h.got).walk_cb, b([1]), unchecked)
+    c2.walk(Sink("root", h.got).walk_cb, b([1, 11, 0]))
+    c2.walk(Sink("unchecked root", h.got).walk_cb, b([1, 11, 0]), unchecked)
+    c2.walk(Sink("unrelated", h.got).walk_cb, b([2, 1, 1]))
+
+
+actor _test_walk_disorder_scripted(t: testing.AsyncT):
+    """A scripted agent: decreasing but new OIDs fail a checked walk and pass an unchecked one; a loop ends either
+    way; noSuchObject answered to a GETNEXT ends a walk; SNMPv1 noSuchName with error-index 0 ends one too"""
+    t.timeout(30.0)
+    mn = MemNet()
+    server = mn.server(AGENT, 161)
+    root = Oid([1, 3, 6, 1, 4, 1, 99])
+    # GETNEXT successors: R -> R.1 -> R.3 -> R.2 (decreasing, new) -> R.4 -> out of the subtree;
+    # the loop: L -> L.1 -> L.2 -> L.1 again
+    loop = Oid([1, 3, 6, 1, 4, 1, 98])
+    # nso.1 is answered as noSuchObject (an agent bug to tolerate); after nsn.1 an SNMPv1 request gets
+    # noSuchName with error-index 0
+    nso = Oid([1, 3, 6, 1, 4, 1, 97])
+    nsn = Oid([1, 3, 6, 1, 4, 1, 96])
+    var nexts: dict[Oid, Oid] = {root: root.child([1]), root.child([1]): root.child([3]),
+                                 root.child([3]): root.child([2]), root.child([2]): root.child([4]),
+                                 root.child([4]): SYS_DESCR.child([5]),
+                                 loop: loop.child([1]), loop.child([1]): loop.child([2]), loop.child([2]): loop.child([1]),
+                                 nso: nso.child([1]), nsn: nsn.child([1])}
+    var results: dict[str, Got] = {}
+
+    def check() -> None:
+        r = results
+        testing.assertEqual([vb.oid for vb in r["checked"].vbs], [root.child([1]), root.child([3])], "checked: partial")
+        testing.assertEqual(not_increasing(r["checked"], "checked"), (root.child([3]).arcs, root.child([2]).arcs))
+        testing.assertEqual([vb.oid for vb in ok(r["unchecked"], "unchecked")],
+                            [root.child([1]), root.child([3]), root.child([2]), root.child([4])], "unchecked: all four")
+        testing.assertEqual([vb.oid for vb in r["loop"].vbs], [loop.child([1]), loop.child([2])], "loop: partial")
+        testing.assertEqual(not_increasing(r["loop"], "loop"), (loop.child([2]).arcs, loop.child([1]).arcs))
+        testing.assertEqual(ok(r["noSuchObject"], "noSuchObject"), [], "noSuchObject ends the walk, the GET too")
+        testing.assertEqual(ok(r["v1 noSuchName"], "v1 noSuchName"), [VarBind(nsn.child([1]), Integer(8))],
+                            "noSuchName that names no varbind ends an SNMPv1 walk")
+
+    def got(label: str, g: Got) -> None:
+        results[label] = g
+        if len(results) == 5:
+            after now QUIET: report(t, outcome(check))
+
+    def on_request(data: bytes, address: str, port: int) -> None:
+        c, m = message.decode(data)
+        if c is not None:
+            p = c.pdu
+            if p is not None:
+                v1 = (c.version == message.SNMP_V1)
+                out: list[VarBind] = []
+                status = 0
+                index = 0
+                for vb in p.varbinds:
+                    n = nexts.get(vb.oid)
+                    if p.pdu_type == pdu.GET:
+                        out.append(VarBind(vb.oid, NoSuchObject()))
+                        if v1:
+                            status = pdu.NO_SUCH_NAME
+                            index = 1
+                    elif v1 and vb.oid == nsn.child([1]):
+                        status = pdu.NO_SUCH_NAME
+                    elif n is not None:
+                        out.append(VarBind(n, NoSuchObject() if n == nso.child([1]) else Integer(len(n.arcs))))
+                    else:
+                        out.append(VarBind(vb.oid, EndOfMibView()))
+                vbs = p.varbinds if status != 0 else out
+                resp = Pdu(pdu.RESPONSE, p.request_id, status, index, vbs)
+                server.send_to(message.encode_community(message.CommunityMessage(c.version, c.community, resp)),
+                               address, port)
+
+    server.set_receiver(on_request)
+    c2 = client(mn, v2c(), 40001, OPTS.with_(use_bulk=False))
+    c2.walk(Sink("checked", got).walk_cb, root)
+    c2.walk(Sink("unchecked", got).walk_cb, root, OPTS.with_(use_bulk=False, check_increasing=False))
+    c2.walk(Sink("loop", got).walk_cb, loop, OPTS.with_(use_bulk=False, check_increasing=False))
+    c2.walk(Sink("noSuchObject", got).walk_cb, nso, OPTS.with_(use_bulk=False))
+    c1 = client(mn, v1(), 40002, OPTS.with_(v1_fix_errors=False))
+    c1.walk(Sink("v1 noSuchName", got).walk_cb, nsn)
+
+
+def check_truncated(r: dict[str, Got]) -> None:
+    s = r["cut to 3"]
+    testing.assertEqual(ok(s, "cut to 3"), scalars())
+    testing.assertEqual(s.batches, [3, 3, 3, 3, 3, 3, 3, 2], "every response holds 3 varbinds")
+    e = failed_with(r["empty"], "empty")
+    testing.assertTrue(isinstance(e, errors.InvalidResponseError), "an empty GETBULK response: " + str(e))
+    testing.assertEqual(r["empty"].vbs, [], "nothing collected")
+    s2 = r["empty stream"]
+    testing.assertEqual((s2.count, s2.batches), (0, []))
+    testing.assertTrue(isinstance(failed_with(s2, "empty stream"), errors.InvalidResponseError))
+    testing.assertEqual(ok(r["getnext"], "getnext"), scalars(), "GETNEXT is not affected")
+
+actor _test_walk_truncated_bulk(t: testing.AsyncT):
+    """Faults.truncate_bulk: short GETBULK responses are resumed; an empty one fails (no progress) and never loops"""
+    t.timeout(30.0)
+    mn = MemNet()
+    agent = Agent(mn.server(AGENT, 161), small_view(), config(), None, Faults(truncate_bulk=3))
+    mn0 = MemNet()
+    agent0 = Agent(mn0.server(AGENT, 161), small_view(), config(), None, Faults(truncate_bulk=0))
+    h = Harness(t, 4, check_truncated)
+    c = client(mn, v2c(), 40001)
+    s = Sink("cut to 3", h.got)
+    c.walk_stream(s.on_batch, s.on_done, b([1]), OPTS.with_(max_repetitions=10))
+    c0 = client(mn0, v2c(), 40001)
+    c0.walk(Sink("empty", h.got).walk_cb, b([1]))
+    s0 = Sink("empty stream", h.got)
+    c0.walk_stream(s0.on_batch, s0.on_done, b([1]))
+    c0.walk(Sink("getnext", h.got).walk_cb, b([1]), OPTS.with_(use_bulk=False))
+
+
+actor _test_walk_adaptive_too_big(t: testing.AsyncT):
+    """Faults.too_big_over: the walk halves max-repetitions until the answer fits, completes, and the Client
+    remembers the value for later walks; adaptive_bulk=False does not remember"""
+    t.timeout(30.0)
+    mn = MemNet()
+    agent = Agent(mn.server(AGENT, 161), small_view(), config(), None, Faults(too_big_over=1200))
+    want = [VarBind(b([5, n, 0]), big(n)) for n in range(1, 61)]
+    var results: dict[str, Got] = {}
+    var reps: dict[str, list[int]] = {}
+    var calls = 0
+    c = client(mn, v2c(), 40001)
+    plain = client(mn, v2c(), 40002)
+
+    def sent_reps(port: int) -> list[int]:
+        return bulk_reps(requests_sent([d.data for d in mn.history() if d.src_port == port]))
+
+    def check() -> None:
+        testing.assertEqual(calls, 4, "callbacks")
+        testing.assertEqual(ok(results["first"], "first"), want)
+        testing.assertEqual(ok(results["second"], "second"), want)
+        testing.assertEqual(ok(results["plain"], "plain"), want)
+        testing.assertEqual(ok(results["plain again"], "plain again"), want)
+        # 25 rows of 70 octets do not fit 1200, 12 do: the second walk starts at 12
+        first = reps["first"]
+        testing.assertEqual(first[:2], [25, 12], "tooBig halves: " + str(first))
+        rest = sent_reps(40001)[len(first):]
+        testing.assertTrue(len(rest) >= 5 and len([m for m in rest if m != 12]) == 0,
+                           "the second walk uses the learned value: " + str(rest))
+        p = sent_reps(40002)
+        testing.assertEqual(p[:3], [25, 12, 25], "adaptive_bulk=False: every request starts at 25: " + str(p))
+
+    def got(label: str, g: Got) -> None:
+        results[label] = g
+        calls += 1
+        if label == "first":
+            reps["first"] = sent_reps(40001)
+            c.walk(Sink("second", got).walk_cb, b([5]))
+        elif label == "plain":
+            plain.walk(Sink("plain again", got).walk_cb, b([5]), OPTS.with_(adaptive_bulk=False))
+        if calls == 4:
+            after now QUIET: report(t, outcome(check))
+
+    c.walk(Sink("first", got).walk_cb, b([5]))
+    plain.walk(Sink("plain", got).walk_cb, b([5]), OPTS.with_(adaptive_bulk=False))
+
+
+actor _test_walk_adaptive_timeout(t: testing.AsyncT):
+    """adaptive_bulk on a timeout: the retry carries half the max-repetitions, the walk completes, the value is kept"""
+    t.timeout(30.0)
+    mn = MemNet()
+    agent = Agent(mn.server(AGENT, 161), small_view(), config(), None)
+    want = [VarBind(b([5, n, 0]), big(n)) for n in range(1, 61)]
+    opts = Options(timeout=0.3, retries=2)
+    var results: dict[str, Got] = {}
+    var calls = 0
+    c = client(mn, v2c(), 40001, opts)
+
+    def sent_reps(port: int) -> list[int]:
+        return bulk_reps(requests_sent([d.data for d in mn.history() if d.src_port == port]))
+
+    def check() -> None:
+        testing.assertEqual(calls, 3, "callbacks")
+        testing.assertEqual(ok(results["first"], "first"), want)
+        testing.assertEqual(ok(results["second"], "second"), want)
+        testing.assertEqual(ok(results["fixed"], "fixed"), want)
+        r = sent_reps(40001)
+        # first walk: 25 (answer lost), 12 (retry), 12, 12, 12, 12 (60 = 12 * 5); second walk: 12 * 5 (+1 to see the end)
+        testing.assertEqual(r[:3], [25, 12, 12], "the retry is halved: " + str(r))
+        testing.assertEqual(len([m for m in r if m == 25]), 1, "the learned value is kept: " + str(r))
+        f = sent_reps(40002)
+        testing.assertEqual(f[:2], [25, 25], "adaptive_bulk=False retries unchanged: " + str(f))
+        testing.assertEqual(c.stats().retries, 1)
+
+    def got(label: str, g: Got) -> None:
+        results[label] = g
+        calls += 1
+        if label == "first":
+            c.walk(Sink("second", got).walk_cb, b([5]))
+            fixed = client(mn, v2c(), 40002, opts.with_(adaptive_bulk=False))
+            mn.set_faults(NetFaults(drop_first_n=1, to_address=MANAGER, to_port=40002))
+            fixed.walk(Sink("fixed", got).walk_cb, b([5]))
+        if calls == 3:
+            after now QUIET: report(t, outcome(check))
+
+    mn.set_faults(NetFaults(drop_first_n=1, to_address=MANAGER, to_port=40001))
+    c.walk(Sink("first", got).walk_cb, b([5]))
+
+
+actor _test_walk_adaptive_timeout_v3(t: testing.AsyncT):
+    """adaptive_bulk on a timeout with SNMPv3 (noAuthNoPriv, so the requests can be read): the retry's ScopedPDU
+    is encoded again with half the max-repetitions"""
+    t.timeout(30.0)
+    mn = MemNet()
+    noauth = Usm.from_passwords("u_noauth")
+    agent = Agent(mn.server(AGENT, 161), small_view(), AgentConfig({}, [noauth]), None)
+    want = [VarBind(b([5, n, 0]), big(n)) for n in range(1, 61)]
+    c = client(mn, noauth, 40001, Options(timeout=0.3, retries=2))
+    var walks: list[Got] = []
+
+    def check() -> None:
+        testing.assertEqual(len(walks), 1, "one callback")
+        testing.assertEqual(ok(walks[0], "v3 walk"), want)
+        r = bulk_reps(requests_sent([d.data for d in mn.history() if d.src_port == 40001]))
+        testing.assertEqual(r[:3], [25, 12, 12], "the retry is halved: " + str(r))
+        testing.assertEqual(c.stats().retries, 1)
+
+    def walked(cl: Client, vbs: list[VarBind], e: ?errors.SnmpError) -> None:
+        walks.append(Got(vbs, None, len(vbs), [], e))
+        after now QUIET: report(t, outcome(check))
+
+    def discovered(cl: Client, info: ?EngineInfo, e: ?errors.SnmpError) -> None:
+        # the next datagram to the Client, the answer to the walk's first GETBULK, is lost
+        mn.set_faults(NetFaults(drop_first_n=1, to_address=MANAGER, to_port=40001))
+        c.walk(walked, b([5]))
+
+    c.discover(discovered)
+
+
+actor _test_walk_retries_mid_walk(t: testing.AsyncT):
+    """Answers lost in the middle of a walk (Faults.drop_first_n set after the first batch) are retried"""
+    t.timeout(30.0)
+    mn = MemNet()
+    agent = Agent(mn.server(AGENT, 161), small_view(), config(), None)
+    # every request waits 10 ms on its way to the agent, so the walk is still running when the faults are set
+    mn.set_faults(NetFaults(delay=0.01, to_address=AGENT))
+    c = client(mn, v2c(), 40001, Options(timeout=0.2, retries=3, use_bulk=False))
+    var batches = 0
+    var delivered: list[VarBind] = []
+    var done: list[Got] = []
+
+    def check() -> None:
+        testing.assertEqual(len(done), 1, "on_done once")
+        g = done[0]
+        testing.assertEqual(ok(g, "walk"), scalars(), "nothing lost")
+        testing.assertEqual(g.count, 23)
+        testing.assertEqual(c.stats().retries, 2, "one retry per dropped answer")
+
+    def on_batch(cl: Client, vbs: list[VarBind]) -> None:
+        batches += 1
+        delivered.extend(vbs)
+        if batches == 3:
+            agent.set_faults(Faults(drop_first_n=2))
+
+    def on_done(cl: Client, count: int, e: ?errors.SnmpError) -> None:
+        done.append(Got(delivered, None, count, [], e))
+        after now QUIET: report(t, outcome(check))
+
+    c.walk_stream(on_batch, on_done, b([1]))
+
+
+def check_errors(r: dict[str, Got]) -> None:
+    e = failed_with(r["genErr"], "genErr")
+    if isinstance(e, errors.ErrorStatusError):
+        testing.assertEqual(e.status, pdu.GEN_ERR)
+    else:
+        raise AssertionError("expected an ErrorStatusError: " + str(e))
+    testing.assertEqual(r["genErr"].vbs, scalars()[:5], "the partial result")
+    testing.assertEqual(r["genErr bulk"].vbs, scalars()[:5], "GETBULK: the partial result")
+    testing.assertTrue(isinstance(failed_with(r["timeout"], "timeout"), errors.TimeoutError), "no agent")
+    testing.assertEqual(r["timeout"].vbs, [])
+    testing.assertEqual(ok(r["limit"], "limit"), scalars()[:5], "max_walk_varbinds ends the walk without an error")
+    testing.assertEqual(ok(r["limit bulk"], "limit bulk"), scalars()[:7], "also in the middle of a GETBULK response")
+    s = r["limit stream"]
+    testing.assertEqual((ok(s, "limit stream"), s.count, s.batches), (scalars()[:7], 7, [7]))
+    testing.assertEqual(ok(r["limit 1"], "limit 1"), scalars()[:1])
+
+actor _test_walk_errors_and_limits(t: testing.AsyncT):
+    """An error-status mid-walk and a timeout end the walk with the partial result; max_walk_varbinds stops it"""
+    t.timeout(30.0)
+    mn = MemNet()
+    agent = Agent(mn.server(AGENT, 161), small_view(), config(), None, Faults(error_at=b([1, 5, 0])))
+    mn2 = MemNet()
+    clean = Agent(mn2.server(AGENT, 161), small_view(), config(), None)
+    h = Harness(t, 7, check_errors)
+    c = client(mn, v2c(), 40001)
+    c.walk(Sink("genErr", h.got).walk_cb, b([1]), OPTS.with_(use_bulk=False))
+    c.walk(Sink("genErr bulk", h.got).walk_cb, b([1]), OPTS.with_(max_repetitions=5))
+    lonely = Client(None, "10.9.9.9", v2c(), None, opts=Options(timeout=0.1, retries=1),
+                    transport=mn.client(MANAGER, 40002, "10.9.9.9", 161))
+    lonely.walk(Sink("timeout", h.got).walk_cb, b([1]))
+    c2 = client(mn2, v2c(), 40001)
+    c2.walk(Sink("limit", h.got).walk_cb, b([1]), OPTS.with_(use_bulk=False, max_walk_varbinds=5))
+    c2.walk(Sink("limit bulk", h.got).walk_cb, b([1]), OPTS.with_(max_walk_varbinds=7))
+    s = Sink("limit stream", h.got)
+    c2.walk_stream(s.on_batch, s.on_done, b([1]), OPTS.with_(max_walk_varbinds=7))
+    c2.walk(Sink("limit 1", h.got).walk_cb, b([1]), OPTS.with_(max_walk_varbinds=1))
+
+
+# Cancel, close, invalid arguments ##################################################################
+
+actor _test_walk_cancel(t: testing.AsyncT):
+    """cancel() of a walk, a walk_stream and a table: CancelledError exactly once with the partial result"""
+    t.timeout(30.0)
+    mn = MemNet()
+    agent = Agent(mn.server(AGENT, 161), small_view(), config(), None)
+    # every request waits 20 ms on its way to the agent, so the walks are still running when cancelled
+    mn.set_faults(NetFaults(delay=0.02, to_address=AGENT))
+    c = client(mn, v2c(), 40001, OPTS.with_(use_bulk=False))
+    var results: dict[str, list[Got]] = {}
+    var hs = 0
+    var batches = 0
+    var delivered: list[VarBind] = []
+
+    def check() -> None:
+        testing.assertEqual(ok(results["unaffected"][0], "unaffected"), scalars(),
+                            "cancel() of a walk's internal request handle does nothing")
+        for label in ["immediate", "stream", "table"]:
+            testing.assertEqual(len(results[label]), 1, label + ": exactly one callback")
+            testing.assertTrue(is_cancelled(failed_with(results[label][0], label)), label)
+        testing.assertEqual(results["immediate"][0].vbs, [], "cancelled before any answer")
+        s = results["stream"][0]
+        testing.assertEqual(s.count, len(s.vbs), "on_done counts what the batches delivered")
+        testing.assertTrue(s.count >= 2 and s.count < 23, "cancelled mid-walk: %d" % s.count)
+        testing.assertEqual(s.vbs, scalars()[:s.count], "the delivered prefix")
+        tb = results["table"][0].table
+        testing.assertTrue(tb is not None, "a cancelled table still has its (partial) rows")
+        testing.assertEqual(ok(results["after"][0], "after"), scalars(), "the Client keeps working")
+        st = c.stats()
+        testing.assertEqual((st.queued, st.in_flight), (0, 0), "nothing left over: " + str(st))
+
+    def got(label: str, g: Got) -> None:
+        if label not in results:
+            results[label] = []
+        results[label].append(g)
+        if label == "stream":
+            c.walk(Sink("after", got).walk_cb, b([1]))
+        if label == "after":
+            after now QUIET: report(t, outcome(check))
+
+    def on_batch(cl: Client, vbs: list[VarBind]) -> None:
+        batches += 1
+        delivered.extend(vbs)
+        if batches == 2:
+            c.cancel(hs)
+            c.cancel(hs)
+
+    def on_done(cl: Client, count: int, e: ?errors.SnmpError) -> None:
+        got("stream", Got(delivered, None, count, [], e))
+
+    hu = c.walk(Sink("unaffected", got).walk_cb, b([1]))
+    c.cancel(hu + 1)
+    h1 = c.walk(Sink("immediate", got).walk_cb, b([1]))
+    c.cancel(h1)
+    c.cancel(h1)
+    ht = c.get_table(Sink("table", got).table_cb, [b([2, 1, 1]), b([2, 1, 3])])
+    c.cancel(ht)
+    hs = c.walk_stream(on_batch, on_done, b([1]))
+
+
+actor _test_walk_close(t: testing.AsyncT):
+    """close() during walks and a table: CancelledError("client closed") once each; later walks fail at once"""
+    t.timeout(30.0)
+    mn = MemNet()
+    agent = Agent(mn.server(AGENT, 161), small_view(), config(), None)
+    # every request waits 10 ms on its way to the agent, so the walks are still running at close()
+    mn.set_faults(NetFaults(delay=0.01, to_address=AGENT))
+    c = client(mn, v2c(), 40001, OPTS.with_(use_bulk=False, max_in_flight=2))
+    var results: dict[str, list[Got]] = {}
+    var closed = False
+
+    def check() -> None:
+        for label in ["a", "b", "table", "stream", "late", "late table"]:
+            testing.assertEqual(len(results[label]), 1, label + ": exactly one callback")
+            e = failed_with(results[label][0], label)
+            testing.assertTrue(is_cancelled(e), label + ": " + str(e))
+            testing.assertEqual(e.error_message, "client closed", label)
+
+    def got(label: str, g: Got) -> None:
+        if label not in results:
+            results[label] = []
+        results[label].append(g)
+        if len(results) == 6:
+            after now QUIET: report(t, outcome(check))
+
+    def on_batch(cl: Client, vbs: list[VarBind]) -> None:
+        if not closed:
+            closed = True
+            c.close()
+            c.walk(Sink("late", got).walk_cb, b([1]))
+            c.get_table(Sink("late table", got).table_cb, [b([2, 1, 1])])
+
+    def on_done(cl: Client, count: int, e: ?errors.SnmpError) -> None:
+        got("stream", Got([], None, count, [], e))
+
+    c.walk(Sink("a", got).walk_cb, b([1]))
+    c.walk(Sink("b", got).walk_cb, b([5]))
+    c.get_table(Sink("table", got).table_cb, [b([2, 1, 1]), b([2, 1, 3])])
+    c.walk_stream(on_batch, on_done, b([1]))
+
+
+def check_invalid(r: dict[str, Got]) -> None:
+    for label in ["one arc", "no columns", "bad column", "nested columns", "same column", "same last arc"]:
+        e = failed_with(r[label], label)
+        testing.assertTrue(isinstance(e, errors.EncodeError), label + ": " + str(e))
+    testing.assertEqual(r["one arc"].vbs, [])
+    testing.assertTrue(r["no columns"].table is None, "no table for invalid arguments")
+    s = r["stream one arc"]
+    testing.assertTrue(isinstance(failed_with(s, "stream"), errors.EncodeError))
+    testing.assertEqual((s.count, s.batches), (0, []))
+    testing.assertTrue(isinstance(failed_with(r["queue full"], "queue full"), errors.QueueFullError))
+
+actor _test_walk_invalid_arguments(t: testing.AsyncT):
+    """Invalid roots and columns, and a full queue, are reported through the callback"""
+    t.timeout(30.0)
+    mn = MemNet()
+    h = Harness(t, 8, check_invalid)
+
+    def ignore(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        pass
+
+    c = client(mn, v2c(), 40001, Options(timeout=5.0, retries=0, max_queued=1))
+    c.walk(Sink("one arc", h.got).walk_cb, Oid([1]))
+    s = Sink("stream one arc", h.got)
+    c.walk_stream(s.on_batch, s.on_done, Oid([1]))
+    c.get_table(Sink("no columns", h.got).table_cb, [])
+    c.get_table(Sink("bad column", h.got).table_cb, [b([1]), Oid([7, 1])])
+    c.get_table(Sink("nested columns", h.got).table_cb, [b([2, 1]), b([2, 1, 3])])
+    c.get_table(Sink("same column", h.got).table_cb, [b([2, 1, 3]), b([2, 1, 3])])
+    c.get_table(Sink("same last arc", h.got).table_cb, [b([2, 1, 3]), b([4, 1, 3])])
+    # nobody answers 10.0.0.1 on this network: the first walk stays in flight, the second is queued
+    c.walk(Sink("in flight", h.got).walk_cb, b([1]))
+    c.get(ignore, [b([1])])
+    c.walk(Sink("queue full", h.got).walk_cb, b([1]))
+
+
+# Tables ############################################################################################
+
+def small_table(with_counter64: bool) -> list[VarBind]:
+    """The B.2 table of small_view() in walk order (column 2, Counter64, only with_counter64)"""
+    out: list[VarBind] = []
+    for i in range(1, 11):
+        out.append(VarBind(b([2, 1, 1, i]), Integer(100 + i)))
+    if with_counter64:
+        for i in range(1, 11):
+            out.append(VarBind(b([2, 1, 2, i]), Counter64(u64(1000 + i))))
+    for i in range(2, 11, 2):
+        out.append(VarBind(b([2, 1, 3, i]), OctetString(("row%d" % i).encode())))
+    return out
+
+def check_tables(r: dict[str, Got]) -> None:
+    full = small_table(True)
+    for label in ["bulk", "getnext", "cut mid-row", "groups", "groups in parallel", "v3"]:
+        t = table_of(r[label], label)
+        testing.assertEqual(table_varbinds(t), full, label)
+        testing.assertEqual([row.index for row in t.rows], [[i] for i in range(1, 11)], label + ": rows sorted")
+    t = table_of(r["bulk"], "bulk")
+    testing.assertEqual(t.columns, [b([2, 1, 1]), b([2, 1, 2]), b([2, 1, 3])])
+    testing.assertEqual(sorted(list(t.rows[0].values.keys())), [1, 2], "row 1 has no column 3")
+    testing.assertEqual(sorted(list(t.rows[1].values.keys())), [1, 2, 3], "row 2 has all three")
+    testing.assertEqual(t.rows[1].values[3], OctetString(b"row2"))
+    v1t = table_of(r["v1"], "v1")
+    testing.assertEqual(table_varbinds(v1t), small_table(False), "SNMPv1: no Counter64 column values")
+    lim = table_of(r["limit"], "limit")
+    testing.assertEqual(len(table_varbinds(lim)), 4, "max_walk_varbinds counts every column")
+    one = table_of(r["one column"], "one column")
+    testing.assertEqual(table_varbinds(one), full[20:], "the sparse column alone")
+    testing.assertEqual([row.index for row in one.rows], [[i] for i in range(2, 11, 2)])
+    empty = table_of(r["empty"], "empty")
+    testing.assertEqual((len(empty.rows), len(empty.columns)), (0, 1), "a missing column: no rows, no GET")
+
+actor _test_tables(t: testing.AsyncT):
+    """get_table: lock-step columns, a sparse column, truncated rows, column groups, SNMPv1 and SNMPv3"""
+    t.timeout(30.0)
+    mn = MemNet()
+    agent = Agent(mn.server(AGENT, 161), small_view(), config(), None)
+    mn2 = MemNet()
+    cut = Agent(mn2.server(AGENT, 161), small_view(), config(), None, Faults(truncate_bulk=4))
+    h = Harness(t, 11, check_tables)
+    cols = [b([2, 1, 1]), b([2, 1, 2]), b([2, 1, 3])]
+    c = client(mn, v2c(), 40001)
+    c.get_table(Sink("bulk", h.got).table_cb, cols, OPTS.with_(max_repetitions=4))
+    c.get_table(Sink("getnext", h.got).table_cb, cols, OPTS.with_(use_bulk=False))
+    c.get_table(Sink("groups", h.got).table_cb, cols, OPTS.with_(max_oids_per_request=2, max_repetitions=3))
+    c.get_table(Sink("limit", h.got).table_cb, cols, OPTS.with_(max_walk_varbinds=4))
+    c.get_table(Sink("one column", h.got).table_cb, [b([2, 1, 3])])
+    c.get_table(Sink("empty", h.got).table_cb, [b([2, 1, 9])])
+    parallel = client(mn, v2c(), 40002, OPTS.with_(max_in_flight=3))
+    parallel.get_table(Sink("groups in parallel", h.got).table_cb, cols, OPTS.with_(max_oids_per_request=1,
+                       max_repetitions=2))
+    client(mn2, v2c(), 40001).get_table(Sink("cut mid-row", h.got).table_cb, cols)
+    client(mn, v1(), 40003).get_table(Sink("v1", h.got).table_cb, cols)
+    client(mn, shaaes(), 40004).get_table(Sink("v3", h.got).table_cb, cols, OPTS.with_(max_repetitions=5))
+    client(mn, v2c(), 40005).walk(Sink("unrelated walk", h.got).walk_cb, b([1]))
+
+
+# Lab dataset (env tests) ###########################################################################
+
+SNMPREC = "interop/dataset/actsnmp.snmprec"
+CANON_DATASET = "interop/expected/canon/dataset.txt"
+CANON_DATASET_V1 = "interop/expected/canon/dataset-v1.txt"
+CANON_TABLE = "interop/expected/canon/table.txt"
+CANON_STRTABLE = "interop/expected/canon/strtable.txt"
+CANON_BIGTABLE = "interop/expected/canon/bigtable.txt"
+
+def lab_agent(mn: MemNet, snmprec: str, faults: ?Faults=None) -> Agent:
+    return Agent(mn.server(AGENT, 161), load_snmprec(snmprec), config(), None, faults)
+
+def under(text: str, prefix: str) -> str:
+    """The lines of an expected file that start with prefix"""
+    return "".join([line + "\n" for line in text.split("\n") if line.startswith(prefix)])
+
+actor Gather(want: int, done: action(dict[str, Got], int) -> None):
+    """Collects the results of want walks by label and hands them to done QUIET seconds after the
+    last one, with the number of callbacks (env tests check in their own actor)"""
+    var results: dict[str, Got] = {}
+    var calls = 0
+    var armed = False
+
+    def finish() -> None:
+        done(results, calls)
+
+    def got(label: str, g: Got) -> None:
+        results[label] = g
+        calls += 1
+        if calls >= want and not armed:
+            armed = True
+            after now QUIET: finish()
+
+def check_lab(results: dict[str, Got], calls: int, want: int, expected: str, labels: list[str]) -> None:
+    testing.assertEqual(calls, want, "callbacks (exactly once per walk)")
+    for label in labels:
+        g = results[label]
+        assert_same_lines(canon(ok(g, label)), expected, label)
+
+actor _test_lab_walks_v2c(t: testing.EnvT):
+    """SNMPv2c walks of the lab dataset, GETNEXT, GETBULK and walk_stream, equal expected/canon/dataset.txt"""
+    t.timeout(120.0)
+    snmprec = read_text(t, SNMPREC)
+    expected = read_text(t, CANON_DATASET)
+    mn = MemNet()
+    agent = lab_agent(mn, snmprec)
+
+    def done(r: dict[str, Got], calls: int) -> None:
+        def check() -> None:
+            check_lab(r, calls, 3, expected, ["getnext", "bulk", "stream"])
+            testing.assertEqual(r["stream"].count, 6038)
+        report_env(t, outcome(check))
+
+    g = Gather(3, done)
+    c = client(mn, v2c(), 40001)
+    c.walk(Sink("getnext", g.got).walk_cb, BASE, OPTS.with_(use_bulk=False))
+    c.walk(Sink("bulk", g.got).walk_cb, BASE)
+    s = Sink("stream", g.got)
+    c.walk_stream(s.on_batch, s.on_done, BASE, OPTS.with_(max_repetitions=40))
+
+actor _test_lab_walks_v1(t: testing.EnvT):
+    """SNMPv1 walk of the lab dataset (GETNEXT, Counter64 skipped) equals expected/canon/dataset-v1.txt"""
+    t.timeout(120.0)
+    snmprec = read_text(t, SNMPREC)
+    expected = read_text(t, CANON_DATASET_V1)
+    mn = MemNet()
+    agent = lab_agent(mn, snmprec)
+
+    def done(r: dict[str, Got], calls: int) -> None:
+        def check() -> None:
+            check_lab(r, calls, 1, expected, ["v1"])
+        report_env(t, outcome(check))
+
+    g = Gather(1, done)
+    client(mn, v1(), 40001).walk(Sink("v1", g.got).walk_cb, BASE)
+
+actor _test_lab_walks_v3(t: testing.EnvT):
+    """SNMPv3 (authPriv, SHA/AES) walks of the lab dataset, GETNEXT and GETBULK, equal expected/canon/dataset.txt"""
+    t.timeout(120.0)
+    snmprec = read_text(t, SNMPREC)
+    expected = read_text(t, CANON_DATASET)
+    mn = MemNet()
+    agent = lab_agent(mn, snmprec)
+
+    def done(r: dict[str, Got], calls: int) -> None:
+        def check() -> None:
+            check_lab(r, calls, 2, expected, ["getnext", "bulk"])
+        report_env(t, outcome(check))
+
+    g = Gather(2, done)
+    c = client(mn, shaaes(), 40001)
+    c.walk(Sink("getnext", g.got).walk_cb, BASE, OPTS.with_(use_bulk=False))
+    c.walk(Sink("bulk", g.got).walk_cb, BASE)
+
+def lab_columns(table: int, n: int) -> list[Oid]:
+    return [b([table, 1, c]) for c in range(1, n + 1)]
+
+actor _test_lab_tables(t: testing.EnvT):
+    """get_table of the lab tables (B.10 with sparse column 7, B.11 string-indexed, B.12 2000 rows) equals the expected files"""
+    t.timeout(120.0)
+    snmprec = read_text(t, SNMPREC)
+    table = read_text(t, CANON_TABLE)
+    strtable = read_text(t, CANON_STRTABLE)
+    bigtable = read_text(t, CANON_BIGTABLE)
+    v1_table = under(read_text(t, CANON_DATASET_V1), b([10]).dotted() + ".")
+    mn = MemNet()
+    agent = lab_agent(mn, snmprec)
+    mn2 = MemNet()
+    cut = lab_agent(mn2, snmprec, Faults(truncate_bulk=10))
+
+    def verify(r: dict[str, Got], calls: int) -> None:
+        testing.assertEqual(calls, 7, "callbacks (exactly once per table)")
+        for label in ["table", "table getnext", "table cut mid-row", "table in groups"]:
+            tb = table_of(r[label], label)
+            assert_same_lines(canon(table_varbinds(tb)), table, label)
+            testing.assertEqual(len(tb.rows), 300, label + ": rows")
+        tb = table_of(r["table"], "table")
+        testing.assertEqual(len(tb.rows[2].values), 7, "row 3 has column 7")
+        testing.assertEqual(len(tb.rows[3].values), 6, "row 4 has not")
+        assert_same_lines(canon(table_varbinds(table_of(r["strtable"], "strtable"))), strtable, "strtable")
+        st = table_of(r["strtable"], "strtable")
+        testing.assertEqual(st.rows[0].index, [1, 120], "the string index \"x\" sorts first")
+        assert_same_lines(canon(table_varbinds(table_of(r["bigtable"], "bigtable"))), bigtable, "bigtable")
+        assert_same_lines(canon(table_varbinds(table_of(r["v1 table"], "v1 table"))), v1_table, "v1 table")
+
+    def done(r: dict[str, Got], calls: int) -> None:
+        def check() -> None:
+            verify(r, calls)
+        report_env(t, outcome(check))
+
+    g = Gather(7, done)
+    c = client(mn, v2c(), 40001)
+    c.get_table(Sink("table", g.got).table_cb, lab_columns(10, 7))
+    c.get_table(Sink("table getnext", g.got).table_cb, lab_columns(10, 7), OPTS.with_(use_bulk=False))
+    c.get_table(Sink("table in groups", g.got).table_cb, lab_columns(10, 7), OPTS.with_(max_oids_per_request=3))
+    c.get_table(Sink("strtable", g.got).table_cb, lab_columns(11, 3))
+    c.get_table(Sink("bigtable", g.got).table_cb, lab_columns(12, 2), OPTS.with_(max_repetitions=50))
+    client(mn, v1(), 40002).get_table(Sink("v1 table", g.got).table_cb, lab_columns(10, 7))
+    client(mn2, v2c(), 40001).get_table(Sink("table cut mid-row", g.got).table_cb, lab_columns(10, 7))
+
+actor _test_lab_bulk_walk_time(t: testing.EnvT):
+    """Times a GETBULK walk of the 6038-varbind lab dataset over MemNet (SNMPv2c, max-repetitions 25 and 100)
+
+    The times are logged (acton test --fast --show-log --name lab_bulk_walk_time); the test only
+    checks the results.
+    """
+    t.timeout(120.0)
+    snmprec = read_text(t, SNMPREC)
+    expected = read_text(t, CANON_DATASET)
+    log = logging.Logger(t.log_handler)
+    mn = MemNet()
+    agent = Agent(mn.server(AGENT, 161), load_snmprec(snmprec), AgentConfig({"public": False}, max_bulk_varbinds=100),
+                  None)
+    c = client(mn, v2c(), 40001)
+    var started = 0.0
+    var times: list[float] = []
+
+    def ms() -> float:
+        return float(time.monotonic_ns()) / 1000000.0
+
+    def second(cl: Client, vbs: list[VarBind], e: ?errors.SnmpError) -> None:
+        times.append(ms() - started)
+        def check() -> None:
+            assert_same_lines(canon(ok(Got(vbs, None, 0, [], e), "M=100")), expected, "M=100")
+        log.info("GETBULK walk of the lab dataset", {"varbinds": len(vbs), "ms_m25": times[0], "ms_m100": times[1]})
+        report_env(t, outcome(check))
+
+    def first(cl: Client, vbs: list[VarBind], e: ?errors.SnmpError) -> None:
+        times.append(ms() - started)
+        if e is not None or len(vbs) != 6038:
+            report_env(t, AssertionError("M=25: " + describe(Got(vbs, None, 0, [], e))))
+            return
+        started = ms()
+        c.walk(second, BASE, OPTS.with_(max_repetitions=100))
+
+    started = ms()
+    c.walk(first, BASE)

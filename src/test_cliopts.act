@@ -1,0 +1,585 @@
+"""Tests for cliopts
+
+Expected values and error messages are those of net-snmp's tools for the
+same command lines.
+"""
+
+import testing
+import cliopts
+import fmt
+import message
+import usm
+from cliopts import CliError, CliOptions, parse, parse_value, parse_agent
+from oid import Oid
+from values import Value, VarBind, Integer, OctetString, Null, ObjectIdentifier, IpAddress, Counter32, Gauge32
+from values import TimeTicks, Opaque, Counter64
+from testutil import h
+
+SYS_DESCR = Oid([1, 3, 6, 1, 2, 1, 1, 1, 0])
+SYS_NAME = Oid([1, 3, 6, 1, 2, 1, 1, 5, 0])
+
+def p(args: list[str]) -> CliOptions:
+    return parse(["actsnmp"] + args)
+
+def fails(args: list[str], text: str) -> CliError:
+    """parse must raise CliError whose message is text"""
+    try:
+        p(args)
+    except CliError as e:
+        testing.assertEqual(e.error_message, text, "message for " + repr(args))
+        return e
+    raise AssertionError("no CliError for " + repr(args))
+
+def value_fails(letter: str, text: str, msg: str) -> None:
+    try:
+        parse_value(letter, text)
+    except ValueError as e:
+        testing.assertEqual(e.error_message, msg, "message for " + letter + " " + repr(text))
+        return
+    raise AssertionError("no ValueError for " + letter + " " + repr(text))
+
+def get2c(extra: list[str]) -> CliOptions:
+    return p(["get"] + extra + ["-v2c", "-c", "public", "agent", "1.3.6.1.2.1.1.1.0"])
+
+
+# Common options ####################################################################################
+
+def _test_get_glued_and_separated() -> None:
+    a = p(["get", "-v2c", "-c", "public", "127.0.0.1:1161", "1.3.6.1.2.1.1.1.0", ".1.3.6.1.2.1.1.5.0"])
+    b = p(["get", "-v", "2c", "-cpublic", "127.0.0.1:1161", "1.3.6.1.2.1.1.1.0", ".1.3.6.1.2.1.1.5.0"])
+    c = p(["get", "127.0.0.1:1161", "-cpublic", "1.3.6.1.2.1.1.1.0", "-v", "2c", ".1.3.6.1.2.1.1.5.0"])
+    for o in [a, b, c]:
+        testing.assertEqual(o.command, "get")
+        testing.assertEqual(o.version, message.SNMP_V2C)
+        testing.assertEqual(o.community, "public")
+        testing.assertEqual(o.address, "127.0.0.1")
+        testing.assertEqual(o.port, 1161)
+        testing.assertEqual(o.peer, "127.0.0.1:1161")
+        testing.assertEqual(o.transport_domain, "udp")
+        testing.assertEqual(o.oids, [SYS_DESCR, SYS_NAME])
+        testing.assertEqual(o.timeout, 1.0)
+        testing.assertEqual(o.retries, 5)
+        testing.assertFalse(o.canon)
+        testing.assertFalse(o.dont_fix)
+
+def _test_versions() -> None:
+    testing.assertEqual(p(["get", "-v1", "-c", "x", "h", "1.3"]).version, message.SNMP_V1)
+    testing.assertEqual(p(["get", "-v", "1", "-c", "x", "h", "1.3"]).version, message.SNMP_V1)
+    testing.assertEqual(p(["get", "-v2c", "-c", "x", "h", "1.3"]).version, message.SNMP_V2C)
+    testing.assertEqual(p(["get", "-v2C", "-c", "x", "h", "1.3"]).version, message.SNMP_V2C)
+    testing.assertEqual(p(["get", "-c", "x", "h", "1.3"]).version, message.SNMP_V2C)
+    testing.assertEqual(p(["get", "-v3", "-u", "u", "h", "1.3"]).version, message.SNMP_V3)
+    fails(["get", "-v4", "-c", "x", "h", "1.3"], "Invalid version specified after -v flag: 4")
+    fails(["get", "-v", "2", "-c", "x", "h", "1.3"], "Invalid version specified after -v flag: 2")
+    # the last -v wins, as with getopt
+    testing.assertEqual(p(["get", "-v1", "-v2c", "-c", "x", "h", "1.3"]).version, message.SNMP_V2C)
+
+def _test_community() -> None:
+    testing.assertEqual(p(["get", "-c", "a b", "h", "1.3"]).community, "a b")
+    o = p(["get", "-c", "first", "-csecond", "h", "1.3"])
+    testing.assertEqual(o.community, "second")
+    testing.assertEqual(o.communities, ["first", "second"])
+    testing.assertEqual(p(["get", "-c", "", "h", "1.3"]).community, "")
+    e = fails(["get", "-v2c", "h", "1.3"], "No community name specified.")
+    testing.assertTrue(e.usage)
+    fails(["get", "-v1", "h", "1.3"], "No community name specified.")
+
+def _test_timeout_retries() -> None:
+    o = p(["get", "-t", "2.5", "-r3", "-c", "x", "h", "1.3"])
+    testing.assertEqual(o.timeout, 2.5)
+    testing.assertEqual(o.retries, 3)
+    testing.assertEqual(p(["get", "-t1", "-r", "0", "-c", "x", "h", "1.3"]).timeout, 1.0)
+    testing.assertEqual(p(["get", "-t", "0.01", "-c", "x", "h", "1.3"]).timeout, 0.01)
+    for bad in ["abc", "0", "-1", "", "1e9", "1.2.3"]:
+        fails(["get", "-t", bad, "-c", "x", "h", "1.3"], "Invalid timeout in seconds after -t flag.")
+    for bad in ["x", "-1", "", "1.5"]:
+        fails(["get", "-r", bad, "-c", "x", "h", "1.3"], "Invalid number of retries after -r flag.")
+
+def _test_output_options() -> None:
+    testing.assertEqual(repr(get2c(["-On"]).output), repr(fmt.OutputOptions()))
+    o = get2c(["-Oqv"])
+    testing.assertTrue(o.output.quick)
+    testing.assertTrue(o.output.bare_value)
+    q = get2c(["-O", "q"])
+    testing.assertTrue(q.output.quick)
+    # repeated letters toggle, in order, as in net-snmp
+    testing.assertFalse(get2c(["-Oq", "-Oq"]).output.quick)
+    testing.assertFalse(get2c(["-Oqq"]).output.quick)
+    x = get2c(["-Ox", "--hexOutputLength=0"])
+    testing.assertEqual(x.output.string_format, fmt.STRING_HEX)
+    testing.assertEqual(x.output.hex_line_length, 0)
+    testing.assertEqual(get2c(["--hexOutputLength", "8"]).output.hex_line_length, 8)
+    # --hexOutputLength keeps the -O flags given before it, and -O flags keep the length
+    y = get2c(["-Oa", "--hexOutputLength=4", "-OT"])
+    testing.assertEqual(y.output.string_format, fmt.STRING_ASCII)
+    testing.assertEqual(y.output.hex_line_length, 4)
+    testing.assertTrue(y.output.hex_text)
+    testing.assertTrue(get2c(["-OQ"]).output.quick_equals)
+    testing.assertTrue(get2c(["-Ot"]).output.numeric_timeticks)
+    testing.assertEqual(repr(get2c(["-OneUbEX"]).output), repr(fmt.OutputOptions()))
+    e = fails(["get", "-Of", "-c", "x", "h", "1.3"], "Unknown output option passed to -O: f.")
+    testing.assertTrue(e.usage)
+    fails(["get", "-Onqs", "-c", "x", "h", "1.3"], "Unknown output option passed to -O: s.")
+    fails(["get", "--hexOutputLength=x", "-c", "x", "h", "1.3"], "Invalid value for --hexOutputLength: x")
+    testing.assertTrue(get2c(["--canon"]).canon)
+
+def _test_ignored_options() -> None:
+    """net-snmp's MIB, input and debug options are accepted (the lab runs net-snmp with -m '')"""
+    o = p(["get", "-m", "", "-M", "/usr/share/snmp/mibs", "-Ir", "-d", "-v2c", "-c", "x", "h", "1.3"])
+    testing.assertEqual(o.oids, [Oid([1, 3])])
+    testing.assertEqual(p(["get", "-m", "ALL", "-c", "x", "h", "1.3"]).oids, [Oid([1, 3])])
+
+def _test_flags_grouped() -> None:
+    testing.assertTrue(p(["get", "-dh"]).help)
+    testing.assertTrue(p(["get", "-h"]).help)
+    testing.assertTrue(p(["get", "-H"]).help)
+    testing.assertTrue(p(["get", "--help"]).help)
+    testing.assertTrue(p(["walk", "-V"]).show_version)
+    # -dv1 is -d and -v 1
+    testing.assertEqual(p(["get", "-dv1", "-c", "x", "h", "1.3"]).version, message.SNMP_V1)
+
+def _test_unknown_options() -> None:
+    e = fails(["get", "-z", "-c", "x", "h", "1.3"], "invalid option -- 'z'")
+    testing.assertTrue(e.usage)
+    fails(["get", "-dz", "-c", "x", "h", "1.3"], "invalid option -- 'z'")
+    fails(["get", "-w", "rw", "-c", "x", "h", "1.3"], "invalid option -- 'w'")
+    fails(["get", "-L", "e", "-c", "x", "h", "1.3"], "invalid option -- 'L'")
+    fails(["get", "--bogus", "-c", "x", "h", "1.3"], "unrecognized option '--bogus'")
+    fails(["get", "--snmprec=x", "-c", "x", "h", "1.3"], "unrecognized option '--snmprec'")
+    fails(["get", "-c", "x", "h", "1.3", "-c"], "option requires an argument -- 'c'")
+    fails(["get", "-c", "x", "h", "1.3", "-O"], "option requires an argument -- 'O'")
+    fails(["agent", "--port"], "option '--port' requires an argument")
+
+def _test_positional_rules() -> None:
+    """A dash followed by a digit is a value, not an option; -- ends the options"""
+    o = p(["set", "-c", "x", "h", "1.3.1", "i", "-5"])
+    testing.assertEqual(o.varbinds, [VarBind(Oid([1, 3, 1]), Integer(-5))])
+    o2 = p(["set", "-c", "x", "--", "h", "1.3.1", "s", "-v2c"])
+    testing.assertEqual(o2.varbinds, [VarBind(Oid([1, 3, 1]), OctetString(b"-v2c"))])
+    testing.assertEqual(o2.version, message.SNMP_V2C)
+    o3 = p(["set", "-c", "x", "h", "1.3.1", "s", "-"])
+    testing.assertEqual(o3.varbinds, [VarBind(Oid([1, 3, 1]), OctetString(b"-"))])
+
+
+# SNMPv3 ############################################################################################
+
+def _test_v3_options() -> None:
+    o = p(["get", "-v3", "-l", "authPriv", "-u", "u_sha_aes", "-a", "SHA", "-A", "authpass123", "-x", "AES", "-X",
+           "privpass123", "-n", "ctx", "-e", "0x80001f8880616374736e6d7061", "-E", "80001f888001020304", "h", "1.3"])
+    testing.assertEqual(o.user, "u_sha_aes")
+    testing.assertEqual(o.level, usm.LEVEL_AUTH_PRIV)
+    testing.assertEqual(o.auth_protocol, usm.AUTH_SHA1)
+    testing.assertEqual(o.priv_protocol, usm.PRIV_AES128)
+    testing.assertEqual(o.auth_password, "authpass123")
+    testing.assertEqual(o.priv_password, "privpass123")
+    testing.assertEqual(o.context, "ctx")
+    testing.assertEqual(o.engine_id, h("80001f8880616374736e6d7061"))
+    testing.assertEqual(o.context_engine_id, h("80001f888001020304"))
+    g = p(["get", "-v3", "-lauthNoPriv", "-uu", "-aSHA-512", "-Aauthpass123", "h", "1.3"])
+    testing.assertEqual(g.level, usm.LEVEL_AUTH_NO_PRIV)
+    testing.assertEqual(g.auth_protocol, usm.AUTH_SHA512)
+    testing.assertEqual(g.priv_protocol, usm.PRIV_NONE)
+    # every net-snmp privacy name
+    for pair in [("DES", usm.PRIV_DES), ("AES", usm.PRIV_AES128), ("AES-192", usm.PRIV_AES192),
+                 ("AES-256", usm.PRIV_AES256), ("AES-192-C", usm.PRIV_AES192C), ("AES-256-C", usm.PRIV_AES256C),
+                 ("3DES", usm.PRIV_3DES)]:
+        q = p(["get", "-v3", "-l", "ap", "-u", "u", "-a", "MD5", "-A", "authpass123", "-x", pair.0, "-X",
+               "privpass123", "h", "1.3"])
+        testing.assertEqual(q.priv_protocol, pair.1)
+
+def _test_v3_defaults_and_levels() -> None:
+    # without -l: noAuthNoPriv, the passwords are not used
+    o = p(["get", "-v3", "-u", "u", "-a", "SHA", "-A", "authpass123", "h", "1.3"])
+    testing.assertEqual(o.level, usm.LEVEL_NO_AUTH_NO_PRIV)
+    testing.assertEqual(o.auth_protocol, usm.AUTH_NONE)
+    testing.assertEqual(o.auth_password, "")
+    # net-snmp's default protocols MD5 and DES
+    d = p(["get", "-v3", "-l", "authPriv", "-u", "u", "-A", "authpass123", "-X", "privpass123", "h", "1.3"])
+    testing.assertEqual(d.auth_protocol, usm.AUTH_MD5)
+    testing.assertEqual(d.priv_protocol, usm.PRIV_DES)
+    # authNoPriv drops the privacy settings
+    a = p(["get", "-v3", "-l", "authNoPriv", "-u", "u", "-A", "authpass123", "-x", "AES", "-X", "privpass123", "h",
+           "1.3"])
+    testing.assertEqual(a.priv_protocol, usm.PRIV_NONE)
+    testing.assertEqual(a.priv_password, "")
+    testing.assertEqual(p(["get", "-v3", "-l", "1", "-u", "u", "h", "1.3"]).level, usm.LEVEL_NO_AUTH_NO_PRIV)
+    # a v3 command needs no community
+    testing.assertEqual(p(["get", "-v3", "-u", "u", "h", "1.3"]).community, None)
+
+def _test_v3_errors() -> None:
+    fails(["get", "-v3", "h", "1.3"], "No security name specified (-u).")
+    fails(["get", "-v3", "-u", "u", "-l", "authNoPriv", "h", "1.3"],
+          "Error: authentication pass phrase must be given with -A for -l authNoPriv")
+    fails(["get", "-v3", "-u", "u", "-l", "authPriv", "-A", "authpass123", "h", "1.3"],
+          "Error: privacy pass phrase must be given with -X for -l authPriv")
+    fails(["get", "-v3", "-u", "u", "-l", "authNoPriv", "-A", "short", "h", "1.3"],
+          "Error: passphrase chosen is below the length requirements of the USM (min=8).")
+    fails(["get", "-v3", "-u", "u", "-l", "authPriv", "-A", "authpass123", "-X", "1234567", "h", "1.3"],
+          "Error: passphrase chosen is below the length requirements of the USM (min=8).")
+    fails(["get", "-v3", "-u", "u", "-l", "high", "h", "1.3"], "Invalid security level specified after -l flag: high")
+    fails(["get", "-v3", "-u", "u", "-a", "SHA3", "h", "1.3"],
+          "Invalid authentication protocol specified after -a flag: SHA3")
+    fails(["get", "-v3", "-u", "u", "-x", "AES-512", "h", "1.3"],
+          "Invalid privacy protocol specified after -x flag: AES-512")
+    fails(["get", "-v3", "-u", "u", "-e", "0x1234", "h", "1.3"], "Bad engine ID value after -e flag.")
+    fails(["get", "-v3", "-u", "u", "-e", "80001f88zz", "h", "1.3"], "Bad engine ID value after -e flag.")
+    fails(["get", "-v3", "-u", "u", "-e", "80001f888", "h", "1.3"], "Bad engine ID value after -e flag.")
+    fails(["get", "-v3", "-u", "u", "-E", "x", "h", "1.3"], "Bad engine ID value after -E flag.")
+    fails(["get", "-v3", "-u", "u", "-e", "00" * 33, "h", "1.3"], "Bad engine ID value after -e flag.")
+    testing.assertEqual(p(["get", "-v3", "-u", "u", "-e", "00" * 32, "h", "1.3"]).engine_id, b"\x00" * 32)
+
+def _test_boots() -> None:
+    testing.assertEqual(p(["trap", "-v3", "-u", "u", "-Z", "7", "h", "", "1.3"]).boots, 7)
+    testing.assertEqual(p(["trap", "-v3", "-u", "u", "-Z9,1234", "h", "", "1.3"]).boots, 9)
+    testing.assertEqual(p(["trap", "-v3", "-u", "u", "h", "", "1.3"]).boots, 1)
+    fails(["trap", "-v3", "-u", "u", "-Z", "0", "h", "", "1.3"], "Invalid engine boots after -Z flag.")
+
+
+# -C flags ##########################################################################################
+
+def _test_c_get() -> None:
+    testing.assertTrue(p(["get", "-Cf", "-c", "x", "h", "1.3"]).dont_fix)
+    testing.assertTrue(p(["getnext", "-C", "f", "-c", "x", "h", "1.3"]).dont_fix)
+    e = fails(["get", "-Cr5", "-c", "x", "h", "1.3"], "Unknown flag passed to -C: r")
+    testing.assertTrue(e.usage)
+
+def _test_c_bulk() -> None:
+    o = p(["bulkget", "-Cr25", "-Cn2", "-c", "x", "h", "1.3", "1.4", "1.5"])
+    testing.assertEqual(o.max_repetitions, 25)
+    testing.assertEqual(o.non_repeaters, 2)
+    testing.assertEqual(o.oids, [Oid([1, 3]), Oid([1, 4]), Oid([1, 5])])
+    b = p(["bulkget", "-Cr10n1", "-c", "x", "h", "1.3"])
+    testing.assertEqual((b.max_repetitions, b.non_repeaters), (10, 1))
+    c = p(["bulkwalk", "-C", "r0x10", "-c", "x", "h"])
+    testing.assertEqual(c.max_repetitions, 16)
+    d = p(["bulkwalk", "-c", "x", "h"])
+    testing.assertEqual((d.max_repetitions, d.non_repeaters), (10, 0))
+    testing.assertEqual(p(["bulkget", "-Cr-3", "-c", "x", "h", "1.3"]).max_repetitions, 0)
+    fails(["bulkget", "-Cr", "-c", "x", "h", "1.3"], "No number given with -Cr")
+    fails(["bulkget", "-Cnx", "-c", "x", "h", "1.3"], "No number given with -Cn")
+    fails(["bulkget", "-Cf", "-c", "x", "h", "1.3"], "Unknown flag passed to -C: f")
+    fails(["walk", "-Cr5", "-c", "x", "h"], "Unknown flag passed to -C: r")
+
+def _test_c_walk() -> None:
+    o = p(["walk", "-Cc", "-Ci", "-Cp", "-Ct", "-c", "x", "h", "1.3.6.1.2.1.2"])
+    testing.assertTrue(o.dont_check)
+    testing.assertTrue(o.include_requested)
+    testing.assertTrue(o.print_count)
+    testing.assertTrue(o.print_time)
+    testing.assertFalse(o.dont_get_requested)
+    testing.assertTrue(p(["walk", "-CI", "-c", "x", "h"]).dont_get_requested)
+    testing.assertTrue(p(["bulkwalk", "-CcIp", "-c", "x", "h"]).dont_get_requested)
+    # -CE takes the end OID from the next argument (snmpwalk), or glued
+    e = p(["walk", "-CE", "1.3.6.1.2.1.3", "-c", "x", "h", "1.3.6.1.2.1"])
+    testing.assertEqual(e.end_oid, Oid([1, 3, 6, 1, 2, 1, 3]))
+    testing.assertEqual(e.oids, [Oid([1, 3, 6, 1, 2, 1])])
+    g = p(["walk", "-CpE.1.3.6.1.2.1.3", "-c", "x", "h"])
+    testing.assertEqual(g.end_oid, Oid([1, 3, 6, 1, 2, 1, 3]))
+    testing.assertTrue(g.print_count)
+    fails(["walk", "-CE", "x.y", "-c", "x", "h"], "x.y: Unknown Object Identifier")
+    fails(["bulkwalk", "-CE", "-c", "x", "h"], "Unknown flag passed to -C: E")
+
+def _test_c_other() -> None:
+    testing.assertTrue(p(["set", "-Cq", "-c", "x", "h", "1.3", "i", "1"]).quiet)
+    t = p(["trap", "-Ci", "-c", "x", "h", "", "1.3"])
+    testing.assertTrue(t.inform)
+    testing.assertEqual(p(["table", "-Cr3", "-Cc", "-c", "x", "h", "1.3"]).max_repetitions, 3)
+    fails(["inform", "-Ci", "-c", "x", "h", "", "1.3"], "Unknown flag passed to -C: i")
+    fails(["agent", "-Cq"], "Unknown flag passed to -C: q")
+
+
+# Agent specifications and OIDs ########################################################################
+
+def _test_agent_specs() -> None:
+    cases: list[(str, str, str, int)] = [
+        ("127.0.0.1", "udp", "127.0.0.1", 161),
+        ("127.0.0.1:1161", "udp", "127.0.0.1", 1161),
+        ("udp:127.0.0.1:1161", "udp", "127.0.0.1", 1161),
+        ("UDP:host", "udp", "host", 161),
+        ("localhost:65535", "udp", "localhost", 65535),
+        ("udp6:[::1]:161", "udp6", "::1", 161),
+        ("udp6:[::1]", "udp6", "::1", 161),
+        ("[::1]:1161", "udp", "::1", 1161),
+        ("udp6:::1", "udp6", "::1", 161),
+        ("fe80::1", "udp", "fe80::1", 161),
+        ("udp6:host6:162", "udp6", "host6", 162),
+        ("udpv6:[2001:db8::1]:10161", "udp6", "2001:db8::1", 10161),
+    ]
+    for c in cases:
+        r = parse_agent(c.0, 161)
+        testing.assertEqual((r.domain, r.host, r.port), (c.1, c.2, c.3), "agent " + c.0)
+    for bad in ["", "udp:", "host:", "host:0", "host:65536", "host:x", "[::1", "[::1]x", "[::1]:", "[]:161",
+                "tcp:host", "unix:/tmp/s", "udp6:"]:
+        try:
+            parse_agent(bad, 161)
+            raise AssertionError("no CliError for " + repr(bad))
+        except CliError:
+            pass
+    o = p(["get", "-c", "x", "udp6:[::1]:1161", "1.3"])
+    testing.assertEqual((o.address, o.port, o.transport_domain, o.peer), ("::1", 1161, "udp6", "udp6:[::1]:1161"))
+    fails(["get", "-c", "x", "tcp:h:161", "1.3"], "Unsupported transport in agent address: tcp:h:161 (only udp and udp6)")
+    fails(["get", "-c", "x", "h:99999", "1.3"], "Invalid port in agent address: h:99999")
+    # traps and informs default to port 162
+    testing.assertEqual(p(["trap", "-c", "x", "h", "", "1.3"]).port, 162)
+    testing.assertEqual(p(["inform", "-c", "x", "h", "", "1.3"]).port, 162)
+    testing.assertEqual(p(["trap", "-c", "x", "h:16164", "", "1.3"]).port, 16164)
+
+def _test_oids() -> None:
+    o = p(["getnext", "-c", "x", "h", "1.3.6.1.2.1.1.1.0", ".1.3.6.1.2.1.1.5.0", "0.0", "2.999.4294967295"])
+    testing.assertEqual(o.oids, [SYS_DESCR, SYS_NAME, Oid([0, 0]), Oid([2, 999, 4294967295])])
+    fails(["get", "-c", "x", "h", "sysDescr.0"], "sysDescr.0: Unknown Object Identifier")
+    fails(["get", "-c", "x", "h", "1.3.", "1.3"], "1.3.: Unknown Object Identifier")
+    fails(["get", "-c", "x", "h", "1.3.4294967296"], "1.3.4294967296: Unknown Object Identifier")
+    fails(["get", "-c", "x", "h", ""], ": Unknown Object Identifier")
+    fails(["get", "-c", "x", "h", ".".join(["1"] * 129)],
+          ".".join(["1"] * 129) + ": Unknown Object Identifier (too many sub-identifiers)")
+
+def _test_missing_arguments() -> None:
+    e = fails(["get", "-c", "x"], "No hostname specified.")
+    testing.assertTrue(e.usage)
+    fails(["walk", "-v2c", "-c", "x"], "No hostname specified.")
+    m = fails(["get", "-c", "x", "h"], "Missing object name")
+    testing.assertTrue(m.usage)
+    fails(["bulkget", "-c", "x", "h"], "Missing object name")
+    fails(["table", "-c", "x", "h"], "Missing object name")
+    fails(["set", "-c", "x", "h"], "Missing object name")
+    fails(["get", "-c", "x", "h"] + ["1.3"] * 129, "Too many object identifiers specified. Only 128 allowed in one request.")
+    testing.assertEqual(len(p(["get", "-c", "x", "h"] + ["1.3"] * 128).oids), 128)
+
+def _test_walk_root() -> None:
+    testing.assertEqual(p(["walk", "-c", "x", "h"]).oids, [Oid([1, 3, 6, 1, 2, 1])])
+    testing.assertEqual(p(["bulkwalk", "-c", "x", "h", ".1.3.6.1.4"]).oids, [Oid([1, 3, 6, 1, 4])])
+    fails(["walk", "-c", "x", "h", "1.3", "1.4"], "Unexpected argument: 1.4 (one root OID only)")
+
+
+# set: OID TYPE VALUE ###############################################################################
+
+def _test_set_triples() -> None:
+    o = p(["set", "-v2c", "-c", "private", "h", "1.3.1", "i", "5", ".1.3.2", "s", "hello world", "1.3.3", "a",
+           "192.0.2.1"])
+    testing.assertEqual(o.varbinds, [VarBind(Oid([1, 3, 1]), Integer(5)),
+                                     VarBind(Oid([1, 3, 2]), OctetString(b"hello world")),
+                                     VarBind(Oid([1, 3, 3]), IpAddress(b"\xc0\x00\x02\x01"))])
+    fails(["set", "-c", "x", "h", "1.3.1"], "1.3.1: Needs type and value")
+    fails(["set", "-c", "x", "h", "1.3.1", "i"], "1.3.1: Needs value")
+    fails(["set", "-c", "x", "h", "1.3.1", "i", "1", "1.3.2", "s"], "1.3.2: Needs value")
+    fails(["set", "-c", "x", "h", "1.3.1", "z", "1"], "1.3.1: Bad object type: z")
+    fails(["set", "-c", "x", "h", "1.3.1", "=", "1"], "1.3.1: Bad object type: =")
+    fails(["set", "-c", "x", "h", "1.3.1", "int", "1"], "1.3.1: Bad object type: i")
+    fails(["set", "-c", "x", "h", "1.3.1", "", "1"], "1.3.1: Bad object type: ''")
+    fails(["set", "-c", "x", "h", "1.3.1", "i", "abc"], "1.3.1: Bad value notation (abc)")
+    fails(["set", "-c", "x", "h", "1.3.1", "i", "2147483648"], "1.3.1: Value out of range (2147483648)")
+    fails(["set", "-c", "x", "h", "x.1", "i", "1"], "x.1: Unknown Object Identifier")
+
+def _test_value_integers() -> None:
+    testing.assertEqual(parse_value("i", "2147483647"), Integer(2147483647))
+    testing.assertEqual(parse_value("i", "-2147483648"), Integer(-2147483648))
+    testing.assertEqual(parse_value("i", "+7"), Integer(7))
+    testing.assertEqual(parse_value("i", "007"), Integer(7))
+    value_fails("i", "-2147483649", "Value out of range (-2147483649)")
+    value_fails("i", "99999999999999999999999", "Value out of range (99999999999999999999999)")
+    value_fails("i", "", "Bad value notation ()")
+    value_fails("i", "1.5", "Bad value notation (1.5)")
+    value_fails("i", "0x10", "Bad value notation (0x10)")
+    value_fails("i", " 1", "Bad value notation ( 1)")
+    testing.assertEqual(parse_value("u", "4294967295"), Gauge32(4294967295))
+    testing.assertEqual(parse_value("c", "0"), Counter32(0))
+    testing.assertEqual(parse_value("t", "8640000"), TimeTicks(8640000))
+    value_fails("u", "4294967296", "Value out of range (4294967296)")
+    value_fails("c", "-1", "Bad value notation (-1)")
+    value_fails("t", "x", "Bad value notation (x)")
+    testing.assertEqual(parse_value("C", "18446744073709551615"), Counter64(18446744073709551615))
+    testing.assertEqual(parse_value("C", "0"), Counter64(0))
+    value_fails("C", "18446744073709551616", "Value out of range (18446744073709551616)")
+    value_fails("C", "-1", "Bad value notation (-1)")
+
+def _test_value_strings() -> None:
+    testing.assertEqual(parse_value("s", ""), OctetString(b""))
+    testing.assertEqual(parse_value("s", "Zürich"), OctetString(b"Z\xc3\xbcrich"))
+    testing.assertEqual(parse_value("x", "000102ff"), OctetString(b"\x00\x01\x02\xff"))
+    testing.assertEqual(parse_value("x", "0x0A0b"), OctetString(b"\x0a\x0b"))
+    testing.assertEqual(parse_value("x", "de ad be ef"), OctetString(b"\xde\xad\xbe\xef"))
+    testing.assertEqual(parse_value("x", ""), OctetString(b""))
+    value_fails("x", "abc", "Bad value notation (abc)")
+    value_fails("x", "zz", "Bad value notation (zz)")
+    testing.assertEqual(parse_value("d", "1.2.250"), OctetString(b"\x01\x02\xfa"))
+    testing.assertEqual(parse_value("d", "0 255"), OctetString(b"\x00\xff"))
+    value_fails("d", "256", "Value out of range (256)")
+    value_fails("d", "1.a", "Bad value notation (a)")
+    # BITS: bit 0 is the top bit of the first octet
+    testing.assertEqual(parse_value("b", "0 9 15"), OctetString(b"\x80\x41"))
+    testing.assertEqual(parse_value("b", "1,2"), OctetString(b"\x60"))
+    testing.assertEqual(parse_value("b", "16"), OctetString(b"\x00\x00\x80"))
+    testing.assertEqual(parse_value("b", ""), OctetString(b""))
+    value_fails("b", "x", "Bad value notation (x)")
+
+def _test_value_others() -> None:
+    testing.assertEqual(parse_value("a", "255.255.255.255"), IpAddress(b"\xff\xff\xff\xff"))
+    value_fails("a", "1.2.3", "Bad value notation (1.2.3)")
+    value_fails("a", "1.2.3.256", "Bad value notation (1.2.3.256)")
+    value_fails("a", "host", "Bad value notation (host)")
+    testing.assertEqual(parse_value("o", ".1.3.6.1"), ObjectIdentifier(Oid([1, 3, 6, 1])))
+    testing.assertEqual(parse_value("o", "0.0"), ObjectIdentifier(Oid([0, 0])))
+    value_fails("o", "sysDescr", "Bad value notation (sysDescr)")
+    testing.assertEqual(parse_value("n", "anything"), Null())
+    testing.assertEqual(parse_value("q", "DEADBEEF"), Opaque(b"\xde\xad\xbe\xef"))
+    value_fails("Q", "1", "Bad object type: Q")
+
+def _test_value_opaque_specials() -> None:
+    """F, D, I and U as net-snmp's snmp_add_var encodes them (Opaque wrappers 9f 78/79/7a/7b)"""
+    testing.assertEqual(parse_value("F", "1.0"), Opaque(h("9f78043f800000")))
+    testing.assertEqual(parse_value("F", "1"), Opaque(h("9f78043f800000")))
+    testing.assertEqual(parse_value("F", "-2.5"), Opaque(h("9f7804c0200000")))
+    testing.assertEqual(parse_value("F", "0.1"), Opaque(h("9f78043dcccccd")))
+    testing.assertEqual(parse_value("F", "0"), Opaque(h("9f780400000000")))
+    testing.assertEqual(parse_value("F", "-0.0"), Opaque(h("9f780480000000")))
+    testing.assertEqual(parse_value("F", "3.4028235e38"), Opaque(h("9f78047f7fffff")))
+    testing.assertEqual(parse_value("F", "1e39"), Opaque(h("9f78047f800000")))
+    testing.assertEqual(parse_value("F", "1.4e-45"), Opaque(h("9f780400000001")))
+    testing.assertEqual(parse_value("F", "1e-50"), Opaque(h("9f780400000000")))
+    testing.assertEqual(parse_value("F", "1.17549435e-38"), Opaque(h("9f780400800000")))
+    testing.assertEqual(parse_value("F", "inf"), Opaque(h("9f78047f800000")))
+    testing.assertEqual(parse_value("F", "-Infinity"), Opaque(h("9f7804ff800000")))
+    testing.assertEqual(parse_value("F", "nan"), Opaque(h("9f78047fc00000")))
+    testing.assertEqual(parse_value("F", "16777217"), Opaque(h("9f78044b800000")))
+    testing.assertEqual(parse_value("F", "1.5e3"), Opaque(h("9f780444bb8000")))
+    value_fails("F", "x", "Bad value notation (x)")
+    value_fails("F", "1e", "Bad value notation (1e)")
+    value_fails("F", ".", "Bad value notation (.)")
+    testing.assertEqual(parse_value("D", "-2.5"), Opaque(h("9f7908c004000000000000")))
+    testing.assertEqual(parse_value("D", "0.1"), Opaque(h("9f79083fb999999999999a")))
+    testing.assertEqual(parse_value("D", "1"), Opaque(h("9f79083ff0000000000000")))
+    testing.assertEqual(parse_value("D", "5e-324"), Opaque(h("9f79080000000000000001")))
+    testing.assertEqual(parse_value("D", "1.7976931348623157e308"), Opaque(h("9f79087fefffffffffffff")))
+    testing.assertEqual(parse_value("I", "42"), Opaque(h("9f7a012a")))
+    testing.assertEqual(parse_value("I", "-1"), Opaque(h("9f7a01ff")))
+    testing.assertEqual(parse_value("I", "128"), Opaque(h("9f7a020080")))
+    testing.assertEqual(parse_value("I", "9223372036854775807"), Opaque(h("9f7a087fffffffffffffff")))
+    testing.assertEqual(parse_value("I", "-9223372036854775808"), Opaque(h("9f7a088000000000000000")))
+    value_fails("I", "9223372036854775808", "Value out of range (9223372036854775808)")
+    testing.assertEqual(parse_value("U", "0"), Opaque(h("9f7b0100")))
+    testing.assertEqual(parse_value("U", "255"), Opaque(h("9f7b0200ff")))
+    testing.assertEqual(parse_value("U", "18446744073709551615"), Opaque(h("9f7b0900ffffffffffffffff")))
+
+
+# trap and inform ###################################################################################
+
+def _test_trap_v2() -> None:
+    o = p(["trap", "-v2c", "-c", "public", "127.0.0.1:16164", "12345", ".1.3.6.1.6.3.1.1.5.1", ".1.3.6.1.2.1.1.5.0",
+           "s", "x", "1.3.6.1.2.1.1.3.0", "t", "5"])
+    testing.assertEqual(o.uptime, 12345)
+    testing.assertEqual(o.trap_oid, Oid([1, 3, 6, 1, 6, 3, 1, 1, 5, 1]))
+    testing.assertEqual(o.varbinds, [VarBind(SYS_NAME, OctetString(b"x")),
+                                     VarBind(Oid([1, 3, 6, 1, 2, 1, 1, 3, 0]), TimeTicks(5))])
+    testing.assertFalse(o.inform)
+    testing.assertEqual(p(["trap", "-c", "x", "h", "", "1.3"]).uptime, -1)
+    testing.assertEqual(p(["trap", "-c", "x", "h", "4294967295", "1.3"]).uptime, 4294967295)
+    i = p(["inform", "-v3", "-u", "u", "-r", "0", "-t", "5", "h", "0", "1.3"])
+    testing.assertTrue(i.inform)
+    testing.assertEqual(i.retries, 0)
+    fails(["trap", "-c", "x", "h", "1"], "Missing argument: traps and informs need UPTIME TRAPOID")
+    fails(["trap", "-c", "x", "h", "x", "1.3"], "Invalid uptime: x")
+    fails(["trap", "-c", "x", "h", "4294967296", "1.3"], "Invalid uptime: 4294967296")
+    fails(["trap", "-c", "x", "h", "1", "foo"], "foo: Unknown Object Identifier")
+    fails(["inform", "-c", "x", "h", "1", "1.3", "1.3.1", "i"], "1.3.1: Needs value")
+
+def _test_trap_v1() -> None:
+    o = p(["trap", "-v1", "-c", "public", "h", ".1.3.6.1.4.1.8072.9999", "192.0.2.1", "6", "42", "12345",
+           ".1.3.6.1.4.1.8072.9999.1.1.1.0", "i", "0"])
+    testing.assertEqual(o.enterprise, Oid([1, 3, 6, 1, 4, 1, 8072, 9999]))
+    testing.assertEqual(o.agent_addr, b"\xc0\x00\x02\x01")
+    testing.assertEqual((o.generic, o.specific, o.uptime), (6, 42, 12345))
+    testing.assertEqual(o.varbinds, [VarBind(Oid([1, 3, 6, 1, 4, 1, 8072, 9999, 1, 1, 1, 0]), Integer(0))])
+    # empty ENTERPRISE, AGENT-ADDR and UPTIME: snmptrap's defaults
+    d = p(["trap", "-v1", "-c", "public", "h", "", "", "0", "0", ""])
+    testing.assertEqual(d.enterprise, Oid([1, 3, 6, 1, 4, 1, 3, 1, 1]))
+    testing.assertEqual(d.agent_addr, b"\x00\x00\x00\x00")
+    testing.assertEqual(d.uptime, -1)
+    testing.assertEqual(p(["trap", "-v1", "-c", "x", "h", "1.3", "1.2.3.4", "6", "2147483647", "1"]).specific,
+                        2147483647)
+    fails(["trap", "-v1", "-c", "x", "h", "1.3", "1.2.3.4", "6", "1"],
+          "Missing argument: v1 traps need ENTERPRISE AGENT-ADDR GENERIC SPECIFIC UPTIME")
+    fails(["trap", "-v1", "-c", "x", "h", "1.3", "1.2.3.4", "7", "0", "1"], "Invalid generic trap type: 7")
+    testing.assertEqual(p(["trap", "-v1", "-c", "x", "h", "1.3", "1.2.3.4", "6", "4294967295", "1"]).specific,
+                        4294967295)
+    fails(["trap", "-v1", "-c", "x", "h", "1.3", "1.2.3.4", "6", "x", "1"], "Invalid specific trap type: x")
+    fails(["trap", "-v1", "-c", "x", "h", "1.3", "1.2.3.4", "6", "4294967296", "1"],
+          "Invalid specific trap type: 4294967296")
+    fails(["trap", "-v1", "-c", "x", "h", "1.3", "1.2.3.4", "-1", "0", "1"], "Invalid generic trap type: -1")
+    fails(["trap", "-v1", "-c", "x", "h", "1.3", "host", "6", "0", "1"], "host: Unknown host")
+    fails(["inform", "-v1", "-c", "x", "h", "1", "1.3"], "Cannot send INFORM as SNMPv1 PDU")
+    fails(["trap", "-Ci", "-v1", "-c", "x", "h", "1", "1.3"], "Cannot send INFORM as SNMPv1 PDU")
+
+def _test_trap_v3() -> None:
+    o = p(["trap", "-v3", "-l", "authPriv", "-u", "u_sha_aes", "-a", "SHA", "-A", "authpass123", "-x", "AES", "-X",
+           "privpass123", "-e", "0x8000000001020304", "127.0.0.1:16164", "3000000", ".1.3.6.1.4.1.8072.9999.3.0.1"])
+    testing.assertEqual(o.engine_id, h("8000000001020304"))
+    testing.assertEqual(o.uptime, 3000000)
+    testing.assertEqual(o.level, usm.LEVEL_AUTH_PRIV)
+
+
+# agent and trapd ###################################################################################
+
+def _test_agent_options() -> None:
+    a = p(["agent"])
+    testing.assertEqual(a.snmprec, "interop/dataset/actsnmp.snmprec")
+    testing.assertEqual(a.write_rules, "interop/dataset/write-rules.tsv")
+    testing.assertEqual(a.users, "interop/config/users.tsv")
+    testing.assertFalse(a.users_given)
+    testing.assertEqual(a.server_engine_id, h("80001f8880616374736e6d7061"))
+    testing.assertEqual((a.bind_address, a.listen_port), ("127.0.0.1", 16163))
+    b = p(["agent", "--snmprec", "x.snmprec", "--write-rules=r.tsv", "--users", "u.tsv", "--engine-id",
+           "0x8000000001020304", "--port=0", "--bind", "::1", "-c", "ro", "-w", "rw"])
+    testing.assertEqual((b.snmprec, b.write_rules, b.users), ("x.snmprec", "r.tsv", "u.tsv"))
+    testing.assertTrue(b.users_given)
+    testing.assertEqual(b.server_engine_id, h("8000000001020304"))
+    testing.assertEqual((b.bind_address, b.listen_port), ("::1", 0))
+    testing.assertEqual((b.communities, b.rw_communities), (["ro"], ["rw"]))
+    testing.assertEqual(p(["agent", "-e", "8000000001020305"]).server_engine_id, h("8000000001020305"))
+    fails(["agent", "extra"], "Unexpected argument: extra")
+    fails(["agent", "--port", "70000"], "Invalid port after --port: 70000")
+    fails(["agent", "--engine-id", "12"], "Bad engine ID value after --engine-id flag.")
+    fails(["agent", "--bind="], "Invalid address after --bind")
+
+def _test_trapd_options() -> None:
+    t = p(["trapd"])
+    testing.assertEqual(t.server_engine_id, h("80001f8880616374736e6d7072"))
+    testing.assertEqual((t.bind_address, t.listen_port), ("127.0.0.1", 16165))
+    testing.assertFalse(t.canon)
+    u = p(["trapd", "--port", "16166", "-c", "public", "-c", "other", "--users", "interop/config/users.tsv",
+           "--engine-id", "80001f8880616374736e6d7072", "--canon", "-Ox"])
+    testing.assertEqual(u.listen_port, 16166)
+    testing.assertEqual(u.communities, ["public", "other"])
+    testing.assertTrue(u.canon)
+    testing.assertTrue(u.users_given)
+    testing.assertEqual(u.output.string_format, fmt.STRING_HEX)
+    fails(["trapd", "--snmprec", "x"], "unrecognized option '--snmprec'")
+    fails(["trapd", "-w", "x"], "invalid option -- 'w'")
+
+
+# Commands, help and usage ##########################################################################
+
+def _test_commands() -> None:
+    for c in cliopts.COMMANDS:
+        testing.assertTrue(cliopts.usage(c).startswith("USAGE: actsnmp " + c), "usage of " + c)
+    testing.assertTrue(p([]).help)
+    testing.assertEqual(p([]).command, "")
+    testing.assertTrue(p(["-h"]).help)
+    testing.assertTrue(p(["--help"]).help)
+    testing.assertTrue(p(["-V"]).show_version)
+    e = fails(["frobnicate"], "Unknown command: frobnicate")
+    testing.assertTrue(e.usage)
+    whole = cliopts.usage("")
+    for c in cliopts.COMMANDS:
+        testing.assertTrue(("actsnmp " + c + " ") in whole, c + " in the usage text")
+    # -h needs no further arguments
+    testing.assertTrue(p(["set", "-h"]).help)
+    testing.assertTrue("TYPE" in cliopts.usage("set"))
+    testing.assertTrue("-Cr<N>" in cliopts.usage("bulkwalk"))
+
+def _test_repr_hides_secrets() -> None:
+    o = p(["get", "-v3", "-l", "authPriv", "-u", "u", "-A", "secretpass1", "-X", "secretpass2", "h", "1.3"])
+    r = repr(o)
+    testing.assertFalse("secretpass" in r)
+    c = p(["get", "-c", "topsecret", "h", "1.3"])
+    testing.assertFalse("topsecret" in repr(c))

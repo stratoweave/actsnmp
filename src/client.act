@@ -53,6 +53,28 @@ The request engine:
     (one resend), errors.ReportError for every other Report, and a reset
     of the engine state after repeated timeouts or time-window failures.
 
+Walks and tables: walk() collects a subtree,
+walk_stream() hands it over one response at a time, get_table() fetches
+columns in lock-step and merges them into rows. Their requests take the
+Client's own request path (queue, retries, tooBig handling, SNMPv1
+normalisation, SNMPv3 discovery and recovery) and are not visible to the
+caller; each walk has one handle, one callback (walk_stream: on_done) that
+is called exactly once, and cancel() and close() work on it like on a
+request. GETBULK is used on SNMPv2c and SNMPv3 (Options.use_bulk), GETNEXT
+on SNMPv1. A walk ends at the first OID outside its root, at an exception
+value (endOfMibView, and noSuchObject/noSuchInstance which some agents
+answer to a GETNEXT), at SNMPv1 noSuchName, after
+Options.max_walk_varbinds varbinds, or when it is cancelled. OIDs must
+increase strictly, within one GETBULK response too
+(errors.OidNotIncreasingError); with check_increasing=False an OID seen
+before ends the walk with that error instead (a loop guard). A walk that
+found nothing GETs its root (get_root_if_empty), as net-snmp and gosnmp do.
+An empty GETBULK response makes no progress and fails the walk
+(errors.InvalidResponseError). With Options.adaptive_bulk a GETBULK of a
+walk that gets tooBig, or times out, is resent with half the
+max-repetitions (at least 1), and the value that worked is remembered for
+the Client's later walks.
+
 Notifications: trap() sends an SNMPv2-Trap (v2c, or v3 where the Client is
 the authoritative engine: local_engine_id, local_engine_boots, time since
 the Client started), trap_v1() an SNMPv1 Trap-PDU, inform() an InformRequest that is
@@ -79,7 +101,7 @@ from pdu import Pdu, TrapV1Pdu
 from security import Community, Security, Usm
 from transport import Transport, is_unreachable, normalize_address, udp_transport
 from usm import EngineTime, LocalizedUser, SaltCounter
-from values import Counter32, EndOfMibView, NoSuchObject, VarBind
+from values import Counter32, EndOfMibView, NoSuchObject, Value, VarBind, is_exception
 
 # msgMaxSize of our SNMPv3 messages: the largest UDP payload over IPv4, as net-snmp and pysnmp send
 MAX_MSG_SIZE = 65507
@@ -154,7 +176,18 @@ class Options(object):
     SET is not atomic. max_repetitions is the GETBULK default.
 
     use_bulk, adaptive_bulk, check_increasing, get_root_if_empty and
-    max_walk_varbinds are reserved for walks and tables.
+    max_walk_varbinds control walks and tables:
+    use_bulk makes them use GETBULK with max_repetitions (at least 1) on
+    SNMPv2c and SNMPv3 (SNMPv1 always uses GETNEXT). With adaptive_bulk a
+    GETBULK of a walk that gets tooBig, or times out, is resent with half
+    the max-repetitions (at least 1, within the request's retries), and
+    the value that worked is kept for the Client's later walks (it does
+    not grow again). check_increasing requires every OID a walk receives
+    to be greater than the previous one of its subtree
+    (errors.OidNotIncreasingError); without it, an OID received a second
+    time ends the walk with that error (a loop guard). get_root_if_empty
+    makes a walk that found nothing GET its root. max_walk_varbinds stops
+    a walk or table, without an error, after that many varbinds.
 
     v1_fix_errors: with SNMPv1, a GET answered with noSuchName drops that
     varbind, sends the rest again and reports NoSuchObject for it; a GETNEXT
@@ -446,6 +479,48 @@ class Stats(object):
         return self.__repr__()
 
 
+class Row(object):
+    """One row of a Table
+
+    index is the row's instance suffix: the arcs after the column OID
+    (RFC 2578 section 7.7; how they encode the INDEX objects depends on
+    the table). values maps a column number, the last arc of the column's
+    OID, to the row's value in that column. A column the row has no value
+    in (a sparse table) has no entry.
+    """
+    index: list[int]
+    values: dict[int, Value]
+
+    def __init__(self, index: list[int], values: dict[int, Value]):
+        self.index = index
+        self.values = values
+
+    def __repr__(self) -> str:
+        cols = sorted(list(self.values.keys()))
+        return ("Row(index=" + ".".join([str(a) for a in self.index]) + ", values=["
+                + ", ".join([str(c) + ": " + repr(self.values[c]) for c in cols]) + "])")
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
+
+class Table(object):
+    """The result of Client.get_table(): the requested columns and the rows found, sorted by index"""
+    columns: list[Oid]
+    rows: list[Row]
+
+    def __init__(self, columns: list[Oid], rows: list[Row]):
+        self.columns = columns
+        self.rows = rows
+
+    def __repr__(self) -> str:
+        return ("Table(columns=[" + ", ".join([c.dotted() for c in self.columns]) + "], rows=["
+                + ", ".join([repr(r) for r in self.rows]) + "])")
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
+
 # Internal request state #############################################################################
 
 class _Op(object):
@@ -472,6 +547,9 @@ class _Op(object):
     resync_left: int
     rediscover_left: int
     wait_gen: int
+    job: int
+    stream: int
+    adaptive: bool
 
     def __init__(self, handle: int, kind: int, opts: Options, varbinds: list[VarBind], non_repeaters: int,
                  max_repetitions: int, chunks: list[list[int]]):
@@ -494,6 +572,11 @@ class _Op(object):
         self.resync_left = 1
         self.rediscover_left = 1
         self.wait_gen = 0
+        # A request of a walk or table (_Job): the job's handle and the stream it belongs to; 0 for
+        # a request of the caller. adaptive: a walk's GETBULK that halves max-repetitions on retries.
+        self.job = 0
+        self.stream = 0
+        self.adaptive = False
 
     def single(self, positions: list[int]) -> bool:
         # The op is answered by one PDU covering all its varbinds in order
@@ -532,6 +615,7 @@ class _Exchange(object):
     scoped: bytes
     keys: ?LocalizedUser
     time_window_drops: int
+    bulk_limit: int
 
     def __init__(self, serial: int, handle: int, pdu_type: int, positions: list[int], varbinds: list[VarBind],
                  non_repeaters: int, max_repetitions: int, opts: Options, counters: list[int]):
@@ -558,6 +642,9 @@ class _Exchange(object):
         self.scoped = b""
         self.keys = None
         self.time_window_drops = 0
+        # The largest max-repetitions any attempt carried (adaptive bulk shrinks it between
+        # attempts; a late answer to an earlier attempt may hold that many rows)
+        self.bulk_limit = max_repetitions
 
 
 def _budget(o: Options) -> float:
@@ -585,7 +672,7 @@ def _shape_problem(ex: _Exchange, p: Pdu, strict: bool) -> str:
     t = ex.pdu_type
     if t == pdu.GETBULK:
         nr = ex.non_repeaters if ex.non_repeaters < n else n
-        limit = nr + ex.max_repetitions * (n - nr)
+        limit = nr + ex.bulk_limit * (n - nr)
         if m > limit:
             return "GETBULK response has %d varbinds, at most %d were asked for" % (m, limit)
         return ""
@@ -688,6 +775,107 @@ def _is_ip(address: str) -> bool:
     return net.is_ipv4(address) or net.is_ipv6(address)
 
 
+# Walks and tables ###################################################################################
+
+# _Job.kind
+_JOB_WALK = 1          # walk(): collects every varbind
+_JOB_STREAM = 2        # walk_stream(): hands the varbinds of each response to on_batch
+_JOB_TABLE = 3         # get_table(): merges the columns into rows
+
+class _Stream(object):
+    # A group of a job's roots (a walk's one root, or up to max_oids_per_request table columns)
+    # walked in lock-step: one request at a time names the current OID of each of its live roots.
+    # sent lists the roots that request names, in its varbind order (the GETBULK layout repeats
+    # them row by row); op is its handle (0: none in flight) and reps its max-repetitions.
+    roots: list[int]
+    sent: list[int]
+    op: int
+    reps: int
+
+    def __init__(self, roots: list[int]):
+        self.roots = roots
+        self.sent = []
+        self.op = 0
+        self.reps = 0
+
+
+class _Job(object):
+    # A walk or table. opts are the Options of its requests (v1_fix_errors on, so that SNMPv1
+    # noSuchName ends a column as EndOfMibView). Per root (index k): cur[k] is the OID the walk
+    # continues from (the last one received, at first the root itself) and live[k] is False once
+    # the root's subtree is done; numbers[k] is the last arc of a table column. found holds what a
+    # walk collected (walk_stream: what is not delivered yet), rows what a table did, keyed by
+    # index; seen is the loop guard of check_increasing=False; count counts every varbind taken.
+    handle: int
+    kind: int
+    opts: Options
+    roots: list[Oid]
+    numbers: list[int]
+    cur: list[Oid]
+    live: list[bool]
+    bulk: bool
+    adaptive: bool
+    check: bool
+    get_root: bool
+    limit: int
+    count: int
+    found: list[VarBind]
+    rows: dict[Oid, Row]
+    seen: set[Oid]
+    streams: list[_Stream]
+
+    def __init__(self, handle: int, kind: int, opts: Options, roots: list[Oid], bulk: bool, adaptive: bool,
+                 check: bool, get_root: bool, limit: int, streams: list[_Stream]):
+        self.handle = handle
+        self.kind = kind
+        self.opts = opts
+        self.roots = roots
+        self.numbers = [r.arcs[len(r.arcs) - 1] for r in roots]
+        self.cur = roots.copy()
+        self.live = [True for _ in roots]
+        self.bulk = bulk
+        self.adaptive = adaptive
+        self.check = check
+        self.get_root = get_root
+        self.limit = limit
+        self.count = 0
+        self.found = []
+        self.rows = {}
+        self.seen = set()
+        self.streams = streams
+
+
+def _streams(n: int, per_stream: int) -> list[_Stream]:
+    # Roots 0..n-1 in groups of at most per_stream (0: one group)
+    if per_stream <= 0 or n <= per_stream:
+        return [_Stream(list(range(n)))]
+    out: list[_Stream] = []
+    i = 0
+    while i < n:
+        end = i + per_stream if i + per_stream < n else n
+        out.append(_Stream(list(range(i, end))))
+        i = end
+    return out
+
+def _table_problem(columns: list[Oid]) -> str:
+    # Why columns cannot be fetched as one table, "" if they can: Row.values is keyed by the last
+    # arc of a column, and a column inside another one would be walked twice
+    for i in range(len(columns)):
+        a = columns[i]
+        for j in range(i + 1, len(columns)):
+            b = columns[j]
+            if a.startswith(b) or b.startswith(a):
+                return "table columns must not contain one another: " + a.dotted() + " and " + b.dotted()
+            if a.arcs[len(a.arcs) - 1] == b.arcs[len(b.arcs) - 1]:
+                return ("table columns need distinct last arcs (the keys of Row.values): " + a.dotted() + " and "
+                        + b.dotted())
+    return ""
+
+def _table_of(job: _Job) -> Table:
+    keys = sorted(list(job.rows.keys()))
+    return Table(job.roots, [job.rows[k] for k in keys])
+
+
 actor Client(cap: ?net.UDPConnectCap,
              address: str,
              security: Security,
@@ -748,6 +936,15 @@ actor Client(cap: ?net.UDPConnectCap,
     var _active = 0
     var _exchanges: dict[int, _Exchange] = {}
     var _ids: dict[int, int] = {}
+
+    # Walks and tables by handle, their callbacks, and the max-repetitions adaptive bulk learned
+    # (0: nothing learned yet)
+    var _jobs: dict[int, _Job] = {}
+    var _walk_cbs: dict[int, action(Client, list[VarBind], ?errors.SnmpError) -> None] = {}
+    var _batch_cbs: dict[int, action(Client, list[VarBind]) -> None] = {}
+    var _done_cbs: dict[int, action(Client, int, ?errors.SnmpError) -> None] = {}
+    var _table_cbs: dict[int, action(Client, ?Table, ?errors.SnmpError) -> None] = {}
+    var _bulk_reps = 0
 
     # SNMPv3 state: the agent's engine ID (None until discovered), the time
     # records and localized keys per engine ID, the running discovery probe
@@ -885,6 +1082,8 @@ actor Client(cap: ?net.UDPConnectCap,
             if e is not None:
                 _log.debug("request failed", {"handle": h, "error": e.error_message})
             cb(self, r, e)
+        elif op.job != 0:
+            _job_answer(op, r, e)
         _pump()
 
     proc def _fail_engine_cbs(e: errors.SnmpError) -> None:
@@ -1104,9 +1303,27 @@ actor Client(cap: ?net.UDPConnectCap,
                 if ex.retries_used < ex.opts.retries:
                     ex.retries_used += 1
                     _retries += 1
+                    _shrink_bulk(ex)
                     _send(ex)
                 else:
                     _timed_out(ex)
+
+    proc def _shrink_bulk(ex: _Exchange) -> None:
+        # Options.adaptive_bulk: the GETBULK of a walk is retried with half the max-repetitions, as
+        # some agents drop answers that are too large instead of answering tooBig. A late answer to
+        # an earlier attempt is still accepted (_Exchange.bulk_limit).
+        if ex.pdu_type != pdu.GETBULK or ex.max_repetitions <= 1:
+            return
+        op = _ops.get(ex.handle)
+        if op is not None:
+            if op.adaptive:
+                m = ex.max_repetitions // 2
+                ex.max_repetitions = m
+                op.max_repetitions = m
+                if _usm is not None:
+                    p = Pdu(pdu.GETBULK, ex.request_id, ex.non_repeaters, m, ex.varbinds)
+                    ex.scoped = message.encode_scoped(ScopedPdu(ex.context_engine_id, ex.context_name, p))
+                _log.debug("timeout: halving max-repetitions", {"handle": op.handle, "max_repetitions": m})
 
     proc def _timed_out(ex: _Exchange) -> None:
         _timeouts += 1
@@ -1613,6 +1830,335 @@ actor Client(cap: ?net.UDPConnectCap,
         _engine_cbs.append(cb)
         _start_discovery(_opts)
 
+    # Walks and tables ###############################################################################
+
+    proc def _job_refusal(roots: list[Oid], table: bool) -> ?errors.SnmpError:
+        # Why a walk or table cannot start, None if it can (reported through its callback)
+        if _closed:
+            return errors.CancelledError("client closed")
+        if len(roots) == 0:
+            return errors.EncodeError("get_table needs at least one column")
+        problem = _validate(pdu.GETNEXT, [VarBind(o) for o in roots], 0, 0)
+        if problem == "" and table:
+            problem = _table_problem(roots)
+        if problem != "":
+            return errors.EncodeError(problem)
+        queued = len(_ops) - _active
+        if _opts.max_queued > 0 and queued >= _opts.max_queued:
+            return errors.QueueFullError("request queue full: %d requests queued" % queued)
+        return None
+
+    proc def _new_job(h: int, kind: int, roots: list[Oid], o: ?Options) -> _Job:
+        eff = o if o is not None else _opts
+        sub = eff if eff.v1_fix_errors else eff.with_(v1_fix_errors=True)
+        per_stream = eff.max_oids_per_request if kind == _JOB_TABLE else 0
+        return _Job(h, kind, sub, roots, eff.use_bulk and _version != message.SNMP_V1, eff.adaptive_bulk,
+                    eff.check_increasing, eff.get_root_if_empty, eff.max_walk_varbinds,
+                    _streams(len(roots), per_stream))
+
+    proc def _start_job(job: _Job) -> None:
+        h = job.handle
+        _jobs[h] = job
+        if _logging:
+            _log.debug("walk started", {"handle": h, "roots": len(job.roots), "bulk": job.bulk,
+                                        "streams": len(job.streams)})
+        for si in range(len(job.streams)):
+            # a request can fail at once (a failed transport) and end the whole job
+            if h in _jobs:
+                _job_step(job, si)
+
+    proc def _job_reps(job: _Job) -> int:
+        # max-repetitions of a walk's next GETBULK: the Options' value, or less when adaptive bulk
+        # has learned that the agent cannot do more; at least 1
+        m = job.opts.max_repetitions
+        if job.adaptive and _bulk_reps > 0 and _bulk_reps < m:
+            m = _bulk_reps
+        return m if m > 0 else 1
+
+    proc def _job_request(job: _Job, si: int, kind: int, oids: list[Oid], reps: int) -> None:
+        # Queue one request of a job on the Client's own request path. The stream records its
+        # handle first: a request can complete inside _pump() (a failed transport).
+        h = _next_handle
+        _next_handle += 1
+        op = _Op(h, kind, job.opts, [VarBind(o) for o in oids], 0, reps,
+                 _plan(kind, len(oids), job.opts.max_oids_per_request))
+        op.job = job.handle
+        op.stream = si
+        op.adaptive = job.adaptive and kind == pdu.GETBULK
+        st = job.streams[si]
+        st.op = h
+        st.reps = reps
+        _ops[h] = op
+        _queue.append(h)
+        _requests += 1
+        _pump()
+
+    proc def _job_step(job: _Job, si: int) -> None:
+        # The next request of stream si: the current OID of each of its live roots
+        st = job.streams[si]
+        sent = [k for k in st.roots if job.live[k]]
+        st.sent = sent
+        oids = [job.cur[k] for k in sent]
+        if job.bulk:
+            _job_request(job, si, pdu.GETBULK, oids, _job_reps(job))
+        else:
+            _job_request(job, si, pdu.GETNEXT, oids, 0)
+
+    proc def _job_answer(op: _Op, r: ?Response, e: ?errors.SnmpError) -> None:
+        # A request of a job completed (_complete); requests of finished jobs are ignored
+        if op.job not in _jobs:
+            return
+        job = _jobs[op.job]
+        st = job.streams[op.stream]
+        if st.op != op.handle:
+            return
+        st.op = 0
+        if op.kind == pdu.GET:
+            _root_answer(job, r, e)
+            return
+        if e is not None:
+            if isinstance(e, errors.ErrorStatusError):
+                if e.status == pdu.NO_SUCH_NAME and _version == message.SNMP_V1:
+                    # SNMPv1 "End of MIB" that the request engine could not pin on one varbind
+                    for k in st.sent:
+                        job.live[k] = False
+                    _job_stream_ended(job)
+                    return
+            _job_finish(job, e)
+            return
+        if r is not None:
+            if op.kind == pdu.GETBULK and job.adaptive and op.max_repetitions < st.reps:
+                # this request needed fewer repetitions than it started with: later walks start there
+                if _bulk_reps == 0 or op.max_repetitions < _bulk_reps:
+                    _bulk_reps = op.max_repetitions
+                    _log.debug("adaptive bulk: max-repetitions lowered", {"max_repetitions": _bulk_reps})
+            failure = _job_take(job, st.sent, r.varbinds)
+            if failure is not None:
+                _job_finish(job, failure)
+            elif job.count >= job.limit:
+                _log.debug("walk stopped at max_walk_varbinds", {"handle": job.handle, "varbinds": job.count})
+                _job_finish(job, None)
+            else:
+                _job_flush(job)
+                more = False
+                for k in st.roots:
+                    if job.live[k]:
+                        more = True
+                if more:
+                    _job_step(job, op.stream)
+                else:
+                    _job_stream_ended(job)
+        else:
+            _job_finish(job, errors.InvalidResponseError("a request of the walk completed without a response"))
+
+    proc def _job_take(job: _Job, sent: list[int], vbs: list[VarBind]) -> ?errors.SnmpError:
+        # Take the varbinds of one response; return the error that ends the job, if any. The
+        # varbinds follow the request's layout: one per sent root, row after row for a GETBULK,
+        # which the agent may cut anywhere (mid-row included). A root's subtree ends at an
+        # exception value or the first OID outside it; later varbinds for it are ignored.
+        n = len(sent)
+        if len(vbs) == 0:
+            return errors.InvalidResponseError("GETBULK response without varbinds: the walk makes no progress")
+        for j in range(len(vbs)):
+            k = sent[j % n]
+            if job.live[k]:
+                vb = vbs[j]
+                name = vb.oid
+                if is_exception(vb.value) or not name.startswith(job.roots[k]):
+                    job.live[k] = False
+                else:
+                    last = job.cur[k]
+                    if job.check:
+                        if not (last < name):
+                            return errors.OidNotIncreasingError(last.arcs, name.arcs)
+                    else:
+                        if name in job.seen:
+                            # the loop guard: the agent sent this OID before
+                            return errors.OidNotIncreasingError(last.arcs, name.arcs)
+                        job.seen.add(name)
+                    job.cur[k] = name
+                    _job_collect(job, k, vb)
+                    if job.count >= job.limit:
+                        return None
+        return None
+
+    proc def _job_collect(job: _Job, k: int, vb: VarBind) -> None:
+        job.count += 1
+        if job.kind == _JOB_TABLE:
+            arcs = vb.oid.arcs
+            idx = arcs[len(job.roots[k].arcs):]
+            key = Oid(idx)
+            row = job.rows.get(key)
+            if row is not None:
+                row.values[job.numbers[k]] = vb.value
+            else:
+                vals: dict[int, Value] = {}
+                vals[job.numbers[k]] = vb.value
+                job.rows[key] = Row(idx, vals)
+        else:
+            job.found.append(vb)
+
+    proc def _job_stream_ended(job: _Job) -> None:
+        # A stream has no live root left: the job is done when no stream has one. A walk that
+        # found nothing then GETs its root (get_root_if_empty).
+        for alive in job.live:
+            if alive:
+                return
+        if job.kind != _JOB_TABLE and job.count == 0 and job.get_root:
+            _job_request(job, 0, pdu.GET, [job.roots[0]], 0)
+            return
+        _job_finish(job, None)
+
+    proc def _root_answer(job: _Job, r: ?Response, e: ?errors.SnmpError) -> None:
+        # The GET of an empty walk's root: its varbind, unless it is an exception (no such object)
+        if e is not None:
+            if isinstance(e, errors.ErrorStatusError):
+                if e.status == pdu.NO_SUCH_NAME and _version == message.SNMP_V1:
+                    _job_finish(job, None)
+                    return
+            _job_finish(job, e)
+            return
+        if r is not None:
+            for vb in r.varbinds:
+                if not is_exception(vb.value):
+                    job.count += 1
+                    job.found.append(vb)
+        _job_finish(job, None)
+
+    proc def _job_flush(job: _Job) -> None:
+        # walk_stream: hand the varbinds taken since the last batch to on_batch
+        if job.kind == _JOB_STREAM and len(job.found) > 0:
+            cb = _batch_cbs.get(job.handle)
+            if cb is not None:
+                batch = job.found
+                job.found = []
+                cb(self, batch)
+
+    proc def _job_finish(job: _Job, e: ?errors.SnmpError) -> None:
+        # End a job and call its callback (walk_stream: the last batch, then on_done); a second
+        # call finds nothing (exactly once). Its requests still in flight are dropped silently.
+        h = job.handle
+        if h not in _jobs:
+            return
+        del _jobs[h]
+        for st in job.streams:
+            sub = st.op
+            st.op = 0
+            if sub != 0:
+                op = _ops.get(sub)
+                if op is not None:
+                    _complete(op, None, errors.CancelledError())
+        if _logging:
+            if e is not None:
+                _log.debug("walk failed", {"handle": h, "varbinds": job.count, "error": e.error_message})
+            else:
+                _log.debug("walk done", {"handle": h, "varbinds": job.count})
+        if job.kind == _JOB_WALK:
+            cb = _walk_cbs.get(h)
+            if cb is not None:
+                del _walk_cbs[h]
+                cb(self, job.found, e)
+        elif job.kind == _JOB_STREAM:
+            _job_flush(job)
+            if h in _batch_cbs:
+                del _batch_cbs[h]
+            done = _done_cbs.get(h)
+            if done is not None:
+                del _done_cbs[h]
+                done(self, job.count, e)
+        else:
+            tcb = _table_cbs.get(h)
+            if tcb is not None:
+                del _table_cbs[h]
+                tcb(self, _table_of(job), e)
+
+    def walk(cb: action(Client, list[VarBind], ?errors.SnmpError) -> None, root: Oid, opts: ?Options=None) -> int:
+        """Walk the subtree below root and call cb(c, varbinds, error) once; returns a handle for cancel()
+
+        varbinds are those found in the subtree, in the order received
+        (OID order: check_increasing makes sure of it), without the varbind
+        that ended the walk. error is None when the walk ended normally: an
+        OID outside root, an exception value, SNMPv1 noSuchName, or
+        Options.max_walk_varbinds varbinds collected. Otherwise varbinds
+        holds what was collected before the error: errors.OidNotIncreasingError,
+        errors.InvalidResponseError (a GETBULK response without varbinds),
+        a request's own errors (TimeoutError, ErrorStatusError, ...), or
+        errors.CancelledError from cancel() or close(). A walk that found
+        nothing GETs root and returns its varbind unless it is an exception
+        (Options.get_root_if_empty), so walking a scalar instance works.
+        Invalid arguments (a root that cannot be encoded) give
+        errors.EncodeError with no varbinds, and a full queue
+        errors.QueueFullError (Options.max_queued counts the walk as one
+        request).
+
+        GETBULK with Options.max_repetitions is used for SNMPv2c and
+        SNMPv3 when Options.use_bulk is set, GETNEXT otherwise and always
+        for SNMPv1. The other Options (timeouts, retries, ...) apply to
+        every request of the walk.
+        """
+        h = _next_handle
+        _next_handle += 1
+        refusal = _job_refusal([root], False)
+        if refusal is not None:
+            cb(self, [], refusal)
+            return h
+        _walk_cbs[h] = cb
+        _start_job(_new_job(h, _JOB_WALK, [root], opts))
+        return h
+
+    def walk_stream(on_batch: action(Client, list[VarBind]) -> None, on_done: action(Client, int, ?errors.SnmpError) -> None,
+                    root: Oid, opts: ?Options=None) -> int:
+        """Walk the subtree below root like walk(), handing the varbinds over as they arrive; returns a handle
+
+        on_batch(c, varbinds) gets the new varbinds of each response, in
+        order (never an empty list), so a large subtree is never held in
+        memory; then on_done(c, count, error) is called exactly once with
+        the number of varbinds delivered and the error that ended the walk
+        (None for a normal end, as in walk()). The varbinds a response held
+        before an error are delivered before on_done.
+        """
+        h = _next_handle
+        _next_handle += 1
+        refusal = _job_refusal([root], False)
+        if refusal is not None:
+            on_done(self, 0, refusal)
+            return h
+        _batch_cbs[h] = on_batch
+        _done_cbs[h] = on_done
+        _start_job(_new_job(h, _JOB_STREAM, [root], opts))
+        return h
+
+    def get_table(cb: action(Client, ?Table, ?errors.SnmpError) -> None, columns: list[Oid],
+                  opts: ?Options=None) -> int:
+        """Fetch table columns and call cb(c, table, error) once; returns a handle for cancel()
+
+        columns are column OIDs (for example ifDescr, ifType, ...). They are
+        walked in lock-step, one varbind per column in each request
+        (GETBULK on SNMPv2c and SNMPv3 with Options.use_bulk, else GETNEXT);
+        a column that leaves its subtree or ends (an exception value) drops
+        out of later requests, so sparse tables work. With more columns than
+        Options.max_oids_per_request, the columns are split into groups
+        walked in parallel (as far as the Client's max_in_flight allows).
+        The values are merged into rows by their index (the OID suffix after
+        the column), sorted by index; Row.values is keyed by the column's
+        last arc. Termination, ordering and errors are as for walk(), per
+        column, and max_walk_varbinds counts the values of all columns.
+
+        On an error cb gets the rows found so far with it. Invalid
+        arguments give EncodeError with table None: no columns, a column
+        that cannot be encoded, a column inside another one, or two columns
+        with the same last arc.
+        """
+        h = _next_handle
+        _next_handle += 1
+        refusal = _job_refusal(columns, True)
+        if refusal is not None:
+            cb(self, None, refusal)
+            return h
+        _table_cbs[h] = cb
+        _start_job(_new_job(h, _JOB_TABLE, columns, opts))
+        return h
+
     # Notifications #################################################################################
 
     proc def _emit(cb: action(Client, ?errors.SnmpError) -> None, data: bytes) -> None:
@@ -1723,13 +2269,20 @@ actor Client(cap: ?net.UDPConnectCap,
     # Control #######################################################################################
 
     def cancel(handle: int) -> None:
-        """Cancel a request: its callback gets errors.CancelledError, unless it completed already
+        """Cancel a request, walk or table: its callback gets errors.CancelledError, unless it completed already
 
-        A late answer to it is dropped (Stats.drops_unknown_id).
+        A walk's callback gets what it collected so far (walk_stream: the
+        pending batch, then on_done). A late answer is dropped
+        (Stats.drops_unknown_id).
         """
+        job = _jobs.get(handle)
+        if job is not None:
+            _job_finish(job, errors.CancelledError())
+            return
         op = _ops.get(handle)
         if op is not None:
-            _complete(op, None, errors.CancelledError())
+            if op.job == 0:
+                _complete(op, None, errors.CancelledError())
 
     def engine_info() -> ?EngineInfo:
         """Return what is known about the agent's SNMPv3 engine, None before discovery (and for SNMPv1/v2c)"""
@@ -1743,7 +2296,7 @@ actor Client(cap: ?net.UDPConnectCap,
                      len(_ops) - _active, _active)
 
     def close() -> None:
-        """Cancel every pending and queued request and discovery (errors.CancelledError) and close the transport
+        """Cancel every pending and queued request, walk and discovery (errors.CancelledError) and close the transport
 
         Idempotent. Later requests get CancelledError("client closed").
         """
@@ -1757,6 +2310,8 @@ actor Client(cap: ?net.UDPConnectCap,
             op = _ops.get(h)
             if op is not None:
                 _complete(op, None, err)
+        for job in list(_jobs.values()):
+            _job_finish(job, err)
         ex = _exchanges.get(_disc_serial)
         if ex is not None:
             _end_exchange(ex)
