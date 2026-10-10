@@ -1067,14 +1067,14 @@ actor _test_parse_file(t: testing.EnvT):
     t.success()
 
 
-# Level-1/2 diagnostics expected on the golden set: only modules where smilint also reports
-# level-1/2 problems (interop/mibs/golden/expected/smilint). GMPLS-TC-MIB has draft page
-# footers inside an enumeration and the date 200224060900Z twice (smilint: date-month at the
-# same lines 15 and 73), SNMPv2-PDU is an ASN.1 protocol module (not SMI), and
-# TCPIPX-MIB has commas missing in two SEQUENCEs (and a trailing one, level 3).
+# Level-1/2 diagnostics expected on the golden set, only where smilint also reports level-1/2
+# problems (interop/mibs/golden/expected/smilint). GMPLS-TC-MIB has draft page footers inside
+# an enumeration and the date 200224060900Z twice (smilint reports date-month at the same
+# lines), SNMPv2-PDU is an ASN.1 protocol module rather than SMI, and TCPIPX-MIB lacks commas
+# in two SEQUENCEs.
 GOLDEN_ERRORS: dict[str, str] = {
     "GMPLS-TC-MIB": "lex.page-header, lex.page-header, parse.date-invalid, parse.date-invalid",
-    "SNMPv2-PDU": "parse.non-smi-assignment, parse.range-symbolic, parse.range-symbolic, parse.range-symbolic, parse.syntax, parse.syntax",
+    "SNMPv2-PDU": "parse.non-smi-assignment, parse.range-symbolic, parse.range-symbolic, parse.range-symbolic",
     "TCPIPX-MIB": "parse.missing-comma, parse.missing-comma",
 }
 
@@ -1085,7 +1085,7 @@ actor _test_golden_set(t: testing.EnvT):
     fc = file.FileCap(t.env.cap)
     fs = file.FS(fc)
     files = sorted(fs.listdir(GOLDEN_DIR))
-    testing.assertTrue(len(files) >= 44)
+    testing.assertTrue(len(files) >= 43)
     nmods = 0
     ndefs = 0
     for nm in files:
@@ -1101,8 +1101,8 @@ actor _test_golden_set(t: testing.EnvT):
             testing.assertTrue(d.level > 0, "internal diagnostic in " + nm + ": " + str(d))
             testing.assertEqual(d.module, nm, str(d))
     testing.assertEqual(nmods, len(files))
-    if len(files) == 44:
-        testing.assertEqual(ndefs, 3343)
+    if len(files) == 43:
+        testing.assertEqual(ndefs, 3344)
     t.success()
 
 
