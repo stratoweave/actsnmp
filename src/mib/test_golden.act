@@ -1,0 +1,296 @@
+"""Golden tier of the resolver: every module of `interop/mibs/golden/mibs/` (44 IETF, IANA
+and net-snmp modules) resolves without level-1 diagnostics, and its name -> OID map equals
+the committed oracle outputs (`interop/mibs/golden/expected/netsnmp/<MOD>.jsonl` and
+`.../pysmi/<MOD>.json`).
+
+Known oracle differences are listed in `KNOWN` (name -> reason) and skipped.
+
+`MIBMETA_OUT=<dir>` also writes `<MOD>.mibmeta.json` per golden module (for
+`interop/mibs/compare/meta_vs_oracles.py`); `MIBDIAG_OUT=<file>` writes all diagnostics.
+"""
+
+import file
+import json
+import testing
+import time
+import mib.diag
+import mib.meta
+import mib.model
+import mib.resolver
+import mib.source
+
+GOLDEN_DIR = "interop/mibs/golden"
+
+# "MOD::name" -> why our OID differs from the oracle's (checked by hand)
+KNOWN: dict[str, str] = {}
+
+
+def jstr(d: dict[str, ?value], k: str) -> str:
+    if k in d:
+        v = d[k]
+        if isinstance(v, str):
+            return v
+    return ""
+
+
+class GoldenStats(object):
+    modules: int
+    nodes: int
+    compared: int
+    mismatches: list[str]
+    missing: list[str]
+
+    def __init__(self):
+        self.modules = 0
+        self.nodes = 0
+        self.compared = 0
+        self.mismatches = []
+        self.missing = []
+
+    def check(self, ms: mib.model.MibSet, oracle: str, module: str, name: str, oid: str) -> None:
+        if name == "" or oid == "":
+            return
+        q = module + "::" + name
+        if q in KNOWN:
+            return
+        self.compared += 1
+        n = ms.node(module, name)
+        if n is not None:
+            got = mib.model.oid_str(n.oid) if n.linked else "<unlinked>"
+            if got != oid:
+                self.mismatches.append(oracle + " " + q + " oracle=" + oid + " ours=" + got)
+        else:
+            self.missing.append(oracle + " " + q + " " + oid)
+
+
+proc def read_text(fc: file.FileCap, path: str) -> ?str:
+    try:
+        return mib.source.read_bytes(fc, path).decode()
+    except OSError:
+        return None
+
+
+proc def write_text(fc: file.FileCap, path: str, text: str) -> None:
+    wf = file.WriteFile(file.WriteFileCap(fc), path)
+    wf.write(text.encode())
+    wf.close()
+
+
+proc def compare_module(fc: file.FileCap, ms: mib.model.MibSet, mod: str, st: GoldenStats, expected: str = GOLDEN_DIR + "/expected") -> None:
+    nj = read_text(fc, expected + "/netsnmp/" + mod + ".jsonl")
+    if nj is not None:
+        for line in nj.split("\n"):
+            if line.strip() == "":
+                continue
+            d = json.decode(line)
+            if jstr(d, "module") == mod:
+                st.check(ms, "netsnmp", mod, jstr(d, "name"), jstr(d, "oid"))
+    pj = read_text(fc, expected + "/pysmi/" + mod + ".json")
+    if pj is not None:
+        top = json.decode(pj)
+        for k, v in top.items():
+            if isinstance(v, dict):
+                ent: dict[str, ?value] = v
+                st.check(ms, "pysmi", mod, jstr(ent, "name"), jstr(ent, "oid"))
+
+
+actor _test_golden_resolve(t: testing.EnvT):
+    """Resolve the whole golden set: no level-0/1 diagnostics, name -> OID equal to the oracles."""
+    t.timeout(600.0)
+    fc = file.FileCap(t.env.cap)
+    mp = mib.source.MibPath([GOLDEN_DIR + "/mibs"], True, True)
+    dg = mib.diag.Diagnostics()
+    mib.source.index_path(mp, fc, dg)
+    names = sorted(list(mp.entries.keys()))
+    ms = mib.resolver.resolve_path(fc, mp, names)
+    errs = [str(d) for d in ms.diags if d.level <= 1]
+    st = GoldenStats()
+    for nm in names:
+        st.modules += 1
+        m = ms.module(nm)
+        if m is not None:
+            st.nodes += len(m.nodes)
+        compare_module(fc, ms, nm, st)
+    eo = t.env.getenv("MIBMETA_OUT")
+    if eo is not None and eo != "":
+        for nm in names:
+            mm = mib.meta.module_meta(ms, nm)
+            if mm is not None:
+                write_text(fc, eo + "/" + nm + ".mibmeta.json", mib.meta.to_json(mm))
+    edo = t.env.getenv("MIBDIAG_OUT")
+    if edo is not None and edo != "":
+        write_text(fc, edo, "\n".join([str(d) for d in ms.diags if not d.file.startswith("<builtin>")]) + "\n")
+    report = "modules=" + str(st.modules) + " nodes=" + str(st.nodes) + " compared=" + str(st.compared) + \
+             " mismatches=" + str(len(st.mismatches)) + " missing=" + str(len(st.missing)) + " errors=" + str(len(errs))
+    print(report)
+    for e in errs[:40]:
+        print("ERROR " + e)
+    for x in st.mismatches[:40]:
+        print("MISMATCH " + x)
+    for x in st.missing[:40]:
+        print("MISSING " + x)
+    testing.assertEqual(len(errs), 0)
+    testing.assertEqual(len(st.mismatches), 0)
+    testing.assertEqual(len(st.missing), 0)
+    testing.assertTrue(st.compared > 2000)
+    t.success()
+
+
+actor _test_golden_vendor(t: testing.EnvT):
+    """The IEEE/vendor golden modules (texts staged from the local corpus by
+    `meta_vs_oracles.py --stage-vendor interop/mibs/cache/golden-vendor`, or the directory in
+    `MIBGOLDEN_VENDOR`), resolved over the IETF golden modules and compared with
+    `golden/expected-local/`. A report only: the vendor expectations are local and may be
+    regenerated; the gate is that nothing crashes (no level-0 diagnostic)."""
+    t.require("mibcorpus")
+    t.timeout(600.0)
+    fc = file.FileCap(t.env.cap)
+    vdir = "interop/mibs/cache/golden-vendor"
+    ev = t.env.getenv("MIBGOLDEN_VENDOR")
+    if ev is not None and ev != "":
+        vdir = ev
+    mp = mib.source.MibPath([GOLDEN_DIR + "/mibs", vdir], True, True)
+    dg = mib.diag.Diagnostics()
+    mib.source.index_path(mp, fc, dg)
+    names: list[str] = []
+    for nm in sorted(list(mp.entries.keys())):
+        for e in mp.entries[nm]:
+            if e.dir_index == 1 and nm not in names:
+                names.append(nm)
+    ms = mib.resolver.resolve_path(fc, mp, names)
+    st = GoldenStats()
+    for nm in names:
+        st.modules += 1
+        m = ms.module(nm)
+        if m is not None:
+            st.nodes += len(m.nodes)
+        compare_module(fc, ms, nm, st, GOLDEN_DIR + "/expected-local")
+    eo = t.env.getenv("MIBMETA_OUT")
+    if eo is not None and eo != "":
+        for nm in ms.order:
+            mm = mib.meta.module_meta(ms, nm)
+            if mm is not None:
+                write_text(fc, eo + "/" + nm + ".mibmeta.json", mib.meta.to_json(mm))
+    edo = t.env.getenv("MIBDIAG_OUT")
+    if edo is not None and edo != "":
+        write_text(fc, edo, "\n".join([str(d) for d in ms.diags if not d.file.startswith("<builtin>")]) + "\n")
+    errs = [str(d) for d in ms.diags if d.level <= 1]
+    internal = [str(d) for d in ms.diags if d.level == 0]
+    print("vendor modules=" + str(st.modules) + " nodes=" + str(st.nodes) + " compared=" + str(st.compared) +
+          " mismatches=" + str(len(st.mismatches)) + " missing=" + str(len(st.missing)) + " level01=" + str(len(errs)))
+    for e in errs[:60]:
+        print("ERROR " + e)
+    for x in st.mismatches[:60]:
+        print("MISMATCH " + x)
+    for x in st.missing[:60]:
+        print("MISSING " + x)
+    testing.assertEqual(internal, [])
+    t.success()
+
+
+CORPUS_FLAT = "interop/mibs/corpus/flat"
+
+
+def corpus_chunk(spec: str, n: int) -> (int, int):
+    """`[lo, hi)` of the k-th of m slices for `k/m` (all for an empty or bad spec)."""
+    parts = spec.split("/")
+    if len(parts) == 2:
+        try:
+            k = int(parts[0].strip())
+            m = int(parts[1].strip())
+            if m >= 1 and k >= 1 and k <= m:
+                return ((k - 1) * n // m, k * n // m)
+        except ValueError:
+            pass
+    return (0, n)
+
+
+def module_row(ms: mib.model.MibSet, nm: str) -> str:
+    """TSV row: module, loaded, smi, nodes, unlinked, types, level-0/1/2 counts (own file),
+    resolver codes `code*count` (levels 0-2)."""
+    m = ms.module(nm)
+    if m is not None:
+        return module_row_of(ms, m)
+    return nm + "\tno\t-\t0\t0\t0\t0\t0\t0\t"
+
+
+def module_row_of(ms: mib.model.MibSet, m: mib.model.MibModule) -> str:
+    nm = m.name
+    unl = len([n for n in m.nodes if not n.linked])
+    cnt = [0, 0, 0]
+    codes: dict[str, int] = {}
+    for d in ms.diags:
+        if d.module == nm and d.level <= 2:
+            cnt[d.level] += 1
+            if d.code.startswith("resolve.") or d.code.startswith("source."):
+                codes[d.code] = codes.get_def(d.code, 0) + 1
+    cs = ",".join([k + "*" + str(codes[k]) for k in sorted(list(codes.keys()))])
+    return "\t".join([nm, "yes", m.smi, str(len(m.nodes)), str(unl), str(len(m.types)), str(cnt[0]), str(cnt[1]), str(cnt[2]), cs])
+
+
+actor _test_corpus_resolve(t: testing.EnvT):
+    """Resolve the corpus, or a slice of it, and write one TSV row per module.
+
+        acton test --fast --tag mibcorpus --no-cache --module mib.test_golden --name corpus_resolve
+
+    `MIBCORPUS_CHUNK=k/n` resolves the k-th slice of the sorted module names with its import
+    closure and writes `interop/mibs/cache/actsnmp-resolve.part<k>of<n>.tsv` (`MIBCORPUS_OUT`
+    overrides the directory). `MIBCORPUS_ONLY=A-MIB,B-MIB` resolves only those modules and
+    also writes their diagnostics. `MIBMETA_OUT=<dir>` writes mibmeta JSON per module. Fails
+    only on internal (level-0) diagnostics.
+    """
+    t.require("mibcorpus")
+    t.timeout(1800.0)
+    fc = file.FileCap(t.env.cap)
+    cdir = CORPUS_FLAT
+    ed = t.env.getenv("MIBCORPUS_DIR")
+    if ed is not None and ed != "":
+        cdir = ed
+    odir = "interop/mibs/cache"
+    eo = t.env.getenv("MIBCORPUS_OUT")
+    if eo is not None and eo != "":
+        odir = eo
+    spec = ""
+    ec = t.env.getenv("MIBCORPUS_CHUNK")
+    if ec is not None:
+        spec = ec.strip()
+    t0 = time.monotonic_ns()
+    mp = mib.source.MibPath([cdir], True, False)
+    dg = mib.diag.Diagnostics()
+    mib.source.index_path(mp, fc, dg)
+    allnames = sorted(list(mp.entries.keys()))
+    lo, hi = corpus_chunk(spec, len(allnames))
+    names = allnames[lo:hi]
+    only = ""
+    eon = t.env.getenv("MIBCORPUS_ONLY")
+    if eon is not None:
+        only = eon.strip()
+    if only != "":
+        names = [x.strip() for x in only.split(",") if x.strip() != ""]
+        spec = "only"
+    t1 = time.monotonic_ns()
+    ms = mib.resolver.resolve_path(fc, mp, names)
+    t2 = time.monotonic_ns()
+    rows = ["module\tloaded\tsmi\tnodes\tunlinked\ttypes\tl0\tl1\tl2\tcodes"]
+    for nm in names:
+        rows.append(module_row(ms, nm))
+    suffix = ""
+    if only != "":
+        suffix = ".only"
+        write_text(fc, odir + "/actsnmp-resolve.only.diags.txt", "\n".join([str(d) for d in ms.diags if d.module in names]) + "\n")
+    elif lo != 0 or hi != len(allnames):
+        suffix = ".part" + spec.replace("/", "of")
+    write_text(fc, odir + "/actsnmp-resolve" + suffix + ".tsv", "\n".join(rows) + "\n")
+    em = t.env.getenv("MIBMETA_OUT")
+    if em is not None and em != "":
+        for nm in names:
+            mm = mib.meta.module_meta(ms, nm)
+            if mm is not None:
+                write_text(fc, em + "/" + nm + ".mibmeta.json", mib.meta.to_json(mm))
+    internal = [str(d) for d in ms.diags if d.level == 0]
+    summary = "modules [" + str(lo) + ", " + str(hi) + ") of " + str(len(allnames)) + "; loaded with imports " + str(len(ms.order)) + \
+              "; index " + str((t1 - t0) // 1000000) + " ms, resolve " + str((t2 - t1) // 1000000) + " ms; internal " + str(len(internal)) + \
+              "; level-1 " + str(len([d for d in ms.diags if d.level == 1])) + "\n" + "\n".join(internal[:50]) + "\n"
+    write_text(fc, odir + "/actsnmp-resolve" + suffix + ".summary.txt", summary)
+    testing.assertEqual(len(internal), 0)
+    t.success()

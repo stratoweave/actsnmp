@@ -1,0 +1,109 @@
+"""Tests of `mib.meta`: derivation from the resolved model, the actsnmp-mibmeta/1 JSON
+round trip and the lookup structures."""
+
+import testing
+import mib.meta
+import mib.model
+import mib.resolver
+
+M_MIB = r"""M-MIB DEFINITIONS ::= BEGIN
+IMPORTS
+    MODULE-IDENTITY, OBJECT-TYPE, NOTIFICATION-TYPE, Integer32, Counter64, IpAddress, enterprises
+        FROM SNMPv2-SMI
+    TEXTUAL-CONVENTION, DisplayString, PhysAddress, TruthValue, RowStatus
+        FROM SNMPv2-TC;
+mMIB MODULE-IDENTITY
+    LAST-UPDATED "202610100000Z"
+    ORGANIZATION "o"
+    CONTACT-INFO "c"
+    DESCRIPTION  "d \"quoted\""
+    ::= { enterprises 99997 }
+Percent ::= TEXTUAL-CONVENTION DISPLAY-HINT "d-2" STATUS current DESCRIPTION "p" SYNTAX Integer32 (0..10000)
+mObjects OBJECT IDENTIFIER ::= { mMIB 1 }
+mName OBJECT-TYPE SYNTAX DisplayString (SIZE (0..32)) MAX-ACCESS read-write STATUS current DESCRIPTION "n"
+    DEFVAL { "x" } ::= { mObjects 1 }
+mBig OBJECT-TYPE SYNTAX Counter64 UNITS "octets" MAX-ACCESS read-only STATUS current DESCRIPTION "b" ::= { mObjects 2 }
+mTable OBJECT-TYPE SYNTAX SEQUENCE OF MEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "t" ::= { mObjects 3 }
+mEntry OBJECT-TYPE SYNTAX MEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "e" INDEX { mAddr, IMPLIED mKey } ::= { mTable 1 }
+MEntry ::= SEQUENCE { mAddr IpAddress, mKey DisplayString, mMac PhysAddress, mOn TruthValue, mPct Percent, mStatus RowStatus }
+mAddr OBJECT-TYPE SYNTAX IpAddress MAX-ACCESS not-accessible STATUS current DESCRIPTION "a" ::= { mEntry 1 }
+mKey OBJECT-TYPE SYNTAX DisplayString MAX-ACCESS not-accessible STATUS current DESCRIPTION "k" ::= { mEntry 2 }
+mMac OBJECT-TYPE SYNTAX PhysAddress MAX-ACCESS read-create STATUS current DESCRIPTION "m" ::= { mEntry 3 }
+mOn OBJECT-TYPE SYNTAX TruthValue MAX-ACCESS read-create STATUS current DESCRIPTION "o" DEFVAL { true } ::= { mEntry 4 }
+mPct OBJECT-TYPE SYNTAX Percent MAX-ACCESS read-create STATUS deprecated DESCRIPTION "p" ::= { mEntry 5 }
+mStatus OBJECT-TYPE SYNTAX RowStatus MAX-ACCESS read-create STATUS current DESCRIPTION "s" ::= { mEntry 6 }
+mEvent NOTIFICATION-TYPE OBJECTS { mName, mOn } STATUS current DESCRIPTION "e" ::= { mMIB 0 1 }
+END
+"""
+
+
+def meta() -> mib.meta.ModuleMeta:
+    ms = mib.resolver.resolve_texts([M_MIB])
+    mm = mib.meta.module_meta(ms, "M-MIB")
+    if mm is not None:
+        return mm
+    raise ValueError("M-MIB not resolved")
+
+
+def _test_module_meta_json() -> str:
+    """Snapshot of the JSON of a small module (key order and content are the contract)."""
+    return mib.meta.to_json(meta())
+
+
+def _test_json_round_trip() -> None:
+    mm = meta()
+    j1 = mib.meta.to_json(mm)
+    mm2 = mib.meta.from_json(j1)
+    testing.assertEqual(mib.meta.to_json(mm2), j1)
+    b = mib.meta.MibBundle([mm, mm2])
+    bj = mib.meta.bundle_to_json(b)
+    b2 = mib.meta.bundle_from_json(bj)
+    testing.assertEqual(len(b2.modules), 2)
+    testing.assertEqual(mib.meta.bundle_to_json(b2), bj)
+
+
+def _test_derivation() -> None:
+    mm = meta()
+    testing.assertEqual(mm.yang_prefix, "m-mib")
+    testing.assertEqual(mm.revision, "2026-10-10")
+    testing.assertEqual([n.name for n in mm.nodes],
+                        ["mMIB", "mEvent", "mObjects", "mName", "mBig", "mTable", "mEntry", "mAddr", "mKey", "mMac", "mOn", "mPct", "mStatus"])
+    convs: list[str] = []
+    for n in mm.nodes:
+        s = n.syntax
+        if s is not None:
+            convs.append(n.name + ":" + s.conv)
+    testing.assertEqual(convs, ["mName:string-hint", "mBig:uint", "mAddr:ipv4", "mKey:string-hint", "mMac:phys-address",
+                                "mOn:truthvalue", "mPct:int-hint", "mStatus:enum"])
+    row = mm.nodes[6]
+    testing.assertEqual([p.obj + "=" + p.enc for p in row.index], ["M-MIB::mAddr=ipv4", "M-MIB::mKey=implied"])
+    testing.assertTrue(row.implied)
+
+
+def _test_lookup() -> None:
+    mm = meta()
+    ix = mib.meta.MetaIndex(mib.meta.MibBundle([mm]))
+    r = ix.lookup([1, 3, 6, 1, 4, 1, 99997, 1, 3, 1, 4, 192, 0, 2, 1, 97, 98])
+    if r is not None:
+        testing.assertEqual(r.0.name, "mOn")
+        testing.assertEqual(r.1, [192, 0, 2, 1, 97, 98])
+    else:
+        testing.error("no match")
+    s = ix.lookup([1, 3, 6, 1, 4, 1, 99997, 1, 2, 0])
+    testing.assertEqual(s.0.name + ":" + str(s.1) if s is not None else "", "mBig:[0]")
+    testing.assertNone(ix.lookup([1, 3, 6, 1, 4, 1, 5]))
+    n = ix.find("M-MIB::mName")
+    testing.assertEqual(n.oid if n is not None else [], [1, 3, 6, 1, 4, 1, 99997, 1, 1])
+    n2 = ix.find("mStatus")
+    testing.assertEqual(n2.qname() if n2 is not None else "", "M-MIB::mStatus")
+    n3 = ix.find("M-MIB.mKey")
+    testing.assertEqual(n3.kind if n3 is not None else "", "column")
+    testing.assertNone(ix.find("nothing"))
+
+
+def _test_bad_format() -> None:
+    try:
+        mib.meta.from_json(r"""{"format":"other/1","module":"X"}""")
+        testing.error("accepted a wrong format")
+    except mib.meta.MetaError as e:
+        testing.assertEqual(e.error_message, "unsupported mibmeta format other/1")

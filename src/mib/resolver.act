@@ -1,0 +1,1837 @@
+"""Multi-module MIB resolution.
+
+`resolve_path` resolves the named modules and their import closure over an indexed
+`mib.source.MibPath`. `resolve_texts` does the same for in-memory module texts (tests,
+embedded modules), and `Loader` with `resolve_asts` is the core for callers that bring their
+own ASTs.
+
+The result is a `mib.model.MibSet`. Resolution is partial: a broken module contributes
+everything that parsed and resolved, and dependents get what exists plus level-2 diagnostics
+for the missing symbols. Diagnostics are ordered by file, line, column and report order, and
+each problem is reported once.
+
+What is resolved (L<n> is the diagnostic level):
+
+- module lookup through the search path, aliases and the built-in base modules (which are
+  always loaded); `source.not-found` (L1) for a missing import module, except RFC1213-MIB and
+  RFC1158-MIB, whose symbols have a built-in rewrite table;
+- symbol lookup: local definitions, then imports (following a module that only imports the
+  symbol itself), then the base modules ("used but not imported", L3); duplicate
+  definitions (first kept, L2); local definitions shadowing imports (local wins, L2);
+- OIDs, with forward references across modules, NameAndNumber forms, the bare-name-not-first
+  rule, sub-id limits, cycles and unlinked declarations; SMIv1 traps at `E.0.N`, the
+  generic `snmp` traps at `snmpTraps.(N+1)`;
+- types: TC chains (nested TCs L5), APPLICATION tags, SMIv1 base names (Counter, Gauge,
+  NetworkAddress), constraint composition (subset or intersection, L2 on widening), swapped
+  ranges, illegal subtypes (kept, L2), enumerations and BITS checks, DISPLAY-HINT validation
+  (an invalid hint is dropped, L2);
+- node kinds (table, row, column, scalar, ...) from the OID tree;
+- STATUS and ACCESS normalised to SMIv2 (RFC 3584 section 2), raw values kept;
+- DEFVAL normalisation, lenient forms converted, invalid values dropped;
+- index specs (int, fixed(n), var, implied, oid, oid-implied, ipv4, netaddr), AUGMENTS,
+  synthetic keys for SMIv1 base-type index items, keyless rows, sparse tables;
+- notification OBJECTS, group, compliance and capabilities members.
+
+The resolver's diagnostic codes (`resolve.*`) are catalogued in `CATALOG` below, in the same
+form as `mib.diag.CATALOG`; `level_of()` covers both.
+"""
+
+import file
+import mib.ast
+import mib.diag
+import mib.model
+import mib.parser
+import mib.source
+
+# code -> (default level, libsmi error name or "", description)
+CATALOG: dict[str, (int, str, str)] = {
+    "resolve.internal": (0, "", "an internal error while resolving a declaration; it is skipped"),
+    "resolve.import-not-found": (2, "import-failed", "an imported symbol is not defined in the module it is imported from"),
+    "resolve.import-indirect": (3, "", "an imported symbol is only imported (not defined) by the module it is imported from; that module's import is followed"),
+    "resolve.import-rewritten": (5, "obsolete-import", "an import from an obsolete module is resolved to its SMIv2 home"),
+    "resolve.import-unused-module": (6, "", "a module is imported from but none of its symbols is found"),
+    "resolve.not-imported": (3, "basetype-not-imported", "a base-module symbol is used without being imported"),
+    "resolve.unresolved": (2, "", "a symbol cannot be resolved"),
+    "resolve.type-unknown": (2, "type-unknown", "a type cannot be resolved; the object keeps an unresolved syntax"),
+    "resolve.type-name-case": (2, "", "an unknown type that is a base type name in other case (INTEGER32) is read as that base type"),
+    "resolve.not-a-type": (2, "", "a SYNTAX names something that is not a type"),
+    "resolve.type-cycle": (1, "", "a type is defined in terms of itself"),
+    "resolve.tc-nested": (5, "textual-convention-nested", "a TC's SYNTAX names another TC"),
+    "resolve.redefined": (2, "identifier-redefined", "a name is defined twice in a module; the first definition is kept"),
+    "resolve.redefined-oid": (2, "identifier-redefined", "a name is defined twice in a module with different OIDs; the second is kept in the OID tree, the name refers to the first"),
+    "resolve.import-shadowed": (2, "identifier-external-redefined", "a local definition has the name of an imported symbol; the local one wins"),
+    "resolve.oid-undefined": (1, "", "the first component of an OID value is undefined; the declaration is unlinked"),
+    "resolve.oid-cycle": (1, "oid-recursive", "an OID value refers to itself"),
+    "resolve.oid-not-prefix": (2, "object-identifier-not-prefix", "a bare name that is not the first component of an OID value"),
+    "resolve.oid-subid-range": (1, "", "an OID sub-identifier is larger than 4294967295; the declaration is dropped"),
+    "resolve.oid-too-long": (1, "", "an OID has more than 128 sub-identifiers; the declaration is dropped"),
+    "resolve.oid-first-arc": (2, "", "the first arc of an OID is not 0, 1 or 2"),
+    "resolve.oid-missing": (1, "", "a declaration has no OID value"),
+    "resolve.oid-registered": (2, "oid-registered", "an OID is registered twice in one module; both are kept, the first is preferred"),
+    "resolve.oid-reuse": (5, "oid-reuse", "several descriptors are assigned the same OID in one module"),
+    "resolve.implicit-node": (6, "node-implicit", "a name(number) component labels an arc no declaration of the module names; an implicit node is created"),
+    "resolve.last-subid-zero": (3, "last-subid-zero", "a registration's last sub-identifier is 0"),
+    "resolve.range-swapped": (2, "range-exchanged", "a range has its bounds exchanged; they are swapped"),
+    "resolve.range-widened": (2, "", "a refinement is not a subset of its parent's constraint; the intersection is used"),
+    "resolve.range-bounds": (2, "range-bounds", "a range lies outside the base type's value space (kept; the YANG emitter clamps)"),
+    "resolve.range-illegal": (2, "subtype-illegal", "a subtype on a type that may not be subtyped (Counter32, TimeTicks, ...); kept"),
+    "resolve.range-kind": (2, "", "a range on a string type or a SIZE on an integer type; read as the other kind"),
+    "resolve.range-symbolic": (2, "", "a range bound that is not a number; the range item is dropped"),
+    "resolve.enum-duplicate-label": (2, "enum-name-redefinition", "an enumeration label or bit name is used twice; the first is kept"),
+    "resolve.enum-duplicate-value": (2, "enum-number-redefinition", "an enumeration value or bit position is used twice; both labels are kept"),
+    "resolve.enum-range": (2, "enum-range", "an enumeration value outside the Integer32 range (kept)"),
+    "resolve.enum-zero": (5, "enum-zero", "an SMIv1 enumeration has the value 0"),
+    "resolve.enum-not-subset": (2, "", "a refined enumeration or BITS list is not a subset of its parent's"),
+    "resolve.bits-negative": (2, "bits-negative", "a negative bit position; the bit is dropped"),
+    "resolve.hint-invalid": (2, "invalid-format", "a DISPLAY-HINT does not parse or does not fit the base type; it is dropped"),
+    "resolve.status-smiv1": (3, "status-invalid-smiv2", "SMIv1 STATUS mandatory/optional in an SMIv2 construct; read as current"),
+    "resolve.status-smiv2": (5, "status-invalid-smiv1", "SMIv2 STATUS current in an SMIv1 construct (accepted)"),
+    "resolve.status-invalid": (2, "status-invalid", "an unknown STATUS value; normalised when it is close to a valid one, else current"),
+    "resolve.access-write-only": (4, "access-write-only-smiv1", "ACCESS write-only is read as read-write"),
+    "resolve.access-smiv2": (5, "access-invalid-smiv1", "an SMIv2 access value in an SMIv1 ACCESS clause (accepted)"),
+    "resolve.access-invalid": (2, "access-invalid", "an unknown access value; normalised when it is close to a valid one, else dropped"),
+    "resolve.row-subid": (3, "row-node-subidentifier-one", "a row's sub-identifier is not 1"),
+    "resolve.row-without-index": (2, "", "a row has neither INDEX nor AUGMENTS; it becomes a keyless list"),
+    "resolve.augments-not-row": (2, "", "AUGMENTS names something that is not a row; the row is keyless"),
+    "resolve.augments-nested": (2, "augment-nested", "AUGMENTS names a row that is itself an augmentation"),
+    "resolve.index-unresolved": (2, "", "an INDEX object cannot be resolved; its encoding is unknown"),
+    "resolve.index-not-column": (3, "index-element-not-column", "an INDEX object is not a column (a scalar or another kind of node)"),
+    "resolve.index-counter": (2, "", "a Counter32/Counter64 INDEX object (encoded as int)"),
+    "resolve.index-type": (2, "", "an INDEX object whose type cannot be encoded in an instance identifier; encoded as int"),
+    "resolve.index-implied-fixed": (3, "", "IMPLIED on a fixed-length or integer index item is ignored"),
+    "resolve.index-implied-not-last": (2, "", "IMPLIED on an index item that is not the last is ignored"),
+    "resolve.access-table": (3, "access-table-illegal", "a table or row is not not-accessible"),
+    "resolve.access-scalar-create": (3, "scalar-read-create", "a scalar is read-create"),
+    "resolve.notification-not-reversible": (5, "notification-not-reversible", "the next-to-last sub-identifier of a notification is not 0"),
+    "resolve.row-misplaced": (2, "", "a row is not directly below a table (RFC 3584 (14))"),
+    "resolve.sequence-missing-column": (3, "sequence-missing-column", "a column of a row is missing from its SEQUENCE type (the OID tree decides)"),
+    "resolve.sequence-no-column": (3, "sequence-no-column", "a SEQUENCE item is not a column of the row"),
+    "resolve.defval-invalid": (2, "defval-syntax", "a DEFVAL does not match the object's syntax; it is dropped"),
+    "resolve.defval-lenient": (3, "", "a DEFVAL in a non-standard form is converted"),
+    "resolve.defval-quoted-number": (2, "defval-syntax", "a quoted number as the DEFVAL of an integer object is read as the number"),
+    "resolve.defval-enum-number": (5, "", "an enumeration DEFVAL given as a number is mapped to its label"),
+    "resolve.defval-null": (5, "", "DEFVAL NULL gives no default"),
+    "resolve.defval-counter": (3, "", "a DEFVAL on a Counter32/Counter64 object (kept)"),
+    "resolve.notification-object": (3, "", "a notification object is not-accessible"),
+}
+
+def level_of(code: str) -> int:
+    """Default level of a resolver code (or of a `mib.diag` code)."""
+    e = CATALOG.get(code)
+    if e is not None:
+        return e.0
+    return mib.diag.level_of(code)
+
+
+# --- tables -----------------------------------------------------------------------------------
+
+BASE_ORDER = ["SNMPv2-SMI", "SNMPv2-TC", "SNMPv2-CONF", "RFC1155-SMI", "RFC-1212", "RFC-1215"]
+
+# names that are base types when they resolve to (or fall back to) a base module
+BASE_TYPES: dict[str, str] = {
+    "Integer32": "INTEGER",
+    "Unsigned32": "Unsigned32",
+    "Gauge32": "Gauge32",
+    "Gauge": "Gauge32",
+    "Counter32": "Counter32",
+    "Counter": "Counter32",
+    "Counter64": "Counter64",
+    "TimeTicks": "TimeTicks",
+    "IpAddress": "IpAddress",
+    "NetworkAddress": "IpAddress",
+    "Opaque": "Opaque",
+    "UInteger32": "Unsigned32",
+    "ObjectName": "OBJECT IDENTIFIER",
+    "NotificationName": "OBJECT IDENTIFIER",
+}
+
+BASE_TYPE_MODULES: dict[str, bool] = {"SNMPv2-SMI": True, "RFC1155-SMI": True}
+
+# [APPLICATION n] IMPLICIT tags (vendor copies of the base types)
+APP_TAGS: dict[int, str] = {0: "IpAddress", 1: "Counter32", 2: "Gauge32", 3: "TimeTicks", 4: "Opaque",
+                            5: "OCTET STRING", 6: "Counter64", 7: "Unsigned32"}
+
+ROOTS: dict[str, int] = {"ccitt": 0, "iso": 1, "joint-iso-ccitt": 2}
+
+# RFC1213-MIB / RFC1158-MIB symbols resolved to their SMIv2 homes
+MIB2_REWRITE: dict[str, (str, str)] = {
+    "mib-2": ("SNMPv2-SMI", "mib-2"),
+    "DisplayString": ("SNMPv2-TC", "DisplayString"),
+    "PhysAddress": ("SNMPv2-TC", "PhysAddress"),
+    "nullSpecific": ("SNMPv2-SMI", "zeroDotZero"),
+    "ipRoutingTable": ("RFC1213-MIB", "ipRouteTable"),
+    "snmpEnableAuthTraps": ("SNMPv2-MIB", "snmpEnableAuthenTraps"),
+}
+
+# name prefix -> SMIv2 home of MIB-II objects (net-snmp style)
+MIB2_PREFIXES: list[(str, str)] = [
+    ("sys", "SNMPv2-MIB"), ("snmp", "SNMPv2-MIB"), ("if", "IF-MIB"), ("ip", "IP-MIB"),
+    ("icmp", "IP-MIB"), ("tcp", "TCP-MIB"), ("udp", "UDP-MIB"), ("egp", "RFC1213-MIB"),
+    ("at", "RFC1213-MIB"),
+]
+
+OBSOLETE_MIB2 = ["RFC1213-MIB", "RFC1158-MIB"]
+
+INT_BASES: dict[str, bool] = {"INTEGER": True, "Unsigned32": True, "Gauge32": True, "Counter32": True,
+                              "Counter64": True, "TimeTicks": True}
+STRING_BASES: dict[str, bool] = {"OCTET STRING": True, "Opaque": True}
+
+ACCESS_V1: dict[str, bool] = {"read-only": True, "read-write": True, "write-only": True, "not-accessible": True}
+ACCESS_V2: dict[str, bool] = {"not-accessible": True, "accessible-for-notify": True, "read-only": True,
+                              "read-write": True, "read-create": True}
+ACCESS_ALL = ["read-only", "read-write", "write-only", "not-accessible", "accessible-for-notify", "read-create"]
+STATUS_ALL = ["current", "deprecated", "obsolete", "mandatory", "optional"]
+
+MAX_OID_LEN = 128
+
+
+def base_limits(base: str) -> (bigint, bigint):
+    """Value space of an integer base type ((1, 0) when there is none)."""
+    if base == "INTEGER":
+        return (bigint(-2147483648), bigint(2147483647))
+    if base == "Unsigned32" or base == "Gauge32" or base == "Counter32" or base == "TimeTicks":
+        return (bigint(0), bigint(4294967295))
+    if base == "Counter64":
+        return (bigint(0), bigint("18446744073709551615"))
+    return (bigint(1), bigint(0))
+
+
+def _is_digit(c: str) -> bool:
+    return c >= "0" and c <= "9"
+
+
+def hint_ok(h: str, base: str) -> bool:
+    """Whether DISPLAY-HINT `h` parses (RFC 2579 section 3.1) and fits `base`."""
+    if h == "":
+        return False
+    if base in INT_BASES:
+        if h == "x" or h == "o" or h == "b" or h == "d":
+            return True
+        if h.startswith("d-") and len(h) > 2:
+            for c in h[2:]:
+                if not _is_digit(c):
+                    return False
+            return True
+        return False
+    if base in STRING_BASES:
+        n = len(h)
+        i = 0
+        while i < n:
+            star = False
+            if h[i] == "*":
+                star = True
+                i += 1
+            j = i
+            while i < n and _is_digit(h[i]):
+                i += 1
+            if i == j or i >= n:
+                return False
+            if h[i] not in "xdoat":
+                return False
+            i += 1
+            if i < n and not _is_digit(h[i]) and h[i] != "*":
+                i += 1
+                if star and i < n and not _is_digit(h[i]) and h[i] != "*":
+                    i += 1
+        return True
+    return False
+
+
+def _compress(s: str) -> str:
+    return s.lower().replace("-", "").replace("_", "").replace(" ", "")
+
+
+def _edit_distance(a: str, b: str) -> int:
+    prev = list(range(len(b) + 1))
+    for i in range(1, len(a) + 1):
+        cur = [i] + [0] * len(b)
+        for j in range(1, len(b) + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            x = prev[j] + 1
+            y = cur[j - 1] + 1
+            z = prev[j - 1] + cost
+            m = x if x < y else y
+            cur[j] = m if m < z else z
+        prev = cur
+    return prev[len(b)]
+
+
+def fuzzy_value(raw: str, valid: list[str]) -> str:
+    """The valid value `raw` most plausibly means (case, '_' and hyphens ignored, then within
+    edit distance 2), or ""."""
+    c = _compress(raw)
+    for v in valid:
+        if _compress(v) == c:
+            return v
+    best = ""
+    bd = 3
+    for v in valid:
+        d = _edit_distance(c, _compress(v))
+        if d < bd:
+            bd = d
+            best = v
+    return best
+
+
+def _subset(own: list[mib.model.Range], parent: list[mib.model.Range]) -> bool:
+    for r in own:
+        ok = False
+        for p in parent:
+            if p.lo <= r.lo and r.hi <= p.hi:
+                ok = True
+                break
+        if not ok:
+            return False
+    return True
+
+
+def _intersect(own: list[mib.model.Range], parent: list[mib.model.Range]) -> list[mib.model.Range]:
+    out: list[mib.model.Range] = []
+    for r in own:
+        for p in parent:
+            lo = r.lo if r.lo > p.lo else p.lo
+            hi = r.hi if r.hi < p.hi else p.hi
+            if lo <= hi:
+                out.append(mib.model.Range(lo, hi))
+    return out
+
+
+def _copy_named(xs: list[mib.model.NamedValue]) -> list[mib.model.NamedValue]:
+    return [mib.model.NamedValue(x.label, x.value) for x in xs]
+
+
+def _named_subset(own: list[mib.model.NamedValue], parent: list[mib.model.NamedValue]) -> bool:
+    ps: set[str] = set()
+    for p in parent:
+        ps.add(p.label + "(" + str(p.value) + ")")
+    for o in own:
+        if (o.label + "(" + str(o.value) + ")") not in ps:
+            return False
+    return True
+
+
+def order_diags(a: list[mib.diag.Diagnostic], b: list[mib.diag.Diagnostic]) -> list[mib.diag.Diagnostic]:
+    """`a + b` ordered by file, line, column, then report order (bucketed by file, so the
+    sort compares ints only)."""
+    buckets: dict[str, list[mib.diag.Diagnostic]] = {}
+    for d in a:
+        lst = buckets.get(d.file)
+        if lst is not None:
+            lst.append(d)
+        else:
+            buckets[d.file] = [d]
+    for d in b:
+        lst = buckets.get(d.file)
+        if lst is not None:
+            lst.append(d)
+        else:
+            buckets[d.file] = [d]
+    out: list[mib.diag.Diagnostic] = []
+    for f in sorted(list(buckets.keys())):
+        ds = buckets[f]
+        keyed = [(d.line, d.col, i) for i, d in enumerate(ds)]
+        for k in sorted(keyed):
+            out.append(ds[k.2])
+    return out
+
+
+def node_key(n: mib.model.MibNode) -> str:
+    """A unique key of a node (duplicate names in one module are distinct nodes)."""
+    return n.module + "::" + n.name + "@" + str(n.line) + ":" + str(n.col)
+
+
+# --- loading ----------------------------------------------------------------------------------
+
+class Loader(object):
+    """Collects the ASTs of the requested modules and their import closure.
+
+    Drive it with `next()` (the next module name to load, "" when done), `locate()`,
+    `add()` (the parsed file of a located module) and `missing()`. `asts` maps loaded module
+    names to ASTs, `order` is the load order, `home` maps every module name as written in an
+    IMPORTS clause (or requested) to the loaded module's name ("" when not found)."""
+    mp: mib.source.MibPath
+    asts: dict[str, mib.ast.Module]
+    order: list[str]
+    home: dict[str, str]
+    queue: list[str]
+    queued: set[str]
+    builtin: dict[str, bool]
+    diags: list[mib.diag.Diagnostic]
+    parsed: dict[str, list[mib.ast.Module]]
+    requested: list[str]
+
+    def __init__(self, mp: mib.source.MibPath):
+        self.mp = mp
+        self.asts = {}
+        self.order = []
+        self.home = {}
+        self.queue = []
+        self.queued = set()
+        self.builtin = {}
+        self.diags = []
+        self.parsed = {}
+        self.requested = []
+
+    def request(self, name: str) -> None:
+        if name not in self.queued:
+            self.queued.add(name)
+            self.queue.append(name)
+
+    def next_name(self) -> str:
+        if len(self.queue) == 0:
+            return ""
+        return self.queue.pop(0)
+
+    def locate(self, name: str) -> ?mib.source.ModuleEntry:
+        d = mib.diag.Diagnostics("")
+        e = self.mp.find(name, d)
+        return e
+
+    def missing(self, name: str) -> None:
+        self.home[name] = ""
+
+    def add(self, name: str, e: mib.source.ModuleEntry, r: mib.parser.ParseResult) -> None:
+        """Register the module `e.name` from the parse of its file (`name` is the name it was
+        requested as)."""
+        self.home[name] = e.name
+        if e.name in self.asts:
+            return
+        if e.path not in self.parsed:
+            self.parsed[e.path] = r.modules
+            self.diags.extend(r.diags)
+        found: ?mib.ast.Module = None
+        for m in self.parsed[e.path]:
+            if m.name == e.name:
+                found = m
+                break
+        if found is not None:
+            if found.sha256 == "":
+                found.sha256 = e.sha256
+            self.asts[e.name] = found
+            self.order.append(e.name)
+            self.builtin[e.name] = e.builtin
+            self.home[e.name] = e.name
+            for imp in found.import_modules():
+                self.request(imp)
+        else:
+            self.home[name] = ""
+
+    def need_parse(self, e: mib.source.ModuleEntry) -> bool:
+        return e.path not in self.parsed
+
+    def cached(self, e: mib.source.ModuleEntry) -> mib.parser.ParseResult:
+        return mib.parser.ParseResult(e.path, self.parsed[e.path], [])
+
+
+def new_loader(mp: mib.source.MibPath, names: list[str]) -> Loader:
+    ld = Loader(mp)
+    for b in BASE_ORDER:
+        ld.request(b)
+    for n in names:
+        ld.request(n)
+        ld.requested.append(n)
+    return ld
+
+
+def resolve_texts(texts: list[str], names: list[str] = [], mp: ?mib.source.MibPath = None) -> mib.model.MibSet:
+    """Parse and resolve in-memory module texts. `names` selects the modules to resolve (with
+    their imports); by default every module in the texts. `mp` adds a search path whose
+    in-memory files (`add_file`) are used as well."""
+    p = mp if mp is not None else mib.source.MibPath([], True, False)
+    files: dict[str, bytes] = {}
+    want: list[str] = []
+    for i, t in enumerate(texts):
+        path = "text" + str(i + 1) + ".mib"
+        data = t.encode()
+        files[path] = data
+        for e in p.add_file(path, data, 0):
+            want.append(e.name)
+    ld = new_loader(p, names if len(names) > 0 else want)
+    while True:
+        nm = ld.next_name()
+        if nm == "":
+            break
+        e = ld.locate(nm)
+        if e is not None:
+            if ld.need_parse(e):
+                data = b""
+                if e.builtin:
+                    data = mib.source.base_module_bytes(e.name)
+                else:
+                    data = files.get_def(e.path, b"")
+                ld.add(nm, e, mib.parser.parse_bytes(data, e.path, False, 6, True))
+            else:
+                ld.add(nm, e, ld.cached(e))
+        else:
+            ld.missing(nm)
+    return resolve_loaded(ld)
+
+
+proc def resolve_path(fcap: file.FileCap, mp: mib.source.MibPath, names: list[str]) -> mib.model.MibSet:
+    """Resolve the modules `names` (and their imports) over an indexed search path."""
+    ld = new_loader(mp, names)
+    while True:
+        nm = ld.next_name()
+        if nm == "":
+            break
+        e = ld.locate(nm)
+        if e is not None:
+            if ld.need_parse(e):
+                ld.add(nm, e, mib.parser.parse_entry(fcap, e))
+            else:
+                ld.add(nm, e, ld.cached(e))
+        else:
+            ld.missing(nm)
+    return resolve_loaded(ld)
+
+
+def resolve_loaded(ld: Loader) -> mib.model.MibSet:
+    r = Resolver(ld)
+    r.run()
+    return r.ms
+
+
+# --- the resolver -----------------------------------------------------------------------------
+
+class Resolver(object):
+    ms: mib.model.MibSet
+    ld: Loader
+    defs: dict[str, dict[str, mib.ast.Def]]
+    raw_imports: dict[str, dict[str, (str, int, int)]]
+    imp_memo: dict[str, dict[str, (str, str)]]
+    diags: list[mib.diag.Diagnostic]
+    reported: set[str]
+    oid_state: dict[str, int]
+    type_state: dict[str, int]
+    rows_by_oid: dict[str, mib.model.MibNode]
+    index_state: dict[str, int]
+    label_hints: list[(str, str, list[int], int, int)]
+    hint_keys: set[str]
+    columns: dict[str, list[mib.model.MibNode]]
+    tables_by_oid: dict[str, mib.model.MibNode]
+
+    def __init__(self, ld: Loader):
+        self.ms = mib.model.MibSet()
+        self.ld = ld
+        self.defs = {}
+        self.raw_imports = {}
+        self.imp_memo = {}
+        self.diags = []
+        self.reported = set()
+        self.oid_state = {}
+        self.type_state = {}
+        self.rows_by_oid = {}
+        self.index_state = {}
+        self.label_hints = []
+        self.hint_keys = set()
+        self.columns = {}
+        self.tables_by_oid = {}
+
+    # --- diagnostics ---
+
+    def rep(self, mod: str, code: str, line: int, col: int, msg: str) -> None:
+        lv = level_of(code)
+        fl = ""
+        m = self.ms.modules.get(mod)
+        if m is not None:
+            fl = m.file
+        self.diags.append(mib.diag.Diagnostic(lv, code, mod, fl, line, col, msg))
+
+    def rep_once(self, key: str, mod: str, code: str, line: int, col: int, msg: str) -> None:
+        k = mod + "|" + code + "|" + key
+        if k not in self.reported:
+            self.reported.add(k)
+            self.rep(mod, code, line, col, msg)
+
+    # --- driver ---
+
+    def run(self) -> None:
+        ms = self.ms
+        for nm in self.ld.order:
+            a = self.ld.asts[nm]
+            m = mib.model.MibModule(a, self.ld.builtin.get_def(nm, False))
+            ms.modules[nm] = m
+            ms.order.append(nm)
+        for nm in self.ld.requested:
+            if self.ld.home.get_def(nm, "") == "":
+                ms.not_found.append(nm)
+        for nm in ms.order:
+            self.collect(ms.modules[nm])
+        for nm in ms.order:
+            self.check_imports(ms.modules[nm])
+        for nm in ms.order:
+            m = ms.modules[nm]
+            for t in m.types:
+                self.guard_type(t)
+        for nm in ms.order:
+            m = ms.modules[nm]
+            for n in m.nodes:
+                self.guard_oid(n)
+        self.implicit_nodes()
+        for nm in ms.order:
+            m = ms.modules[nm]
+            for n in m.nodes:
+                self.guard_details(n)
+        # columns: children of rows
+        for nm in ms.order:
+            for n in ms.modules[nm].nodes:
+                if n.kind == "row" and n.linked:
+                    k = mib.model.oid_str(n.oid)
+                    if k not in self.rows_by_oid:
+                        self.rows_by_oid[k] = n
+        for nm in ms.order:
+            for n in ms.modules[nm].nodes:
+                if n.kind == "scalar" and n.linked and len(n.oid) > 1:
+                    pk = mib.model.oid_str(n.oid[:-1])
+                    if pk in self.rows_by_oid:
+                        n.kind = "column"
+                        cl = self.columns.get(pk)
+                        if cl is not None:
+                            cl.append(n)
+                        else:
+                            self.columns[pk] = [n]
+                elif n.kind == "table" and n.linked:
+                    self.tables_by_oid[mib.model.oid_str(n.oid)] = n
+        for nm in ms.order:
+            for n in ms.modules[nm].nodes:
+                if n.kind == "row":
+                    self.guard_index(n)
+        self.sparse()
+        for nm in ms.order:
+            for n in ms.modules[nm].nodes:
+                self.guard_members(n)
+        for nm in ms.order:
+            if not ms.modules[nm].builtin:
+                for n in ms.modules[nm].nodes:
+                    self.guard_lint(n)
+        self.build_tree()
+        self.defval_oid_names()
+        # pass the loader's parse diagnostics on, then ours, all ordered
+        ms.diags = order_diags(self.ld.diags, self.diags)
+
+    # --- symbol tables ---
+
+    def collect(self, m: mib.model.MibModule) -> None:
+        a = m.amod
+        table: dict[str, mib.ast.Def] = {}
+        self.defs[m.name] = table
+        raw: dict[str, (str, int, int)] = {}
+        for g in a.imports:
+            hm = self.ld.home.get_def(g.module, "")
+            for s in g.symbols:
+                if s.name not in raw:
+                    raw[s.name] = (g.module if hm == "" else hm, g.line, g.col)
+        self.raw_imports[m.name] = raw
+        self.imp_memo[m.name] = {}
+        for d in a.defs:
+            if d.name == "":
+                continue
+            if d.name in table:
+                prev = table[d.name]
+                po = prev.oid
+                do = d.oid
+                if po is not None and do is not None and po.dump() != do.dump():
+                    self.rep(m.name, "resolve.redefined-oid", d.line, d.col,
+                             d.name + " is already defined at line " + str(prev.line) + " with another OID; this definition is kept at its OID but the name refers to the first")
+                    self.make(m, d, False)
+                elif isinstance(prev, mib.ast.ValueAssignment) and d.is_registration() and po is not None and do is not None:
+                    # `x OBJECT IDENTIFIER ::= { p 1 }` followed by `x OBJECT-TYPE ... ::= { p 1 }`
+                    # (declare, then define): the registration carries the information
+                    self.rep(m.name, "resolve.redefined", d.line, d.col,
+                             d.name + " is already assigned the same OID at line " + str(prev.line) + "; this registration replaces the assignment")
+                    table[d.name] = d
+                    m.nodes = [x for x in m.nodes if x.name != d.name]
+                    if d.name in m.node_by_name:
+                        del m.node_by_name[d.name]
+                    self.make(m, d)
+                else:
+                    self.rep(m.name, "resolve.redefined", d.line, d.col,
+                             d.name + " is already defined at line " + str(prev.line) + "; the first definition is kept")
+                continue
+            table[d.name] = d
+            if d.name in raw and not m.builtin:
+                self.rep(m.name, "resolve.import-shadowed", d.line, d.col,
+                         d.name + " is imported from " + raw[d.name].0 + " and defined here; the local definition wins")
+            self.make(m, d)
+        mi = a.module_identity()
+        if mi is not None:
+            m.identity = mi.name
+            lu = mi.last_updated
+            m.last_updated = lu.value if lu is not None else ""
+            og = mi.organization
+            m.organization = og.value if og is not None else ""
+            ci = mi.contact_info
+            m.contact = ci.value if ci is not None else ""
+            ds = mi.description
+            m.description = ds.value if ds is not None else ""
+            rf = mi.reference
+            m.reference = rf.value if rf is not None else ""
+            for rv in mi.revisions:
+                rd = rv.description
+                m.revisions.append(mib.model.Revision(rv.date.value, rd.value if rd is not None else ""))
+
+    def make(self, m: mib.model.MibModule, d: mib.ast.Def, by_name: bool = True) -> None:
+        """Create the model object (node or type) for a definition (`by_name` False: a later
+        duplicate, kept in the node list and the OID tree only)."""
+        kind = ""
+        tkind = ""
+        if isinstance(d, mib.ast.TextualConvention):
+            tkind = "tc"
+        elif isinstance(d, mib.ast.TypeAssignment):
+            tkind = "type"
+        elif isinstance(d, mib.ast.SequenceType):
+            tkind = "sequence"
+        elif isinstance(d, mib.ast.ChoiceType):
+            tkind = "choice"
+        elif isinstance(d, mib.ast.MacroDefinition):
+            return
+        elif isinstance(d, mib.ast.ValueAssignment):
+            kind = "node"
+        elif isinstance(d, mib.ast.ModuleIdentity):
+            kind = "module-identity"
+        elif isinstance(d, mib.ast.ObjectIdentity):
+            kind = "object-identity"
+        elif isinstance(d, mib.ast.ObjectType):
+            kind = "scalar"
+        elif isinstance(d, mib.ast.NotificationType):
+            kind = "notification"
+        elif isinstance(d, mib.ast.TrapType):
+            kind = "notification"
+        elif isinstance(d, mib.ast.ObjectGroup):
+            kind = "object-group"
+        elif isinstance(d, mib.ast.NotificationGroup):
+            kind = "notification-group"
+        elif isinstance(d, mib.ast.ModuleCompliance):
+            kind = "compliance"
+        elif isinstance(d, mib.ast.AgentCapabilities):
+            kind = "capabilities"
+        elif isinstance(d, mib.ast.UnknownMacro):
+            kind = "node"
+        else:
+            return
+        ds = d.description
+        rf = d.reference
+        if tkind != "":
+            if not by_name:
+                return
+            t = mib.model.MibType(d.name, m.name, tkind, d, m.file)
+            t.description = ds.value if ds is not None else ""
+            t.reference = rf.value if rf is not None else ""
+            m.types.append(t)
+            m.type_by_name[d.name] = t
+            return
+        n = mib.model.MibNode(d.name, m.name, kind, d, m.file)
+        n.description = ds.value if ds is not None else ""
+        n.reference = rf.value if rf is not None else ""
+        m.nodes.append(n)
+        if by_name:
+            m.node_by_name[d.name] = n
+
+    # --- imports ---
+
+    def check_imports(self, m: mib.model.MibModule) -> None:
+        a = m.amod
+        seen: set[str] = set()
+        reported_missing: set[str] = set()
+        for g in a.imports:
+            hm = self.ld.home.get_def(g.module, "")
+            if hm == "" and g.module not in OBSOLETE_MIB2 and g.module not in reported_missing:
+                reported_missing.add(g.module)
+                self.rep(m.name, "source.not-found", g.line, g.col,
+                         "module " + g.module + " is not found; the symbols imported from it are unresolved")
+            for s in g.symbols:
+                if s.name in seen:
+                    continue
+                seen.add(s.name)
+                r = self.imported(m.name, s.name, s.line, s.col, True)
+                m.imports.append(mib.model.Import(s.name, g.module, r.0))
+
+    def imported(self, mod: str, name: str, line: int, col: int, report: bool) -> (str, str):
+        """Where the symbol `name` imported by `mod` is defined: (module, name), ("", "") when
+        unresolved or not imported."""
+        memo = self.imp_memo[mod]
+        got = memo.get(name)
+        if got is not None:
+            return got
+        raw = self.raw_imports[mod].get(name)
+        if raw is not None:
+            res = self._chase(mod, name, raw.0, raw.1, raw.2)
+            memo[name] = res
+            return res
+        return ("", "")
+
+    def _chase(self, mod: str, name: str, frm: str, line: int, col: int) -> (str, str):
+        hm = self.ld.home.get_def(frm, "")
+        if frm in OBSOLETE_MIB2 or hm in OBSOLETE_MIB2:
+            rw = MIB2_REWRITE.get(name)
+            if rw is not None:
+                tgt = self.ld.home.get_def(rw.0, "")
+                if tgt != "" and rw.1 in self.defs.get_def(tgt, {}):
+                    if rw.0 != "RFC1213-MIB" or hm == "":
+                        self.rep(mod, "resolve.import-rewritten", line, col,
+                                 name + " from " + frm + " is read as " + rw.0 + "::" + rw.1)
+                    return (tgt, rw.1)
+        if hm != "":
+            cur = hm
+            depth = 0
+            while depth < 8:
+                depth += 1
+                tbl = self.defs.get(cur)
+                if tbl is not None and name in tbl:
+                    if depth > 1:
+                        self.rep(mod, "resolve.import-indirect", line, col,
+                                 name + " is not defined in " + hm + "; it is taken from " + cur + ", which " + hm + " imports it from")
+                    return (cur, name)
+                nxt = self.raw_imports.get_def(cur, {}).get(name)
+                nfrom = ""
+                if nxt is not None:
+                    nfrom = nxt.0
+                if nfrom == "":
+                    break
+                cur2 = self.ld.home.get_def(nfrom, "")
+                if cur2 == "" or cur2 == cur:
+                    break
+                cur = cur2
+            fb = self.base_fallback(name)
+            if fb != "":
+                self.rep(mod, "resolve.import-not-found", line, col,
+                         name + " is not defined in " + hm + "; resolved in the base module " + fb)
+                return (fb, name)
+            self.rep(mod, "resolve.import-not-found", line, col, name + " is not defined in " + hm)
+            return ("", "")
+        # the module is missing
+        if frm in OBSOLETE_MIB2:
+            for pf in MIB2_PREFIXES:
+                if name.startswith(pf.0):
+                    tgt = self.ld.home.get_def(pf.1, "")
+                    if tgt != "" and name in self.defs.get_def(tgt, {}):
+                        self.rep(mod, "resolve.import-rewritten", line, col,
+                                 name + " from " + frm + " is read as " + tgt + "::" + name)
+                        return (tgt, name)
+            fb = self.base_fallback(name)
+            if fb != "":
+                return (fb, name)
+            self.rep(mod, "resolve.unresolved", line, col, name + " from " + frm + " cannot be resolved (" + frm + " is not loaded)")
+            return ("", "")
+        fb = self.base_fallback(name)
+        if fb != "":
+            return (fb, name)
+        return ("", "")
+
+    def base_fallback(self, name: str) -> str:
+        for b in BASE_ORDER:
+            tbl = self.defs.get(b)
+            if tbl is not None and name in tbl:
+                return b
+        return ""
+
+    def lookup(self, mod: str, qual: str, name: str, line: int, col: int) -> (str, str):
+        """Resolve a symbol reference made in `mod`: (module, name) of its definition, or
+        ("", "") when unresolved (not reported here)."""
+        if qual != "":
+            q = self.ld.home.get_def(qual, "")
+            if q != "" and name in self.defs.get_def(q, {}):
+                return (q, name)
+        tbl = self.defs.get(mod)
+        if tbl is not None and name in tbl:
+            return (mod, name)
+        if name in self.raw_imports.get_def(mod, {}):
+            r = self.imported(mod, name, line, col, False)
+            if r.0 != "":
+                return r
+            return ("", "")
+        fb = self.base_fallback(name)
+        if fb != "":
+            m = self.ms.modules.get(mod)
+            if m is not None and not m.builtin:
+                self.rep_once(name, mod, "resolve.not-imported", line, col, name + " is used without being imported; it is taken from " + fb)
+            return (fb, name)
+        return ("", "")
+
+    # --- types ---
+
+    def guard_type(self, t: mib.model.MibType) -> None:
+        try:
+            self.resolve_type(t)
+        except Exception as e:
+            self.rep(t.module, "resolve.internal", t.line, t.col, "while resolving type " + t.name + ": " + str(e))
+
+    def resolve_type(self, t: mib.model.MibType) -> None:
+        key = t.module + "::" + t.name
+        st = self.type_state.get_def(key, 0)
+        if st == 2:
+            return
+        if st == 1:
+            self.rep(t.module, "resolve.type-cycle", t.line, t.col, "type " + t.name + " is defined in terms of itself")
+            t.syntax = mib.model.Syntax()
+            t.syntax.unresolved = t.name
+            return
+        self.type_state[key] = 1
+        d = t.defn
+        syn: ?mib.ast.Syntax = None
+        hint = ""
+        if isinstance(d, mib.ast.TextualConvention):
+            syn = d.syntax
+            h = d.display_hint
+            if h is not None:
+                hint = h.value.strip()
+            st0 = d.status
+            if st0 is not None:
+                t.status_raw = st0.name
+                t.status = self.norm_status(t.module, st0.name, st0.line, st0.col, "")
+        elif isinstance(d, mib.ast.TypeAssignment):
+            syn = d.syntax
+        elif isinstance(d, mib.ast.SequenceType):
+            s = mib.model.Syntax()
+            s.base = "SEQUENCE"
+            s.row_type = t.name
+            t.syntax = s
+            t.items = [(it.name, it.syntax.dump()) for it in d.items]
+        elif isinstance(d, mib.ast.ChoiceType):
+            s = mib.model.Syntax()
+            s.base = "CHOICE"
+            t.syntax = s
+        if syn is not None:
+            s2 = self.resolve_syntax(t.module, syn, t.name)
+            if len(s2.chain) > 0:
+                t.parent = s2.chain[0]
+                if t.kind == "tc" and s2.tc_name != "":
+                    pt = self.find_type(s2.tc_module, s2.tc_name)
+                    if pt is not None and pt.kind == "tc":
+                        self.rep(t.module, "resolve.tc-nested", t.line, t.col,
+                                 "the TC " + t.name + " refines the TC " + s2.tc())
+            t.display_hint = hint
+            if hint != "":
+                if hint_ok(hint, s2.base) and not (s2.base == "INTEGER" and len(s2.enums) > 0):
+                    s2.hint = hint
+                else:
+                    self.rep(t.module, "resolve.hint-invalid", t.line, t.col,
+                             "DISPLAY-HINT \"" + hint + "\" does not fit " + (s2.base if s2.base != "" else "the type") + "; it is dropped")
+            t.syntax = s2
+        self.type_state[key] = 2
+
+    def is_plain_type(self, mod: str, name: str) -> bool:
+        t = self.find_type(mod, name)
+        if t is not None:
+            return t.kind == "type"
+        return False
+
+    def find_type(self, mod: str, name: str) -> ?mib.model.MibType:
+        m = self.ms.modules.get(mod)
+        if m is not None:
+            return m.type_by_name.get(name)
+        return None
+
+    def resolve_syntax(self, mod: str, syn: mib.ast.Syntax, owner: str) -> mib.model.Syntax:
+        s = mib.model.Syntax()
+        k = syn.kind
+        tg = syn.tag
+        app = ""
+        if tg is not None and tg.cls == "APPLICATION":
+            app = APP_TAGS.get_def(tg.number, "")
+        if k == mib.ast.SYN_REF:
+            r = self.lookup(mod, syn.module, syn.name, syn.line, syn.col)
+            s.ref_name = syn.name
+            s.ref_module = r.0
+            if r.0 != "" and r.0 in BASE_TYPE_MODULES and r.1 in BASE_TYPES:
+                s.base = BASE_TYPES[r.1]
+                s.base_name = r.1
+                s.netaddr = (r.1 == "NetworkAddress")
+            elif r.0 != "" and r.1 in BASE_TYPES and self.is_plain_type(r.0, r.1):
+                # a vendor re-definition of a base type name (`Unsigned32 ::= Gauge`,
+                # `Counter32 ::= Counter`): the name means the base type, as in pysmi and net-snmp
+                s.base = BASE_TYPES[r.1]
+                s.base_name = r.1
+                s.netaddr = (r.1 == "NetworkAddress")
+            elif r.0 != "":
+                t = self.find_type(r.0, r.1)
+                if t is not None:
+                    self.resolve_type(t)
+                    ts = t.syntax
+                    s.base = ts.base
+                    s.base_name = ts.base_name
+                    s.netaddr = ts.netaddr
+                    s.unresolved = ts.unresolved
+                    if t.kind == "sequence":
+                        s.row_type = t.name
+                        s.base = "SEQUENCE"
+                    else:
+                        s.tc_name = t.name
+                        s.tc_module = t.module
+                        s.chain = [mib.model.qual_name(t.module, t.name)] + ts.chain
+                        s.ranges = ts.ranges
+                        s.sizes = ts.sizes
+                        s.enums = ts.enums
+                        s.bits = ts.bits
+                        s.hint = ts.hint
+                        s.row_type = ts.row_type
+                else:
+                    self.rep(mod, "resolve.not-a-type", syn.line, syn.col, syn.name + " is not a type")
+                    s.unresolved = syn.name
+            elif syn.name in BASE_TYPES:
+                s.base = BASE_TYPES[syn.name]
+                s.base_name = syn.name
+                s.netaddr = (syn.name == "NetworkAddress")
+                self.rep_once(syn.name, mod, "resolve.not-imported", syn.line, syn.col,
+                              syn.name + " is used without being imported; it is read as the base type")
+            else:
+                cand = ""
+                up = syn.name.upper()
+                for bk in BASE_TYPES.keys():
+                    if bk.upper() == up:
+                        cand = bk
+                if cand != "":
+                    self.rep_once("type " + syn.name, mod, "resolve.type-name-case", syn.line, syn.col,
+                                  "unknown type " + syn.name + " is read as the base type " + cand)
+                    s.base = BASE_TYPES[cand]
+                    s.base_name = cand
+                    s.netaddr = (cand == "NetworkAddress")
+                else:
+                    self.rep_once("type " + syn.name, mod, "resolve.type-unknown", syn.line, syn.col,
+                                  "unknown type " + syn.name + (" (in " + owner + ")" if owner != "" else ""))
+                    s.unresolved = syn.name
+        elif k == mib.ast.SYN_INTEGER:
+            s.base = "INTEGER"
+            s.base_name = "INTEGER"
+        elif k == mib.ast.SYN_OCTET_STRING:
+            s.base = "OCTET STRING"
+            s.base_name = "OCTET STRING"
+        elif k == mib.ast.SYN_OBJECT_IDENTIFIER:
+            s.base = "OBJECT IDENTIFIER"
+            s.base_name = "OBJECT IDENTIFIER"
+        elif k == mib.ast.SYN_BITS:
+            s.base = "BITS"
+            s.base_name = "BITS"
+        elif k == mib.ast.SYN_NULL:
+            s.base = "NULL"
+            s.base_name = "NULL"
+        elif k == mib.ast.SYN_CHOICE:
+            s.base = "CHOICE"
+        elif k == mib.ast.SYN_SEQUENCE:
+            s.base = "SEQUENCE"
+        elif k == mib.ast.SYN_SEQUENCE_OF:
+            s.base = "SEQUENCE OF"
+            s.row_type = syn.name
+        if app != "":
+            s.base = app
+            s.base_name = app
+        self.refine(mod, s, syn, app != "")
+        return s
+
+    def range_items(self, mod: str, c: mib.ast.Constraint, base: str, size: bool) -> list[mib.model.Range]:
+        lim = (bigint(0), bigint(65535)) if size else base_limits(base)
+        out: list[mib.model.Range] = []
+        for it in c.ranges:
+            lo = self.bound(it.lo, lim)
+            hv = it.hi
+            hi = lo
+            if hv is not None:
+                hi = self.bound(hv, lim)
+            if lo is not None and hi is not None:
+                if lo > hi:
+                    self.rep(mod, "resolve.range-swapped", c.line, c.col,
+                             "range " + str(lo) + ".." + str(hi) + " has its bounds exchanged; read as " + str(hi) + ".." + str(lo))
+                    out.append(mib.model.Range(hi, lo))
+                else:
+                    out.append(mib.model.Range(lo, hi))
+            else:
+                self.rep(mod, "resolve.range-symbolic", c.line, c.col, "range item " + it.dump() + " is not numeric; it is dropped")
+        return out
+
+    def bound(self, v: mib.ast.Value, lim: (bigint, bigint)) -> ?bigint:
+        if v.is_number():
+            return v.big_value()
+        if v.kind == mib.ast.VAL_NAME:
+            if v.text == "MIN" and lim.0 <= lim.1:
+                return lim.0
+            if v.text == "MAX" and lim.0 <= lim.1:
+                return lim.1
+        return None
+
+    def refine(self, mod: str, s: mib.model.Syntax, syn: mib.ast.Syntax, tagged: bool) -> None:
+        """Apply the constraint and named numbers written at this level (a tagged base-type
+        definition such as `[APPLICATION 1] IMPLICIT INTEGER (0..4294967295)` defines the
+        limits and is never an illegal subtype)."""
+        c = syn.constraint
+        if c is not None and s.unresolved == "":
+            size = (c.kind == mib.ast.CON_SIZE)
+            if size and s.base in INT_BASES:
+                self.rep(mod, "resolve.range-kind", c.line, c.col, "SIZE on the integer type " + s.base + " is read as a range")
+                size = False
+            elif not size and (s.base in STRING_BASES or s.base == "BITS"):
+                self.rep(mod, "resolve.range-kind", c.line, c.col, "a range on the string type " + s.base + " is read as SIZE")
+                size = True
+            items = self.range_items(mod, c, s.base, size)
+            if size:
+                if s.base not in STRING_BASES and s.base != "" and not tagged:
+                    self.rep(mod, "resolve.range-illegal", c.line, c.col, "SIZE on " + s.base + " is not allowed (kept)")
+                s.own_sizes = items
+                s.sizes = self.compose(mod, s.sizes, items, c)
+            else:
+                if tagged:
+                    pass
+                elif s.base == "Counter32" or s.base == "Counter64" or s.base == "TimeTicks" or s.base == "IpAddress" or s.base == "OBJECT IDENTIFIER":
+                    self.rep(mod, "resolve.range-illegal", c.line, c.col, "a range on " + s.base + " is not allowed (kept)")
+                elif s.base in INT_BASES:
+                    lim = base_limits(s.base)
+                    for r in items:
+                        if r.lo < lim.0 or r.hi > lim.1:
+                            self.rep(mod, "resolve.range-bounds", c.line, c.col,
+                                     "range " + r.dump() + " lies outside " + s.base + " (" + str(lim.0) + ".." + str(lim.1) + ")")
+                            break
+                s.own_ranges = items
+                s.ranges = self.compose(mod, s.ranges, items, c)
+        if syn.has_named and s.unresolved == "":
+            bits = (s.base == "BITS")
+            lst = self.named(mod, syn, bits)
+            s.own_named = lst
+            s.has_own_named = True
+            parent = s.bits if bits else s.enums
+            if len(parent) > 0 and not _named_subset(lst, parent):
+                self.rep(mod, "resolve.enum-not-subset", syn.line, syn.col,
+                         ("BITS" if bits else "enumeration") + " refinement is not a subset of the parent type's list")
+            if bits:
+                s.bits = lst
+            else:
+                s.enums = lst
+
+    def compose(self, mod: str, parent: list[mib.model.Range], own: list[mib.model.Range], c: mib.ast.Constraint) -> list[mib.model.Range]:
+        if len(parent) == 0 or len(own) == 0:
+            return own if len(own) > 0 else parent
+        if _subset(own, parent):
+            return own
+        x = _intersect(own, parent)
+        self.rep(mod, "resolve.range-widened", c.line, c.col,
+                 "constraint " + mib.model.dump_ranges(own) + " is not a subset of " + mib.model.dump_ranges(parent) + "; the intersection is used")
+        return x
+
+    def named(self, mod: str, syn: mib.ast.Syntax, bits: bool) -> list[mib.model.NamedValue]:
+        out: list[mib.model.NamedValue] = []
+        labels: set[str] = set()
+        values: set[int] = set()
+        v1 = self.is_v1(mod)
+        for nn in syn.named:
+            iv = nn.value.int_value()
+            v: int = iv if iv is not None else 0
+            if iv is None:
+                continue
+            if nn.label in labels:
+                self.rep(mod, "resolve.enum-duplicate-label", nn.line, nn.col, "label " + nn.label + " is used twice; the first is kept")
+                continue
+            if bits and v < 0:
+                self.rep(mod, "resolve.bits-negative", nn.line, nn.col, "bit " + nn.label + "(" + str(v) + ") has a negative position; it is dropped")
+                continue
+            if v in values:
+                self.rep(mod, "resolve.enum-duplicate-value", nn.line, nn.col, "value " + str(v) + " of " + nn.label + " is used twice; both labels are kept")
+            if not bits and (v < -2147483648 or v > 2147483647):
+                self.rep(mod, "resolve.enum-range", nn.line, nn.col, "value " + str(v) + " of " + nn.label + " is outside Integer32 (kept)")
+            if not bits and v == 0 and v1:
+                self.rep(mod, "resolve.enum-zero", nn.line, nn.col, "SMIv1 enumeration value 0 (" + nn.label + ")")
+            labels.add(nn.label)
+            values.add(v)
+            out.append(mib.model.NamedValue(nn.label, v))
+        return out
+
+    # --- OIDs ---
+
+    def guard_oid(self, n: mib.model.MibNode) -> None:
+        try:
+            self.node_oid(n)
+        except Exception as e:
+            self.rep(n.module, "resolve.internal", n.line, n.col, "while resolving the OID of " + n.name + ": " + str(e))
+
+    def node_oid(self, n: mib.model.MibNode) -> bool:
+        """Resolve the OID of `n` (memoized). True when it is linked."""
+        key = node_key(n)
+        st = self.oid_state.get_def(key, 0)
+        if st == 2:
+            return n.linked
+        if st == 1:
+            self.rep(n.module, "resolve.oid-cycle", n.line, n.col, "the OID of " + n.name + " refers to itself")
+            return False
+        self.oid_state[key] = 1
+        d = n.defn
+        res: ?list[int] = None
+        if isinstance(d, mib.ast.TrapType):
+            n.trap_number = d.number
+            ent = d.enterprise
+            if ent is not None:
+                if len(ent.components) > 0:
+                    c0 = ent.components[0]
+                    n.enterprise = c0.name
+                e = self.oid_value(n, ent)
+                if e is not None:
+                    if e == [1, 3, 6, 1, 2, 1, 11] and d.number >= 0 and d.number <= 5:
+                        res = [1, 3, 6, 1, 6, 3, 1, 1, 5, d.number + 1]
+                    elif d.number >= 0:
+                        res = e + [0, d.number]
+            else:
+                self.rep(n.module, "resolve.oid-missing", n.line, n.col, "TRAP-TYPE " + n.name + " has no ENTERPRISE")
+        else:
+            ov = d.oid
+            if ov is not None:
+                res = self.oid_value(n, ov)
+            else:
+                self.rep(n.module, "resolve.oid-missing", n.line, n.col, n.name + " has no OID value")
+        if res is not None:
+            if len(res) > MAX_OID_LEN:
+                self.rep(n.module, "resolve.oid-too-long", n.line, n.col, "the OID of " + n.name + " has more than 128 sub-identifiers")
+            else:
+                n.oid = res
+                n.linked = True
+                if n.kind != "node" and len(res) > 0 and res[-1] == 0 and n.kind != "module-identity":
+                    m = self.ms.modules.get(n.module)
+                    if m is not None and not m.builtin:
+                        self.rep(n.module, "resolve.last-subid-zero", n.line, n.col, "the last sub-identifier of " + n.name + " is 0")
+        if not n.linked:
+            self.ms.unlinked.append(n)
+        self.oid_state[key] = 2
+        return n.linked
+
+    def symbol_oid(self, n: mib.model.MibNode, qual: str, name: str, line: int, col: int) -> (int, list[int]):
+        """The OID of a name used in an OID value of `n`: (0, oid) when resolved, (1, []) when
+        the symbol is undefined, (2, []) when it is defined but unlinked (or not an OID)."""
+        r = self.lookup(n.module, qual, name, line, col)
+        if r.0 == "":
+            if name in ROOTS:
+                return (0, [ROOTS[name]])
+            return (1, [])
+        m = self.ms.modules.get(r.0)
+        if m is not None:
+            t = m.node_by_name.get(r.1)
+            if t is not None:
+                if self.node_oid(t):
+                    return (0, t.oid)
+                return (2, [])
+        if name in ROOTS:
+            return (0, [ROOTS[name]])
+        return (1, [])
+
+    def oid_value(self, n: mib.model.MibNode, ov: mib.ast.OidValue) -> ?list[int]:
+        comps = ov.components
+        if len(comps) == 0:
+            self.rep(n.module, "resolve.oid-missing", ov.line, ov.col, "empty OID value for " + n.name)
+            return None
+        out: list[int] = []
+        for i, c in enumerate(comps):
+            if c.number == mib.ast.OID_TOO_BIG:
+                return None
+            if c.number > 4294967295:
+                self.rep(n.module, "resolve.oid-subid-range", c.line, c.col,
+                         "sub-identifier " + str(c.number) + " in the OID of " + n.name + " is larger than 4294967295; the declaration is dropped")
+                return None
+            if i == 0:
+                if c.number >= 0:
+                    if c.name == "" and c.number > 2:
+                        self.rep(n.module, "resolve.oid-first-arc", c.line, c.col, "the first arc " + str(c.number) + " is not 0, 1 or 2")
+                    out.append(c.number)
+                else:
+                    r = self.symbol_oid(n, c.module, c.name, c.line, c.col)
+                    if r.0 == 1:
+                        self.rep(n.module, "resolve.oid-undefined", c.line, c.col,
+                                 "unknown OID parent " + c.name + " of " + n.name + "; the declaration is unlinked")
+                        return None
+                    if r.0 == 2:
+                        return None
+                    out.extend(r.1)
+            else:
+                if c.number >= 0:
+                    out.append(c.number)
+                    if c.name != "" and c.module == "":
+                        hk = n.module + "|" + c.name + "|" + mib.model.oid_str(out)
+                        if hk not in self.hint_keys:
+                            self.hint_keys.add(hk)
+                            self.label_hints.append((n.module, c.name, list(out), c.line, c.col))
+                else:
+                    r = self.symbol_oid(n, c.module, c.name, c.line, c.col)
+                    if r.0 == 0 and len(r.1) == len(out) + 1 and r.1[:len(out)] == out:
+                        self.rep(n.module, "resolve.oid-not-prefix", c.line, c.col,
+                                 "the bare name " + c.name + " is not the first component of the OID of " + n.name + " (it is read as its last arc)")
+                        out.append(r.1[-1])
+                    else:
+                        self.rep(n.module, "resolve.oid-not-prefix", c.line, c.col,
+                                 "the bare name " + c.name + " is not the first component of the OID of " + n.name + "; the declaration is dropped")
+                        return None
+        return out
+
+    def implicit_nodes(self) -> None:
+        """`name(n)` components after the first one label their arc (net-snmp and libsmi
+        create the node): an implicit `node` in the module that writes
+        it, unless the module defines the name itself."""
+        for h in self.label_hints:
+            m = self.ms.modules.get(h.0)
+            if m is not None and h.1 not in m.node_by_name and h.1 not in self.defs.get_def(h.0, {}) and h.1 not in ROOTS:
+                d = mib.ast.ValueAssignment(h.1, h.3, h.4)
+                n = mib.model.MibNode(h.1, h.0, "node", d, m.file)
+                n.macro = "implicit"
+                n.oid = h.2
+                n.linked = True
+                self.oid_state[node_key(n)] = 2
+                m.nodes.append(n)
+                m.node_by_name[h.1] = n
+                if not m.builtin:
+                    self.rep(h.0, "resolve.implicit-node", h.3, h.4, "the label " + h.1 + " creates the node " + mib.model.oid_str(h.2))
+
+    # --- per-node details ---
+
+    def guard_details(self, n: mib.model.MibNode) -> None:
+        try:
+            self.details(n)
+        except Exception as e:
+            self.rep(n.module, "resolve.internal", n.line, n.col, "while resolving " + n.name + ": " + str(e))
+
+    def details(self, n: mib.model.MibNode) -> None:
+        d = n.defn
+        st = d.status
+        style = ""
+        if isinstance(d, mib.ast.ObjectType):
+            style = d.access_kw
+        if st is not None:
+            n.status_raw = st.name
+            n.status = self.norm_status(n.module, st.name, st.line, st.col, style)
+        if isinstance(d, mib.ast.ObjectType):
+            u = d.units
+            n.units = u.value if u is not None else ""
+            acc = d.access
+            if acc is not None:
+                n.access_raw = acc.name
+                n.access = self.norm_access(n.module, acc.name, acc.line, acc.col, d.access_kw)
+            syn = d.syntax
+            if syn is not None:
+                s = self.resolve_syntax(n.module, syn, n.name)
+                n.syntax = s
+                if s.base == "SEQUENCE OF":
+                    n.kind = "table"
+                elif s.base == "SEQUENCE" and syn.kind == mib.ast.SYN_REF:
+                    n.kind = "row"
+                elif s.unresolved != "" and (d.has_index or len(d.augments) > 0):
+                    n.kind = "row"
+                elif s.base == "SEQUENCE":
+                    n.kind = "scalar"
+            elif d.has_index or len(d.augments) > 0:
+                n.kind = "row"
+            if n.kind == "row" and n.linked and len(n.oid) > 0 and n.oid[-1] != 1:
+                self.rep(n.module, "resolve.row-subid", n.line, n.col, "the row " + n.name + " has sub-identifier " + str(n.oid[-1]) + ", not 1")
+            dv = d.defval
+            sx = n.syntax
+            if dv is not None and sx is not None:
+                n.defval = self.defval(n, sx, dv)
+
+    def is_v1(self, mod: str) -> bool:
+        m = self.ms.modules.get(mod)
+        if m is not None:
+            return m.smi == "v1"
+        return False
+
+    def is_builtin(self, mod: str) -> bool:
+        m = self.ms.modules.get(mod)
+        if m is not None:
+            return m.builtin
+        return False
+
+    def norm_status(self, mod: str, raw: str, line: int, col: int, style: str) -> str:
+        v1 = False
+        if style == "ACCESS":
+            v1 = True
+        elif style == "":
+            v1 = self.is_v1(mod)
+        builtin = self.is_builtin(mod)
+        r = raw
+        if r not in STATUS_ALL:
+            f = fuzzy_value(raw, STATUS_ALL)
+            self.rep(mod, "resolve.status-invalid", line, col,
+                     "unknown STATUS " + raw + ("; read as " + f if f != "" else "; read as current"))
+            r = f if f != "" else "current"
+        if r == "mandatory" or r == "optional":
+            if not v1 and not builtin:
+                self.rep(mod, "resolve.status-smiv1", line, col, "STATUS " + r + " in an SMIv2 construct; read as current")
+            return "current"
+        if r == "current" and v1 and not builtin:
+            self.rep(mod, "resolve.status-smiv2", line, col, "STATUS current in an SMIv1 construct")
+        return r
+
+    def norm_access(self, mod: str, raw: str, line: int, col: int, kw: str) -> str:
+        a = raw
+        if a not in ACCESS_ALL:
+            f = fuzzy_value(raw, ACCESS_ALL)
+            self.rep(mod, "resolve.access-invalid", line, col,
+                     "unknown access value " + raw + ("; read as " + f if f != "" else "; dropped"))
+            a = f
+        if a == "write-only":
+            self.rep(mod, "resolve.access-write-only", line, col, "write-only is read as read-write")
+            return "read-write"
+        if kw == "ACCESS" and (a == "read-create" or a == "accessible-for-notify"):
+            self.rep(mod, "resolve.access-smiv2", line, col, "the SMIv2 value " + a + " in an SMIv1 ACCESS clause")
+        return a
+
+    # --- DEFVAL ---
+
+    def defval(self, n: mib.model.MibNode, s: mib.model.Syntax, dv: mib.ast.DefVal) -> ?mib.model.DefVal:
+        v = dv.value
+        base = s.base
+        mod = n.module
+        bad = "DEFVAL " + dv.text.strip() + " of " + n.name + " does not match its syntax (" + base + "); it is dropped"
+        if v.kind == mib.ast.VAL_NAME and v.text == "NULL" and base != "INTEGER":
+            self.rep(mod, "resolve.defval-null", dv.line, dv.col, "DEFVAL NULL gives no default")
+            return None
+        if base == "INTEGER" and len(s.enums) > 0:
+            lbl = ""
+            if v.kind == mib.ast.VAL_NAME:
+                lbl = v.text
+            elif v.kind == mib.ast.VAL_BRACED and len(v.items) == 1 and v.items[0].kind == mib.ast.VAL_NAME:
+                lbl = v.items[0].text
+                self.rep(mod, "resolve.defval-lenient", dv.line, dv.col, "DEFVAL {{ {{ label }} }} is read as the label")
+            elif v.is_number():
+                iv = v.int_value()
+                for e in s.enums:
+                    if iv is not None and e.value == iv:
+                        lbl = e.label
+                        break
+                if lbl != "":
+                    self.rep(mod, "resolve.defval-enum-number", dv.line, dv.col, "DEFVAL " + v.dump() + " is read as the label " + lbl)
+            for e in s.enums:
+                if e.label == lbl:
+                    return mib.model.DefVal(dv.text, "enum", lbl, lbl)
+            self.rep(mod, "resolve.defval-invalid", dv.line, dv.col, bad)
+            return None
+        if base in INT_BASES:
+            bv: ?bigint = None
+            if v.is_number():
+                bv = v.big_value()
+            elif v.kind == mib.ast.VAL_STRING:
+                t = v.text.strip()
+                ok = len(t) > 0
+                for i, ch in enumerate(t):
+                    if not (_is_digit(ch) or (i == 0 and ch == "-" and len(t) > 1)):
+                        ok = False
+                if ok:
+                    bv = bigint(t)
+                    self.rep(mod, "resolve.defval-quoted-number", dv.line, dv.col, "the quoted number " + v.dump() + " is read as a number")
+            if bv is not None:
+                if base == "Counter32" or base == "Counter64":
+                    self.rep(mod, "resolve.defval-counter", dv.line, dv.col, "DEFVAL on the counter " + n.name)
+                if len(s.ranges) > 0:
+                    inr = False
+                    for r in s.ranges:
+                        if r.lo <= bv and bv <= r.hi:
+                            inr = True
+                    if not inr:
+                        self.rep(mod, "resolve.defval-invalid", dv.line, dv.col, "DEFVAL " + str(bv) + " of " + n.name + " is outside its range; it is dropped")
+                        return None
+                return mib.model.DefVal(dv.text, "int", str(bv), str(bv))
+            self.rep(mod, "resolve.defval-invalid", dv.line, dv.col, bad)
+            return None
+        if base == "OCTET STRING" or base == "Opaque":
+            if v.kind == mib.ast.VAL_STRING:
+                return mib.model.DefVal(dv.text, "string", v.text, v.text)
+            if v.kind == mib.ast.VAL_HEX:
+                return mib.model.DefVal(dv.text, "octets", v.text.lower(), "'" + v.text + "'H" if v.text != "" else "")
+            if v.kind == mib.ast.VAL_BIN:
+                bb = v.big_value()
+                hx = ""
+                if bb is not None:
+                    nbytes = (len(v.text) + 7) // 8
+                    for i in range(nbytes):
+                        sh = 8 * (nbytes - 1 - i)
+                        byte = int((bb >> sh) & bigint(255))
+                        hx += "%02x" % byte
+                return mib.model.DefVal(dv.text, "octets", hx, "'" + hx + "'H" if hx != "" else "")
+            self.rep(mod, "resolve.defval-invalid", dv.line, dv.col, bad)
+            return None
+        if base == "IpAddress":
+            if v.kind == mib.ast.VAL_HEX and len(v.text) == 8:
+                parts = [str(int(v.text[i:i + 2], 16)) for i in range(0, 8, 2)]
+                return mib.model.DefVal(dv.text, "ip", ".".join(parts), "'" + v.text + "'H")
+            if v.kind == mib.ast.VAL_STRING:
+                ps = v.text.strip().split(".")
+                ok = len(ps) == 4
+                for p in ps:
+                    if len(p) == 0 or len(p) > 3:
+                        ok = False
+                    else:
+                        for ch in p:
+                            if not _is_digit(ch):
+                                ok = False
+                if ok:
+                    hx = ""
+                    for p in ps:
+                        hx += "%02x" % (int(p) & 255)
+                    self.rep(mod, "resolve.defval-lenient", dv.line, dv.col, "the quoted address " + v.dump() + " is read as an IpAddress")
+                    return mib.model.DefVal(dv.text, "ip", v.text.strip(), "'" + hx + "'H")
+            self.rep(mod, "resolve.defval-invalid", dv.line, dv.col, bad)
+            return None
+        if base == "OBJECT IDENTIFIER":
+            if v.kind == mib.ast.VAL_NAME:
+                r = self.symbol_oid(n, v.module, v.text, dv.line, dv.col)
+                if r.0 == 0:
+                    return mib.model.DefVal(dv.text, "oid", mib.model.oid_str(r.1), v.text)
+            elif v.kind == mib.ast.VAL_BRACED:
+                comps: list[mib.ast.OidComponent] = []
+                ok = True
+                for it in v.items:
+                    if it.kind == mib.ast.VAL_NUMBER:
+                        iv = it.int_value()
+                        comps.append(mib.ast.OidComponent("", "", iv if iv is not None else mib.ast.OID_TOO_BIG, it.line, it.col))
+                    elif it.kind == mib.ast.VAL_NAME:
+                        comps.append(mib.ast.OidComponent(it.text, it.module, mib.ast.OID_NO_NUMBER, it.line, it.col))
+                    elif it.kind == mib.ast.VAL_NAMED_NUMBER and len(it.items) > 0:
+                        iv = it.items[0].int_value()
+                        comps.append(mib.ast.OidComponent(it.text, "", iv if iv is not None else mib.ast.OID_TOO_BIG, it.line, it.col))
+                    else:
+                        ok = False
+                if ok and len(comps) > 0:
+                    o = self.oid_value(n, mib.ast.OidValue(comps, dv.line, dv.col))
+                    if o is not None:
+                        self.rep(mod, "resolve.defval-lenient", dv.line, dv.col, "the OID value " + v.dump() + " is resolved to " + mib.model.oid_str(o))
+                        nm = self.ms.preferred(o)
+                        return mib.model.DefVal(dv.text, "oid", mib.model.oid_str(o), nm.name if nm is not None else mib.model.oid_str(o))
+            self.rep(mod, "resolve.defval-invalid", dv.line, dv.col, bad)
+            return None
+        if base == "BITS":
+            names: list[str] = []
+            ok = True
+            if v.kind == mib.ast.VAL_BRACED:
+                for it in v.items:
+                    if it.kind == mib.ast.VAL_NAME:
+                        names.append(it.text)
+                    else:
+                        ok = False
+            elif v.kind == mib.ast.VAL_NAME:
+                names.append(v.text)
+                self.rep(mod, "resolve.defval-lenient", dv.line, dv.col, "the unbraced bit " + v.text + " is read as the set {{" + v.text + "}}")
+            elif v.kind == mib.ast.VAL_HEX or v.kind == mib.ast.VAL_BIN:
+                bb = v.big_value()
+                nbits = len(v.text) * 4 if v.kind == mib.ast.VAL_HEX else len(v.text)
+                if bb is not None:
+                    for b in s.bits:
+                        if b.value < nbits and ((bb >> (nbits - 1 - b.value)) & bigint(1)) == bigint(1):
+                            names.append(b.label)
+                self.rep(mod, "resolve.defval-lenient", dv.line, dv.col, "the bit string " + v.dump() + " is decoded to {{" + ", ".join(names) + "}}")
+            else:
+                ok = False
+            known: set[str] = set()
+            for b in s.bits:
+                known.add(b.label)
+            for x in names:
+                if x not in known:
+                    ok = False
+            if ok:
+                return mib.model.DefVal(dv.text, "bits", " ".join(names), "{{" + ", ".join(names) + "}}")
+            self.rep(mod, "resolve.defval-invalid", dv.line, dv.col, bad)
+            return None
+        if base == "NULL":
+            return None
+        if base == "":
+            return mib.model.DefVal(dv.text, "raw", dv.text.strip(), dv.text.strip())
+        self.rep(mod, "resolve.defval-invalid", dv.line, dv.col, bad)
+        return None
+
+    # --- index ---
+
+    def guard_index(self, n: mib.model.MibNode) -> None:
+        try:
+            self.derive_index(n)
+        except Exception as e:
+            self.rep(n.module, "resolve.internal", n.line, n.col, "while deriving the index of " + n.name + ": " + str(e))
+
+    def derive_index(self, n: mib.model.MibNode) -> None:
+        key = node_key(n)
+        st = self.index_state.get_def(key, 0)
+        if st != 0:
+            return
+        self.index_state[key] = 1
+        d = n.defn
+        if isinstance(d, mib.ast.ObjectType):
+            if len(d.augments) > 0:
+                a = d.augments[0]
+                r = self.lookup(n.module, a.module, a.name, a.line, a.col)
+                tgt: ?mib.model.MibNode = None
+                if r.0 != "":
+                    tgt = self.ms.node(r.0, r.1)
+                if tgt is not None and tgt.kind == "row":
+                    self.derive_index(tgt)
+                    n.augments = tgt.qname()
+                    if tgt.augments != "":
+                        self.rep(n.module, "resolve.augments-nested", a.line, a.col, n.name + " augments " + tgt.name + ", which is itself an augmentation")
+                    n.index = tgt.index
+                    n.implied = tgt.implied
+                    n.keyless = tgt.keyless
+                else:
+                    if tgt is None:
+                        self.rep(n.module, "resolve.unresolved", a.line, a.col, "AUGMENTS " + a.name + " of " + n.name + " cannot be resolved; the row is keyless")
+                    else:
+                        self.rep(n.module, "resolve.augments-not-row", a.line, a.col, "AUGMENTS " + a.name + " of " + n.name + " is not a row; the row is keyless")
+                    n.keyless = True
+            elif len(d.index) > 0:
+                keys: set[str] = set()
+                cnt = len(d.index)
+                for i, it in enumerate(d.index):
+                    last = (i == cnt - 1)
+                    sx: ?mib.model.Syntax = None
+                    pmod = ""
+                    pname = ""
+                    kname = ""
+                    isy = it.syntax
+                    if isy is not None:
+                        sx = self.resolve_syntax(n.module, isy, n.name)
+                        kname = n.name + "Index" + str(i + 1)
+                    else:
+                        r = self.lookup(n.module, it.module, it.name, it.line, it.col)
+                        kname = it.name
+                        if r.0 != "" and self.find_type(r.0, r.1) is not None and self.ms.node(r.0, r.1) is None:
+                            # SMIv1 style: a type name as an INDEX item (`INDEX { DmiCompId }`)
+                            sx = self.resolve_syntax(n.module, mib.ast.Syntax(mib.ast.SYN_REF, it.name, it.line, it.col), n.name)
+                            kname = n.name + "Index" + str(i + 1)
+                            pname = "-"
+                        elif r.0 != "":
+                            obj = self.ms.node(r.0, r.1)
+                            if obj is not None:
+                                pmod = obj.module
+                                pname = obj.name
+                                sx = obj.syntax
+                                if obj.kind != "column" and obj.kind != "scalar":
+                                    self.rep(n.module, "resolve.index-not-column", it.line, it.col, "INDEX object " + it.name + " of " + n.name + " is a " + obj.kind)
+                                elif obj.kind == "scalar":
+                                    self.rep(n.module, "resolve.index-not-column", it.line, it.col, "INDEX object " + it.name + " of " + n.name + " is a scalar")
+                        if pname == "":
+                            self.rep(n.module, "resolve.index-unresolved", it.line, it.col, "INDEX object " + it.name + " of " + n.name + " cannot be resolved")
+                            pname = it.name
+                            pmod = r.0
+                    if pname == "-":
+                        pname = ""
+                    k = kname
+                    j = 2
+                    while k in keys:
+                        k = kname + "_" + str(j)
+                        j += 1
+                    keys.add(k)
+                    enc = self.encoding(n, sx, it, last)
+                    n.index.append(mib.model.IndexPart(pmod, pname, k, enc.0, enc.1, enc.2, sx))
+                if len(n.index) > 0:
+                    n.implied = n.index[-1].implied
+            else:
+                self.rep(n.module, "resolve.row-without-index", n.line, n.col, "the row " + n.name + " has neither INDEX nor AUGMENTS; it becomes a keyless list")
+                n.keyless = True
+        self.index_state[key] = 2
+
+    def encoding(self, n: mib.model.MibNode, sx: ?mib.model.Syntax, it: mib.ast.IndexItem, last: bool) -> (str, int, bool):
+        """(enc, size, effective implied) of one index item."""
+        imp = it.implied
+        if imp and not last:
+            self.rep(n.module, "resolve.index-implied-not-last", it.line, it.col, "IMPLIED on " + it.name + ", which is not the last index item, is ignored")
+            imp = False
+        if sx is not None:
+            return self.enc_of(n, sx, it, imp)
+        return ("unknown", 0, False)
+
+    def enc_of(self, n: mib.model.MibNode, sx: mib.model.Syntax, it: mib.ast.IndexItem, imp: bool) -> (str, int, bool):
+        if sx.unresolved != "":
+            return ("unknown", 0, False)
+        b = sx.base
+        if sx.netaddr:
+            return ("netaddr", 0, False)
+        if b == "INTEGER" or b == "Unsigned32" or b == "Gauge32" or b == "TimeTicks" or b == "Counter32" or b == "Counter64":
+            if b == "Counter32" or b == "Counter64":
+                self.rep(n.module, "resolve.index-counter", it.line, it.col, "the counter " + it.name + " is used as an index (encoded as int)")
+            if imp:
+                self.rep(n.module, "resolve.index-implied-fixed", it.line, it.col, "IMPLIED on the integer " + it.name + " is ignored")
+            return ("int", 0, False)
+        if b == "IpAddress":
+            if imp:
+                self.rep(n.module, "resolve.index-implied-fixed", it.line, it.col, "IMPLIED on the IpAddress " + it.name + " is ignored")
+            return ("ipv4", 0, False)
+        if b == "OCTET STRING" or b == "Opaque":
+            fs = sx.fixed_size()
+            if fs >= 0:
+                if imp:
+                    self.rep(n.module, "resolve.index-implied-fixed", it.line, it.col, "IMPLIED on the fixed-length " + it.name + " is ignored")
+                return ("fixed", fs, False)
+            if imp:
+                return ("implied", 0, True)
+            return ("var", 0, False)
+        if b == "BITS":
+            if imp:
+                return ("implied", 0, True)
+            return ("var", 0, False)
+        if b == "OBJECT IDENTIFIER":
+            if imp:
+                return ("oid-implied", 0, True)
+            return ("oid", 0, False)
+        self.rep(n.module, "resolve.index-type", it.line, it.col, "the index object " + it.name + " has the type " + b + ", which cannot be an index; encoded as int")
+        return ("int", 0, False)
+
+    def sparse(self) -> None:
+        """`sparse_of`: a row whose INDEX is exactly the INDEX of the row that owns its first
+        index object (a sparse dependent table)."""
+        owner: dict[str, mib.model.MibNode] = {}
+        for nm in self.ms.order:
+            for n in self.ms.modules[nm].nodes:
+                if n.kind == "row" and n.augments == "" and len(n.index) > 0:
+                    p0 = n.index[0]
+                    if p0.name == "":
+                        continue
+                    col = self.ms.node(p0.module, p0.name)
+                    if col is not None and col.linked and len(col.oid) > 1 and n.linked and col.oid[:-1] == n.oid:
+                        k = "|".join([p.object() for p in n.index])
+                        if k not in owner:
+                            owner[k] = n
+        for nm in self.ms.order:
+            for n in self.ms.modules[nm].nodes:
+                if n.kind == "row" and n.augments == "" and len(n.index) > 0:
+                    k = "|".join([p.object() for p in n.index])
+                    o = owner.get(k)
+                    if o is not None and (o.module != n.module or o.name != n.name):
+                        n.sparse_of = o.qname()
+
+    # --- members ---
+
+    def guard_members(self, n: mib.model.MibNode) -> None:
+        try:
+            self.members(n)
+        except Exception as e:
+            self.rep(n.module, "resolve.internal", n.line, n.col, "while resolving the members of " + n.name + ": " + str(e))
+
+    def ref(self, n: mib.model.MibNode, x: mib.ast.Name) -> str:
+        r = self.lookup(n.module, x.module, x.name, x.line, x.col)
+        if r.0 == "":
+            self.rep_once("ref " + x.name, n.module, "resolve.unresolved", x.line, x.col, x.name + " (in " + n.name + ") cannot be resolved")
+            return ""
+        return mib.model.qual_name(r.0, r.1)
+
+    def in_module(self, n: mib.model.MibNode, modname: str, x: mib.ast.Name) -> str:
+        """A name in a MODULE-COMPLIANCE/AGENT-CAPABILITIES section about module `modname`."""
+        if modname == "" or modname == n.module:
+            return self.ref(n, x)
+        hm = self.ld.home.get_def(modname, "")
+        if hm != "" and x.name in self.defs.get_def(hm, {}):
+            return mib.model.qual_name(hm, x.name)
+        return mib.model.qual_name(hm if hm != "" else modname, x.name)
+
+    def members(self, n: mib.model.MibNode) -> None:
+        d = n.defn
+        if isinstance(d, mib.ast.NotificationType):
+            for x in d.objects:
+                q = self.ref(n, x)
+                if q != "":
+                    n.objects.append(q)
+                    o = self.node_of(q)
+                    if o is not None and o.access == "not-accessible":
+                        self.rep(n.module, "resolve.notification-object", x.line, x.col, x.name + " in the OBJECTS of " + n.name + " is not-accessible")
+        elif isinstance(d, mib.ast.TrapType):
+            for x in d.variables:
+                q = self.ref(n, x)
+                if q != "":
+                    n.objects.append(q)
+        elif isinstance(d, mib.ast.ObjectGroup):
+            for x in d.objects:
+                q = self.ref(n, x)
+                if q != "":
+                    n.objects.append(q)
+        elif isinstance(d, mib.ast.NotificationGroup):
+            for x in d.notifications:
+                q = self.ref(n, x)
+                if q != "":
+                    n.members.append(q)
+        elif isinstance(d, mib.ast.ModuleCompliance):
+            for cm in d.modules:
+                for g in cm.mandatory_groups:
+                    q = self.in_module(n, cm.name, g)
+                    if q != "":
+                        n.members.append(q)
+                for cg in cm.groups:
+                    q = self.in_module(n, cm.name, cg.name)
+                    if q != "":
+                        n.members.append(q)
+        elif isinstance(d, mib.ast.AgentCapabilities):
+            for sp in d.supports:
+                for g in sp.includes:
+                    q = self.in_module(n, sp.module, g)
+                    if q != "":
+                        n.members.append(q)
+
+    def node_of(self, q: str) -> ?mib.model.MibNode:
+        p = q.split("::")
+        if len(p) == 2:
+            return self.ms.node(p[0], p[1])
+        return None
+
+    # --- structural checks (diagnostics only) ---
+
+    def guard_lint(self, n: mib.model.MibNode) -> None:
+        try:
+            self.lint(n)
+        except Exception as e:
+            self.rep(n.module, "resolve.internal", n.line, n.col, "while checking " + n.name + ": " + str(e))
+
+    def lint(self, n: mib.model.MibNode) -> None:
+        if (n.kind == "table" or n.kind == "row") and n.access != "" and n.access != "not-accessible":
+            self.rep(n.module, "resolve.access-table", n.line, n.col, "the " + n.kind + " " + n.name + " is " + n.access + ", not not-accessible")
+        if n.kind == "scalar" and n.access == "read-create":
+            self.rep(n.module, "resolve.access-scalar-create", n.line, n.col, "the scalar " + n.name + " is read-create")
+        if n.kind == "notification" and n.macro == "NOTIFICATION-TYPE" and n.linked and len(n.oid) > 2 and n.oid[-2] != 0:
+            self.rep(n.module, "resolve.notification-not-reversible", n.line, n.col,
+                     "the next-to-last sub-identifier of the notification " + n.name + " is not 0")
+        if n.kind == "row" and n.linked and len(n.oid) > 1:
+            pk = mib.model.oid_str(n.oid[:-1])
+            if pk not in self.tables_by_oid:
+                self.rep(n.module, "resolve.row-misplaced", n.line, n.col, "the row " + n.name + " is not directly below a table")
+            sx = n.syntax
+            if sx is not None and sx.row_type != "" and sx.ref_module != "":
+                t = self.find_type(sx.ref_module, sx.row_type)
+                if t is not None and t.kind == "sequence":
+                    items: set[str] = set()
+                    for it in t.items:
+                        items.add(it.0)
+                    cols: set[str] = set()
+                    for c in self.columns.get_def(mib.model.oid_str(n.oid), []):
+                        cols.add(c.name)
+                        if c.name not in items:
+                            self.rep(c.module, "resolve.sequence-missing-column", c.line, c.col,
+                                     "the column " + c.name + " is not in the SEQUENCE " + t.name)
+                    for it in t.items:
+                        if it.0 not in cols:
+                            self.rep(t.module, "resolve.sequence-no-column", t.line, t.col,
+                                     "the SEQUENCE " + t.name + " item " + it.0 + " is not a column of " + n.name)
+
+    def defval_oid_names(self) -> None:
+        """An OID DEFVAL is rendered as a descriptor when one names its OID."""
+        for nm in self.ms.order:
+            for n in self.ms.modules[nm].nodes:
+                dv = n.defval
+                if dv is not None and dv.kind == "oid" and dv.smi == dv.value and dv.value != "":
+                    try:
+                        o = [int(x) for x in dv.value.split(".")]
+                        p = self.ms.preferred(o)
+                        if p is not None:
+                            dv.smi = p.name
+                    except ValueError:
+                        pass
+
+    # --- the OID tree ---
+
+    def build_tree(self) -> None:
+        for nm in self.ms.order:
+            m = self.ms.modules[nm]
+            regs: dict[str, mib.model.MibNode] = {}
+            assigns: dict[str, mib.model.MibNode] = {}
+            for n in m.nodes:
+                if not n.linked:
+                    continue
+                cur = self.ms.root
+                for a in n.oid:
+                    cur = cur.child(a)
+                cur.names.append(n)
+                k = mib.model.oid_str(n.oid)
+                if n.kind == "node":
+                    p = assigns.get(k)
+                    if p is not None and not m.builtin:
+                        self.rep(nm, "resolve.oid-reuse", n.line, n.col, n.name + " is assigned the same OID " + k + " as " + p.name)
+                    else:
+                        assigns[k] = n
+                else:
+                    p = regs.get(k)
+                    if p is not None:
+                        self.rep(nm, "resolve.oid-registered", n.line, n.col,
+                                 "the OID " + k + " of " + n.name + " is already registered by " + p.name + "; both are kept")
+                    else:
+                        regs[k] = n

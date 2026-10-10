@@ -207,9 +207,12 @@ class Value(object):
                 return -bigint(self.text[1:])
             return bigint(self.text)
         if self.kind == VAL_HEX:
-            if self.text == "":
-                return bigint(0)
-            return bigint(self.text, 16)
+            h = bigint(0)
+            for ch in self.text.lower():
+                d = "0123456789abcdef".find(ch)
+                if d >= 0:
+                    h = h * bigint(16) + bigint(d)
+            return h
         if self.kind == VAL_BIN:
             v = bigint(0)
             for ch in self.text:

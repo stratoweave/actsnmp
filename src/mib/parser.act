@@ -714,6 +714,10 @@ class Parser(object):
             return s
         elif k == KW_SEQUENCE:
             self.pos += 1
+            if self.peek() == P_LPAREN:
+                # ASN.1 `SEQUENCE (SIZE (..)) OF X` (SNMPv2-PDU): the constraint is skipped
+                self.report("parse.sequence-subtype", self.pos, "a SIZE constraint on SEQUENCE OF is ignored")
+                self.skip_balanced()
             self.expect(KW_OF, "OF after SEQUENCE")
             nk = self.peek()
             if nk == KW_INTEGER or nk == KW_OCTET or nk == KW_OBJECT or nk == KW_BITS or mib.lexer.is_type_kw(nk):
@@ -1100,6 +1104,13 @@ class Parser(object):
                     self.report("parse.double-comma", j, "empty element in SEQUENCE " + st.name)
                 comma = True
                 self.pos += 1
+                continue
+            if k == KW_CHOICE and self.peek_at(1) == P_LBRACE:
+                # an anonymous ASN.1 CHOICE item (SNMPv2-PDU VarBind): skipped
+                self.report("parse.choice", j, "an anonymous CHOICE item in SEQUENCE " + st.name + " is skipped")
+                self.pos += 1
+                self.skip_balanced()
+                comma = False
                 continue
             if k == K_LIDENT or k == K_UIDENT:
                 if len(st.items) > 0 and not comma:

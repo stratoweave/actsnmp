@@ -1,0 +1,759 @@
+"""Unit tests of `mib.resolver` and `mib.model` on inline module sets.
+
+`_test_q*` tests check the resolver's part of the test_quirks.act cases commented
+`resolver:`, under the same names and with the same snippets where possible. The others cover imports,
+forward references, TC chains and constraint composition, AUGMENTS, IMPLIED, every index
+encoding, SMIv1 traps, duplicates, missing imports with partial results and aliases.
+"""
+
+import testing
+import mib.ast
+import mib.diag
+import mib.model
+import mib.resolver
+import mib.source
+
+V2_HEAD = r"""QUIRK-MIB DEFINITIONS ::= BEGIN
+IMPORTS
+    MODULE-IDENTITY, OBJECT-TYPE, OBJECT-IDENTITY, NOTIFICATION-TYPE,
+    Integer32, Counter32, Counter64, Unsigned32, Gauge32, TimeTicks, IpAddress, Opaque, enterprises
+        FROM SNMPv2-SMI
+    TEXTUAL-CONVENTION, DisplayString, RowStatus, TruthValue, MacAddress, PhysAddress
+        FROM SNMPv2-TC
+    MODULE-COMPLIANCE, OBJECT-GROUP, NOTIFICATION-GROUP, AGENT-CAPABILITIES
+        FROM SNMPv2-CONF;
+quirkMIB MODULE-IDENTITY
+    LAST-UPDATED "202610100000Z"
+    ORGANIZATION "actsnmp"
+    CONTACT-INFO "none"
+    DESCRIPTION  "Quirk test module."
+    ::= { enterprises 99999 }
+quirkObjects OBJECT IDENTIFIER ::= { quirkMIB 1 }
+"""
+
+V1_HEAD = r"""QUIRK-V1-MIB DEFINITIONS ::= BEGIN
+IMPORTS
+    enterprises, Counter, Gauge, TimeTicks, IpAddress, NetworkAddress FROM RFC1155-SMI
+    OBJECT-TYPE FROM RFC-1212
+    TRAP-TYPE FROM RFC-1215
+    DisplayString FROM RFC1213-MIB;
+quirkV1 OBJECT IDENTIFIER ::= { enterprises 99998 }
+"""
+
+TAIL = r"""
+END
+"""
+
+
+def rcodes(ms: mib.model.MibSet) -> str:
+    """`L<level> <code>` of the resolver (`resolve.*`, `source.*`) diagnostics outside the
+    built-in modules, in order, or `ok`."""
+    out: list[str] = []
+    for d in ms.diags:
+        if d.file.startswith("<builtin>"):
+            continue
+        if d.code.startswith("resolve.") or d.code.startswith("source."):
+            out.append("L" + str(d.level) + " " + d.code)
+    return ", ".join(out) if len(out) > 0 else "ok"
+
+
+def node(ms: mib.model.MibSet, module: str, name: str) -> str:
+    n = ms.node(module, name)
+    if n is not None:
+        return n.dump()
+    return "<missing>"
+
+
+def tdump(ms: mib.model.MibSet, module: str, name: str) -> str:
+    m = ms.module(module)
+    if m is not None:
+        t = m.find_type(name)
+        if t is not None:
+            return t.dump()
+    return "<missing>"
+
+
+def r2(body: str) -> mib.model.MibSet:
+    return mib.resolver.resolve_texts([V2_HEAD + body + TAIL])
+
+
+def r1(body: str) -> mib.model.MibSet:
+    return mib.resolver.resolve_texts([V1_HEAD + body + TAIL])
+
+
+def q2(body: str, name: str) -> str:
+    """`codes | node dump` of `name` in QUIRK-MIB."""
+    ms = r2(body)
+    return rcodes(ms) + " | " + node(ms, "QUIRK-MIB", name)
+
+
+def q1(body: str, name: str) -> str:
+    """`codes | node dump` of `name` in QUIRK-V1-MIB (without the L5 rewrite of the
+    head's `DisplayString FROM RFC1213-MIB`)."""
+    ms = r1(body)
+    c = rcodes(ms).replace("L5 resolve.import-rewritten, ", "").replace("L5 resolve.import-rewritten", "ok")
+    return c + " | " + node(ms, "QUIRK-V1-MIB", name)
+
+
+def obj(syntax: str, extra: str = "", access: str = "read-only") -> str:
+    """An SMIv2 scalar `q` with the given SYNTAX and extra clauses after DESCRIPTION."""
+    return r"""
+q OBJECT-TYPE
+    SYNTAX """ + syntax + r"""
+    MAX-ACCESS """ + access + r"""
+    STATUS current
+    DESCRIPTION "d"
+    """ + extra + r"""
+    ::= { quirkObjects 5 }
+"""
+
+
+def obj1(syntax: str, extra: str = "") -> str:
+    return r"""
+q OBJECT-TYPE
+    SYNTAX """ + syntax + r"""
+    ACCESS read-only
+    STATUS mandatory
+    """ + extra + r"""
+    ::= { quirkV1 5 }
+"""
+
+
+def syn2(syntax: str) -> str:
+    return q2(obj(syntax), "q")
+
+
+def dv2(syntax: str, defval: str) -> str:
+    return q2(obj(syntax, "DEFVAL " + defval), "q")
+
+
+# ============================================================================================
+# basics, imports, forward references
+# ============================================================================================
+
+A_MIB = r"""A-MIB DEFINITIONS ::= BEGIN
+IMPORTS
+    MODULE-IDENTITY, OBJECT-TYPE, NOTIFICATION-TYPE, Integer32, Counter32, enterprises
+        FROM SNMPv2-SMI
+    TEXTUAL-CONVENTION, DisplayString
+        FROM SNMPv2-TC
+    bThing, BIndex
+        FROM B-MIB;
+aMIB MODULE-IDENTITY
+    LAST-UPDATED "202610100000Z"
+    ORGANIZATION "o"
+    CONTACT-INFO "c"
+    DESCRIPTION  "d"
+    REVISION "202610100000Z" DESCRIPTION "first"
+    ::= { enterprises 99999 }
+aChild OBJECT IDENTIFIER ::= { aObjects 7 }
+aObjects OBJECT IDENTIFIER ::= { aMIB 1 }
+aCount OBJECT-TYPE SYNTAX Counter32 MAX-ACCESS read-only STATUS current DESCRIPTION "c" ::= { aObjects 1 }
+aUnder OBJECT IDENTIFIER ::= { bThing 3 }
+aIdx OBJECT-TYPE SYNTAX BIndex MAX-ACCESS read-only STATUS current DESCRIPTION "c" ::= { aObjects 2 }
+END
+"""
+
+B_MIB = r"""B-MIB DEFINITIONS ::= BEGIN
+IMPORTS
+    OBJECT-TYPE, Integer32 FROM SNMPv2-SMI
+    TEXTUAL-CONVENTION FROM SNMPv2-TC
+    aObjects FROM A-MIB;
+bThing OBJECT IDENTIFIER ::= { aObjects 9 }
+BIndex ::= TEXTUAL-CONVENTION DISPLAY-HINT "d" STATUS current DESCRIPTION "i" SYNTAX Integer32 (1..100)
+END
+"""
+
+
+def _test_basic_and_module_identity() -> None:
+    ms = mib.resolver.resolve_texts([A_MIB, B_MIB], ["A-MIB"])
+    testing.assertEqual(rcodes(ms), "ok")
+    testing.assertEqual(node(ms, "A-MIB", "aCount"), "scalar aCount 1.3.6.1.4.1.99999.1.1 access=read-only syntax=Counter32")
+    testing.assertEqual(node(ms, "A-MIB", "aMIB"), "module-identity aMIB 1.3.6.1.4.1.99999")
+    m = ms.module("A-MIB")
+    if m is not None:
+        testing.assertEqual(m.identity, "aMIB")
+        testing.assertEqual(m.organization, "o")
+        testing.assertEqual(m.last_updated, "202610100000Z")
+        testing.assertEqual([r.date + ":" + r.description for r in m.revisions], ["202610100000Z:first"])
+        testing.assertEqual([i.symbol + "<" + i.home for i in m.imports if i.module == "B-MIB"], ["bThing<B-MIB", "BIndex<B-MIB"])
+        testing.assertEqual(m.smi, "v2")
+    else:
+        testing.error("A-MIB missing")
+
+
+def _test_forward_references_across_modules() -> None:
+    # aChild is defined before its parent; bThing (B-MIB) hangs below A-MIB's aObjects, and
+    # A-MIB hangs aUnder below bThing: an import cycle with forward references.
+    ms = mib.resolver.resolve_texts([A_MIB, B_MIB], ["A-MIB"])
+    testing.assertEqual(node(ms, "A-MIB", "aChild"), "node aChild 1.3.6.1.4.1.99999.1.7")
+    testing.assertEqual(node(ms, "B-MIB", "bThing"), "node bThing 1.3.6.1.4.1.99999.1.9")
+    testing.assertEqual(node(ms, "A-MIB", "aUnder"), "node aUnder 1.3.6.1.4.1.99999.1.9.3")
+    testing.assertEqual(node(ms, "A-MIB", "aIdx"), "scalar aIdx 1.3.6.1.4.1.99999.1.2 access=read-only syntax=INTEGER tc=B-MIB::BIndex range=1..100 hint=d")
+    testing.assertEqual(ms.order[:6], mib.resolver.BASE_ORDER)
+    testing.assertEqual(ms.order[6:], ["A-MIB", "B-MIB"])
+
+
+def _test_oid_tree_and_preferred_name() -> None:
+    ms = r2(r"""
+alias OBJECT IDENTIFIER ::= { quirkObjects 5 }
+""" + obj("Integer32"))
+    testing.assertEqual([n.name for n in ms.names_at([1, 3, 6, 1, 4, 1, 99999, 1, 5])], ["alias", "q"])
+    p = ms.preferred([1, 3, 6, 1, 4, 1, 99999, 1, 5])
+    testing.assertEqual(p.name if p is not None else "", "q")
+    testing.assertEqual([n.name for n in ms.names_at([1, 3, 6, 1, 4, 1])], ["enterprises", "enterprises"])
+
+
+def _test_missing_import_module_partial_result() -> None:
+    ms = mib.resolver.resolve_texts([V2_HEAD.replace("FROM SNMPv2-CONF;", "FROM SNMPv2-CONF fooThing, FooType FROM NO-SUCH-MIB;") + r"""
+a OBJECT IDENTIFIER ::= { fooThing 1 }
+b OBJECT IDENTIFIER ::= { quirkObjects 2 }
+c OBJECT-TYPE SYNTAX FooType MAX-ACCESS read-only STATUS current DESCRIPTION "d" ::= { quirkObjects 3 }
+d OBJECT IDENTIFIER ::= { a 1 }
+""" + TAIL])
+    testing.assertEqual(rcodes(ms), "L1 source.not-found, L1 resolve.oid-undefined, L2 resolve.type-unknown")
+    testing.assertEqual(node(ms, "QUIRK-MIB", "a"), "node a <unlinked>")
+    testing.assertEqual(node(ms, "QUIRK-MIB", "b"), "node b 1.3.6.1.4.1.99999.1.2")
+    testing.assertEqual(node(ms, "QUIRK-MIB", "c"), "scalar c 1.3.6.1.4.1.99999.1.3 access=read-only syntax=<unresolved FooType>")
+    testing.assertEqual(node(ms, "QUIRK-MIB", "d"), "node d <unlinked>")
+    testing.assertEqual([n.name for n in ms.unlinked], ["a", "d"])
+
+
+def _test_alias_module_names() -> None:
+    # SNMPv2-SMI-v1 and SNMPv2-TC-v1 are aliases of the base modules
+    ms = mib.resolver.resolve_texts([r"""AL-MIB DEFINITIONS ::= BEGIN
+IMPORTS OBJECT-TYPE, Integer32, enterprises FROM SNMPv2-SMI-v1
+        DisplayString FROM SNMPv2-TC-v1;
+al OBJECT IDENTIFIER ::= { enterprises 5 }
+x OBJECT-TYPE SYNTAX DisplayString MAX-ACCESS read-only STATUS current DESCRIPTION "d" ::= { al 1 }
+END
+"""])
+    testing.assertEqual(rcodes(ms), "ok")
+    testing.assertEqual(node(ms, "AL-MIB", "x"), "scalar x 1.3.6.1.4.1.5.1 access=read-only syntax=OCTET STRING tc=SNMPv2-TC::DisplayString size=0..255 hint=255a")
+    m = ms.module("AL-MIB")
+    testing.assertEqual([i.symbol + "<" + i.home for i in m.imports] if m is not None else [],
+                        ["OBJECT-TYPE<SNMPv2-SMI", "Integer32<SNMPv2-SMI", "enterprises<SNMPv2-SMI", "DisplayString<SNMPv2-TC"])
+
+
+def _test_user_alias_and_rfc1213_rewrite() -> None:
+    mp = mib.source.MibPath([], True, False)
+    mp.add_alias("MY-OLD-MIB", "B-MIB")
+    ms = mib.resolver.resolve_texts([B_MIB.replace("aObjects FROM A-MIB", "enterprises FROM SNMPv2-SMI").replace(r"{ aObjects 9 }", r"{ enterprises 9 }"), r"""C-MIB DEFINITIONS ::= BEGIN
+IMPORTS bThing FROM MY-OLD-MIB
+        mib-2, DisplayString, ifIndex FROM RFC1213-MIB;
+c OBJECT IDENTIFIER ::= { bThing 1 }
+m OBJECT IDENTIFIER ::= { mib-2 99 }
+END
+"""], ["C-MIB"], mp)
+    testing.assertEqual(rcodes(ms), "L5 resolve.import-rewritten, L5 resolve.import-rewritten, L2 resolve.unresolved")
+    testing.assertEqual(node(ms, "C-MIB", "c"), "node c 1.3.6.1.4.1.9.1")
+    testing.assertEqual(node(ms, "C-MIB", "m"), "node m 1.3.6.1.2.1.99")
+
+
+# ============================================================================================
+# types, TC chains and constraint composition
+# ============================================================================================
+
+TCS = r"""
+SmallString ::= TEXTUAL-CONVENTION DISPLAY-HINT "64a" STATUS current DESCRIPTION "s" SYNTAX DisplayString (SIZE (0..64))
+TinyString ::= TEXTUAL-CONVENTION STATUS current DESCRIPTION "t" SYNTAX SmallString (SIZE (1..8))
+WideString ::= TEXTUAL-CONVENTION STATUS current DESCRIPTION "w" SYNTAX SmallString (SIZE (0..100))
+Level ::= TEXTUAL-CONVENTION STATUS current DESCRIPTION "l" SYNTAX INTEGER { low(1), mid(2), high(3) }
+Pct ::= Integer32 (0..100)
+"""
+
+
+def _test_tc_chain_and_constraint_composition() -> None:
+    ms = r2(TCS + obj("TinyString") + r"""
+w OBJECT-TYPE SYNTAX WideString MAX-ACCESS read-only STATUS current DESCRIPTION "d" ::= { quirkObjects 6 }
+l OBJECT-TYPE SYNTAX Level { low(1), high(3) } MAX-ACCESS read-only STATUS current DESCRIPTION "d" ::= { quirkObjects 7 }
+p OBJECT-TYPE SYNTAX Pct (10..20) MAX-ACCESS read-only STATUS current DESCRIPTION "d" ::= { quirkObjects 8 }
+""")
+    testing.assertEqual(rcodes(ms), "L5 resolve.tc-nested, L5 resolve.tc-nested, L5 resolve.tc-nested, L2 resolve.range-widened")
+    testing.assertEqual(tdump(ms, "QUIRK-MIB", "TinyString"), "TYPE TinyString tc status=current parent=QUIRK-MIB::SmallString syntax=OCTET STRING tc=QUIRK-MIB::SmallString size=1..8 hint=64a")
+    testing.assertEqual(node(ms, "QUIRK-MIB", "q"), "scalar q 1.3.6.1.4.1.99999.1.5 access=read-only syntax=OCTET STRING tc=QUIRK-MIB::TinyString size=1..8 hint=64a")
+    testing.assertEqual(node(ms, "QUIRK-MIB", "w"), "scalar w 1.3.6.1.4.1.99999.1.6 access=read-only syntax=OCTET STRING tc=QUIRK-MIB::WideString size=0..64 hint=64a")
+    testing.assertEqual(node(ms, "QUIRK-MIB", "l"), "scalar l 1.3.6.1.4.1.99999.1.7 access=read-only syntax=INTEGER tc=QUIRK-MIB::Level enums=low(1),high(3)")
+    testing.assertEqual(node(ms, "QUIRK-MIB", "p"), "scalar p 1.3.6.1.4.1.99999.1.8 access=read-only syntax=INTEGER tc=QUIRK-MIB::Pct range=10..20")
+    n = ms.node("QUIRK-MIB", "q")
+    if n is not None:
+        s = n.syntax
+        if s is not None:
+            testing.assertEqual(s.chain, ["QUIRK-MIB::TinyString", "QUIRK-MIB::SmallString", "SNMPv2-TC::DisplayString"])
+            testing.assertEqual(s.base_name, "OCTET STRING")
+            return
+    testing.error("q missing")
+
+
+def _test_type_cycle_and_unknown_type() -> None:
+    ms = r2(r"""
+LoopA ::= TEXTUAL-CONVENTION STATUS current DESCRIPTION "a" SYNTAX LoopB
+LoopB ::= TEXTUAL-CONVENTION STATUS current DESCRIPTION "b" SYNTAX LoopA
+""" + obj("LoopA"))
+    testing.assertEqual(rcodes(ms), "L1 resolve.type-cycle, L5 resolve.tc-nested, L5 resolve.tc-nested")
+    testing.assertEqual(node(ms, "QUIRK-MIB", "q"), "scalar q 1.3.6.1.4.1.99999.1.5 access=read-only syntax=<unresolved LoopA>")
+
+
+def _test_base_type_names_redefined_or_miscased() -> None:
+    # old vendor MIBs define `Unsigned32 ::= Gauge` locally, or write INTEGER32
+    ms = r2(r"""
+Unsigned32 ::= Gauge
+""" + obj("Unsigned32") + r"""
+z OBJECT-TYPE SYNTAX INTEGER32 (0..9) MAX-ACCESS read-only STATUS current DESCRIPTION "d" ::= { quirkObjects 6 }
+""")
+    testing.assertEqual(rcodes(ms), "L2 resolve.import-shadowed, L3 resolve.not-imported, L2 resolve.type-name-case")
+    testing.assertEqual(node(ms, "QUIRK-MIB", "q"), "scalar q 1.3.6.1.4.1.99999.1.5 access=read-only syntax=Unsigned32")
+    testing.assertEqual(node(ms, "QUIRK-MIB", "z"), "scalar z 1.3.6.1.4.1.99999.1.6 access=read-only syntax=INTEGER range=0..9")
+
+
+def _test_application_tags() -> None:
+    testing.assertEqual(q2(r"MyCounter ::= [APPLICATION 1] IMPLICIT INTEGER (0..4294967295)" + obj("MyCounter"), "q"),
+                        "ok | scalar q 1.3.6.1.4.1.99999.1.5 access=read-only syntax=Counter32 tc=QUIRK-MIB::MyCounter range=0..4294967295")
+
+
+# ============================================================================================
+# tables, index encodings, AUGMENTS, IMPLIED
+# ============================================================================================
+
+TABLE = r"""
+qTable OBJECT-TYPE SYNTAX SEQUENCE OF QEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "t" ::= { quirkObjects 7 }
+qEntry OBJECT-TYPE SYNTAX QEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "e"
+    INDEX { qInt, qMac, qName, qOid, qAddr, qFix, IMPLIED qTail } ::= { qTable 1 }
+QEntry ::= SEQUENCE { qInt Integer32, qMac MacAddress, qName DisplayString, qOid OBJECT IDENTIFIER, qAddr IpAddress, qFix OCTET STRING, qTail OCTET STRING, qValue Counter32 }
+qInt OBJECT-TYPE SYNTAX Integer32 (1..10) MAX-ACCESS not-accessible STATUS current DESCRIPTION "i" ::= { qEntry 1 }
+qMac OBJECT-TYPE SYNTAX MacAddress MAX-ACCESS not-accessible STATUS current DESCRIPTION "i" ::= { qEntry 2 }
+qName OBJECT-TYPE SYNTAX DisplayString MAX-ACCESS not-accessible STATUS current DESCRIPTION "i" ::= { qEntry 3 }
+qOid OBJECT-TYPE SYNTAX OBJECT IDENTIFIER MAX-ACCESS not-accessible STATUS current DESCRIPTION "i" ::= { qEntry 4 }
+qAddr OBJECT-TYPE SYNTAX IpAddress MAX-ACCESS not-accessible STATUS current DESCRIPTION "i" ::= { qEntry 5 }
+qFix OBJECT-TYPE SYNTAX OCTET STRING (SIZE (4)) MAX-ACCESS not-accessible STATUS current DESCRIPTION "i" ::= { qEntry 6 }
+qTail OBJECT-TYPE SYNTAX OCTET STRING (SIZE (0..32)) MAX-ACCESS not-accessible STATUS current DESCRIPTION "i" ::= { qEntry 7 }
+qValue OBJECT-TYPE SYNTAX Counter32 MAX-ACCESS read-only STATUS current DESCRIPTION "v" ::= { qEntry 8 }
+xTable OBJECT-TYPE SYNTAX SEQUENCE OF XEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "t" ::= { quirkObjects 8 }
+xEntry OBJECT-TYPE SYNTAX XEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "e" AUGMENTS { qEntry } ::= { xTable 1 }
+XEntry ::= SEQUENCE { xValue Integer32 }
+xValue OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current DESCRIPTION "v" ::= { xEntry 1 }
+oTable OBJECT-TYPE SYNTAX SEQUENCE OF OEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "t" ::= { quirkObjects 9 }
+oEntry OBJECT-TYPE SYNTAX OEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "e" INDEX { IMPLIED oKey } ::= { oTable 1 }
+OEntry ::= SEQUENCE { oKey OBJECT IDENTIFIER }
+oKey OBJECT-TYPE SYNTAX OBJECT IDENTIFIER MAX-ACCESS not-accessible STATUS current DESCRIPTION "k" ::= { oEntry 1 }
+sTable OBJECT-TYPE SYNTAX SEQUENCE OF SEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "t" ::= { quirkObjects 10 }
+sEntry OBJECT-TYPE SYNTAX SEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "e"
+    INDEX { qInt, qMac, qName, qOid, qAddr, qFix, IMPLIED qTail } ::= { sTable 1 }
+SEntry ::= SEQUENCE { sValue Integer32 }
+sValue OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current DESCRIPTION "v" ::= { sEntry 1 }
+"""
+
+
+def _test_table_kinds_and_index_encodings() -> None:
+    ms = r2(TABLE)
+    testing.assertEqual(rcodes(ms), "ok")
+    testing.assertEqual(node(ms, "QUIRK-MIB", "qTable"), "table qTable 1.3.6.1.4.1.99999.1.7 access=not-accessible syntax=SEQUENCE OF QEntry")
+    testing.assertEqual(node(ms, "QUIRK-MIB", "qEntry"),
+                        "row qEntry 1.3.6.1.4.1.99999.1.7.1 access=not-accessible syntax=SEQUENCE QEntry index=" +
+                        "QUIRK-MIB::qInt=int,QUIRK-MIB::qMac=fixed(6),QUIRK-MIB::qName=var,QUIRK-MIB::qOid=oid," +
+                        "QUIRK-MIB::qAddr=ipv4,QUIRK-MIB::qFix=fixed(4),QUIRK-MIB::qTail=implied implied")
+    testing.assertEqual(node(ms, "QUIRK-MIB", "qValue"), "column qValue 1.3.6.1.4.1.99999.1.7.1.8 access=read-only syntax=Counter32")
+    testing.assertEqual(node(ms, "QUIRK-MIB", "xEntry"),
+                        "row xEntry 1.3.6.1.4.1.99999.1.8.1 access=not-accessible syntax=SEQUENCE XEntry augments=QUIRK-MIB::qEntry")
+    xe = ms.node("QUIRK-MIB", "xEntry")
+    testing.assertEqual(len(xe.index) if xe is not None else -1, 7)
+    testing.assertEqual(node(ms, "QUIRK-MIB", "oEntry"),
+                        "row oEntry 1.3.6.1.4.1.99999.1.9.1 access=not-accessible syntax=SEQUENCE OEntry index=QUIRK-MIB::oKey=oid-implied implied")
+    testing.assertEqual(node(ms, "QUIRK-MIB", "sEntry").split(" sparse-of=")[1], "QUIRK-MIB::qEntry")
+    testing.assertEqual(node(ms, "QUIRK-MIB", "xValue"), "column xValue 1.3.6.1.4.1.99999.1.8.1.1 access=read-only syntax=INTEGER")
+
+
+def _test_index_implied_rules() -> None:
+    body = TABLE.replace(r"INDEX { qInt, qMac, qName, qOid, qAddr, qFix, IMPLIED qTail } ::= { qTable 1 }",
+                         r"INDEX { IMPLIED qName, qInt, IMPLIED qMac } ::= { qTable 1 }")
+    ms = r2(body)
+    testing.assertEqual(rcodes(ms), "L2 resolve.index-implied-not-last, L3 resolve.index-implied-fixed")
+    testing.assertEqual(node(ms, "QUIRK-MIB", "qEntry").split(" index=")[1],
+                        "QUIRK-MIB::qName=var,QUIRK-MIB::qInt=int,QUIRK-MIB::qMac=fixed(6)")
+
+
+def _test_type_name_as_index_item() -> None:
+    # DMTF-SYSTEMS-MIB: `INDEX { DmiCompId, ... }` names a type, as SMIv1 INDEX { INTEGER } does
+    ms = r2(r"""
+CompId ::= INTEGER (0..65535)
+qTable OBJECT-TYPE SYNTAX SEQUENCE OF QEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "t" ::= { quirkObjects 7 }
+qEntry OBJECT-TYPE SYNTAX QEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "e" INDEX { CompId, a } ::= { qTable 1 }
+QEntry ::= SEQUENCE { a DisplayString }
+a OBJECT-TYPE SYNTAX DisplayString MAX-ACCESS read-only STATUS current DESCRIPTION "a" ::= { qEntry 1 }
+""")
+    testing.assertEqual(rcodes(ms), "ok")
+    testing.assertEqual(node(ms, "QUIRK-MIB", "qEntry").split(" index=")[1], "synthetic:qEntryIndex1=int,QUIRK-MIB::a=var")
+
+
+def _test_smiv1_index_kinds_and_synthetic_keys() -> None:
+    ms = r1(r"""
+qTable OBJECT-TYPE SYNTAX SEQUENCE OF QEntry ACCESS not-accessible STATUS mandatory ::= { quirkV1 7 }
+qEntry OBJECT-TYPE SYNTAX QEntry ACCESS not-accessible STATUS mandatory INDEX { INTEGER, OCTET STRING, qAddr } ::= { qTable 1 }
+QEntry ::= SEQUENCE { qAddr NetworkAddress, qCount Counter }
+qAddr OBJECT-TYPE SYNTAX NetworkAddress ACCESS read-only STATUS mandatory ::= { qEntry 1 }
+qCount OBJECT-TYPE SYNTAX Counter ACCESS read-only STATUS mandatory ::= { qEntry 2 }
+""")
+    testing.assertEqual(rcodes(ms), "L5 resolve.import-rewritten")
+    testing.assertEqual(node(ms, "QUIRK-V1-MIB", "qEntry").split(" index=")[1],
+                        "synthetic:qEntryIndex1=int,synthetic:qEntryIndex2=var,QUIRK-V1-MIB::qAddr=netaddr")
+    testing.assertEqual(node(ms, "QUIRK-V1-MIB", "qCount"), "column qCount 1.3.6.1.4.1.99998.7.1.2 access=read-only syntax=Counter32")
+    testing.assertEqual(node(ms, "QUIRK-V1-MIB", "qAddr"), "column qAddr 1.3.6.1.4.1.99998.7.1.1 access=read-only syntax=IpAddress(netaddr)")
+    m = ms.module("QUIRK-V1-MIB")
+    testing.assertEqual(m.smi if m is not None else "", "v1")
+
+
+# ============================================================================================
+# notifications and SMIv1 traps
+# ============================================================================================
+
+def _test_smiv1_traps_to_notifications() -> None:
+    ms = mib.resolver.resolve_texts([V1_HEAD.replace("DisplayString FROM RFC1213-MIB;", "DisplayString, snmp FROM RFC1213-MIB;") + r"""
+qVar OBJECT-TYPE SYNTAX INTEGER ACCESS read-only STATUS mandatory ::= { quirkV1 1 }
+qTrap TRAP-TYPE ENTERPRISE quirkV1 VARIABLES { qVar } DESCRIPTION "d" ::= 3
+qCold TRAP-TYPE ENTERPRISE snmp DESCRIPTION "d" ::= 0
+qOther TRAP-TYPE ENTERPRISE snmp DESCRIPTION "d" ::= 9
+qDup TRAP-TYPE ENTERPRISE quirkV1 DESCRIPTION "d" ::= 3
+""" + TAIL])
+    # RFC1213-MIB is not loaded: `snmp` would be SNMPv2-MIB's (not loaded either), so the
+    # traps on it are unlinked; the others are kept
+    testing.assertEqual(rcodes(ms), "L5 resolve.import-rewritten, L2 resolve.unresolved, L1 resolve.oid-undefined, L1 resolve.oid-undefined, L2 resolve.oid-registered")
+    testing.assertEqual(node(ms, "QUIRK-V1-MIB", "qTrap"), "notification qTrap 1.3.6.1.4.1.99998.0.3 objects=QUIRK-V1-MIB::qVar")
+    testing.assertEqual(node(ms, "QUIRK-V1-MIB", "qDup"), "notification qDup 1.3.6.1.4.1.99998.0.3")
+
+
+def _test_smiv1_generic_traps() -> None:
+    ms = mib.resolver.resolve_texts([V1_HEAD + r"""
+snmp OBJECT IDENTIFIER ::= { iso 3 6 1 2 1 11 }
+qCold TRAP-TYPE ENTERPRISE snmp DESCRIPTION "d" ::= 0
+qOther TRAP-TYPE ENTERPRISE snmp DESCRIPTION "d" ::= 9
+""" + TAIL])
+    testing.assertEqual(node(ms, "QUIRK-V1-MIB", "qCold"), "notification qCold 1.3.6.1.6.3.1.1.5.1")
+    testing.assertEqual(node(ms, "QUIRK-V1-MIB", "qOther"), "notification qOther 1.3.6.1.2.1.11.0.9")
+
+
+def _test_notification_and_groups() -> None:
+    ms = r2(obj("Integer32") + r"""
+n NOTIFICATION-TYPE OBJECTS { q } STATUS current DESCRIPTION "d" ::= { quirkMIB 0 1 }
+g OBJECT-GROUP OBJECTS { q } STATUS current DESCRIPTION "d" ::= { quirkMIB 2 1 }
+ng NOTIFICATION-GROUP NOTIFICATIONS { n } STATUS current DESCRIPTION "d" ::= { quirkMIB 2 2 }
+c MODULE-COMPLIANCE STATUS current DESCRIPTION "d"
+    MODULE IF-MIB MANDATORY-GROUPS { ifGeneralGroup }
+    MODULE MANDATORY-GROUPS { g } GROUP ng DESCRIPTION "d"
+    ::= { quirkMIB 3 1 }
+""")
+    testing.assertEqual(rcodes(ms), "ok")
+    testing.assertEqual(node(ms, "QUIRK-MIB", "n"), "notification n 1.3.6.1.4.1.99999.0.1 objects=QUIRK-MIB::q")
+    testing.assertEqual(node(ms, "QUIRK-MIB", "g"), "object-group g 1.3.6.1.4.1.99999.2.1 objects=QUIRK-MIB::q")
+    testing.assertEqual(node(ms, "QUIRK-MIB", "ng"), "notification-group ng 1.3.6.1.4.1.99999.2.2 members=QUIRK-MIB::n")
+    testing.assertEqual(node(ms, "QUIRK-MIB", "c"), "compliance c 1.3.6.1.4.1.99999.3.1 members=IF-MIB::ifGeneralGroup,QUIRK-MIB::g,QUIRK-MIB::ng")
+
+
+# ============================================================================================
+# the `resolver:` rows of test_quirks.act
+# ============================================================================================
+
+def _test_q43_base_symbol_used_without_import() -> None:
+    ms = mib.resolver.resolve_texts([V2_HEAD.replace("Counter32, ", "") + obj("Counter32") + r"""
+Integer64 ::= TEXTUAL-CONVENTION STATUS current DESCRIPTION "d" SYNTAX Opaque (SIZE(4..11))
+""" + TAIL])
+    testing.assertEqual(rcodes(ms), "L3 resolve.not-imported")
+    testing.assertEqual(node(ms, "QUIRK-MIB", "q"), "scalar q 1.3.6.1.4.1.99999.1.5 access=read-only syntax=Counter32")
+    testing.assertEqual(tdump(ms, "QUIRK-MIB", "Integer64"), "TYPE Integer64 tc status=current syntax=Opaque size=4..11")
+
+
+def _test_q43_tc_used_without_import() -> None:
+    ms = mib.resolver.resolve_texts([V2_HEAD.replace("RowStatus, TruthValue, ", "RowStatus, ") + obj("TruthValue") + TAIL])
+    testing.assertEqual(rcodes(ms), "L3 resolve.not-imported")
+    testing.assertEqual(node(ms, "QUIRK-MIB", "q"), "scalar q 1.3.6.1.4.1.99999.1.5 access=read-only syntax=INTEGER tc=SNMPv2-TC::TruthValue enums=true(1),false(2)")
+
+
+def _test_q43_displaystring_from_rfc1213() -> None:
+    ms = r1(obj1("DisplayString"))
+    testing.assertEqual(rcodes(ms), "L5 resolve.import-rewritten")
+    testing.assertEqual(node(ms, "QUIRK-V1-MIB", "q"), "scalar q 1.3.6.1.4.1.99998.5 access=read-only syntax=OCTET STRING tc=SNMPv2-TC::DisplayString size=0..255 hint=255a")
+
+
+def _test_q43_symbol_from_wrong_base_module() -> None:
+    ms = mib.resolver.resolve_texts([V2_HEAD.replace("enterprises\n", "enterprises, MacAddress\n").replace("TruthValue, MacAddress,", "TruthValue,") + obj("MacAddress") + TAIL])
+    testing.assertEqual(rcodes(ms), "L2 resolve.import-not-found")
+    testing.assertEqual(node(ms, "QUIRK-MIB", "q"), "scalar q 1.3.6.1.4.1.99999.1.5 access=read-only syntax=OCTET STRING tc=SNMPv2-TC::MacAddress size=6 hint=1x:")
+
+
+def _test_q43_smiv1_and_smiv2_base_modules_mixed() -> None:
+    ms = mib.resolver.resolve_texts([r"""MIX-MIB DEFINITIONS ::= BEGIN
+IMPORTS MODULE-IDENTITY, OBJECT-TYPE, Integer32 FROM SNMPv2-SMI enterprises, Counter FROM RFC1155-SMI;
+mix MODULE-IDENTITY LAST-UPDATED "202610100000Z" ORGANIZATION "o" CONTACT-INFO "c" DESCRIPTION "d" ::= { enterprises 7 }
+c OBJECT-TYPE SYNTAX Counter MAX-ACCESS read-only STATUS current DESCRIPTION "d" ::= { mix 1 }
+END
+"""])
+    testing.assertEqual(rcodes(ms), "ok")
+    testing.assertEqual(node(ms, "MIX-MIB", "c"), "scalar c 1.3.6.1.4.1.7.1 access=read-only syntax=Counter32")
+
+
+def _test_q43_symbol_not_in_imported_module() -> None:
+    ms = mib.resolver.resolve_texts([V2_HEAD.replace("enterprises\n", "enterprises, noSuchSymbol\n") + r"""
+x OBJECT IDENTIFIER ::= { noSuchSymbol 1 }
+""" + TAIL])
+    testing.assertEqual(rcodes(ms), "L2 resolve.import-not-found, L1 resolve.oid-undefined")
+    testing.assertEqual(node(ms, "QUIRK-MIB", "x"), "node x <unlinked>")
+
+
+def _test_q44_duplicate_descriptor() -> None:
+    ms = r2(r"""
+dup OBJECT IDENTIFIER ::= { quirkObjects 1 }
+dup OBJECT IDENTIFIER ::= { quirkObjects 2 }
+same OBJECT IDENTIFIER ::= { quirkObjects 3 }
+same OBJECT IDENTIFIER ::= { quirkObjects 3 }
+""")
+    testing.assertEqual(rcodes(ms), "L2 resolve.redefined-oid, L2 resolve.redefined")
+    testing.assertEqual(node(ms, "QUIRK-MIB", "dup"), "node dup 1.3.6.1.4.1.99999.1.1")
+    # the second dup stays in the OID tree (VGK-MIB defines `interval` 108 times)
+    testing.assertEqual([n.dump() for n in ms.names_at([1, 3, 6, 1, 4, 1, 99999, 1, 2])], ["node dup 1.3.6.1.4.1.99999.1.2"])
+
+
+def _test_q44_assignment_then_registration() -> None:
+    # declare-then-define (HIKVISION-MIB): the OBJECT-TYPE replaces the plain assignment
+    ms = r2(r"""
+q OBJECT IDENTIFIER ::= { quirkObjects 5 }
+""" + obj("Integer32"))
+    testing.assertEqual(rcodes(ms), "L2 resolve.redefined")
+    testing.assertEqual(node(ms, "QUIRK-MIB", "q"), "scalar q 1.3.6.1.4.1.99999.1.5 access=read-only syntax=INTEGER")
+    m = ms.module("QUIRK-MIB")
+    testing.assertEqual(len([n for n in m.nodes if n.name == "q"]) if m is not None else -1, 1)
+
+
+def _test_q44_status_values() -> None:
+    testing.assertEqual(q2(r"""q OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS mandatory DESCRIPTION "d" ::= { quirkObjects 9 }""", "q"),
+                        "L3 resolve.status-smiv1 | scalar q 1.3.6.1.4.1.99999.1.9 access=read-only syntax=INTEGER")
+    testing.assertEqual(q1(obj1("Counter").replace("mandatory", "current"), "q"),
+                        "L5 resolve.status-smiv2 | scalar q 1.3.6.1.4.1.99998.5 access=read-only syntax=Counter32")
+    testing.assertEqual(q1(obj1("Counter").replace("mandatory", "deprecated"), "q"),
+                        "ok | scalar q 1.3.6.1.4.1.99998.5 status=deprecated access=read-only syntax=Counter32")
+    testing.assertEqual(q2(r"""q OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS readonly STATUS currnet DESCRIPTION "d" ::= { quirkObjects 9 }""", "q"),
+                        "L2 resolve.access-invalid, L2 resolve.status-invalid | scalar q 1.3.6.1.4.1.99999.1.9 access=read-only syntax=INTEGER")
+    testing.assertEqual(q2(r"""q OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read_only STATUS current DESCRIPTION "d" ::= { quirkObjects 9 }""", "q"),
+                        "L2 resolve.access-invalid | scalar q 1.3.6.1.4.1.99999.1.9 access=read-only syntax=INTEGER")
+
+
+def _test_q44_access_values() -> None:
+    testing.assertEqual(q2(r"""q OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS write-only STATUS current DESCRIPTION "d" ::= { quirkObjects 9 }""", "q"),
+                        "L4 resolve.access-write-only | scalar q 1.3.6.1.4.1.99999.1.9 access=read-write syntax=INTEGER")
+    testing.assertEqual(q1(obj1("Counter").replace("read-only", "read-create"), "q"),
+                        "L3 resolve.access-scalar-create, L5 resolve.access-smiv2 | scalar q 1.3.6.1.4.1.99998.5 access=read-create syntax=Counter32")
+
+
+def _test_q44_same_trap_number_twice() -> None:
+    ms = r1(r"""
+t1 TRAP-TYPE ENTERPRISE quirkV1 DESCRIPTION "d" ::= 3
+t2 TRAP-TYPE ENTERPRISE quirkV1 DESCRIPTION "d" ::= 3
+""")
+    testing.assertEqual(rcodes(ms), "L5 resolve.import-rewritten, L2 resolve.oid-registered")
+    testing.assertEqual([n.name for n in ms.names_at([1, 3, 6, 1, 4, 1, 99998, 0, 3])], ["t1", "t2"])
+    p = ms.preferred([1, 3, 6, 1, 4, 1, 99998, 0, 3])
+    testing.assertEqual(p.name if p is not None else "", "t1")
+
+
+def _test_q45_enumerations() -> None:
+    testing.assertEqual(syn2(r"INTEGER { up(1), up(2) }"),
+                        "L2 resolve.enum-duplicate-label | scalar q 1.3.6.1.4.1.99999.1.5 access=read-only syntax=INTEGER enums=up(1)")
+    testing.assertEqual(syn2(r"INTEGER { up(1), on(1) }"),
+                        "L2 resolve.enum-duplicate-value | scalar q 1.3.6.1.4.1.99999.1.5 access=read-only syntax=INTEGER enums=up(1),on(1)")
+    testing.assertEqual(q1(obj1(r"INTEGER { off(0), on(1) }"), "q"),
+                        "L5 resolve.enum-zero | scalar q 1.3.6.1.4.1.99998.5 access=read-only syntax=INTEGER enums=off(0),on(1)")
+    testing.assertEqual(syn2(r"INTEGER { big(4294967295) }"),
+                        "L2 resolve.enum-range | scalar q 1.3.6.1.4.1.99999.1.5 access=read-only syntax=INTEGER enums=big(4294967295)")
+
+
+def _test_q45_bits() -> None:
+    testing.assertEqual(syn2(r"BITS { a(0), b(-1) }"),
+                        "L2 resolve.bits-negative | scalar q 1.3.6.1.4.1.99999.1.5 access=read-only syntax=BITS bits=a(0)")
+    testing.assertEqual(syn2(r"BITS { a(0), b(144) }"),
+                        "ok | scalar q 1.3.6.1.4.1.99999.1.5 access=read-only syntax=BITS bits=a(0),b(144)")
+
+
+def _test_q46_sequence_column_missing_or_mismatched() -> None:
+    # the OID tree decides: qOther is a column although QEntry does not list it (L3)
+    ms = r2(TABLE.replace(r"qValue Counter32 }", r"qValue Counter32, qGone Integer32 }") + r"""
+qOther OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current DESCRIPTION "v" ::= { qEntry 9 }
+""")
+    testing.assertEqual(rcodes(ms), "L3 resolve.sequence-no-column, L3 resolve.sequence-missing-column")
+    testing.assertEqual(node(ms, "QUIRK-MIB", "qOther"), "column qOther 1.3.6.1.4.1.99999.1.7.1.9 access=read-only syntax=INTEGER")
+
+
+def _test_structural_checks() -> None:
+    ms = r2(r"""
+t OBJECT-TYPE SYNTAX SEQUENCE OF TEntry MAX-ACCESS read-only STATUS current DESCRIPTION "t" ::= { quirkObjects 7 }
+tEntry OBJECT-TYPE SYNTAX TEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "e" INDEX { a } ::= { quirkObjects 8 1 }
+TEntry ::= SEQUENCE { a Integer32 }
+a OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-create STATUS current DESCRIPTION "a" ::= { tEntry 1 }
+s OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-create STATUS current DESCRIPTION "s" ::= { quirkObjects 9 }
+n NOTIFICATION-TYPE STATUS current DESCRIPTION "n" ::= { quirkMIB 3 }
+""")
+    testing.assertEqual(rcodes(ms), "L3 resolve.access-table, L2 resolve.row-misplaced, L3 resolve.access-scalar-create, L5 resolve.notification-not-reversible")
+
+
+def _test_q46_implied_in_smiv1_or_fixed_size() -> None:
+    ms = r1(r"""
+qTable OBJECT-TYPE SYNTAX SEQUENCE OF QEntry ACCESS not-accessible STATUS mandatory ::= { quirkV1 7 }
+qEntry OBJECT-TYPE SYNTAX QEntry ACCESS not-accessible STATUS mandatory INDEX { IMPLIED qName } ::= { qTable 1 }
+QEntry ::= SEQUENCE { qName DisplayString }
+qName OBJECT-TYPE SYNTAX DisplayString ACCESS read-only STATUS mandatory ::= { qEntry 1 }
+""")
+    testing.assertEqual(node(ms, "QUIRK-V1-MIB", "qEntry").split(" index=")[1], "QUIRK-V1-MIB::qName=implied implied")
+
+
+def _test_q46_index_and_augments() -> None:
+    body = TABLE.replace(r"AUGMENTS { qEntry }", r"INDEX { xValue } AUGMENTS { qEntry }")
+    ms = r2(body)
+    testing.assertEqual(node(ms, "QUIRK-MIB", "xEntry"),
+                        "row xEntry 1.3.6.1.4.1.99999.1.8.1 access=not-accessible syntax=SEQUENCE XEntry augments=QUIRK-MIB::qEntry")
+
+
+def _test_q46_row_sub_id_not_one() -> None:
+    testing.assertEqual(q2(r"""
+qTable OBJECT-TYPE SYNTAX SEQUENCE OF QEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "t" ::= { quirkObjects 7 }
+qEntry OBJECT-TYPE SYNTAX QEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "e" INDEX { a } ::= { qTable 2 }
+QEntry ::= SEQUENCE { a Integer32 }
+a OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS not-accessible STATUS current DESCRIPTION "a" ::= { qEntry 1 }
+""", "qEntry"), "L3 resolve.row-subid | row qEntry 1.3.6.1.4.1.99999.1.7.2 access=not-accessible syntax=SEQUENCE QEntry index=QUIRK-MIB::a=int")
+
+
+def _test_q46_smiv1_row_without_index() -> None:
+    testing.assertEqual(q1(r"""
+qTable OBJECT-TYPE SYNTAX SEQUENCE OF QEntry ACCESS not-accessible STATUS mandatory ::= { quirkV1 7 }
+qEntry OBJECT-TYPE SYNTAX QEntry ACCESS not-accessible STATUS mandatory ::= { qTable 1 }
+QEntry ::= SEQUENCE { a INTEGER }
+a OBJECT-TYPE SYNTAX INTEGER ACCESS read-only STATUS mandatory ::= { qEntry 1 }
+""", "qEntry"), "L2 resolve.row-without-index | row qEntry 1.3.6.1.4.1.99998.7.1 access=not-accessible syntax=SEQUENCE QEntry keyless")
+
+
+def _test_q46_scalar_as_index() -> None:
+    ms = r2(r"""
+s OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current DESCRIPTION "s" ::= { quirkObjects 1 }
+qTable OBJECT-TYPE SYNTAX SEQUENCE OF QEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "t" ::= { quirkObjects 7 }
+qEntry OBJECT-TYPE SYNTAX QEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "e" INDEX { s } ::= { qTable 1 }
+QEntry ::= SEQUENCE { a Integer32 }
+a OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current DESCRIPTION "a" ::= { qEntry 1 }
+""")
+    testing.assertEqual(rcodes(ms), "L3 resolve.index-not-column")
+    testing.assertEqual(node(ms, "QUIRK-MIB", "qEntry").split(" index=")[1], "QUIRK-MIB::s=int")
+
+
+def _test_q47_tc_on_tc_and_bad_hint() -> None:
+    ms = r2(r"""
+QuirkTC ::= TEXTUAL-CONVENTION STATUS current DESCRIPTION "d" SYNTAX DisplayString (SIZE (0..32))
+BadHint ::= TEXTUAL-CONVENTION DISPLAY-HINT "1q" STATUS current DESCRIPTION "d" SYNTAX OCTET STRING
+IntHint ::= TEXTUAL-CONVENTION DISPLAY-HINT "d-2" STATUS current DESCRIPTION "d" SYNTAX Integer32
+""")
+    testing.assertEqual(rcodes(ms), "L5 resolve.tc-nested, L2 resolve.hint-invalid")
+    testing.assertEqual(tdump(ms, "QUIRK-MIB", "QuirkTC"), "TYPE QuirkTC tc status=current parent=SNMPv2-TC::DisplayString syntax=OCTET STRING tc=SNMPv2-TC::DisplayString size=0..32 hint=255a")
+    testing.assertEqual(tdump(ms, "QUIRK-MIB", "BadHint"), "TYPE BadHint tc status=current syntax=OCTET STRING")
+    testing.assertEqual(tdump(ms, "QUIRK-MIB", "IntHint"), "TYPE IntHint tc status=current syntax=INTEGER hint=d-2")
+
+
+def _test_q47_subtyped_timeticks_or_counter() -> None:
+    testing.assertEqual(syn2(r"TimeTicks (0..100)"), "L2 resolve.range-illegal | scalar q 1.3.6.1.4.1.99999.1.5 access=read-only syntax=TimeTicks range=0..100")
+    testing.assertEqual(syn2(r"Counter32 (0..100)"), "L2 resolve.range-illegal | scalar q 1.3.6.1.4.1.99999.1.5 access=read-only syntax=Counter32 range=0..100")
+
+
+def _test_q47_reversed_and_outside_ranges() -> None:
+    testing.assertEqual(syn2(r"Integer32 (100..1)"), "L2 resolve.range-swapped | scalar q 1.3.6.1.4.1.99999.1.5 access=read-only syntax=INTEGER range=1..100")
+    testing.assertEqual(syn2(r"Integer32 (0..4294967295)"), "L2 resolve.range-bounds | scalar q 1.3.6.1.4.1.99999.1.5 access=read-only syntax=INTEGER range=0..4294967295")
+    testing.assertEqual(syn2(r"DisplayString (0..32)"), "L2 resolve.range-kind | scalar q 1.3.6.1.4.1.99999.1.5 access=read-only syntax=OCTET STRING tc=SNMPv2-TC::DisplayString size=0..32 hint=255a")
+
+
+def _test_q47_smiv1_types_in_smiv2() -> None:
+    ms = mib.resolver.resolve_texts([V2_HEAD + obj("Counter") + r"""
+g OBJECT-TYPE SYNTAX Gauge MAX-ACCESS read-only STATUS current DESCRIPTION "d" ::= { quirkObjects 6 }
+a OBJECT-TYPE SYNTAX NetworkAddress MAX-ACCESS read-only STATUS current DESCRIPTION "d" ::= { quirkObjects 7 }
+""" + TAIL])
+    testing.assertEqual(rcodes(ms), "L3 resolve.not-imported, L3 resolve.not-imported, L3 resolve.not-imported")
+    testing.assertEqual(node(ms, "QUIRK-MIB", "q"), "scalar q 1.3.6.1.4.1.99999.1.5 access=read-only syntax=Counter32")
+    testing.assertEqual(node(ms, "QUIRK-MIB", "g"), "scalar g 1.3.6.1.4.1.99999.1.6 access=read-only syntax=Gauge32")
+    testing.assertEqual(node(ms, "QUIRK-MIB", "a"), "scalar a 1.3.6.1.4.1.99999.1.7 access=read-only syntax=IpAddress(netaddr)")
+
+
+def _test_q47_defvals() -> None:
+    pre = "scalar q 1.3.6.1.4.1.99999.1.5 access=read-only syntax="
+    testing.assertEqual(dv2(r"Integer32", r"{ 'ff'h }"), "ok | " + pre + "INTEGER defval=int:255")
+    testing.assertEqual(dv2(r"Integer32", r"""{ "5" }"""), "L2 resolve.defval-quoted-number | " + pre + "INTEGER defval=int:5")
+    testing.assertEqual(dv2(r"INTEGER { up(1), down(2) }", r"{ 2 }"), "L5 resolve.defval-enum-number | " + pre + "INTEGER enums=up(1),down(2) defval=enum:down")
+    testing.assertEqual(dv2(r"INTEGER { up(1), down(2) }", r"{ { down } }"), "L3 resolve.defval-lenient | " + pre + "INTEGER enums=up(1),down(2) defval=enum:down")
+    testing.assertEqual(dv2(r"INTEGER { up(1), down(2) }", r"{ sideways }"), "L2 resolve.defval-invalid | " + pre + "INTEGER enums=up(1),down(2)")
+    testing.assertEqual(dv2(r"Integer32 (1..10)", r"{ 99 }"), "L2 resolve.defval-invalid | " + pre + "INTEGER range=1..10")
+    testing.assertEqual(dv2(r"OBJECT IDENTIFIER", r"{ { 0 0 } }"), "L3 resolve.defval-lenient | " + pre + "OBJECT IDENTIFIER defval=oid:0.0")
+    testing.assertEqual(dv2(r"OBJECT IDENTIFIER", r"{ { quirkObjects 1 } }"), "L3 resolve.defval-lenient | " + pre + "OBJECT IDENTIFIER defval=oid:1.3.6.1.4.1.99999.1.1")
+    testing.assertEqual(dv2(r"OBJECT IDENTIFIER", r"{ zeroDotZero }"), "L3 resolve.not-imported | " + pre + "OBJECT IDENTIFIER defval=oid:0.0")
+    testing.assertEqual(dv2(r"OBJECT IDENTIFIER", r"{ NULL }"), "L5 resolve.defval-null | " + pre + "OBJECT IDENTIFIER")
+    testing.assertEqual(dv2(r"OCTET STRING", r"{ 0 }"), "L2 resolve.defval-invalid | " + pre + "OCTET STRING")
+    testing.assertEqual(dv2(r"IpAddress", r"""{ "192.0.2.1" }"""), "L3 resolve.defval-lenient | " + pre + "IpAddress defval=ip:192.0.2.1")
+    testing.assertEqual(dv2(r"IpAddress", r"{ 'c0000201'H }"), "ok | " + pre + "IpAddress defval=ip:192.0.2.1")
+    testing.assertEqual(dv2(r"BITS { a(0), b(1) }", r"{ a }"), "L3 resolve.defval-lenient | " + pre + "BITS bits=a(0),b(1) defval=bits:a")
+    testing.assertEqual(dv2(r"BITS { a(0), b(1) }", r"{ { a, b } }"), "ok | " + pre + "BITS bits=a(0),b(1) defval=bits:a b")
+    testing.assertEqual(dv2(r"BITS { a(0), b(1) }", r"{ {} }"), "ok | " + pre + "BITS bits=a(0),b(1) defval=bits:")
+    testing.assertEqual(dv2(r"BITS { a(0), b(1) }", r"{ '80'H }"), "L3 resolve.defval-lenient | " + pre + "BITS bits=a(0),b(1) defval=bits:a")
+    testing.assertEqual(dv2(r"Counter64", r"{ 0 }"), "L3 resolve.defval-counter | " + pre + "Counter64 defval=int:0")
+    testing.assertEqual(dv2(r"DisplayString", r"""{ "abc" }"""), "ok | " + pre + "OCTET STRING tc=SNMPv2-TC::DisplayString size=0..255 hint=255a defval=string:abc")
+
+
+def smi_defval(syntax: str, defval: str) -> str:
+    ms = r2(obj(syntax, "DEFVAL " + defval) + r"""
+qTarget OBJECT IDENTIFIER ::= { quirkObjects 77 }
+""")
+    n = ms.node("QUIRK-MIB", "q")
+    if n is not None:
+        dv = n.defval
+        if dv is not None:
+            return dv.smi
+    return "<none>"
+
+
+def _test_defval_t22_rendering() -> None:
+    testing.assertEqual(smi_defval(r"Integer32", r"{ -1 }"), "-1")
+    testing.assertEqual(smi_defval(r"TruthValue", r"{ true }"), "true")
+    testing.assertEqual(smi_defval(r"DisplayString", r"""{ "abc" }"""), "abc")
+    testing.assertEqual(smi_defval(r"DisplayString", r"""{ "" }"""), "")
+    testing.assertEqual(smi_defval(r"OCTET STRING", r"{ '00'H }"), "'00'H")
+    testing.assertEqual(smi_defval(r"OCTET STRING", r"{ ''H }"), "")
+    testing.assertEqual(smi_defval(r"OBJECT IDENTIFIER", r"{ zeroDotZero }"), "zeroDotZero")
+    testing.assertEqual(smi_defval(r"OBJECT IDENTIFIER", r"{ { quirkObjects 77 } }"), "qTarget")
+    testing.assertEqual(smi_defval(r"OBJECT IDENTIFIER", r"{ { 1 3 99 } }"), "1.3.99")
+    testing.assertEqual(smi_defval(r"BITS { a(0), b(1) }", r"{ { a, b } }"), r"{a, b}")
+    testing.assertEqual(smi_defval(r"BITS { a(0), b(1) }", r"{ { } }"), r"{}")
+
+
+def _test_q48_oids() -> None:
+    testing.assertEqual(q2(r"q OBJECT IDENTIFIER ::= { enterprises quirkObjects 1 }", "q"), "L2 resolve.oid-not-prefix | node q <unlinked>")
+    testing.assertEqual(q2(r"q OBJECT IDENTIFIER ::= { enterprises quirkMIB 1 }", "q"), "L5 resolve.oid-reuse, L2 resolve.oid-not-prefix | node q 1.3.6.1.4.1.99999.1")
+    testing.assertEqual(q2(r"q OBJECT IDENTIFIER ::= { 1 3 6 1 4 1 9 }", "q"), "ok | node q 1.3.6.1.4.1.9")
+    # the labels create implicit nodes in the module, as net-snmp does (L6)
+    testing.assertEqual(q2(r"q OBJECT IDENTIFIER ::= { iso org(3) dod(6) internet(1) private(4) 1 9 }", "q"),
+                        "L6 resolve.implicit-node, L6 resolve.implicit-node, L6 resolve.implicit-node, L6 resolve.implicit-node | node q 1.3.6.1.4.1.9")
+    ms = r2(r"q OBJECT IDENTIFIER ::= { mib-2 snmpDot3MauMgt(26) 4 }")
+    testing.assertEqual(rcodes(ms), "L3 resolve.not-imported, L6 resolve.implicit-node")
+    testing.assertEqual(node(ms, "QUIRK-MIB", "snmpDot3MauMgt"), "node snmpDot3MauMgt 1.3.6.1.2.1.26")
+    testing.assertEqual(q2(r"q OBJECT IDENTIFIER ::= { quirkObjects 4294967296 }", "q"), "L1 resolve.oid-subid-range | node q <unlinked>")
+    testing.assertEqual(q2(obj("Integer32").replace("quirkObjects 5", "quirkObjects 0"), "q"),
+                        "L3 resolve.last-subid-zero | scalar q 1.3.6.1.4.1.99999.1.0 access=read-only syntax=INTEGER")
+    testing.assertEqual(q2(r"q OBJECT IDENTIFIER ::= { noSuchParent 1 }", "q"), "L1 resolve.oid-undefined | node q <unlinked>")
+    testing.assertEqual(q2(r"""
+child OBJECT IDENTIFIER ::= { parent 1 }
+parent OBJECT IDENTIFIER ::= { quirkObjects 1 }
+""", "child"), "ok | node child 1.3.6.1.4.1.99999.1.1.1")
+    testing.assertEqual(q2(r"""
+c1 OBJECT IDENTIFIER ::= { c2 1 }
+c2 OBJECT IDENTIFIER ::= { c1 1 }
+""", "c1"), "L1 resolve.oid-cycle | node c1 <unlinked>")
+
+
+def _test_q48_oid_registered_twice() -> None:
+    ms = r2(r"""
+a OBJECT IDENTIFIER ::= { quirkObjects 1 }
+b OBJECT IDENTIFIER ::= { quirkObjects 1 }
+""" + obj("Integer32") + obj("Integer32").replace("q OBJECT-TYPE", "q2 OBJECT-TYPE"))
+    testing.assertEqual(rcodes(ms), "L5 resolve.oid-reuse, L2 resolve.oid-registered")
+
+
+def _test_q48_imported_descriptor_redefined() -> None:
+    testing.assertEqual(q2(r"enterprises OBJECT IDENTIFIER ::= { iso 3 6 1 4 1 }", "enterprises"),
+                        "L2 resolve.import-shadowed | node enterprises 1.3.6.1.4.1")

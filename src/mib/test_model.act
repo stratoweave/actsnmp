@@ -1,0 +1,41 @@
+"""Tests of the `mib.model` helpers (the resolver tests cover the model as a whole)."""
+
+import testing
+import mib.model
+
+
+def _test_oid_str_and_names() -> None:
+    testing.assertEqual(mib.model.oid_str([1, 3, 6, 1]), "1.3.6.1")
+    testing.assertEqual(mib.model.oid_str([]), "")
+    testing.assertEqual(mib.model.qual_name("IF-MIB", "ifIndex"), "IF-MIB::ifIndex")
+
+
+def _test_ranges() -> None:
+    testing.assertEqual(mib.model.dump_ranges([mib.model.Range(bigint(1), bigint(10)), mib.model.Range(bigint(20), bigint(20))]), "1..10 | 20")
+
+
+def _test_fixed_size() -> None:
+    s = mib.model.Syntax()
+    s.base = "OCTET STRING"
+    testing.assertEqual(s.fixed_size(), -1)
+    s.sizes = [mib.model.Range(bigint(6), bigint(6))]
+    testing.assertEqual(s.fixed_size(), 6)
+    s.sizes = [mib.model.Range(bigint(4), bigint(4)), mib.model.Range(bigint(4), bigint(4))]
+    testing.assertEqual(s.fixed_size(), 4)
+    s.sizes = [mib.model.Range(bigint(0), bigint(0)), mib.model.Range(bigint(6), bigint(6))]
+    testing.assertEqual(s.fixed_size(), -1)
+    s.sizes = [mib.model.Range(bigint(8), bigint(11))]
+    testing.assertEqual(s.fixed_size(), -1)
+
+
+def _test_syntax_dump() -> None:
+    s = mib.model.Syntax()
+    s.base = "INTEGER"
+    s.tc_name = "TruthValue"
+    s.tc_module = "SNMPv2-TC"
+    s.enums = [mib.model.NamedValue("true", 1), mib.model.NamedValue("false", 2)]
+    testing.assertEqual(s.dump(), "INTEGER tc=SNMPv2-TC::TruthValue enums=true(1),false(2)")
+    testing.assertTrue(s.is_enum())
+    u = mib.model.Syntax()
+    u.unresolved = "FooType"
+    testing.assertEqual(u.dump(), "<unresolved FooType>")

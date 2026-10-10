@@ -1,0 +1,659 @@
+"""mibmeta: compact runtime metadata of compiled MIB modules.
+
+- Classes `MibBundle`, `ModuleMeta`, `TypeMeta`, `NodeMeta`, `SyntaxMeta` and `IndexPart`
+  (`NodeMeta.keyless` marks a row without a usable INDEX or AUGMENTS). Optional strings are
+  "" when absent (written as missing keys in JSON).
+- `module_meta(ms, name)` / `bundle(ms, names)` derive them from a resolved
+  `mib.model.MibSet`.
+- `to_json(m)` / `bundle_to_json(b)` write the `actsnmp-mibmeta/1` JSON format, with a
+  fixed key order so the output is diffable; `from_json(text)` / `bundle_from_json(text)`
+  read it back (`MetaError` on malformed input).
+- `MetaIndex`: an OID trie with longest-prefix match (`lookup(oid)` gives the node and
+  the instance suffix) and by-name lookup (`find("ifIndex")`, `find("IF-MIB::ifIndex")`).
+
+Not yet derived: `NodeMeta.yang` data node paths stay empty, and the module prefix is the
+RFC 6643 Appendix B prefix of `prefix_of`, without collision handling against import prefixes.
+"""
+
+import json
+import mib.model
+import mib.source
+
+FORMAT = "actsnmp-mibmeta/1"
+
+
+class MetaError(Exception):
+    def __init__(self, msg: str):
+        self.error_message = msg
+
+
+class SyntaxMeta(object):
+    """Wire syntax of a leaf: `wire` the SMI base (INTEGER, OCTET STRING, OBJECT
+    IDENTIFIER, IpAddress, Counter32, Gauge32, Unsigned32, TimeTicks, Counter64, Opaque,
+    BITS), `tc` the nearest named type as `MOD::TC` ("" none), `conv` the value conversion
+    kind, `hint` the effective DISPLAY-HINT, effective `ranges`/`sizes`, `enums` and
+    `bits` in MIB order."""
+    wire: str
+    tc: str
+    conv: str
+    hint: str
+    ranges: list[(bigint, bigint)]
+    sizes: list[(bigint, bigint)]
+    enums: list[(str, int)]
+    bits: list[(str, int)]
+
+    def __init__(self, wire: str, tc: str, conv: str, hint: str):
+        self.wire = wire
+        self.tc = tc
+        self.conv = conv
+        self.hint = hint
+        self.ranges = []
+        self.sizes = []
+        self.enums = []
+        self.bits = []
+
+
+class IndexPart(object):
+    """One INDEX item. `obj` (JSON `object`) is "MOD::name", or "" for a synthetic SMIv1 item;
+    `key` is the YANG key leaf name; `enc` the instance encoding (int, fixed, var, implied,
+    oid, oid-implied, ipv4, netaddr), with `size` for `fixed`."""
+    obj: str
+    key: str
+    enc: str
+    size: int
+    syntax: ?SyntaxMeta
+
+    def __init__(self, obj: str, key: str, enc: str, size: int, syntax: ?SyntaxMeta):
+        self.obj = obj
+        self.key = key
+        self.enc = enc
+        self.size = size
+        self.syntax = syntax
+
+
+class TypeMeta(object):
+    name: str
+    parent: str
+    status: str
+    syntax: ?SyntaxMeta
+
+    def __init__(self, name: str, parent: str, status: str, syntax: ?SyntaxMeta):
+        self.name = name
+        self.parent = parent
+        self.status = status
+        self.syntax = syntax
+
+
+class NodeMeta(object):
+    name: str
+    module: str
+    oid: list[int]
+    kind: str
+    access: str
+    status: str
+    units: str
+    defval: str
+    syntax: ?SyntaxMeta
+    yang: str
+    index: list[IndexPart]
+    implied: bool
+    keyless: bool
+    augments: str
+    sparse_of: str
+    objects: list[str]
+    members: list[str]
+
+    def __init__(self, name: str, module: str, oid: list[int], kind: str):
+        self.name = name
+        self.module = module
+        self.oid = oid
+        self.kind = kind
+        self.access = ""
+        self.status = "current"
+        self.units = ""
+        self.defval = ""
+        self.syntax = None
+        self.yang = ""
+        self.index = []
+        self.implied = False
+        self.keyless = False
+        self.augments = ""
+        self.sparse_of = ""
+        self.objects = []
+        self.members = []
+
+    def qname(self) -> str:
+        return self.module + "::" + self.name
+
+
+class ModuleMeta(object):
+    name: str
+    smi: str
+    yang_ns: str
+    yang_prefix: str
+    revision: str
+    source_sha256: str
+    types: list[TypeMeta]
+    nodes: list[NodeMeta]
+
+    def __init__(self, name: str, smi: str):
+        self.name = name
+        self.smi = smi
+        self.yang_ns = "urn:ietf:params:xml:ns:yang:smiv2:" + name
+        self.yang_prefix = prefix_of(name)
+        self.revision = ""
+        self.source_sha256 = ""
+        self.types = []
+        self.nodes = []
+
+
+class MibBundle(object):
+    format: str
+    modules: list[ModuleMeta]
+
+    def __init__(self, modules: list[ModuleMeta]):
+        self.format = FORMAT
+        self.modules = modules
+
+
+# --- derivation from the model ----------------------------------------------------------------
+
+def prefix_of(name: str) -> str:
+    """RFC 6643 Appendix B prefix without collision handling: the first two `-` tokens of the
+    lowercased name (the whole name when it has one token)."""
+    toks = name.lower().split("-")
+    if len(toks) < 2:
+        return name.lower()
+    return toks[0] + "-" + toks[1]
+
+
+def revision_date(m: mib.model.MibModule) -> str:
+    """`YYYY-MM-DD` of LAST-UPDATED (else the first REVISION), "" when there is no valid one."""
+    k = mib.source.date_key(m.last_updated)
+    if k == "" and len(m.revisions) > 0:
+        k = mib.source.date_key(m.revisions[0].date)
+    if len(k) < 8:
+        return ""
+    return k[0:4] + "-" + k[4:6] + "-" + k[6:8]
+
+
+def conv_of(s: mib.model.Syntax) -> str:
+    """The value conversion kind of a resolved syntax."""
+    b = s.base
+    if b == "INTEGER":
+        if len(s.enums) > 0:
+            if s.tc_name == "TruthValue" and s.tc_module == "SNMPv2-TC":
+                return "truthvalue"
+            return "enum"
+        if s.hint.startswith("d-"):
+            return "int-hint"
+        return "int"
+    if b == "Unsigned32" or b == "Gauge32" or b == "Counter32" or b == "TimeTicks" or b == "Counter64":
+        return "uint"
+    if b == "BITS":
+        return "bits"
+    if b == "IpAddress":
+        return "ipv4"
+    if b == "OBJECT IDENTIFIER":
+        return "oid"
+    if b == "Opaque":
+        return "opaque"
+    if b == "OCTET STRING":
+        for c in s.chain:
+            if c == "SNMPv2-TC::PhysAddress":
+                return "phys-address"
+            if c == "SNMPv2-TC::MacAddress":
+                return "mac-address"
+        if s.hint != "":
+            return "string-hint"
+        return "binary"
+    return ""
+
+
+def syntax_meta(s: mib.model.Syntax) -> SyntaxMeta:
+    sm = SyntaxMeta(s.base, s.tc(), conv_of(s), s.hint)
+    sm.ranges = [(r.lo, r.hi) for r in s.ranges]
+    sm.sizes = [(r.lo, r.hi) for r in s.sizes]
+    sm.enums = [(e.label, e.value) for e in s.enums]
+    sm.bits = [(e.label, e.value) for e in s.bits]
+    return sm
+
+
+def _opt_syntax(s: ?mib.model.Syntax) -> ?SyntaxMeta:
+    if s is not None:
+        if s.unresolved == "" and s.base != "" and s.base != "SEQUENCE" and s.base != "SEQUENCE OF" and s.base != "CHOICE":
+            return syntax_meta(s)
+    return None
+
+
+def node_meta(n: mib.model.MibNode) -> NodeMeta:
+    nm = NodeMeta(n.name, n.module, n.oid, n.kind)
+    nm.access = n.access
+    nm.status = n.status
+    nm.units = n.units
+    dv = n.defval
+    if dv is not None:
+        nm.defval = dv.smi
+    nm.syntax = _opt_syntax(n.syntax)
+    if n.kind == "row":
+        if n.augments == "":
+            # an augmenting row has no index of its own: the base row's applies
+            nm.index = [IndexPart(p.object(), p.key, p.enc, p.size, _opt_syntax(p.syntax)) for p in n.index]
+        nm.implied = n.implied
+        nm.keyless = n.keyless
+        nm.augments = n.augments
+        nm.sparse_of = n.sparse_of
+    nm.objects = n.objects
+    nm.members = n.members
+    return nm
+
+
+def module_meta(ms: mib.model.MibSet, name: str) -> ?ModuleMeta:
+    """The mibmeta of module `name` of a resolved set (None when it is not loaded). Nodes are
+    sorted by OID; unlinked nodes are left out."""
+    m = ms.module(name)
+    if m is not None:
+        mm = ModuleMeta(m.name, m.smi)
+        mm.revision = revision_date(m)
+        mm.source_sha256 = m.sha256
+        for t in m.types:
+            if t.kind == "tc" or t.kind == "type":
+                mm.types.append(TypeMeta(t.name, t.parent, t.status, _opt_syntax(t.syntax)))
+        keyed = [(n.oid, i) for i, n in enumerate(m.nodes) if n.linked]
+        for k in sorted(keyed):
+            mm.nodes.append(node_meta(m.nodes[k.1]))
+        return mm
+    return None
+
+
+def bundle(ms: mib.model.MibSet, names: list[str]) -> MibBundle:
+    out: list[ModuleMeta] = []
+    for nm in names:
+        mm = module_meta(ms, nm)
+        if mm is not None:
+            out.append(mm)
+    return MibBundle(out)
+
+
+# --- JSON writer ------------------------------------------------------------------------------
+
+def jq(s: str) -> str:
+    """A JSON string literal."""
+    out: list[str] = []
+    for ch in s:
+        c = ord(ch)
+        if ch == "\"":
+            out.append("\\\"")
+        elif ch == "\\":
+            out.append("\\\\")
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ch == "\t":
+            out.append("\\t")
+        elif c < 32:
+            out.append("\\u%04x" % c)
+        else:
+            out.append(ch)
+    return "\"" + "".join(out) + "\""
+
+
+def _pairs_big(xs: list[(bigint, bigint)]) -> str:
+    return "[" + ",".join(["[" + str(x.0) + "," + str(x.1) + "]" for x in xs]) + "]"
+
+
+def _pairs_named(xs: list[(str, int)]) -> str:
+    return "[" + ",".join(["[" + jq(x.0) + "," + str(x.1) + "]" for x in xs]) + "]"
+
+
+def _strs(xs: list[str]) -> str:
+    return "[" + ",".join([jq(x) for x in xs]) + "]"
+
+
+def syntax_json(s: SyntaxMeta) -> str:
+    f = ["\"wire\":" + jq(s.wire)]
+    if s.tc != "":
+        f.append("\"tc\":" + jq(s.tc))
+    f.append("\"conv\":" + jq(s.conv))
+    if s.hint != "":
+        f.append("\"hint\":" + jq(s.hint))
+    if len(s.ranges) > 0:
+        f.append("\"ranges\":" + _pairs_big(s.ranges))
+    if len(s.sizes) > 0:
+        f.append("\"sizes\":" + _pairs_big(s.sizes))
+    if len(s.enums) > 0:
+        f.append("\"enums\":" + _pairs_named(s.enums))
+    if len(s.bits) > 0:
+        f.append("\"bits\":" + _pairs_named(s.bits))
+    return "{{" + ",".join(f) + "}}"
+
+
+def _index_json(p: IndexPart) -> str:
+    f = ["\"object\":" + jq(p.obj), "\"key\":" + jq(p.key), "\"enc\":" + jq(p.enc)]
+    if p.enc == "fixed":
+        f.append("\"size\":" + str(p.size))
+    sx = p.syntax
+    if sx is not None:
+        f.append("\"syntax\":" + syntax_json(sx))
+    return "{{" + ",".join(f) + "}}"
+
+
+def node_json(n: NodeMeta) -> str:
+    f = ["\"name\":" + jq(n.name), "\"oid\":" + jq(mib.model.oid_str(n.oid)), "\"kind\":" + jq(n.kind)]
+    if n.access != "":
+        f.append("\"access\":" + jq(n.access))
+    f.append("\"status\":" + jq(n.status))
+    if n.units != "":
+        f.append("\"units\":" + jq(n.units))
+    if n.defval != "":
+        f.append("\"defval\":" + jq(n.defval))
+    sx = n.syntax
+    if sx is not None:
+        f.append("\"syntax\":" + syntax_json(sx))
+    if n.yang != "":
+        f.append("\"yang\":" + jq(n.yang))
+    if n.kind == "row":
+        f.append("\"implied\":" + ("true" if n.implied else "false"))
+        if n.keyless:
+            f.append("\"keyless\":true")
+        if n.augments != "":
+            f.append("\"augments\":" + jq(n.augments))
+        else:
+            f.append("\"index\":[" + ",".join([_index_json(p) for p in n.index]) + "]")
+        if n.sparse_of != "":
+            f.append("\"sparse_of\":" + jq(n.sparse_of))
+    if len(n.objects) > 0:
+        f.append("\"objects\":" + _strs(n.objects))
+    if len(n.members) > 0:
+        f.append("\"members\":" + _strs(n.members))
+    return "{{" + ",".join(f) + "}}"
+
+
+def _type_json(t: TypeMeta) -> str:
+    f = ["\"name\":" + jq(t.name)]
+    if t.parent != "":
+        f.append("\"parent\":" + jq(t.parent))
+    f.append("\"status\":" + jq(t.status))
+    sx = t.syntax
+    if sx is not None:
+        f.append("\"syntax\":" + syntax_json(sx))
+    return "{{" + ",".join(f) + "}}"
+
+
+def module_json(m: ModuleMeta) -> str:
+    """The module object (without the `format` key)."""
+    y = ["\"ns\":" + jq(m.yang_ns), "\"prefix\":" + jq(m.yang_prefix)]
+    if m.revision != "":
+        y.append("\"revision\":" + jq(m.revision))
+    f = ["\"module\":" + jq(m.name), "\"smi\":" + jq(m.smi), "\"yang\":{{" + ",".join(y) + "}}"]
+    if m.source_sha256 != "":
+        f.append("\"source_sha256\":" + jq(m.source_sha256))
+    f.append("\"types\":[\n " + ",\n ".join([_type_json(t) for t in m.types]) + "]" if len(m.types) > 0 else "\"types\":[]")
+    f.append("\"nodes\":[\n " + ",\n ".join([node_json(n) for n in m.nodes]) + "]" if len(m.nodes) > 0 else "\"nodes\":[]")
+    return "{{" + ",\n".join(f) + "}}"
+
+
+def to_json(m: ModuleMeta) -> str:
+    """One module as an `actsnmp-mibmeta/1` JSON document, one node per line."""
+    return "{{\"format\":" + jq(FORMAT) + ",\n" + module_json(m)[1:] + "\n"
+
+
+def bundle_to_json(b: MibBundle) -> str:
+    return "{{\"format\":" + jq(b.format) + ",\n\"modules\":[\n" + ",\n".join([module_json(m) for m in b.modules]) + "]}}\n"
+
+
+# --- JSON reader ------------------------------------------------------------------------------
+
+def _get(d: dict[str, ?value], k: str) -> ?value:
+    if k in d:
+        return d[k]
+    return None
+
+
+def _str(d: dict[str, ?value], k: str) -> str:
+    v = _get(d, k)
+    if isinstance(v, str):
+        return v
+    return ""
+
+
+def _bool(d: dict[str, ?value], k: str) -> bool:
+    v = _get(d, k)
+    if isinstance(v, bool):
+        return v
+    return False
+
+
+def _big(v: ?value) -> bigint:
+    if isinstance(v, int):
+        return bigint(v)
+    if isinstance(v, bigint):
+        return v
+    if isinstance(v, float):
+        return bigint(int(v))
+    if isinstance(v, str):
+        return bigint(v)
+    raise MetaError("number expected")
+
+
+def _int(v: ?value) -> int:
+    if isinstance(v, int):
+        return v
+    if isinstance(v, bigint):
+        return int(v)
+    if isinstance(v, float):
+        return int(v)
+    raise MetaError("integer expected")
+
+
+def _list(d: dict[str, ?value], k: str) -> list[?value]:
+    v = _get(d, k)
+    if isinstance(v, list):
+        lst: list[?value] = v
+        return lst
+    return []
+
+
+def _dict(v: ?value) -> dict[str, ?value]:
+    if isinstance(v, dict):
+        dd: dict[str, ?value] = v
+        return dd
+    raise MetaError("object expected")
+
+
+def _strlist(d: dict[str, ?value], k: str) -> list[str]:
+    out: list[str] = []
+    for v in _list(d, k):
+        if isinstance(v, str):
+            out.append(v)
+    return out
+
+
+def _pairs_b(d: dict[str, ?value], k: str) -> list[(bigint, bigint)]:
+    out: list[(bigint, bigint)] = []
+    for v in _list(d, k):
+        if isinstance(v, list):
+            p: list[?value] = v
+            if len(p) == 2:
+                out.append((_big(p[0]), _big(p[1])))
+    return out
+
+
+def _pairs_n(d: dict[str, ?value], k: str) -> list[(str, int)]:
+    out: list[(str, int)] = []
+    for v in _list(d, k):
+        if isinstance(v, list):
+            p: list[?value] = v
+            if len(p) == 2:
+                lbl = p[0]
+                if isinstance(lbl, str):
+                    out.append((lbl, _int(p[1])))
+    return out
+
+
+def _syntax(v: ?value) -> ?SyntaxMeta:
+    if v is None:
+        return None
+    d = _dict(v)
+    s = SyntaxMeta(_str(d, "wire"), _str(d, "tc"), _str(d, "conv"), _str(d, "hint"))
+    s.ranges = _pairs_b(d, "ranges")
+    s.sizes = _pairs_b(d, "sizes")
+    s.enums = _pairs_n(d, "enums")
+    s.bits = _pairs_n(d, "bits")
+    return s
+
+
+def parse_oid(s: str) -> list[int]:
+    if s == "":
+        return []
+    return [int(x) for x in s.split(".")]
+
+
+def _module(d: dict[str, ?value]) -> ModuleMeta:
+    name = _str(d, "module")
+    if name == "":
+        raise MetaError("module name missing")
+    m = ModuleMeta(name, _str(d, "smi"))
+    yv = _get(d, "yang")
+    if yv is not None:
+        y = _dict(yv)
+        m.yang_ns = _str(y, "ns")
+        m.yang_prefix = _str(y, "prefix")
+        m.revision = _str(y, "revision")
+    m.source_sha256 = _str(d, "source_sha256")
+    for tv in _list(d, "types"):
+        td = _dict(tv)
+        m.types.append(TypeMeta(_str(td, "name"), _str(td, "parent"), _str(td, "status"), _syntax(_get(td, "syntax"))))
+    for nv in _list(d, "nodes"):
+        nd = _dict(nv)
+        n = NodeMeta(_str(nd, "name"), name, parse_oid(_str(nd, "oid")), _str(nd, "kind"))
+        n.access = _str(nd, "access")
+        n.status = _str(nd, "status")
+        n.units = _str(nd, "units")
+        n.defval = _str(nd, "defval")
+        n.syntax = _syntax(_get(nd, "syntax"))
+        n.yang = _str(nd, "yang")
+        n.implied = _bool(nd, "implied")
+        n.keyless = _bool(nd, "keyless")
+        n.augments = _str(nd, "augments")
+        n.sparse_of = _str(nd, "sparse_of")
+        n.objects = _strlist(nd, "objects")
+        n.members = _strlist(nd, "members")
+        for pv in _list(nd, "index"):
+            pd = _dict(pv)
+            sz = _get(pd, "size")
+            n.index.append(IndexPart(_str(pd, "object"), _str(pd, "key"), _str(pd, "enc"), _int(sz) if sz is not None else 0,
+                                     _syntax(_get(pd, "syntax"))))
+        m.nodes.append(n)
+    return m
+
+
+def from_json(text: str) -> ModuleMeta:
+    """Read one module written by `to_json`."""
+    d = json.decode(text)
+    f = _str(d, "format")
+    if f != FORMAT:
+        raise MetaError("unsupported mibmeta format " + f)
+    return _module(d)
+
+
+def bundle_from_json(text: str) -> MibBundle:
+    d = json.decode(text)
+    f = _str(d, "format")
+    if f != FORMAT:
+        raise MetaError("unsupported mibmeta format " + f)
+    return MibBundle([_module(_dict(v)) for v in _list(d, "modules")])
+
+
+# --- lookup structures --------------------------------------------------------------------------
+
+class TrieNode(object):
+    children: dict[int, TrieNode]
+    nodes: list[NodeMeta]
+
+    def __init__(self):
+        self.children = {}
+        self.nodes = []
+
+
+class MetaIndex(object):
+    """Runtime lookup over a bundle: an OID trie (longest-prefix match) and names.
+
+    At an OID with several names the first one added wins for `lookup` (bundle order, then
+    module order); a registration is preferred over a plain OID assignment."""
+    root: TrieNode
+    by_qname: dict[str, NodeMeta]
+    by_name: dict[str, list[NodeMeta]]
+
+    def __init__(self, b: MibBundle):
+        self.root = TrieNode()
+        self.by_qname = {}
+        self.by_name = {}
+        for m in b.modules:
+            for n in m.nodes:
+                self.add(n)
+
+    def add(self, n: NodeMeta) -> None:
+        cur = self.root
+        for a in n.oid:
+            c = cur.children.get(a)
+            if c is not None:
+                cur = c
+            else:
+                t = TrieNode()
+                cur.children[a] = t
+                cur = t
+        if n.kind != "node" and len(cur.nodes) > 0 and cur.nodes[0].kind == "node":
+            cur.nodes.insert(0, n)
+        else:
+            cur.nodes.append(n)
+        q = n.qname()
+        if q not in self.by_qname:
+            self.by_qname[q] = n
+        lst = self.by_name.get(n.name)
+        if lst is not None:
+            lst.append(n)
+        else:
+            self.by_name[n.name] = [n]
+
+    def lookup(self, oid: list[int]) -> ?(NodeMeta, list[int]):
+        """The deepest named node that is a prefix of `oid`, with the remaining sub-ids (the
+        instance suffix for a column or scalar), or None."""
+        cur = self.root
+        best: ?NodeMeta = None
+        depth = 0
+        for i, a in enumerate(oid):
+            c = cur.children.get(a)
+            if c is not None:
+                cur = c
+                if len(cur.nodes) > 0:
+                    best = cur.nodes[0]
+                    depth = i + 1
+            else:
+                break
+        if best is not None:
+            return (best, oid[depth:])
+        return None
+
+    def exact(self, oid: list[int]) -> list[NodeMeta]:
+        cur = self.root
+        for a in oid:
+            c = cur.children.get(a)
+            if c is not None:
+                cur = c
+            else:
+                return []
+        return cur.nodes
+
+    def find(self, name: str) -> ?NodeMeta:
+        """By `MOD::name` (also `MOD.name`) or bare name (the first module that defines it)."""
+        if "::" in name:
+            return self.by_qname.get(name)
+        lst = self.by_name.get(name)
+        if lst is not None and len(lst) > 0:
+            return lst[0]
+        p = name.split(".")
+        if len(p) == 2:
+            return self.by_qname.get(p[0] + "::" + p[1])
+        return None

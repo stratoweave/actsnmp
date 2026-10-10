@@ -1,0 +1,569 @@
+"""The resolved MIB model, produced by `mib.resolver`.
+
+Both emitters (`mib.yang`, `mib.meta`) work from this model, never from the AST. It holds:
+
+- `MibModule`: name, file, sha256, SMI language, MODULE-IDENTITY data (ORGANIZATION,
+  CONTACT-INFO, DESCRIPTION, LAST-UPDATED, REVISIONs), the imports with each symbol mapped to
+  the module that defines it, and the module's nodes and types in source order.
+- `MibType`: a textual convention, an SMIv1 type assignment or a SEQUENCE (row) type, with
+  its parent in the TC chain and its effective `Syntax`.
+- `MibNode`: every named OID (value assignments and macro registrations, SMIv1 traps
+  converted to notifications) with its kind, full OID, status/access (normalised to SMIv2,
+  raw values kept), syntax, UNITS, DEFVAL (raw and normalised), index spec (with instance
+  encodings) or AUGMENTS target, notification OBJECTS and group/compliance members, and the
+  source position of the definition.
+- `Syntax`: a resolved type: the wire base, the type reference as written, the nearest named
+  type, the anonymous refinement at this level and the effective constraints (ranges, sizes,
+  enumerations, bits, display hint) composed along the TC chain.
+- `MibSet`: all modules resolved together, the OID tree (every name per OID, for the
+  YANG emitter's ambiguous-parent rule) and the diagnostics.
+
+Kinds and base types are plain strings, so they can be written to mibmeta JSON as they are:
+
+- node kinds: node, module-identity, object-identity, scalar, table, row, column,
+  notification, object-group, notification-group, compliance, capabilities;
+- wire bases: INTEGER (also Integer32 and enumerations), Unsigned32, Gauge32, Counter32,
+  Counter64, TimeTicks, IpAddress, Opaque, OCTET STRING, OBJECT IDENTIFIER, BITS, plus NULL,
+  CHOICE, SEQUENCE and SEQUENCE OF for the non-leaf forms, and "" when unresolved;
+- index encodings: int, fixed, var, implied, oid, oid-implied, ipv4, netaddr,
+  and "unknown" when the index object could not be resolved.
+"""
+
+import mib.ast
+import mib.diag
+
+
+def oid_str(oid: list[int]) -> str:
+    """Dotted form of an OID ("" for the empty OID)."""
+    return ".".join([str(x) for x in oid])
+
+
+def qual_name(module: str, name: str) -> str:
+    """`MOD::name`"""
+    return module + "::" + name
+
+
+class Range(object):
+    """One `lo..hi` of a range or SIZE constraint (`lo == hi` for a single value)."""
+    lo: bigint
+    hi: bigint
+
+    def __init__(self, lo: bigint, hi: bigint):
+        self.lo = lo
+        self.hi = hi
+
+    def dump(self) -> str:
+        if self.lo == self.hi:
+            return str(self.lo)
+        return str(self.lo) + ".." + str(self.hi)
+
+
+def dump_ranges(rs: list[Range]) -> str:
+    return " | ".join([r.dump() for r in rs])
+
+
+class NamedValue(object):
+    """An enumeration label or a named bit, with its value or bit position."""
+    label: str
+    value: int
+
+    def __init__(self, label: str, value: int):
+        self.label = label
+        self.value = value
+
+    def dump(self) -> str:
+        return self.label + "(" + str(self.value) + ")"
+
+
+class Syntax(object):
+    """A resolved type (of an object, a TC, an index item, ...)."""
+    # The wire base (see the module doc), and the base as written at the end of the chain
+    # (`Integer32`, `Counter`, `NetworkAddress`, ...).
+    base: str
+    base_name: str
+    # The type reference as written and the module defining it; "" for an inline ASN.1 type.
+    ref_name: str
+    ref_module: str
+    # The nearest named type that is not a base type ("" if none), and all of them as
+    # `MOD::Type`, nearest first.
+    tc_name: str
+    tc_module: str
+    chain: list[str]
+    # The anonymous refinement written at this level. has_own_named tells an empty list from
+    # no list.
+    own_ranges: list[Range]
+    own_sizes: list[Range]
+    own_named: list[NamedValue]
+    has_own_named: bool
+    # Effective constraints, composed along the chain.
+    ranges: list[Range]
+    sizes: list[Range]
+    enums: list[NamedValue]
+    bits: list[NamedValue]
+    hint: str
+    # SMIv1 NetworkAddress, normalised to IpAddress but encoded as `netaddr` in an INDEX.
+    netaddr: bool
+    # The name of the type that could not be resolved, "" when resolved.
+    unresolved: str
+    # For SEQUENCE OF the row type; for a row's syntax the SEQUENCE type name.
+    row_type: str
+
+    def __init__(self):
+        self.base = ""
+        self.base_name = ""
+        self.ref_name = ""
+        self.ref_module = ""
+        self.tc_name = ""
+        self.tc_module = ""
+        self.chain = []
+        self.own_ranges = []
+        self.own_sizes = []
+        self.own_named = []
+        self.has_own_named = False
+        self.ranges = []
+        self.sizes = []
+        self.enums = []
+        self.bits = []
+        self.hint = ""
+        self.netaddr = False
+        self.unresolved = ""
+        self.row_type = ""
+
+    def is_enum(self) -> bool:
+        return self.base == "INTEGER" and len(self.enums) > 0
+
+    def fixed_size(self) -> int:
+        """The single effective size value, or -1 when the size is variable or unknown
+        (pysmi's rule: all ranges are one and the same value)."""
+        if len(self.sizes) == 0:
+            return -1
+        v = self.sizes[0].lo
+        for r in self.sizes:
+            if r.lo != v or r.hi != v:
+                return -1
+        if v > bigint(1000000):
+            return -1
+        return int(v)
+
+    def tc(self) -> str:
+        """`MOD::TC` of the nearest named type, or ""."""
+        if self.tc_name == "":
+            return ""
+        return qual_name(self.tc_module, self.tc_name)
+
+    def dump(self) -> str:
+        """A deterministic one-line form, for tests."""
+        if self.unresolved != "":
+            return "<unresolved " + self.unresolved + ">"
+        out = self.base
+        if self.netaddr:
+            out += "(netaddr)"
+        if self.row_type != "":
+            out += " " + self.row_type
+        if self.tc_name != "":
+            out += " tc=" + self.tc()
+        if len(self.ranges) > 0:
+            out += " range=" + dump_ranges(self.ranges)
+        if len(self.sizes) > 0:
+            out += " size=" + dump_ranges(self.sizes)
+        if len(self.enums) > 0:
+            out += " enums=" + ",".join([e.dump() for e in self.enums])
+        if len(self.bits) > 0:
+            out += " bits=" + ",".join([e.dump() for e in self.bits])
+        if self.hint != "":
+            out += " hint=" + self.hint
+        return out
+
+
+class DefVal(object):
+    """A DEFVAL: `text` is the source text between the braces; `kind` the normalised form
+    (int, enum, string, octets, bits, oid, ip); `value` the normalised value as text (a decimal
+    integer, an enumeration label, the string content, hex digits, space-separated bit labels,
+    a dotted OID or a dotted quad); `smi` the value as `smiv2:defval` renders it
+    (a decimal, a label, the unquoted string, `'0a'H` or "" for an
+    empty hex string, a descriptor else a dotted OID, `{a, b}` for BITS)."""
+    text: str
+    kind: str
+    value: str
+    smi: str
+
+    def __init__(self, text: str, kind: str, value: str, smi: str):
+        self.text = text
+        self.kind = kind
+        self.value = value
+        self.smi = smi
+
+    def dump(self) -> str:
+        return self.kind + ":" + self.value
+
+
+class IndexPart(object):
+    """One INDEX element with its instance encoding.
+
+    `module`/`name` name the index object ("" for a synthetic SMIv1 base-type item, whose
+    `key` is `<row>Index<N>`). `enc` is the encoding kind, `size` the octet
+    count for `fixed`, `implied` the effective IMPLIED flag. `syntax` is the index object's
+    resolved syntax (None when it could not be resolved)."""
+    module: str
+    name: str
+    key: str
+    enc: str
+    size: int
+    implied: bool
+    syntax: ?Syntax
+
+    def __init__(self, module: str, name: str, key: str, enc: str, size: int, implied: bool, syntax: ?Syntax):
+        self.module = module
+        self.name = name
+        self.key = key
+        self.enc = enc
+        self.size = size
+        self.implied = implied
+        self.syntax = syntax
+
+    def object(self) -> str:
+        """`MOD::name`, or "" for a synthetic item."""
+        if self.name == "":
+            return ""
+        return qual_name(self.module, self.name)
+
+    def dump(self) -> str:
+        e = self.enc + ("(" + str(self.size) + ")" if self.enc == "fixed" else "")
+        o = self.object()
+        return (o if o != "" else "synthetic:" + self.key) + "=" + e
+
+
+class MibType(object):
+    """A named type defined in a module: a TC (`kind` "tc"), an SMIv1-style type assignment
+    ("type"), a row type ("sequence") or a CHOICE ("choice", base modules only).
+
+    `parent` is `MOD::Type` of the next named type in the chain ("" when the syntax is a base
+    type). `syntax` is the effective resolved syntax. `display_hint` is the hint as written;
+    `syntax.hint` is the effective (valid) one. `items` are the SEQUENCE items (name, type as
+    written)."""
+    name: str
+    module: str
+    kind: str
+    status: str
+    status_raw: str
+    description: str
+    reference: str
+    display_hint: str
+    parent: str
+    syntax: Syntax
+    items: list[(str, str)]
+    file: str
+    line: int
+    col: int
+    defn: mib.ast.Def
+
+    def __init__(self, name: str, module: str, kind: str, defn: mib.ast.Def, file: str):
+        self.name = name
+        self.module = module
+        self.kind = kind
+        self.status = "current"
+        self.status_raw = ""
+        self.description = ""
+        self.reference = ""
+        self.display_hint = ""
+        self.parent = ""
+        self.syntax = Syntax()
+        self.items = []
+        self.file = file
+        self.line = defn.line
+        self.col = defn.col
+        self.defn = defn
+
+    def dump(self) -> str:
+        out = "TYPE " + self.name + " " + self.kind + " status=" + self.status
+        if self.parent != "":
+            out += " parent=" + self.parent
+        if self.kind == "sequence":
+            return out + " items=" + ",".join([i.0 for i in self.items])
+        return out + " syntax=" + self.syntax.dump()
+
+
+class MibNode(object):
+    """A named OID: a value assignment, a macro registration or an SMIv1 trap."""
+    name: str
+    module: str
+    kind: str
+    # The declaration form as written (`OBJECT-TYPE`, `TRAP-TYPE`, `OBJECT IDENTIFIER`, ...).
+    macro: str
+    # Empty when the OID could not be resolved, and then `linked` is False.
+    oid: list[int]
+    linked: bool
+    # current, deprecated or obsolete (SMIv1 mandatory and optional are current, RFC 3584).
+    status: str
+    status_raw: str
+    # The SMIv2 access, "" if none. SMIv1 write-only becomes read-write; read-create stays.
+    access: str
+    access_raw: str
+    syntax: ?Syntax
+    units: str
+    description: str
+    reference: str
+    defval: ?DefVal
+    # Rows only. `augments` is `MOD::row`.
+    index: list[IndexPart]
+    implied: bool
+    augments: str
+    keyless: bool
+    sparse_of: str
+    # Notification OBJECTS (or TRAP-TYPE VARIABLES) and OBJECT-GROUP members as `MOD::name`.
+    objects: list[str]
+    # Notification-group, compliance and capabilities members.
+    members: list[str]
+    # SMIv1 TRAP-TYPE only; trap_number is -1 for everything else.
+    enterprise: str
+    trap_number: int
+    file: str
+    line: int
+    col: int
+    defn: mib.ast.Def
+
+    def __init__(self, name: str, module: str, kind: str, defn: mib.ast.Def, file: str):
+        self.name = name
+        self.module = module
+        self.kind = kind
+        self.macro = defn.form()
+        self.oid = []
+        self.linked = False
+        self.status = "current"
+        self.status_raw = ""
+        self.access = ""
+        self.access_raw = ""
+        self.syntax = None
+        self.units = ""
+        self.description = ""
+        self.reference = ""
+        self.defval = None
+        self.index = []
+        self.implied = False
+        self.augments = ""
+        self.keyless = False
+        self.sparse_of = ""
+        self.objects = []
+        self.members = []
+        self.enterprise = ""
+        self.trap_number = -1
+        self.file = file
+        self.line = defn.line
+        self.col = defn.col
+        self.defn = defn
+
+    def qname(self) -> str:
+        return qual_name(self.module, self.name)
+
+    def dump(self) -> str:
+        """A deterministic one-line form, for tests."""
+        out = self.kind + " " + self.name + " " + (oid_str(self.oid) if self.linked else "<unlinked>")
+        if self.status != "current":
+            out += " status=" + self.status
+        if self.access != "":
+            out += " access=" + self.access
+        sx = self.syntax
+        if sx is not None:
+            out += " syntax=" + sx.dump()
+        if self.units != "":
+            out += " units=" + self.units
+        dv = self.defval
+        if dv is not None:
+            out += " defval=" + dv.dump()
+        if self.augments != "":
+            out += " augments=" + self.augments
+        if self.kind == "row" and self.augments == "":
+            if self.keyless:
+                out += " keyless"
+            else:
+                out += " index=" + ",".join([p.dump() for p in self.index])
+            if self.implied:
+                out += " implied"
+        if self.sparse_of != "":
+            out += " sparse-of=" + self.sparse_of
+        if len(self.objects) > 0:
+            out += " objects=" + ",".join(self.objects)
+        if len(self.members) > 0:
+            out += " members=" + ",".join(self.members)
+        return out
+
+
+class Import(object):
+    """One imported symbol: `module` as written in FROM, `home` the module that defines the
+    symbol after aliases and rewrites ("" when unresolved)."""
+    symbol: str
+    module: str
+    home: str
+
+    def __init__(self, symbol: str, module: str, home: str):
+        self.symbol = symbol
+        self.module = module
+        self.home = home
+
+
+class Revision(object):
+    date: str
+    description: str
+
+    def __init__(self, date: str, description: str):
+        self.date = date
+        self.description = description
+
+
+class MibModule(object):
+    """One resolved module. `lang` is the SMI language (`SMIv1`, `SMIv2`, `SPPI`), `smi` the
+    mibmeta form (`v1`/`v2`). `identity` is the MODULE-IDENTITY descriptor ("" for SMIv1
+    modules, which get no synthetic identity node; RFC 3584 (2) is the emitter's business)."""
+    name: str
+    file: str
+    sha256: str
+    builtin: bool
+    lang: str
+    smi: str
+    identity: str
+    last_updated: str
+    organization: str
+    contact: str
+    description: str
+    reference: str
+    revisions: list[Revision]
+    imports: list[Import]
+    nodes: list[MibNode]
+    types: list[MibType]
+    node_by_name: dict[str, MibNode]
+    type_by_name: dict[str, MibType]
+    amod: mib.ast.Module
+
+    def __init__(self, a: mib.ast.Module, builtin: bool):
+        self.name = a.name
+        self.file = a.file
+        self.sha256 = a.sha256
+        self.builtin = builtin
+        self.lang = mib.ast.lang_name(a.lang)
+        self.smi = "v1" if a.lang == mib.ast.LANG_SMIV1 else "v2"
+        self.identity = ""
+        self.last_updated = ""
+        self.organization = ""
+        self.contact = ""
+        self.description = ""
+        self.reference = ""
+        self.revisions = []
+        self.imports = []
+        self.nodes = []
+        self.types = []
+        self.node_by_name = {}
+        self.type_by_name = {}
+        self.amod = a
+
+    def node(self, name: str) -> ?MibNode:
+        return self.node_by_name.get(name)
+
+    def find_type(self, name: str) -> ?MibType:
+        return self.type_by_name.get(name)
+
+    def dump(self) -> str:
+        """Deterministic multi-line dump: header, then types and nodes in source order."""
+        out = ["MODULE " + self.name + " " + self.lang + (" identity=" + self.identity if self.identity != "" else "")]
+        for t in self.types:
+            out.append("  " + t.dump())
+        for n in self.nodes:
+            out.append("  " + n.dump())
+        return "\n".join(out)
+
+
+class OidNode(object):
+    """A node of the OID tree: its arc, children by arc, and every `MibNode` registered or
+    assigned at this OID (all loaded modules, in resolution order)."""
+    arc: int
+    children: dict[int, OidNode]
+    names: list[MibNode]
+
+    def __init__(self, arc: int):
+        self.arc = arc
+        self.children = {}
+        self.names = []
+
+    def child(self, arc: int) -> OidNode:
+        c = self.children.get(arc)
+        if c is not None:
+            return c
+        n = OidNode(arc)
+        self.children[arc] = n
+        return n
+
+
+def _rank(n: MibNode) -> int:
+    """Preference of a name at an OID: a registration beats an assignment."""
+    if n.kind == "node":
+        return 1
+    return 0
+
+
+class MibSet(object):
+    """A set of modules resolved together (the requested modules and their imports).
+
+    `order` lists the module names in load order. `diags` are all diagnostics, ordered by file,
+    line and column. `unlinked` are the nodes whose OID could not be resolved."""
+    modules: dict[str, MibModule]
+    order: list[str]
+    root: OidNode
+    diags: list[mib.diag.Diagnostic]
+    unlinked: list[MibNode]
+    not_found: list[str]
+
+    def __init__(self):
+        self.modules = {}
+        self.order = []
+        self.root = OidNode(-1)
+        self.diags = []
+        self.unlinked = []
+        self.not_found = []
+
+    def module(self, name: str) -> ?MibModule:
+        return self.modules.get(name)
+
+    def node(self, module: str, name: str) -> ?MibNode:
+        m = self.modules.get(module)
+        if m is not None:
+            return m.node_by_name.get(name)
+        return None
+
+    def oid_node(self, oid: list[int]) -> ?OidNode:
+        cur = self.root
+        for a in oid:
+            c = cur.children.get(a)
+            if c is not None:
+                cur = c
+            else:
+                return None
+        return cur
+
+    def names_at(self, oid: list[int]) -> list[MibNode]:
+        """Every node registered or assigned at `oid` (all modules)."""
+        n = self.oid_node(oid)
+        if n is not None:
+            return n.names
+        return []
+
+    def preferred(self, oid: list[int]) -> ?MibNode:
+        """The preferred name at `oid`: a registration over an assignment, then an SMIv2
+        module over an SMIv1 one, then the first loaded."""
+        best: ?MibNode = None
+        bk = (9, 9)
+        for n in self.names_at(oid):
+            m = self.modules.get(n.module)
+            v1 = 1 if m is not None and m.smi == "v1" else 0
+            k = (_rank(n), v1)
+            if k < bk:
+                bk = k
+                best = n
+        return best
+
+    def errors(self, max_level: int = 1) -> list[mib.diag.Diagnostic]:
+        return [d for d in self.diags if d.level <= max_level]
+
+    def dump(self, module: str) -> str:
+        m = self.modules.get(module)
+        if m is not None:
+            return m.dump()
+        return "<no module " + module + ">"
