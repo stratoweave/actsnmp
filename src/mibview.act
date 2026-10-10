@@ -1,0 +1,454 @@
+"""An ordered store of SNMP variables, its data files and SET rules
+
+MibView is what the test agent serves: varbinds kept in OID order, with GET
+and GETNEXT lookups in O(log n) and the SNMPv2 exception values of
+RFC 3416 section 4.2. Two loaders read the lab's data files
+(interop/README.md, "Dataset files for our Acton test agent"):
+load_snmprec() the snmpsim .snmprec records, load_write_rules() the
+write-rules.tsv rules. MibView.check_set() and apply_set() apply a SET
+request to the view with the test-then-commit semantics of RFC 3416
+section 4.2.5 and the error statuses snmpd answers with.
+
+Everything here is pure; the agent owns the MibView and serializes access to
+it. Version-specific mappings (v1 noSuchName for exceptions and SET errors,
+Counter64 hidden from v1) are the agent's.
+"""
+
+import ber
+import errors
+import pdu
+import values
+from oid import Oid
+from values import Value, VarBind
+
+_UINT32_MAX = 4294967295
+_INT64_MAX = 9223372036854775807
+
+
+def _object_of(o: Oid) -> Oid:
+    # The object an instance belongs to, as far as the view can tell: the OID without its last arc.
+    return Oid(o.arcs[:len(o.arcs) - 1])
+
+
+class MibView(object):
+    """Variables in OID order, for GET, GETNEXT and SET
+
+    The view has no MIB, so it tells noSuchObject from noSuchInstance with
+    a heuristic: the object of an instance is its OID without the last arc
+    (sysDescr for sysDescr.0, ifDescr for ifDescr.7). get() of a missing OID
+    returns NoSuchInstance when the OID lies at or below the object of some
+    entry, and NoSuchObject otherwise. That reproduces what snmpd answers
+    for scalars and tables with a single-arc index: sysDescr.1,
+    sysDescr (no .0) and sysDescr.0.5 give
+    noSuchInstance, while 1.3.6.1.2.1.1.99.0 and the group 1.3.6.1.2.1.1
+    give noSuchObject. For a table with a multi-arc index only rows that
+    share all but the last index arc count as the same object, so other
+    missing rows give noSuchObject where snmpd may say noSuchInstance; the
+    lab's checks accept either.
+
+    Exception values stored as data (the pathological dataset has them) are
+    returned like any other value.
+    """
+    _oids: list[Oid]
+    _values: dict[Oid, Value]
+    _objects: set[Oid]
+
+    def __init__(self, entries: list[VarBind]):
+        """Build a view from varbinds in any order; of two entries with the same OID the last wins"""
+        vals: dict[Oid, Value] = {}
+        for vb in entries:
+            vals[vb.oid] = vb.value
+        self._values = vals
+        self._oids = sorted(list(vals.keys()))
+        self._objects = {_object_of(o) for o in self._oids}
+
+    def _after(self, oid: Oid) -> int:
+        # The index of the first OID of the view that is greater than oid (binary search)
+        oids = self._oids
+        lo = 0
+        hi = len(oids)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if oid < oids[mid]:
+                hi = mid
+            else:
+                lo = mid + 1
+        return lo
+
+    def get(self, oid: Oid) -> Value:
+        """Return the value of oid, or NoSuchInstance / NoSuchObject as the class documentation explains"""
+        v = self._values.get(oid)
+        if v is not None:
+            return v
+        arcs = oid.arcs
+        for n in range(len(arcs) + 1):
+            if Oid(arcs[:n]) in self._objects:
+                return values.NoSuchInstance()
+        return values.NoSuchObject()
+
+    def get_next(self, oid: Oid) -> VarBind:
+        """Return the first variable whose OID is greater than oid
+
+        oid need not exist in the view. Past the last variable the result
+        is VarBind(oid, EndOfMibView()), with the requested OID as
+        RFC 3416 section 4.2.2 asks.
+        """
+        i = self._after(oid)
+        if i < len(self._oids):
+            o = self._oids[i]
+            return VarBind(o, self._values[o])
+        return VarBind(oid, values.EndOfMibView())
+
+    def set_value(self, oid: Oid, v: Value) -> None:
+        """Set the value of oid, adding the variable if the view does not have it yet
+
+        No rules apply here; see apply_set() for SET requests.
+        """
+        if oid not in self._values:
+            self._oids.insert(self._after(oid), oid)
+            self._objects.add(_object_of(oid))
+        self._values[oid] = v
+
+    def size(self) -> int:
+        """Return the number of variables"""
+        return len(self._oids)
+
+    def varbinds(self, root: ?Oid=None) -> list[VarBind]:
+        """Return the variables in OID order: all of them, or root and those below it"""
+        if root is not None:
+            return self._subtree(root)
+        return [VarBind(o, self._values[o]) for o in self._oids]
+
+    def _subtree(self, root: Oid) -> list[VarBind]:
+        i = self._after(root)
+        if root in self._values:
+            i -= 1
+        out: list[VarBind] = []
+        while i < len(self._oids) and self._oids[i].startswith(root):
+            o = self._oids[i]
+            out.append(VarBind(o, self._values[o]))
+            i += 1
+        return out
+
+    def check_set(self, varbinds: list[VarBind], rules: list[WriteRule]) -> (int, int):
+        """Test a SET request against rules without changing the view (RFC 3416 section 4.2.5 phase 1)
+
+        Returns (error-status, error-index): (0, 0) when every varbind
+        could be set, else the status of the first varbind that fails and
+        its 1-based index. Per varbind, the first rule whose prefix is a
+        prefix of (or equal to) its OID decides, in RFC 3416's order:
+          * notWritable: no rule matches, or the rule is not writable;
+          * wrongType: the value's tag is not one of the rule's tags;
+          * wrongLength: an OCTET STRING or Opaque longer than 65535 octets
+            or with a length outside the rule's min..max, or an IpAddress
+            that is not 4 octets;
+          * wrongEncoding: a values.MalformedValue, whose content the
+            decoder could not read as its tag's type;
+          * wrongValue: a number (INTEGER, Counter32, Gauge32, TimeTicks,
+            Counter64) outside its type's range or the rule's min..max, or
+            any other value that cannot be encoded;
+          * noCreation: the variable does not exist in the view (rules
+            allow changing variables, never creating them).
+        The lab agents answer the same statuses (write-rules.tsv). Access
+        control (noAccess for a read-only community or user) is the
+        caller's, before this.
+        """
+        for i in range(len(varbinds)):
+            status = self._check_varbind(varbinds[i], rules)
+            if status != pdu.NO_ERROR:
+                return (status, i + 1)
+        return (pdu.NO_ERROR, 0)
+
+    def apply_set(self, varbinds: list[VarBind], rules: list[WriteRule]) -> (int, int):
+        """Test, then commit a SET request: all varbinds are set, or none is
+
+        Returns check_set()'s (error-status, error-index); the view only
+        changes when that is (0, 0). Varbinds are committed in order, so
+        of two varbinds with the same OID the last wins.
+        """
+        status, index = self.check_set(varbinds, rules)
+        if status == pdu.NO_ERROR:
+            for vb in varbinds:
+                self._values[vb.oid] = vb.value
+        return (status, index)
+
+    def _check_varbind(self, vb: VarBind, rules: list[WriteRule]) -> int:
+        rule = find_rule(rules, vb.oid)
+        if rule is not None:
+            if rule.writable:
+                return self._check_writable(vb, rule)
+        return pdu.NOT_WRITABLE
+
+    def _check_writable(self, vb: VarBind, rule: WriteRule) -> int:
+        v = vb.value
+        if v.tag() not in rule.tags:
+            return pdu.WRONG_TYPE
+        status = _check_value(v, rule)
+        if status != pdu.NO_ERROR:
+            return status
+        if vb.oid not in self._values:
+            return pdu.NO_CREATION
+        return pdu.NO_ERROR
+
+    def __repr__(self) -> str:
+        return "MibView(%d variables)" % len(self._oids)
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
+
+# SET rules #########################################################################################
+
+class WriteRule(object):
+    """Which variables a SET may change, and to what
+
+    The rule covers prefix and every OID below it. tags are the BER tags a
+    new value may have (values.Value.tag(): 2 INTEGER, 4 OCTET STRING, 6
+    OBJECT IDENTIFIER, 0x40 IpAddress, 0x41 Counter32, 0x42 Gauge32, 0x43
+    TimeTicks, 0x44 Opaque, 0x46 Counter64, ...). min and max bound the
+    value of a number or the length of an OCTET STRING or Opaque
+    (inclusive; None = only the type's own range) and are ignored for other
+    types. A rule that is not writable makes its variables read-only.
+    """
+    prefix: Oid
+    tags: list[int]
+    min: ?int
+    max: ?int
+    writable: bool
+
+    def __init__(self, prefix: Oid, tags: list[int], min: ?int=None, max: ?int=None, writable: bool=True):
+        self.prefix = prefix
+        self.tags = tags
+        self.min = min
+        self.max = max
+        self.writable = writable
+
+    def __repr__(self) -> str:
+        lo = self.min
+        hi = self.max
+        return ("WriteRule(" + str(self.prefix) + ", tags=" + repr(self.tags)
+                + ", min=" + (str(lo) if lo is not None else "None") + ", max=" + (str(hi) if hi is not None else "None")
+                + ", writable=" + str(self.writable) + ")")
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
+
+def find_rule(rules: list[WriteRule], oid: Oid) -> ?WriteRule:
+    """Return the first rule whose prefix is oid or a prefix of it, or None"""
+    for r in rules:
+        if oid.startswith(r.prefix):
+            return r
+    return None
+
+def _in_bounds(n: int, rule: WriteRule) -> bool:
+    lo = rule.min
+    if lo is not None:
+        if n < lo:
+            return False
+    hi = rule.max
+    if hi is not None:
+        if n > hi:
+            return False
+    return True
+
+def _check_value(v: Value, rule: WriteRule) -> int:
+    # The wrongLength / wrongEncoding / wrongValue checks of check_set() for a value of an allowed type
+    if isinstance(v, values.MalformedValue):
+        return pdu.WRONG_ENCODING
+    if isinstance(v, values.OctetString):
+        n = len(v.value)
+        return pdu.WRONG_LENGTH if n > values.MAX_OCTETS or not _in_bounds(n, rule) else pdu.NO_ERROR
+    if isinstance(v, values.Opaque):
+        n = len(v.value)
+        return pdu.WRONG_LENGTH if n > values.MAX_OCTETS or not _in_bounds(n, rule) else pdu.NO_ERROR
+    if isinstance(v, values.IpAddress):
+        return pdu.WRONG_LENGTH if len(v.value) != 4 else pdu.NO_ERROR
+    if isinstance(v, values.Integer):
+        x = v.value
+        ok = x >= values.INTEGER32_MIN and x <= values.INTEGER32_MAX and _in_bounds(x, rule)
+        return pdu.NO_ERROR if ok else pdu.WRONG_VALUE
+    if isinstance(v, values.Counter32):
+        return _check_unsigned32(v.value, rule)
+    if isinstance(v, values.Gauge32):
+        return _check_unsigned32(v.value, rule)
+    if isinstance(v, values.TimeTicks):
+        return _check_unsigned32(v.value, rule)
+    if isinstance(v, values.Counter64):
+        return _check_counter64(v.value, rule)
+    try:
+        v.encode()
+    except errors.EncodeError:
+        return pdu.WRONG_VALUE
+    return pdu.NO_ERROR
+
+def _check_unsigned32(x: int, rule: WriteRule) -> int:
+    ok = x >= 0 and x <= _UINT32_MAX and _in_bounds(x, rule)
+    return pdu.NO_ERROR if ok else pdu.WRONG_VALUE
+
+def _check_counter64(x: u64, rule: WriteRule) -> int:
+    if x > u64(_INT64_MAX):
+        # above every int bound: only an upper limit can exclude it
+        return pdu.NO_ERROR if rule.max is None else pdu.WRONG_VALUE
+    return pdu.NO_ERROR if _in_bounds(int(x), rule) else pdu.WRONG_VALUE
+
+
+# Data files ########################################################################################
+
+def _lines(text: str) -> list[(int, str)]:
+    # (line number, line without surrounding whitespace) of every line that is neither blank nor a
+    # '#' comment; also strips the \r of CRLF line ends.
+    out: list[(int, str)] = []
+    n = 0
+    for raw in text.split("\n"):
+        n += 1
+        line = raw.strip()
+        if line != "" and not line.startswith("#"):
+            out.append((n, line))
+    return out
+
+def _decimal(s: str, signed: bool) -> int:
+    # A decimal integer of at most 19 digits, with a leading '-' if signed; no '+', blanks or '_'
+    digits = s[1:] if signed and s.startswith("-") else s
+    if digits == "" or len(digits) > 19 or not (digits.isascii() and digits.isdecimal()):
+        raise ValueError("invalid number %r" % s)
+    return int(s)
+
+def _unsigned32(s: str) -> int:
+    n = _decimal(s, False)
+    if n > _UINT32_MAX:
+        raise ValueError("%s exceeds 4294967295" % s)
+    return n
+
+def _ip_address(s: str) -> bytes:
+    parts = s.split(".")
+    if len(parts) != 4:
+        raise ValueError("invalid IpAddress %r" % s)
+    octets: list[bytes] = []
+    for p in parts:
+        n = _decimal(p, False)
+        if n > 255:
+            raise ValueError("invalid IpAddress %r" % s)
+        octets.append(ber.BYTE_TABLE[n])
+    return b"".join(octets)
+
+def _empty(value: str, what: str) -> None:
+    if value != "":
+        raise ValueError(what + " takes no value, got %r" % value)
+
+def _snmprec_value(tag_text: str, value: str) -> Value:
+    # The Value of one record's TAG and VALUE fields
+    if ":" in tag_text:
+        raise ValueError("variation modules are not supported: " + tag_text)
+    hex_value = tag_text.endswith("x")
+    t = tag_text[:-1] if hex_value else tag_text
+    tag = _decimal(t, False)
+    raw = b""
+    if tag == ber.TAG_OCTET_STRING or tag == ber.TAG_IPADDRESS or tag == ber.TAG_OPAQUE or tag == ber.TAG_NSAP:
+        raw = ber.from_hex(value) if hex_value else value.encode()
+    elif hex_value:
+        raise ValueError("the 'x' suffix needs tag 4, 64, 68 or 69, got " + tag_text)
+    if tag == ber.TAG_INTEGER:
+        n = _decimal(value, True)
+        if n < values.INTEGER32_MIN or n > values.INTEGER32_MAX:
+            raise ValueError("INTEGER %s out of range" % value)
+        return values.Integer(n)
+    if tag == ber.TAG_OCTET_STRING:
+        return values.OctetString(raw)
+    if tag == ber.TAG_NULL:
+        _empty(value, "NULL")
+        return values.Null()
+    if tag == ber.TAG_OID:
+        return values.ObjectIdentifier(Oid.parse(value))
+    if tag == ber.TAG_IPADDRESS:
+        if not hex_value:
+            return values.IpAddress(_ip_address(value))
+        if len(raw) != 4:
+            raise ValueError("IpAddress must be 4 octets, got %d" % len(raw))
+        return values.IpAddress(raw)
+    if tag == ber.TAG_COUNTER32:
+        return values.Counter32(_unsigned32(value))
+    if tag == ber.TAG_GAUGE32:
+        return values.Gauge32(_unsigned32(value))
+    if tag == ber.TAG_TIMETICKS:
+        return values.TimeTicks(_unsigned32(value))
+    if tag == ber.TAG_OPAQUE:
+        return values.Opaque(raw)
+    if tag == ber.TAG_NSAP:
+        return values.UnknownValue(ber.TAG_NSAP, raw)
+    if tag == ber.TAG_COUNTER64:
+        if value == "" or len(value) > 20 or not (value.isascii() and value.isdecimal()):
+            raise ValueError("invalid Counter64 %r" % value)
+        return values.Counter64(u64(value))
+    if tag == ber.TAG_NO_SUCH_OBJECT:
+        _empty(value, "noSuchObject")
+        return values.NoSuchObject()
+    if tag == ber.TAG_NO_SUCH_INSTANCE:
+        _empty(value, "noSuchInstance")
+        return values.NoSuchInstance()
+    if tag == ber.TAG_END_OF_MIB_VIEW:
+        _empty(value, "endOfMibView")
+        return values.EndOfMibView()
+    raise ValueError("unknown tag " + tag_text)
+
+def load_snmprec(text: str) -> MibView:
+    """Return a MibView with the records of an snmpsim .snmprec file
+
+    One record per line, OID|TAG|VALUE: OID in dotted decimal (a leading
+    dot is accepted), TAG the decimal BER tag of the type, VALUE as the type
+    needs it:
+      * 2 INTEGER: signed decimal, Integer32;
+      * 4 OCTET STRING, 68 Opaque, 69 NsapAddress: the text as UTF-8;
+      * 5 NULL, 128 noSuchObject, 129 noSuchInstance, 130 endOfMibView:
+        empty;
+      * 6 OBJECT IDENTIFIER: dotted decimal;
+      * 64 IpAddress: dotted quad;
+      * 65 Counter32, 66 Gauge32, 67 TimeTicks: unsigned decimal, 32 bits;
+      * 70 Counter64: unsigned decimal, 64 bits.
+    A TAG with the suffix x (4x, 64x, 68x, 69x) has VALUE in hex instead,
+    possibly empty; an IpAddress then needs 8 digits. Like snmpsim, blank
+    lines and lines starting with # are skipped, every line is stripped of
+    surrounding whitespace (CRLF line ends work), and VALUE extends to the
+    end of the line, '|' included. Records need not be sorted; for a
+    repeated OID the last record wins.
+
+    Raises ValueError naming the line for anything else, including the
+    variation modules of snmpsim (TAG:module).
+    """
+    entries: list[VarBind] = []
+    for n, line in _lines(text):
+        fields = line.split("|", 2)
+        try:
+            if len(fields) != 3:
+                raise ValueError("expected OID|TAG|VALUE")
+            entries.append(VarBind(Oid.parse(fields[0]), _snmprec_value(fields[1], fields[2])))
+        except ValueError as e:
+            raise ValueError("snmprec line %d: " % n + e.error_message)
+    return MibView(entries)
+
+def _bound(s: str) -> ?int:
+    return None if s == "-" else _decimal(s, True)
+
+def load_write_rules(text: str) -> list[WriteRule]:
+    """Return the rules of a write-rules.tsv file (interop/dataset/write-rules.tsv), in file order
+
+    One rule per line with five fields separated by tabs or blanks: OID
+    (dotted decimal, leading dot optional), the allowed tags as
+    comma-separated decimal numbers, min and max as signed decimals or '-'
+    for none, and writable as yes or no. Blank lines and lines starting
+    with # are skipped. Raises ValueError naming the line for anything else.
+    """
+    rules: list[WriteRule] = []
+    for n, line in _lines(text):
+        fields = [f for f in line.replace("\t", " ").split(" ") if f != ""]
+        try:
+            if len(fields) != 5:
+                raise ValueError("expected 5 fields: oid tags min max writable")
+            tags = [_decimal(t, False) for t in fields[1].split(",")]
+            w = fields[4]
+            if w != "yes" and w != "no":
+                raise ValueError("writable must be yes or no, got %r" % w)
+            rules.append(WriteRule(Oid.parse(fields[0]), tags, _bound(fields[2]), _bound(fields[3]), w == "yes"))
+        except ValueError as e:
+            raise ValueError("write rules line %d: " % n + e.error_message)
+    return rules

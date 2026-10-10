@@ -1,0 +1,701 @@
+"""Tests for fmt
+
+The net-snmp style strings were captured from net-snmp's tools run with
+`-m ''` and -On. The canonical style follows interop/README.md and the
+files under interop/expected/canon/ and interop/expected/notify/.
+"""
+
+import testing
+import errors
+import fmt
+import message
+import mibview
+import notify
+import pdu
+import values
+from fmt import OutputOptions
+from message import V3Message, ScopedPdu, UsmSecurityParameters
+from notify import Notification
+from oid import Oid
+from pdu import Pdu, TrapV1Pdu
+from values import Value, VarBind, Integer, OctetString, Null, ObjectIdentifier, IpAddress, Counter32, Gauge32
+from values import TimeTicks, Opaque, Counter64, NoSuchObject, NoSuchInstance, EndOfMibView, UnknownValue
+from values import MalformedValue
+from testutil import h, read_text, value_fails
+
+def o(s: str) -> Oid:
+    return Oid.parse(s)
+
+def vb(oid: str, v: Value) -> VarBind:
+    return VarBind(Oid.parse(oid), v)
+
+def nv(v: Value) -> str:
+    """net-snmp style with the default options"""
+    return fmt.netsnmp_value(v)
+
+def nvf(v: Value, flags: str) -> str:
+    """net-snmp style with -O<flags>"""
+    return fmt.netsnmp_value(v, OutputOptions().with_flags(flags))
+
+def opaque(hx: str) -> Opaque:
+    return Opaque(h(hx))
+
+class Odd(Value):
+    """A Value subclass fmt has no case for, like a later values addition
+
+    encode() returns tlv, or raises EncodeError when tlv is empty.
+    """
+    odd_tag: int
+    tlv: bytes
+
+    def __init__(self, odd_tag: int, tlv: bytes):
+        self.odd_tag = odd_tag
+        self.tlv = tlv
+
+    def tag(self) -> int:
+        return self.odd_tag
+
+    def encode(self) -> bytes:
+        if len(self.tlv) == 0:
+            raise errors.EncodeError("Odd cannot be encoded")
+        return self.tlv
+
+    def equals(self, other: Value) -> bool:
+        return isinstance(other, Odd) and self.odd_tag == other.odd_tag and self.tlv == other.tlv
+
+    def type_name(self) -> str:
+        return "Odd"
+
+    def __repr__(self) -> str:
+        return "Odd(%d, " % self.odd_tag + repr(self.tlv) + ")"
+
+
+# net-snmp style: values with the default options ###################################################
+
+def _test_netsnmp_integer():
+    testing.assertEqual(nv(Integer(-129)), "INTEGER: -129")
+    testing.assertEqual(nv(Integer(0)), "INTEGER: 0")
+    testing.assertEqual(nv(Integer(2147483647)), "INTEGER: 2147483647")
+    testing.assertEqual(nv(Integer(-2147483648)), "INTEGER: -2147483648")
+
+def _test_netsnmp_string_printable():
+    testing.assertEqual(nv(OctetString(b"Linux router 6.1.0")), "STRING: \"Linux router 6.1.0\"")
+    # only " and \ are escaped
+    testing.assertEqual(nv(OctetString(b"say \"hi\" \\ back")), "STRING: \"say \\\"hi\\\" \\\\ back\"")
+    # TAB, LF, VT, FF and CR count as text and are printed raw
+    testing.assertEqual(nv(OctetString(b"tab\there\nnewline")), "STRING: \"tab\there\nnewline\"")
+    testing.assertEqual(nv(OctetString(b"\x09\x0a\x0b\x0c\x0d")), "STRING: \"\x09\x0a\x0b\x0c\x0d\"")
+    testing.assertEqual(nv(OctetString(b" ~")), "STRING: \" ~\"")
+
+def _test_netsnmp_string_empty():
+    # no type label, also with -Ox and -Oq
+    testing.assertEqual(nv(OctetString(b"")), "\"\"")
+    testing.assertEqual(nvf(OctetString(b""), "x"), "\"\"")
+    testing.assertEqual(nvf(OctetString(b""), "q"), "\"\"")
+    testing.assertEqual(nvf(OctetString(b""), "a"), "\"\"")
+
+def _test_netsnmp_hex_string():
+    testing.assertEqual(nv(OctetString(b"abc\x00")), "Hex-STRING: 61 62 63 00 ")
+    testing.assertEqual(nv(OctetString(b"\x7f")), "Hex-STRING: 7F ")
+    testing.assertEqual(nv(OctetString(b"\x08")), "Hex-STRING: 08 ")
+    testing.assertEqual(nv(OctetString(b"\x0e")), "Hex-STRING: 0E ")
+    testing.assertEqual(nv(OctetString("Zürich".encode())), "Hex-STRING: 5A C3 BC 72 69 63 68 ")
+    testing.assertEqual(nv(OctetString(h("00 50 56 9a bc de"))), "Hex-STRING: 00 50 56 9A BC DE ")
+
+def _test_netsnmp_hex_wrap():
+    # a line break after every 16 octets, but not after the last octet
+    b20 = h("00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f 10 11 12 13")
+    testing.assertEqual(nv(OctetString(b20)),
+                        "Hex-STRING: 00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F \n10 11 12 13 ")
+    testing.assertEqual(nv(OctetString(b20[:16])), "Hex-STRING: 00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F ")
+    testing.assertEqual(nv(OctetString(b20[:17])),
+                        "Hex-STRING: 00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F \n10 ")
+    b32 = b20[:16] + b20[:16]
+    testing.assertEqual(nv(OctetString(b32)),
+                        "Hex-STRING: 00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F \n"
+                        + "00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F ")
+
+def _test_netsnmp_hex_line_length():
+    b20 = h("00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f 10 11 12 13")
+    flat = "Hex-STRING: 00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F 10 11 12 13 "
+    testing.assertEqual(fmt.netsnmp_value(OctetString(b20), OutputOptions(hex_line_length=0)), flat)
+    testing.assertEqual(fmt.netsnmp_value(OctetString(b20), OutputOptions(hex_line_length=-1)), flat)
+    testing.assertEqual(fmt.netsnmp_value(OctetString(b20), OutputOptions(hex_line_length=8)),
+                        "Hex-STRING: 00 01 02 03 04 05 06 07 \n08 09 0A 0B 0C 0D 0E 0F \n10 11 12 13 ")
+    testing.assertEqual(fmt.netsnmp_value(OctetString(b20[:3]), OutputOptions(hex_line_length=1)),
+                        "Hex-STRING: 00 \n01 \n02 ")
+
+def _test_netsnmp_oid():
+    testing.assertEqual(nv(ObjectIdentifier(o("1.3.6.1.4.1.8072.3.2.10"))), "OID: .1.3.6.1.4.1.8072.3.2.10")
+    testing.assertEqual(nv(ObjectIdentifier(o("0.0"))), "OID: .0.0")
+    testing.assertEqual(nv(ObjectIdentifier(o("2.999.1"))), "OID: .2.999.1")
+    # the wire OID 06 00 decodes to an OID without arcs; net-snmp prints it as .0
+    testing.assertEqual(nv(ObjectIdentifier(Oid([]))), "OID: .0")
+
+def _test_netsnmp_ipaddress():
+    testing.assertEqual(nv(IpAddress(h("c0 00 02 01"))), "IpAddress: 192.0.2.1")
+    testing.assertEqual(nv(IpAddress(h("00 00 00 00"))), "IpAddress: 0.0.0.0")
+    testing.assertEqual(nv(IpAddress(h("ff ff ff ff"))), "IpAddress: 255.255.255.255")
+    # decoded with a wrong length (net-snmp drops such a message): every octet is shown
+    testing.assertEqual(nv(IpAddress(h("0a 00 00"))), "IpAddress: 10.0.0")
+    testing.assertEqual(nv(IpAddress(b"")), "IpAddress: ")
+
+def _test_netsnmp_unsigned():
+    testing.assertEqual(nv(Counter32(4294967295)), "Counter32: 4294967295")
+    testing.assertEqual(nv(Counter32(0)), "Counter32: 0")
+    testing.assertEqual(nv(Gauge32(1000000000)), "Gauge32: 1000000000")
+    testing.assertEqual(nv(Counter64(u64(18446744073709551615))), "Counter64: 18446744073709551615")
+    testing.assertEqual(nv(Counter64(u64(9223372036854775808))), "Counter64: 9223372036854775808")
+    testing.assertEqual(nv(Counter64(u64(0))), "Counter64: 0")
+
+def _test_netsnmp_timeticks():
+    testing.assertEqual(nv(TimeTicks(12345678)), "Timeticks: (12345678) 1 day, 10:17:36.78")
+    testing.assertEqual(nv(TimeTicks(0)), "Timeticks: (0) 0:00:00.00")
+    testing.assertEqual(nv(TimeTicks(100)), "Timeticks: (100) 0:00:01.00")
+    testing.assertEqual(nv(TimeTicks(8640000)), "Timeticks: (8640000) 1 day, 0:00:00.00")
+    testing.assertEqual(nv(TimeTicks(8639999)), "Timeticks: (8639999) 23:59:59.99")
+    testing.assertEqual(nv(TimeTicks(17280000)), "Timeticks: (17280000) 2 days, 0:00:00.00")
+    testing.assertEqual(nv(TimeTicks(4294967295)), "Timeticks: (4294967295) 497 days, 2:27:52.95")
+
+def _test_netsnmp_opaque():
+    testing.assertEqual(nv(opaque("de ad be ef")), "OPAQUE: DE AD BE EF ")
+    testing.assertEqual(nv(Opaque(b"")), "OPAQUE: ")
+    testing.assertEqual(nv(Opaque(h("00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f 10"))),
+                        "OPAQUE: 00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F \n10 ")
+    # -Ox and -Oa do not apply to Opaque
+    testing.assertEqual(nvf(opaque("41 42"), "a"), "OPAQUE: 41 42 ")
+
+def _test_netsnmp_opaque_special():
+    # net-snmp labels Double as Float too
+    testing.assertEqual(nv(opaque("9f 78 04 3f c0 00 00")), "Opaque: Float: 1.500000")
+    testing.assertEqual(nv(opaque("9f 78 04 3f 80 00 00")), "Opaque: Float: 1.000000")
+    testing.assertEqual(nv(opaque("9f 78 04 40 0b c8 00")), "Opaque: Float: 2.184082")
+    testing.assertEqual(nv(opaque("9f 79 08 40 04 00 00 00 00 00 00")), "Opaque: Float: 2.500000")
+    testing.assertEqual(nv(opaque("9f 7a 01 fb")), "Opaque: Int64: -5")
+    testing.assertEqual(nv(opaque("9f 7a 01 2a")), "Opaque: Int64: 42")
+    testing.assertEqual(nv(opaque("9f 7b 01 05")), "Opaque: UInt64: 5")
+    testing.assertEqual(nv(opaque("9f 7b 09 00 ff ff ff ff ff ff ff ff")), "Opaque: UInt64: 18446744073709551615")
+    testing.assertEqual(nv(opaque("9f 76 06 01 00 00 00 00 00")), "Opaque: Counter64: 1099511627776")
+    # a malformed wrapper is a plain Opaque (float needs exactly 4 content octets)
+    testing.assertEqual(nv(opaque("9f 78 03 3f c0 00")), "OPAQUE: 9F 78 03 3F C0 00 ")
+    # -Oq drops the labels
+    testing.assertEqual(nvf(opaque("9f 78 04 3f c0 00 00"), "q"), "1.500000")
+    testing.assertEqual(nvf(opaque("9f 7a 01 fb"), "q"), "-5")
+    testing.assertEqual(nvf(opaque("9f 7b 01 05"), "q"), "5")
+
+def _test_netsnmp_null_and_exceptions():
+    testing.assertEqual(nv(Null()), "NULL")
+    testing.assertEqual(nv(NoSuchObject()), "No Such Object available on this agent at this OID")
+    testing.assertEqual(nv(NoSuchInstance()), "No Such Instance currently exists at this OID")
+    testing.assertEqual(nv(EndOfMibView()),
+                        "No more variables left in this MIB View (It is past the end of the MIB tree)")
+    # -Oq changes none of them
+    testing.assertEqual(nvf(Null(), "q"), "NULL")
+    testing.assertEqual(nvf(NoSuchObject(), "q"), "No Such Object available on this agent at this OID")
+    testing.assertEqual(nvf(NoSuchInstance(), "q"), "No Such Instance currently exists at this OID")
+    testing.assertEqual(nvf(EndOfMibView(), "q"),
+                        "No more variables left in this MIB View (It is past the end of the MIB tree)")
+
+def _test_netsnmp_unknown():
+    # UInteger32 (47 01 2a) is a bare number, NsapAddress (45 03 47 00 05) a bad type
+    testing.assertEqual(nv(UnknownValue(0x47, h("2a"))), "42")
+    testing.assertEqual(nv(UnknownValue(0x47, h("ff ff ff ff"))), "4294967295")
+    testing.assertEqual(nvf(UnknownValue(0x47, h("2a")), "q"), "42")
+    testing.assertEqual(nv(UnknownValue(0x45, h("47 00 05"))), "Variable has bad type")
+    # UInteger32 content that is not a 32-bit number, and other tags
+    testing.assertEqual(nv(UnknownValue(0x47, b"")), "Variable has bad type")
+    testing.assertEqual(nv(UnknownValue(0x47, h("01 00 00 00 00"))), "Variable has bad type")
+    testing.assertEqual(nv(UnknownValue(0x03, h("00 80"))), "Variable has bad type")
+    testing.assertEqual(nv(UnknownValue(0xa9, b"")), "Variable has bad type")
+
+def _test_netsnmp_other_value_class():
+    testing.assertEqual(nv(Odd(0x43, h("43 08 ff ff ff ff ff ff ff ff"))), "Odd(0x43): FF FF FF FF FF FF FF FF")
+    testing.assertEqual(nv(Odd(0x02, h("02 00"))), "Odd(0x02): \"\"")
+    testing.assertEqual(nv(Odd(0x02, b"")), "Odd(0x02)")
+    # encode() output that is not a TLV
+    testing.assertEqual(nv(Odd(0x02, h("02 05 01"))), "Odd(0x02)")
+
+
+# net-snmp style: varbinds and -O options ###########################################################
+
+def _test_netsnmp_varbind():
+    testing.assertEqual(fmt.netsnmp_varbind(vb("1.3.6.1.2.1.1.2.0", ObjectIdentifier(o("1.3.6.1.4.1.8072.3.2.10")))),
+                        ".1.3.6.1.2.1.1.2.0 = OID: .1.3.6.1.4.1.8072.3.2.10")
+    testing.assertEqual(fmt.netsnmp_varbind(vb("1.3.6.1.2.1.1.4.0", OctetString(b""))), ".1.3.6.1.2.1.1.4.0 = \"\"")
+    testing.assertEqual(fmt.netsnmp_varbind(vb("1.3.6.1.2.1.1.1.0", OctetString(b"Linux router 6.1.0"))),
+                        ".1.3.6.1.2.1.1.1.0 = STRING: \"Linux router 6.1.0\"")
+    testing.assertEqual(fmt.netsnmp_varbind(VarBind(o("1.3.6.1.2.1.1.1.0"))), ".1.3.6.1.2.1.1.1.0 = NULL")
+
+def _test_option_quick():
+    up = vb("1.3.6.1.2.1.1.3.0", TimeTicks(12345678))
+    q = OutputOptions().with_flags("q")
+    testing.assertEqual(fmt.netsnmp_varbind(up, q), ".1.3.6.1.2.1.1.3.0 1:10:17:36.78")
+    testing.assertEqual(nvf(TimeTicks(0), "q"), "0:0:00:00.00")
+    testing.assertEqual(nvf(TimeTicks(4294967295), "q"), "497:2:27:52.95")
+    # strings keep their quotes; a Hex-STRING is quoted instead of labelled
+    testing.assertEqual(nvf(OctetString(b"Linux router 6.1.0"), "q"), "\"Linux router 6.1.0\"")
+    testing.assertEqual(nvf(OctetString(h("00 50 56 9a bc de")), "q"), "\"00 50 56 9A BC DE \"")
+    testing.assertEqual(nvf(Integer(-5), "q"), "-5")
+    testing.assertEqual(nvf(ObjectIdentifier(o("1.3.6.1")), "q"), ".1.3.6.1")
+    testing.assertEqual(nvf(IpAddress(h("c0 00 02 01")), "q"), "192.0.2.1")
+    testing.assertEqual(nvf(Counter32(7), "q"), "7")
+    testing.assertEqual(nvf(Gauge32(8), "q"), "8")
+    testing.assertEqual(nvf(Counter64(u64(9)), "q"), "9")
+    testing.assertEqual(nvf(opaque("de ad be ef"), "q"), "DE AD BE EF ")
+
+def _test_option_quick_equals():
+    up = vb("1.3.6.1.2.1.1.3.0", TimeTicks(12345678))
+    testing.assertEqual(fmt.netsnmp_varbind(up, OutputOptions().with_flags("Q")), ".1.3.6.1.2.1.1.3.0 = 1:10:17:36.78")
+    # Q and q each toggle quick, so -OQq is the default value format with " = "
+    testing.assertEqual(fmt.netsnmp_varbind(up, OutputOptions().with_flags("Qq")),
+                        ".1.3.6.1.2.1.1.3.0 = Timeticks: (12345678) 1 day, 10:17:36.78")
+
+def _test_option_bare_value():
+    up = vb("1.3.6.1.2.1.1.3.0", TimeTicks(12345678))
+    testing.assertEqual(fmt.netsnmp_varbind(up, OutputOptions().with_flags("v")),
+                        "Timeticks: (12345678) 1 day, 10:17:36.78")
+    testing.assertEqual(fmt.netsnmp_varbind(up, OutputOptions().with_flags("vq")), "1:10:17:36.78")
+    testing.assertEqual(fmt.netsnmp_varbind(up, OutputOptions().with_flags("vQ")), "1:10:17:36.78")
+
+def _test_option_hex():
+    x = OutputOptions().with_flags("x")
+    testing.assertEqual(fmt.netsnmp_value(OctetString(b"Linux router 6.1.0"), x),
+                        "Hex-STRING: 4C 69 6E 75 78 20 72 6F 75 74 65 72 20 36 2E 31 \n2E 30 ")
+    testing.assertEqual(fmt.netsnmp_value(OctetString(b"Linux router 6.1.0"), x.with_flags("q")),
+                        "\"4C 69 6E 75 78 20 72 6F 75 74 65 72 20 36 2E 31 \n2E 30 \"")
+    xflat = OutputOptions(hex_line_length=0).with_flags("x")
+    testing.assertEqual(fmt.netsnmp_value(OctetString(b"Linux router 6.1.0"), xflat),
+                        "Hex-STRING: 4C 69 6E 75 78 20 72 6F 75 74 65 72 20 36 2E 31 2E 30 ")
+
+def _test_option_ascii():
+    testing.assertEqual(nvf(OctetString(h("00 50 56 9a bc de")), "a"), "STRING: \".PV...\"")
+    testing.assertEqual(nvf(OctetString(h("00 50 56 9a bc de")), "aq"), "\".PV...\"")
+    # quotes and backslashes are still escaped, white space kept
+    testing.assertEqual(nvf(OctetString(b"\"\\\t\x00"), "a"), "STRING: \"\\\"\\\\\t.\"")
+    # the last of x and a wins
+    testing.assertEqual(nvf(OctetString(b"hi"), "ax"), "Hex-STRING: 68 69 ")
+    testing.assertEqual(nvf(OctetString(h("00")), "xa"), "STRING: \".\"")
+
+def _test_option_hex_text():
+    testing.assertEqual(nvf(OctetString(h("00 50 56 9a bc de")), "T"),
+                        "Hex-STRING: 00 50 56 9A BC DE   [.PV...]")
+    # per line; TAB is not printable here
+    b18 = b"0123456789abcdef\x09z"
+    testing.assertEqual(nvf(OctetString(b18), "xT"),
+                        "Hex-STRING: 30 31 32 33 34 35 36 37 38 39 61 62 63 64 65 66   [0123456789abcdef]\n09 7A   [.z]")
+    testing.assertEqual(nvf(opaque("de ad"), "T"), "OPAQUE: DE AD   [..]")
+    testing.assertEqual(nvf(Opaque(b""), "T"), "OPAQUE:   []")
+
+def _test_option_numeric_timeticks():
+    testing.assertEqual(fmt.netsnmp_varbind(vb("1.3.6.1.2.1.1.3.0", TimeTicks(12345678)),
+                                            OutputOptions().with_flags("t")), ".1.3.6.1.2.1.1.3.0 = 12345678")
+    testing.assertEqual(nvf(TimeTicks(12345678), "tq"), "12345678")
+    testing.assertEqual(nvf(TimeTicks(0), "t"), "0")
+
+def _test_options_without_effect():
+    # -On is the only OID style; -Oe, -OU, -Ob, -OE and -OX need MIBs
+    vs: list[Value] = [Integer(4096), OctetString(b"x\x00"), TimeTicks(1), ObjectIdentifier(o("1.3")), Opaque(h("01"))]
+    for v in vs:
+        testing.assertEqual(nvf(v, "neUbEX"), nv(v), repr(v))
+
+def _test_with_flags():
+    d = OutputOptions()
+    testing.assertFalse(d.quick or d.quick_equals or d.bare_value or d.hex_text or d.numeric_timeticks)
+    testing.assertEqual(d.string_format, fmt.STRING_GUESS)
+    testing.assertEqual(d.hex_line_length, 16)
+    q = d.with_flags("q")
+    testing.assertTrue(q.quick)
+    testing.assertFalse(d.quick, "with_flags must not change the original")
+    testing.assertFalse(d.with_flags("qq").quick)
+    big_q = d.with_flags("Q")
+    testing.assertTrue(big_q.quick and big_q.quick_equals)
+    qq = d.with_flags("QQ")
+    testing.assertFalse(qq.quick or qq.quick_equals)
+    testing.assertTrue(d.with_flags("v").bare_value)
+    testing.assertFalse(d.with_flags("vv").bare_value)
+    testing.assertTrue(d.with_flags("T").hex_text)
+    testing.assertTrue(d.with_flags("t").numeric_timeticks)
+    testing.assertFalse(d.with_flags("tt").numeric_timeticks)
+    testing.assertEqual(d.with_flags("x").string_format, fmt.STRING_HEX)
+    testing.assertEqual(d.with_flags("xa").string_format, fmt.STRING_ASCII)
+    testing.assertEqual(d.with_flags("ax").string_format, fmt.STRING_HEX)
+    testing.assertEqual(d.with_flags("").quick, False)
+    # flags apply on top of the receiver, and keep hex_line_length
+    testing.assertFalse(q.with_flags("q").quick)
+    testing.assertEqual(OutputOptions(hex_line_length=0).with_flags("x").hex_line_length, 0)
+
+def _test_with_flags_rejects():
+    d = OutputOptions()
+    for flags in ["f", "s", "S", "u", "z", "0", "p", " ", "qz", "-q"]:
+        value_fails(lambda: d.with_flags(flags), "-O" + flags)
+
+def _test_output_options_repr():
+    testing.assertEqual(repr(OutputOptions().with_flags("qx")),
+                        "OutputOptions(quick=True, quick_equals=False, bare_value=False, string_format=1, "
+                        + "hex_text=False, numeric_timeticks=False, hex_line_length=16)")
+
+
+# Canonical style ####################################################################################
+
+def _test_canon_readme_examples():
+    # interop/README.md, "Canonical output format"
+    b = "1.3.6.1.4.1.8072.9999."
+    testing.assertEqual(fmt.canon_varbind(vb(b + "1.1.3.0", Integer(-1))), "." + b + "1.1.3.0 = INTEGER: -1")
+    testing.assertEqual(fmt.canon_varbind(vb(b + "1.2.1.0", OctetString(b"Hello, SNMP!"))),
+                        "." + b + "1.2.1.0 = STRING: \"Hello, SNMP!\"")
+    testing.assertEqual(fmt.canon_varbind(vb(b + "1.2.6.0", OctetString(b"tab\t"))),
+                        "." + b + "1.2.6.0 = Hex-STRING: 74 61 62 09")
+    testing.assertEqual(fmt.canon_varbind(vb(b + "1.3.1.0", ObjectIdentifier(o("0.0")))),
+                        "." + b + "1.3.1.0 = OID: .0.0")
+    testing.assertEqual(fmt.canon_varbind(vb(b + "1.4.3.0", IpAddress(h("c0 00 02 01")))),
+                        "." + b + "1.4.3.0 = IpAddress: 192.0.2.1")
+    testing.assertEqual(fmt.canon_varbind(vb(b + "1.5.5.0", Counter32(4294967295))),
+                        "." + b + "1.5.5.0 = Counter32: 4294967295")
+    testing.assertEqual(fmt.canon_varbind(vb(b + "1.9.2.0", opaque("9f 78 04 3f 80 00 00"))),
+                        "." + b + "1.9.2.0 = Opaque: 9F 78 04 3F 80 00 00")
+    testing.assertEqual(fmt.canon_varbind(vb(b + "2.1.2.0", Null())), "." + b + "2.1.2.0 = NULL")
+
+def _test_canon_strings():
+    testing.assertEqual(fmt.canon_value(OctetString(b"")), "STRING: \"\"")
+    testing.assertEqual(fmt.canon_value(OctetString(b"quote \" and backslash \\ chars")),
+                        "STRING: \"quote \\\" and backslash \\\\ chars\"")
+    testing.assertEqual(fmt.canon_value(OctetString(b" ~")), "STRING: \" ~\"")
+    # only 0x20..0x7e is text: TAB and LF give Hex-STRING (unlike net-snmp)
+    testing.assertEqual(fmt.canon_value(OctetString(b"tab\there\nnewline")),
+                        "Hex-STRING: 74 61 62 09 68 65 72 65 0A 6E 65 77 6C 69 6E 65")
+    testing.assertEqual(fmt.canon_value(OctetString(h("00"))), "Hex-STRING: 00")
+    testing.assertEqual(fmt.canon_value(OctetString(h("7f"))), "Hex-STRING: 7F")
+    testing.assertEqual(fmt.canon_value(OctetString(h("ff ff ff ff"))), "Hex-STRING: FF FF FF FF")
+    testing.assertEqual(fmt.canon_value(OctetString("räksmörgås".encode())),
+                        "Hex-STRING: 72 C3 A4 6B 73 6D C3 B6 72 67 C3 A5 73")
+    # no line breaks however long
+    b40 = bytes([i for i in range(40)])
+    testing.assertEqual(fmt.canon_value(OctetString(b40)), "Hex-STRING: " + " ".join(["%02X" % i for i in range(40)]))
+
+def _test_canon_other_types():
+    testing.assertEqual(fmt.canon_value(Integer(-2147483648)), "INTEGER: -2147483648")
+    testing.assertEqual(fmt.canon_value(ObjectIdentifier(o("1.3.6.1.4.1.4294967295.0"))),
+                        "OID: .1.3.6.1.4.1.4294967295.0")
+    testing.assertEqual(fmt.canon_value(ObjectIdentifier(Oid([]))), "OID: .0")
+    testing.assertEqual(fmt.canon_value(IpAddress(h("ff ff ff ff"))), "IpAddress: 255.255.255.255")
+    testing.assertEqual(fmt.canon_value(IpAddress(h("0a 00 00"))), "IpAddress: 10.0.0")
+    testing.assertEqual(fmt.canon_value(Gauge32(4294967295)), "Gauge32: 4294967295")
+    testing.assertEqual(fmt.canon_value(TimeTicks(8640000)), "Timeticks: 8640000")
+    testing.assertEqual(fmt.canon_value(Counter64(u64(18446744073709551615))), "Counter64: 18446744073709551615")
+    testing.assertEqual(fmt.canon_value(opaque("de ad be ef")), "Opaque: DE AD BE EF")
+    testing.assertEqual(fmt.canon_value(opaque("9f 7a 01 2a")), "Opaque: 9F 7A 01 2A")
+    testing.assertEqual(fmt.canon_value(Opaque(b"")), "Opaque: \"\"")
+    testing.assertEqual(fmt.canon_value(NoSuchObject()), "noSuchObject")
+    testing.assertEqual(fmt.canon_value(NoSuchInstance()), "noSuchInstance")
+    testing.assertEqual(fmt.canon_value(EndOfMibView()), "endOfMibView")
+
+def _test_canon_unknown_and_other_classes():
+    testing.assertEqual(fmt.canon_value(UnknownValue(0x45, h("47 00 05"))), "NsapAddress(0x45): 47 00 05")
+    testing.assertEqual(fmt.canon_value(UnknownValue(0x47, h("2a"))), "UInteger32(0x47): 2A")
+    testing.assertEqual(fmt.canon_value(UnknownValue(0xa9, b"")), "Unknown(0xA9): \"\"")
+    testing.assertEqual(fmt.canon_value(Odd(0x43, h("43 08 ff ff ff ff ff ff ff ff"))),
+                        "Odd(0x43): FF FF FF FF FF FF FF FF")
+    testing.assertEqual(fmt.canon_value(Odd(0x02, b"")), "Odd(0x02)")
+
+
+# MalformedValue: one form in both styles #########################################################
+
+def decoded(hx: str) -> Value:
+    """The value values.decode_value makes of the TLV hx"""
+    b = h(hx)
+    v, _ = values.decode_value(b, 0, len(b))
+    return v
+
+def _test_malformed_value():
+    # what decode_value gives for a Counter32 above 2^32-1: tag, content and the decoder's reason
+    m = decoded("41 05 01 00 00 00 05")
+    want = "Malformed(0x41): 01 00 00 00 05 (unsigned integer exceeds 2^32-1)"
+    testing.assertEqual(nv(m), want)
+    testing.assertEqual(fmt.canon_value(m), want)
+    testing.assertEqual(fmt.netsnmp_varbind(vb("1.3.6.1.2.1.2.2.1.10.1", m)), ".1.3.6.1.2.1.2.2.1.10.1 = " + want)
+    testing.assertEqual(fmt.canon_varbind(vb("1.3.6.1.2.1.2.2.1.10.1", m)), ".1.3.6.1.2.1.2.2.1.10.1 = " + want)
+    # the options do not change it (no label to drop, no hex wrapping), apart from the varbind layout
+    testing.assertEqual(nvf(m, "q"), want)
+    testing.assertEqual(nvf(m, "x"), want)
+    testing.assertEqual(nvf(m, "a"), want)
+    testing.assertEqual(fmt.netsnmp_value(m, OutputOptions(hex_line_length=2)), want)
+    testing.assertEqual(fmt.netsnmp_varbind(vb("1.3.6.1.2.1.2.2.1.10.1", m), OutputOptions().with_flags("q")),
+                        ".1.3.6.1.2.1.2.2.1.10.1 " + want)
+    # other decoder rejections
+    testing.assertEqual(nv(decoded("06 02 2b 86")), "Malformed(0x06): 2B 86 (truncated OID sub-identifier)")
+    testing.assertEqual(fmt.canon_value(decoded("46 00")), "Malformed(0x46): \"\" (empty Counter64)")
+    testing.assertEqual(fmt.canon_value(decoded("02 00")), "Malformed(0x02): \"\" (empty INTEGER)")
+    # an INTEGER beyond Integer32 that fits 64 bits is an Integer, printed like net-snmp does
+    testing.assertEqual(nv(decoded("02 05 00 80 00 00 00")), "INTEGER: 2147483648")
+    # constructed by hand: an empty reason is left out
+    testing.assertEqual(nv(MalformedValue(0x43, h("ff"), "")), "Malformed(0x43): FF")
+    testing.assertEqual(fmt.canon_value(MalformedValue(0x43, b"", "")), "Malformed(0x43): \"\"")
+
+
+# Canonical NOTIFICATION blocks ######################################################################
+
+def trap_v1(enterprise: str, agent: str, generic: int, specific: int, uptime: int, vbs: list[VarBind],
+            community: bytes=b"public") -> Notification:
+    return notify.notification_from_v1(TrapV1Pdu(o(enterprise), h(agent), generic, specific, uptime, vbs),
+                                       community, "192.0.2.99", 50162)
+
+def trap_v2c(pdu_type: int, uptime: int, trap_oid: str, vbs: list[VarBind], community: bytes=b"public") -> Notification:
+    p = Pdu(pdu_type, 1234, 0, 0, notify.build_trap_v2(uptime, o(trap_oid), vbs))
+    return notify.notification_from_v2c(p, community, "192.0.2.99", 50162)
+
+def trap_v3(pdu_type: int, user: bytes, flags: int, context: bytes, uptime: int, trap_oid: str,
+            vbs: list[VarBind]) -> Notification:
+    engine = h("80 00 00 00 01 02 03 04")
+    p = Pdu(pdu_type, 77, 0, 0, notify.build_trap_v2(uptime, o(trap_oid), vbs))
+    scoped = ScopedPdu(engine, context, p)
+    msg = V3Message(12, 65507, flags, UsmSecurityParameters(engine_id=engine, boots=1, time=0, user=user),
+                    scoped=scoped)
+    return notify.notification_from_v3(msg, scoped, "192.0.2.99", 50162)
+
+def lines(s: list[str]) -> str:
+    return "\n".join(s)
+
+def _test_canon_notification_v1():
+    # interop/expected/notify/matrix.txt, the first blocks
+    n = trap_v1("1.3.6.1.4.1.8072.9999", "c0 00 02 01", 6, 42, 12345, [vb("1.3.6.1.4.1.8072.9999.1.1.1.0", Integer(0))])
+    testing.assertEqual(fmt.canon_notification(n), lines([
+        "NOTIFICATION v1 TRAP community=\"public\" enterprise=.1.3.6.1.4.1.8072.9999 agent=192.0.2.1 generic=6 specific=42 uptime=12345 trapoid=.1.3.6.1.4.1.8072.9999.0.42",
+        ".1.3.6.1.4.1.8072.9999.1.1.1.0 = INTEGER: 0",
+        "END"]))
+    n = trap_v1("1.3.6.1.4.1.8072.9999.3", "c0 00 02 01", 0, 0, 0, [])
+    testing.assertEqual(fmt.canon_notification(n), lines([
+        "NOTIFICATION v1 TRAP community=\"public\" enterprise=.1.3.6.1.4.1.8072.9999.3 agent=192.0.2.1 generic=0 specific=0 uptime=0 trapoid=.1.3.6.1.6.3.1.1.5.1",
+        "END"]))
+    n = trap_v1("1.3.6.1.4.1.8072.9999.3", "ff ff ff ff", 3, 0, 8640000,
+                [vb("1.3.6.1.4.1.8072.9999.1.10.1.1.7", Integer(7)),
+                 vb("1.3.6.1.4.1.8072.9999.1.10.1.2.7", OctetString(b"row-0007")),
+                 vb("1.3.6.1.4.1.8072.9999.1.10.1.5.7", Gauge32(49))])
+    testing.assertEqual(fmt.canon_notification(n), lines([
+        "NOTIFICATION v1 TRAP community=\"public\" enterprise=.1.3.6.1.4.1.8072.9999.3 agent=255.255.255.255 generic=3 specific=0 uptime=8640000 trapoid=.1.3.6.1.6.3.1.1.5.4",
+        ".1.3.6.1.4.1.8072.9999.1.10.1.1.7 = INTEGER: 7",
+        ".1.3.6.1.4.1.8072.9999.1.10.1.2.7 = STRING: \"row-0007\"",
+        ".1.3.6.1.4.1.8072.9999.1.10.1.5.7 = Gauge32: 49",
+        "END"]))
+    n = trap_v1("1.3.6.1.4.1.8072.9999.3", "c6 33 64 07", 6, 2147483647, 4294967295,
+                [vb("1.3.6.1.4.1.8072.9999.1.2.1.0", OctetString(b"Hello, SNMP!"))])
+    testing.assertEqual(fmt.canon_notification(n), lines([
+        "NOTIFICATION v1 TRAP community=\"public\" enterprise=.1.3.6.1.4.1.8072.9999.3 agent=198.51.100.7 generic=6 specific=2147483647 uptime=4294967295 trapoid=.1.3.6.1.4.1.8072.9999.3.0.2147483647",
+        ".1.3.6.1.4.1.8072.9999.1.2.1.0 = STRING: \"Hello, SNMP!\"",
+        "END"]))
+
+def _test_canon_notification_v1_odd_fields():
+    # out-of-range fields still give the RFC 3584 trap OID of notify; the community is printed once
+    n = trap_v1("1.3.6.1.4.1.8072.9999.3", "0a 00 00", 9, -1, 5, [], community=b"secret")
+    testing.assertEqual(fmt.canon_notification(n), lines([
+        "NOTIFICATION v1 TRAP community=\"secret\" enterprise=.1.3.6.1.4.1.8072.9999.3 agent=10.0.0 generic=9 specific=-1 uptime=5 trapoid=.1.3.6.1.6.3.1.1.5.10",
+        "END"]))
+    n = trap_v1("1.3.6.1.4.1.8072.9999.3", "0a 00 00 01", 6, -1, 5, [])
+    testing.assertIn("trapoid=.1.3.6.1.4.1.8072.9999.3.0.4294967295", fmt.canon_notification(n))
+    t = TrapV1Pdu(Oid([]), h("0a 00 00 01"), 6, 1, 5, [])
+    n = notify.notification_from_v1(t, b"public", "192.0.2.99", 162)
+    testing.assertEqual(fmt.canon_notification(n), lines([
+        "NOTIFICATION v1 TRAP community=\"public\" enterprise=.0 agent=10.0.0.1 generic=6 specific=1 uptime=5 trapoid=.0.1",
+        "END"]))
+
+def _test_canon_notification_v2c():
+    n = trap_v2c(pdu.TRAP_V2, 0, "1.3.6.1.6.3.1.1.5.1", [])
+    testing.assertEqual(fmt.canon_notification(n), lines([
+        "NOTIFICATION v2c TRAP2 community=\"public\" uptime=0 trapoid=.1.3.6.1.6.3.1.1.5.1", "END"]))
+    n = trap_v2c(pdu.INFORM, 1, "1.3.6.1.4.1.8072.9999.3.0.24", [])
+    testing.assertEqual(fmt.canon_notification(n), lines([
+        "NOTIFICATION v2c INFORM community=\"public\" uptime=1 trapoid=.1.3.6.1.4.1.8072.9999.3.0.24", "END"]))
+    n = trap_v2c(pdu.TRAP_V2, 4294967295, "1.3.6.1.4.1.8072.9999.3.0.20",
+                 [vb("1.3.6.1.4.1.8072.9999.1.8.7.0", Counter64(u64(18446744073709551615))),
+                  vb("1.3.6.1.4.1.8072.9999.1.9.1.0", opaque("de ad be ef"))])
+    testing.assertEqual(fmt.canon_notification(n), lines([
+        "NOTIFICATION v2c TRAP2 community=\"public\" uptime=4294967295 trapoid=.1.3.6.1.4.1.8072.9999.3.0.20",
+        ".1.3.6.1.4.1.8072.9999.1.8.7.0 = Counter64: 18446744073709551615",
+        ".1.3.6.1.4.1.8072.9999.1.9.1.0 = Opaque: DE AD BE EF",
+        "END"]))
+
+def _test_canon_notification_v3():
+    n = trap_v3(pdu.TRAP_V2, b"u_noauth", 0, b"", 3000000, "1.3.6.1.4.1.8072.9999.3.0.27",
+                [vb("1.3.6.1.4.1.8072.9999.1.1.7.0", Integer(-129))])
+    testing.assertEqual(fmt.canon_notification(n), lines([
+        "NOTIFICATION v3 TRAP2 user=\"u_noauth\" level=noAuthNoPriv context=\"\" uptime=3000000 trapoid=.1.3.6.1.4.1.8072.9999.3.0.27",
+        ".1.3.6.1.4.1.8072.9999.1.1.7.0 = INTEGER: -129",
+        "END"]))
+    n = trap_v3(pdu.TRAP_V2, b"u_md5", message.FLAG_AUTH, b"", 3000001, "1.3.6.1.4.1.8072.9999.3.0.28", [])
+    testing.assertEqual(fmt.canon_notification(n), lines([
+        "NOTIFICATION v3 TRAP2 user=\"u_md5\" level=authNoPriv context=\"\" uptime=3000001 trapoid=.1.3.6.1.4.1.8072.9999.3.0.28",
+        "END"]))
+    flags = message.FLAG_AUTH | message.FLAG_PRIV | message.FLAG_REPORTABLE
+    n = trap_v3(pdu.INFORM, b"u_sha_aes", flags, b"ctx \"1\"", 3001008, "1.3.6.1.4.1.8072.9999.3.0.65", [])
+    testing.assertEqual(fmt.canon_notification(n), lines([
+        "NOTIFICATION v3 INFORM user=\"u_sha_aes\" level=authPriv context=\"ctx \\\"1\\\"\" uptime=3001008 trapoid=.1.3.6.1.4.1.8072.9999.3.0.65",
+        "END"]))
+    # privacy without authentication is no security level (the receiver never delivers it)
+    n = trap_v3(pdu.TRAP_V2, b"u", message.FLAG_PRIV, b"", 1, "1.3.6.1.4.1.8072.9999.3.0.1", [])
+    testing.assertIn(" level=privWithoutAuth ", fmt.canon_notification(n))
+
+def _test_canon_notification_quoting():
+    n = trap_v2c(pdu.TRAP_V2, 0, "1.3.6.1.6.3.1.1.5.1", [], community=b"a\"b\\c")
+    testing.assertEqual(fmt.canon_notification(n), lines([
+        "NOTIFICATION v2c TRAP2 community=\"a\\\"b\\\\c\" uptime=0 trapoid=.1.3.6.1.6.3.1.1.5.1", "END"]))
+    n = trap_v2c(pdu.TRAP_V2, 0, "1.3.6.1.6.3.1.1.5.1", [], community=b"")
+    testing.assertIn(" community=\"\" ", fmt.canon_notification(n))
+    # octets outside 0x20..0x7e: 0x and hex
+    n = trap_v2c(pdu.TRAP_V2, 0, "1.3.6.1.6.3.1.1.5.1", [], community=b"pub\x00 \xff")
+    testing.assertIn(" community=0x7075620020ff ", fmt.canon_notification(n))
+    n = trap_v3(pdu.TRAP_V2, b"us\ter", 0, b"\x80", 1, "1.3.6.1.4.1.8072.9999.3.0.1", [])
+    testing.assertIn(" user=0x7573096572 level=noAuthNoPriv context=0x80 ", fmt.canon_notification(n))
+
+def _test_canon_notification_malformed_v2():
+    # sysUpTime.0 and snmpTrapOID.0 are not the first two varbinds: snmptrapd2canon.py
+    # writes uptime=? trapoid=? and every varbind
+    vbs = [vb("1.3.6.1.4.1.8072.9999.1.1.1.0", Integer(0)),
+           vb("1.3.6.1.2.1.1.3.0", TimeTicks(5)),
+           vb("1.3.6.1.6.3.1.1.4.1.0", ObjectIdentifier(o("1.3.6.1.6.3.1.1.5.1")))]
+    n = notify.notification_from_v2c(Pdu(pdu.TRAP_V2, 1, 0, 0, vbs), b"public", "192.0.2.99", 50162)
+    testing.assertNotEqual(n.problem, "")
+    testing.assertEqual(fmt.canon_notification(n), lines([
+        "NOTIFICATION v2c TRAP2 community=\"public\" uptime=? trapoid=?",
+        ".1.3.6.1.4.1.8072.9999.1.1.1.0 = INTEGER: 0",
+        ".1.3.6.1.2.1.1.3.0 = Timeticks: 5",
+        ".1.3.6.1.6.3.1.1.4.1.0 = OID: .1.3.6.1.6.3.1.1.5.1",
+        "END"]))
+    n = notify.notification_from_v2c(Pdu(pdu.INFORM, 1, 0, 0, []), b"public", "192.0.2.99", 50162)
+    testing.assertEqual(fmt.canon_notification(n), lines([
+        "NOTIFICATION v2c INFORM community=\"public\" uptime=? trapoid=?", "END"]))
+    # snmpTrapOID.0 with a non-OID value
+    vbs = [vb("1.3.6.1.2.1.1.3.0", TimeTicks(5)), vb("1.3.6.1.6.3.1.1.4.1.0", Integer(1))]
+    n = notify.notification_from_v2c(Pdu(pdu.TRAP_V2, 1, 0, 0, vbs), b"public", "192.0.2.99", 50162)
+    testing.assertEqual(fmt.canon_notification(n), lines([
+        "NOTIFICATION v2c TRAP2 community=\"public\" uptime=? trapoid=?",
+        ".1.3.6.1.2.1.1.3.0 = Timeticks: 5",
+        ".1.3.6.1.6.3.1.1.4.1.0 = INTEGER: 1",
+        "END"]))
+
+def _test_canon_notification_other_version():
+    n = Notification(2, pdu.TRAP_V2, "192.0.2.99", 162, 1, 7, o("1.3.6.1.6.3.1.1.5.1"), [], [], community=b"c")
+    testing.assertEqual(fmt.canon_notification(n), lines([
+        "NOTIFICATION version2 TRAP2 community=\"c\" uptime=7 trapoid=.1.3.6.1.6.3.1.1.5.1", "END"]))
+
+
+# Lab files (env tests) ##############################################################################
+
+SNMPREC = "interop/dataset/actsnmp.snmprec"
+CANON_DATASET = "interop/expected/canon/dataset.txt"
+NETSNMP_DATASET = "interop/expected/netsnmp/snmpd-dataset.On.txt"
+NETSNMP_DATASET_HEX = "interop/expected/netsnmp/snmpd-dataset.On-Ox.txt"
+NOTIFY_MATRIX = "interop/expected/notify/matrix.txt"
+
+# The lab dataset subtree B (interop/README.md, "Dataset")
+DATASET_ROOT = "1.3.6.1.4.1.8072.9999.1"
+
+def dataset_records(snmprec: str) -> list[VarBind]:
+    """The records of the snmprec file below the dataset base B, in OID order (the order of a walk)"""
+    return mibview.load_snmprec(snmprec).varbinds(o(DATASET_ROOT))
+
+def clip(s: str) -> str:
+    return s if len(s) <= 200 else s[:200] + "..."
+
+def assert_same_lines(got: str, want: str, what: str) -> None:
+    """Fail with the first differing line (assertEqual of whole files would print megabytes)"""
+    g = got.split("\n")
+    w = want.split("\n")
+    n = len(g) if len(g) < len(w) else len(w)
+    for i in range(n):
+        if g[i] != w[i]:
+            testing.error("%s, line %d:\n got  %s\n want %s" % (what, i + 1, clip(repr(g[i])), clip(repr(w[i]))))
+    if len(g) != len(w):
+        testing.error("%s: %d lines, expected %d" % (what, len(g), len(w)))
+
+def check_canon_dataset(snmprec: str, canon: str) -> None:
+    recs = dataset_records(snmprec)
+    testing.assertEqual(len(recs), 6038, "dataset records")
+    assert_same_lines("\n".join([fmt.canon_varbind(r) for r in recs]) + "\n", canon, CANON_DATASET)
+
+def check_netsnmp_dataset(snmprec: str, expected: str, opts: OutputOptions, what: str) -> None:
+    recs = dataset_records(snmprec)
+    assert_same_lines("\n".join([fmt.netsnmp_varbind(r, opts) for r in recs]) + "\n", expected, what)
+
+# The payload of the full-payload notifications of the matrix (interop/README.md,
+# "The notification matrix"): dataset objects under B, in this order
+FULL_PAYLOAD = ["1.18.0", "1.19.0", "1.7.0", "2.1.0", "2.2.0", "2.3.0", "2.4.0", "2.5.0", "2.6.0", "2.16.0",
+                "3.1.0", "3.3.0", "3.4.0", "3.7.0", "4.1.0", "4.4.0", "5.4.0", "5.5.0", "6.4.0", "7.3.0", "7.4.0",
+                "8.1.0", "8.7.0", "9.1.0", "9.2.0", "9.3.0"]
+
+def payload(records: list[VarBind], skip: list[str]) -> list[VarBind]:
+    """FULL_PAYLOAD without the suffixes in skip, with the values of the dataset"""
+    out: list[VarBind] = []
+    for suffix in FULL_PAYLOAD:
+        if suffix not in skip:
+            name = o(DATASET_ROOT + "." + suffix)
+            for r in records:
+                if r.oid == name:
+                    out.append(r)
+    return out
+
+def check_matrix_blocks(snmprec: str, matrix: str) -> None:
+    recs = dataset_records(snmprec)
+    netsnmp_v1 = payload(recs, ["8.1.0", "8.7.0", "9.1.0"])      # snmptrap -v1: no Counter64, no raw Opaque
+    netsnmp_v2 = payload(recs, ["9.1.0"])                        # snmptrap cannot send a raw Opaque
+    pysnmp_v2 = payload(recs, [])
+    testing.assertEqual((len(netsnmp_v1), len(netsnmp_v2), len(pysnmp_v2)), (23, 25, 26), "payload sizes")
+    blocks = [
+        # net-snmp, enterpriseSpecific with the full v1 payload
+        trap_v1("1.3.6.1.4.1.8072.9999.3", "cb 00 71 09", 6, 9, 123456789, netsnmp_v1),
+        # net-snmp v2c trap and pysnmp v2c trap and inform with the full payload
+        trap_v2c(pdu.TRAP_V2, 4294967295, "1.3.6.1.4.1.8072.9999.3.0.20", netsnmp_v2),
+        trap_v2c(pdu.TRAP_V2, 4294967295, "1.3.6.1.4.1.8072.9999.3.0.22", pysnmp_v2),
+        trap_v2c(pdu.INFORM, 123, "1.3.6.1.4.1.8072.9999.3.0.25", pysnmp_v2),
+        # net-snmp v3 trap (noAuthNoPriv) and inform (authPriv)
+        trap_v3(pdu.TRAP_V2, b"u_noauth", 0, b"", 3000000, "1.3.6.1.4.1.8072.9999.3.0.27", netsnmp_v2),
+        trap_v3(pdu.INFORM, b"u_sha_aes", message.FLAG_AUTH | message.FLAG_PRIV | message.FLAG_REPORTABLE, b"",
+                3001008, "1.3.6.1.4.1.8072.9999.3.0.65", netsnmp_v2)]
+    for n in blocks:
+        block = fmt.canon_notification(n)
+        if ("\n" + block + "\n") not in ("\n" + matrix):
+            testing.error("block not in " + NOTIFY_MATRIX + ":\n" + clip(block))
+
+actor _test_lab_dataset_canon(t: testing.EnvT):
+    """canon_varbind of every dataset record equals expected/canon/dataset.txt"""
+    t.timeout(60.0)
+    try:
+        check_canon_dataset(read_text(t, SNMPREC), read_text(t, CANON_DATASET))
+        t.success()
+    except AssertionError as e:
+        t.failure(e)
+    except Exception as e:
+        t.error(e)
+
+actor _test_lab_dataset_netsnmp(t: testing.EnvT):
+    """netsnmp_varbind of every dataset record equals net-snmp's snmpbulkwalk -On output"""
+    t.timeout(60.0)
+    try:
+        check_netsnmp_dataset(read_text(t, SNMPREC), read_text(t, NETSNMP_DATASET), OutputOptions(),
+                              NETSNMP_DATASET)
+        t.success()
+    except AssertionError as e:
+        t.failure(e)
+    except Exception as e:
+        t.error(e)
+
+actor _test_lab_dataset_netsnmp_hex(t: testing.EnvT):
+    """the same with -Ox --hexOutputLength=0"""
+    t.timeout(60.0)
+    try:
+        check_netsnmp_dataset(read_text(t, SNMPREC), read_text(t, NETSNMP_DATASET_HEX),
+                              OutputOptions(hex_line_length=0).with_flags("x"), NETSNMP_DATASET_HEX)
+        t.success()
+    except AssertionError as e:
+        t.failure(e)
+    except Exception as e:
+        t.error(e)
+
+actor _test_lab_notify_matrix(t: testing.EnvT):
+    """canon_notification of hand-built notifications matches blocks of expected/notify/matrix.txt"""
+    t.timeout(60.0)
+    try:
+        check_matrix_blocks(read_text(t, SNMPREC), read_text(t, NOTIFY_MATRIX))
+        t.success()
+    except AssertionError as e:
+        t.failure(e)
+    except Exception as e:
+        t.error(e)

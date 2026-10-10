@@ -1,0 +1,474 @@
+"""Text formatting of values, varbinds and notifications
+
+Two styles:
+
+* net-snmp style (netsnmp_value, netsnmp_varbind): byte for byte what the
+  net-snmp tools print with no MIBs loaded and numeric OIDs (`-m '' -On`),
+  for example `.1.3.6.1.2.1.1.3.0 = Timeticks: (12345) 0:02:03.45`, with
+  net-snmp's quirks: the STRING vs Hex-STRING guess, upper case hex with a
+  space after every octet and a line break after every 16 octets, `""` for
+  an empty string, `OPAQUE:` for a plain Opaque but `Opaque: Float:` for
+  net-snmp's wrapped float. OutputOptions selects the `-O` variants.
+* canonical style (canon_value, canon_varbind, canon_notification): the
+  one-line-per-varbind format of the interop lab (interop/README.md,
+  "Canonical output format"), which the interop tests compare against
+  interop/expected/canon/ and interop/expected/notify/.
+
+Both styles show a values.MalformedValue (a value whose content is invalid
+for its tag, which net-snmp would truncate or reject with the whole
+message, and which the lab's format does not have) the same way:
+`Malformed(0xTT): HEX (reason)`, with the tag and the content octets as
+received (`""` when empty) and the reason the decoder gave, for example
+`Malformed(0x41): 01 00 00 00 05 (unsigned integer exceeds 2^32-1)`. Such
+a value is never mistaken for a well-formed one, and nothing is lost.
+
+Nothing is redacted: the header of canon_notification shows the
+community of an SNMPv1/v2c notification, and the snmpTrapCommunity.0
+varbind of an SNMPv1 trap holds it too. Do not format notifications where
+communities must not appear, such as logs.
+"""
+
+import ber
+import errors
+import message
+import pdu
+import usm
+import values
+from notify import Notification
+from oid import Oid
+from values import Value, VarBind, Integer, OctetString, Null, ObjectIdentifier, IpAddress, Counter32, Gauge32
+from values import TimeTicks, Opaque, Counter64, NoSuchObject, NoSuchInstance, EndOfMibView, UnknownValue
+from values import MalformedValue
+
+# How OCTET STRING values are shown (net-snmp's string output format)
+STRING_GUESS = 0    # STRING when every octet is printable or white space, else Hex-STRING (default)
+STRING_HEX = 1      # always Hex-STRING (-Ox)
+STRING_ASCII = 2    # always STRING, other octets as "." (-Oa)
+
+# Octets per Hex-STRING line, net-snmp's default for --hexOutputLength
+HEX_LINE_LENGTH = 16
+
+_HEX: list[str] = ["%02X" % i for i in range(256)]
+
+
+class OutputOptions(object):
+    """net-snmp output options (`-O` flags and `--hexOutputLength`) for the net-snmp style
+
+    quick (-Oq): no type labels, so `INTEGER: 5` becomes `5`, and a single
+    space instead of ` = ` between OID and value; strings keep their quotes
+    and a Hex-STRING is quoted instead of labelled. quick_equals is the
+    second flag that -OQ sets: it keeps ` = ` while quick is on.
+    bare_value (-Ov): the value without the OID. string_format: one of
+    STRING_GUESS, STRING_HEX (-Ox) and STRING_ASCII (-Oa). hex_text (-OT):
+    each hex line followed by its printable characters. numeric_timeticks
+    (-Ot): Timeticks as a bare number of hundredths. hex_line_length
+    (--hexOutputLength): octets per hex line; 0 or less means no line
+    breaks.
+
+    The defaults are net-snmp's defaults. Options that only matter with
+    MIBs loaded (enum labels, units, index formatting) have no field.
+    """
+    quick: bool
+    quick_equals: bool
+    bare_value: bool
+    string_format: int
+    hex_text: bool
+    numeric_timeticks: bool
+    hex_line_length: int
+
+    def __init__(self, quick: bool=False, quick_equals: bool=False, bare_value: bool=False,
+                 string_format: int=STRING_GUESS, hex_text: bool=False, numeric_timeticks: bool=False,
+                 hex_line_length: int=HEX_LINE_LENGTH):
+        self.quick = quick
+        self.quick_equals = quick_equals
+        self.bare_value = bare_value
+        self.string_format = string_format
+        self.hex_text = hex_text
+        self.numeric_timeticks = numeric_timeticks
+        self.hex_line_length = hex_line_length
+
+    def with_flags(self, flags: str) -> OutputOptions:
+        """Return a copy with the letters of a net-snmp -O argument applied in order
+
+        The letters act as in net-snmp: q, Q, v, T and t toggle (so -Oqq is
+        the same as no -Oq; Q toggles both quick_equals and quick), x and a
+        set string_format. n (numeric OIDs, always the case here), e (numeric
+        enums), U (no units), b, E and X (index formatting) are accepted and
+        change nothing, since without MIBs they have no effect. Raises
+        ValueError for any other letter, including the f, s, S and u OID
+        styles, which this module does not produce.
+        """
+        o = OutputOptions(self.quick, self.quick_equals, self.bare_value, self.string_format, self.hex_text,
+                          self.numeric_timeticks, self.hex_line_length)
+        for c in flags:
+            if c == "q":
+                o.quick = not o.quick
+            elif c == "Q":
+                o.quick_equals = not o.quick_equals
+                o.quick = not o.quick
+            elif c == "v":
+                o.bare_value = not o.bare_value
+            elif c == "x":
+                o.string_format = STRING_HEX
+            elif c == "a":
+                o.string_format = STRING_ASCII
+            elif c == "T":
+                o.hex_text = not o.hex_text
+            elif c == "t":
+                o.numeric_timeticks = not o.numeric_timeticks
+            elif c not in "neUbEX":
+                raise ValueError("unsupported output option -O" + c)
+        return o
+
+    def __repr__(self) -> str:
+        return ("OutputOptions(quick=%s, quick_equals=%s, bare_value=%s, string_format=%d, hex_text=%s, "
+                % (str(self.quick), str(self.quick_equals), str(self.bare_value), self.string_format,
+                   str(self.hex_text))
+                + "numeric_timeticks=%s, hex_line_length=%d)" % (str(self.numeric_timeticks), self.hex_line_length))
+
+
+# Helpers shared by both styles ######################################################################
+
+def _oid_value_text(o: Oid) -> str:
+    # An OID value in -On form. net-snmp decodes the empty wire OID 06 00 as
+    # the single arc 0 and prints ".0"; Oid([]).dotted() would be ".".
+    if len(o.arcs) == 0:
+        return ".0"
+    return o.dotted()
+
+def _ip_text(b: bytes) -> str:
+    # Dotted decimal. A decoded IpAddress keeps whatever length was sent, and
+    # every octet is shown (net-snmp drops such a message instead).
+    return ".".join([str(c) for c in b])
+
+def _escape(s: str) -> str:
+    # net-snmp and the canonical format escape exactly '\' and '"' inside quotes
+    return s.replace("\\", "\\\\").replace("\"", "\\\"")
+
+def _spaced_hex(b: bytes) -> str:
+    # "DE AD BE EF": upper case, single spaces, no trailing space
+    return " ".join([_HEX[c] for c in b])
+
+def _is_printable(c: int) -> bool:
+    # isprint() in the C locale
+    return c >= 0x20 and c < 0x7f
+
+def _all_printable(b: bytes) -> bool:
+    for c in b:
+        if not _is_printable(c):
+            return False
+    return True
+
+def _tagged(type_name: str, tag: int, content: bytes) -> str:
+    # The text of a value fmt has no specific format for: type name, wire tag and content
+    head = type_name + "(0x%02X): " % tag
+    if len(content) == 0:
+        return head + "\"\""
+    return head + _spaced_hex(content)
+
+def _malformed(v: MalformedValue) -> str:
+    # Malformed(0xTT): HEX (reason), the same in both styles (see the module documentation)
+    text = _tagged(v.type_name(), v.raw_tag, v.value)
+    return text + " (" + v.reason + ")" if v.reason != "" else text
+
+def _generic(v: Value) -> str:
+    # A Value subclass this module has no case for, from its type name and encoded TLV
+    tag = v.tag()
+    try:
+        tlv = v.encode()
+        inner_tag, start, stop = ber.read_tlv(tlv, 0, len(tlv))
+        return _tagged(v.type_name(), tag, tlv[start:stop])
+    except errors.SnmpError:
+        return v.type_name() + "(0x%02X)" % tag
+
+
+# net-snmp style #####################################################################################
+
+def _label(opts: OutputOptions, label: str) -> str:
+    # The type label, which -Oq drops
+    return "" if opts.quick else label
+
+def _is_netsnmp_text(c: int) -> bool:
+    # isprint() or isspace() in the C locale: 0x20..0x7e and 0x09..0x0d
+    return (c >= 0x20 and c < 0x7f) or (c >= 0x09 and c <= 0x0d)
+
+def _all_netsnmp_text(b: bytes) -> bool:
+    for c in b:
+        if not _is_netsnmp_text(c):
+            return False
+    return True
+
+def _hex_line(b: bytes, start: int, stop: int, text: bool) -> str:
+    line = "".join([_HEX[b[i]] + " " for i in range(start, stop)])
+    if text:
+        line += "  [" + "".join([chr(b[i]) if _is_printable(b[i]) else "." for i in range(start, stop)]) + "]"
+    return line
+
+def _hex_lines(b: bytes, opts: OutputOptions) -> str:
+    # net-snmp's sprint_realloc_hexstring: "XX " per octet and a line break
+    # after each full line that more octets follow (no octets: one empty line)
+    n = len(b)
+    width = opts.hex_line_length if opts.hex_line_length > 0 else n
+    lines: list[str] = []
+    start = 0
+    while start < n or len(lines) == 0:
+        stop = start + width if start + width < n else n
+        lines.append(_hex_line(b, start, stop, opts.hex_text))
+        start = stop
+    return "\n".join(lines)
+
+def _netsnmp_octets(b: bytes, opts: OutputOptions) -> str:
+    if len(b) == 0:
+        return "\"\""
+    f = opts.string_format
+    text = (f != STRING_HEX) and _all_netsnmp_text(b)
+    if not text and f != STRING_ASCII:
+        h = _hex_lines(b, opts)
+        return "\"" + h + "\"" if opts.quick else "Hex-STRING: " + h
+    # net-snmp's sprint_realloc_asciistring: with -Oa other octets become "."
+    s = b.decode() if text else "".join([chr(c) if _is_netsnmp_text(c) else "." for c in b])
+    return _label(opts, "STRING: ") + "\"" + _escape(s) + "\""
+
+def _uptime(t: int, quick: bool) -> str:
+    # net-snmp's uptimeString()
+    cs = t % 100
+    s = t // 100
+    days = s // 86400
+    s = s % 86400
+    hours = s // 3600
+    s = s % 3600
+    if quick:
+        return "%d:%d:%02d:%02d.%02d" % (days, hours, s // 60, s % 60, cs)
+    hms = "%d:%02d:%02d.%02d" % (hours, s // 60, s % 60, cs)
+    if days == 0:
+        return hms
+    if days == 1:
+        return "1 day, " + hms
+    return "%d days, " % days + hms
+
+def _netsnmp_timeticks(t: int, opts: OutputOptions) -> str:
+    if opts.numeric_timeticks:
+        return str(t)
+    if opts.quick:
+        return _uptime(t, True)
+    return "Timeticks: (%d) " % t + _uptime(t, False)
+
+def _opaque_label(kind: str) -> str:
+    # net-snmp labels of the values.opaque_special kinds (Double is labelled Float, as net-snmp does)
+    if kind == "I64":
+        return "Opaque: Int64: "
+    if kind == "U64":
+        return "Opaque: UInt64: "
+    if kind == "Counter64":
+        return "Opaque: Counter64: "
+    return "Opaque: Float: "
+
+def _netsnmp_opaque(v: Opaque, opts: OutputOptions) -> str:
+    special = values.opaque_special(v)
+    if special is not None:
+        return _label(opts, _opaque_label(special.kind)) + special.value
+    return _label(opts, "OPAQUE: ") + _hex_lines(v.value, opts)
+
+def _netsnmp_unknown(v: UnknownValue) -> str:
+    # net-snmp prints UInteger32 as a bare number; it cannot print any other
+    # tag (an NsapAddress gives its "Variable has bad type")
+    if v.raw_tag == ber.TAG_UINTEGER32:
+        try:
+            return str(ber.dec_uint32(v.value, 0, len(v.value)))
+        except errors.DecodeError:
+            pass
+    return "Variable has bad type"
+
+def netsnmp_value(v: Value, opts: OutputOptions=OutputOptions()) -> str:
+    """Return v as net-snmp prints it with no MIBs loaded: the text after ` = `
+
+    Examples with the default options: `INTEGER: -1`, `STRING: "say \\"hi\\""`,
+    `""` (an empty OCTET STRING), `Hex-STRING: 00 FF ` (note the trailing
+    space; longer values break the line after every 16 octets),
+    `OID: .1.3.6.1`, `IpAddress: 192.0.2.1`, `Counter32: 7`, `Gauge32: 7`,
+    `Timeticks: (8640000) 1 day, 0:00:00.00`, `Counter64: 7`,
+    `OPAQUE: DE AD `, `Opaque: Float: 1.500000`, `NULL` and the texts of
+    the exceptions, such as `No Such Object available on this agent at this
+    OID`. The value may span several lines (a long Hex-STRING, or a STRING
+    containing line breaks); there is no final line break.
+
+    As in net-snmp, UInteger32 prints as a bare number and NsapAddress as
+    `Variable has bad type`; so does any other unknown tag. Where net-snmp
+    would drop the whole message, the value still gets a form: an IpAddress
+    that is not 4 octets shows all its octets in dotted decimal, a malformed
+    Opaque float or integer wrapper prints as a plain OPAQUE, a
+    MalformedValue as `Malformed(0xTT): 01 02 (reason)` whatever the
+    options, and a Value subclass this module has no case for as its type
+    name, tag and content octets, `Name(0xTT): 01 02`.
+    """
+    if isinstance(v, Integer):
+        return _label(opts, "INTEGER: ") + str(v.value)
+    if isinstance(v, OctetString):
+        return _netsnmp_octets(v.value, opts)
+    if isinstance(v, ObjectIdentifier):
+        return _label(opts, "OID: ") + _oid_value_text(v.value)
+    if isinstance(v, IpAddress):
+        return _label(opts, "IpAddress: ") + _ip_text(v.value)
+    if isinstance(v, Counter32):
+        return _label(opts, "Counter32: ") + str(v.value)
+    if isinstance(v, Gauge32):
+        return _label(opts, "Gauge32: ") + str(v.value)
+    if isinstance(v, TimeTicks):
+        return _netsnmp_timeticks(v.value, opts)
+    if isinstance(v, Counter64):
+        return _label(opts, "Counter64: ") + str(v.value)
+    if isinstance(v, Opaque):
+        return _netsnmp_opaque(v, opts)
+    if isinstance(v, Null):
+        return "NULL"
+    if isinstance(v, NoSuchObject):
+        return "No Such Object available on this agent at this OID"
+    if isinstance(v, NoSuchInstance):
+        return "No Such Instance currently exists at this OID"
+    if isinstance(v, EndOfMibView):
+        return "No more variables left in this MIB View (It is past the end of the MIB tree)"
+    if isinstance(v, UnknownValue):
+        return _netsnmp_unknown(v)
+    if isinstance(v, MalformedValue):
+        return _malformed(v)
+    return _generic(v)
+
+def netsnmp_varbind(vb: VarBind, opts: OutputOptions=OutputOptions()) -> str:
+    """Return vb as the net-snmp tools print it with `-m '' -On`, without a final line break
+
+    That is `.1.3.6.1.2.1.1.5.0 = STRING: "router"` with the default
+    options; see netsnmp_value for the value part. -Oq separates OID and
+    value with a single space (-OQ keeps ` = `), -Ov prints the value only.
+    """
+    value = netsnmp_value(vb.value, opts)
+    if opts.bare_value:
+        return value
+    if opts.quick and not opts.quick_equals:
+        return vb.oid.dotted() + " " + value
+    return vb.oid.dotted() + " = " + value
+
+
+# Canonical style ####################################################################################
+
+def _canon_octets(b: bytes) -> str:
+    if _all_printable(b):
+        return "STRING: \"" + _escape(b.decode()) + "\""
+    return "Hex-STRING: " + _spaced_hex(b)
+
+def canon_value(v: Value) -> str:
+    """Return v in the canonical format of the interop lab
+
+    `INTEGER: -1`; `STRING: "a \\"b\\""` when every octet is in 0x20..0x7e
+    (also `STRING: ""`), else `Hex-STRING: 74 61 62 09` (upper case, single
+    spaces, no trailing space); `OID: .1.3.6.1` (the empty wire OID as
+    `.0`, like net-snmp); `IpAddress: 192.0.2.1`; `Counter32: N`,
+    `Gauge32: N`, `Timeticks: N` (raw hundredths), `Counter64: N`;
+    `Opaque: 9F 78 04 3F 80 00 00` (the raw content, `Opaque: ""` when
+    empty); `NULL`, `noSuchObject`, `noSuchInstance`, `endOfMibView`.
+
+    The lab's format has no other types. Here an UnknownValue prints as its
+    type name, tag and content, `NsapAddress(0x45): 47 00 05`, and so does
+    any other Value subclass; a MalformedValue adds the reason,
+    `Malformed(0x41): 01 00 00 00 05 (unsigned integer exceeds 2^32-1)`;
+    an IpAddress that is not 4 octets shows all its octets in dotted
+    decimal.
+    """
+    if isinstance(v, Integer):
+        return "INTEGER: " + str(v.value)
+    if isinstance(v, OctetString):
+        return _canon_octets(v.value)
+    if isinstance(v, ObjectIdentifier):
+        return "OID: " + _oid_value_text(v.value)
+    if isinstance(v, IpAddress):
+        return "IpAddress: " + _ip_text(v.value)
+    if isinstance(v, Counter32):
+        return "Counter32: " + str(v.value)
+    if isinstance(v, Gauge32):
+        return "Gauge32: " + str(v.value)
+    if isinstance(v, TimeTicks):
+        return "Timeticks: " + str(v.value)
+    if isinstance(v, Counter64):
+        return "Counter64: " + str(v.value)
+    if isinstance(v, Opaque):
+        return "Opaque: " + (_spaced_hex(v.value) if len(v.value) > 0 else "\"\"")
+    if isinstance(v, Null):
+        return "NULL"
+    if isinstance(v, NoSuchObject):
+        return "noSuchObject"
+    if isinstance(v, NoSuchInstance):
+        return "noSuchInstance"
+    if isinstance(v, EndOfMibView):
+        return "endOfMibView"
+    if isinstance(v, UnknownValue):
+        return _tagged(v.type_name(), v.raw_tag, v.value)
+    if isinstance(v, MalformedValue):
+        return _malformed(v)
+    return _generic(v)
+
+def canon_varbind(vb: VarBind) -> str:
+    """Return vb in the canonical format: `.1.3.6.1.2.1.1.5.0 = STRING: "router"` (see canon_value)"""
+    return vb.oid.dotted() + " = " + canon_value(vb.value)
+
+def _canon_quoted(b: bytes) -> str:
+    # A header string: quoted like a canonical STRING, or 0x and hex if not printable
+    if _all_printable(b):
+        return "\"" + _escape(b.decode()) + "\""
+    return "0x" + b.hex()
+
+def _version_name(version: int) -> str:
+    if version == message.SNMP_V1:
+        return "v1"
+    if version == message.SNMP_V2C:
+        return "v2c"
+    if version == message.SNMP_V3:
+        return "v3"
+    return "version%d" % version
+
+def canon_notification(n: Notification) -> str:
+    """Return the canonical NOTIFICATION block of n, without a final line break
+
+    This is what `actsnmp trapd --canon` prints and what the notification
+    interop tests compare with interop/expected/notify/:
+    a header line, the payload varbinds in canonical format, then `END`:
+
+        NOTIFICATION v1 TRAP community="public" enterprise=.1.3.6.1.4.1.8072.9999 agent=192.0.2.1 generic=6 specific=42 uptime=12345 trapoid=.1.3.6.1.4.1.8072.9999.0.42
+        .1.3.6.1.4.1.8072.9999.1.1.1.0 = INTEGER: 0
+        END
+
+    The header is `NOTIFICATION <v1|v2c|v3> <TRAP|TRAP2|INFORM>`, then
+    `community="..."` (SNMPv1/v2c) or `user="..." level=<level>
+    context="..."` (SNMPv3), then for SNMPv1 `enterprise= agent= generic=
+    specific=`, then `uptime=` (hundredths) and `trapoid=`, separated by
+    single spaces. The level is noAuthNoPriv, authNoPriv or authPriv
+    (privWithoutAuth for the privacy flag alone, which a receiver never
+    delivers). Strings are quoted and escaped like a canonical STRING; one
+    with octets outside 0x20..0x7e is written as 0x and lower case hex
+    instead. There is no source address, port or request-id.
+
+    The payload of an SNMPv1 trap is its original varbinds (without the
+    RFC 3584 extras, so the community does not appear twice); its trapoid
+    is the RFC 3584 one (n.trap_oid). For SNMPv2c/v3 it is n.varbinds,
+    without sysUpTime.0 and snmpTrapOID.0. When those two are not the first
+    varbinds (n.problem is set), the header shows `uptime=? trapoid=?` and
+    all varbinds follow, as the lab's snmptrapd2canon.py writes it.
+
+    The header shows the community in clear text: print the block where
+    receiver output belongs, never into a log.
+    """
+    head = "NOTIFICATION " + _version_name(n.version) + " " + pdu.pdu_type_name(n.pdu_type) + " "
+    if n.version == message.SNMP_V3:
+        head += ("user=" + _canon_quoted(n.user) + " level=" + usm.level_text(n.security_level)
+                 + " context=" + _canon_quoted(n.context_name))
+    else:
+        head += "community=" + _canon_quoted(n.community)
+    payload = n.varbinds
+    t = n.v1
+    if t is not None:
+        head += (" enterprise=" + _oid_value_text(t.enterprise) + " agent=" + _ip_text(t.agent_addr)
+                 + " generic=%d specific=%d" % (t.generic_trap, t.specific_trap))
+        payload = t.varbinds
+    if t is None and n.problem != "":
+        head += " uptime=? trapoid=?"
+    else:
+        head += " uptime=%d trapoid=" % n.uptime + _oid_value_text(n.trap_oid)
+    return "\n".join([head] + [canon_varbind(vb) for vb in payload] + ["END"])

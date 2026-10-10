@@ -1,0 +1,535 @@
+"""Tests for mibview
+
+The env test checks the committed lab dataset against
+interop/expected/canon/dataset.txt.
+"""
+
+import testing
+import ber
+import pdu
+import values
+from mibview import MibView, WriteRule, find_rule, load_snmprec, load_write_rules
+from oid import Oid
+from values import Counter32, Counter64, EndOfMibView, Gauge32, Integer, IpAddress, NoSuchInstance, NoSuchObject
+from values import Null, ObjectIdentifier, OctetString, Opaque, TimeTicks, UnknownValue, Value, VarBind
+from testutil import h, read_text
+
+BASE = "1.3.6.1.4.1.8072.9999.1"
+
+def o(s: str) -> Oid:
+    return Oid.parse(s)
+
+def bo(suffix: str) -> Oid:
+    """An OID below the lab dataset's base B"""
+    return Oid.parse(BASE + "." + suffix)
+
+def oids(vbs: list[VarBind]) -> list[str]:
+    return [str(vb.oid) for vb in vbs]
+
+
+# Store, GET and GETNEXT ############################################################################
+
+def sample() -> MibView:
+    # out of order, with sysDescr.0 twice (the last one wins) and arcs that sort numerically
+    return MibView([
+        VarBind(o("1.3.6.1.2.1.1.5.0"), OctetString(b"name")),
+        VarBind(o("1.3.6.1.2.1.1.1.0"), OctetString(b"first")),
+        VarBind(o("1.3.6.1.2.1.2.2.1.2.10"), OctetString(b"eth10")),
+        VarBind(o("1.3.6.1.2.1.2.2.1.2.9"), OctetString(b"eth9")),
+        VarBind(o("1.3.6.1.2.1.1.1.0"), OctetString(b"sysDescr")),
+        VarBind(o("1.3.6.1.4.1.16384"), Integer(2)),
+        VarBind(o("1.3.6.1.4.1.16383"), Integer(1)),
+        VarBind(o("1.3.6.1.2.1.1.3.0"), TimeTicks(42))])
+
+SAMPLE_ORDER = ["1.3.6.1.2.1.1.1.0", "1.3.6.1.2.1.1.3.0", "1.3.6.1.2.1.1.5.0", "1.3.6.1.2.1.2.2.1.2.9",
+                "1.3.6.1.2.1.2.2.1.2.10", "1.3.6.1.4.1.16383", "1.3.6.1.4.1.16384"]
+
+def _test_ordering() -> None:
+    v = sample()
+    testing.assertEqual(v.size(), 7)
+    testing.assertEqual(oids(v.varbinds()), SAMPLE_ORDER)
+    testing.assertEqual(v.get(o("1.3.6.1.2.1.1.1.0")), OctetString(b"sysDescr"), "the last duplicate wins")
+    testing.assertEqual(v.get(o("1.3.6.1.2.1.1.3.0")), TimeTicks(42))
+    testing.assertEqual(v.get(o("1.3.6.1.4.1.16383")), Integer(1))
+    testing.assertEqual(repr(v), "MibView(7 variables)")
+
+def _test_empty_view() -> None:
+    v = MibView([])
+    testing.assertEqual(v.size(), 0)
+    testing.assertEqual(v.get(o("1.3.6.1.2.1.1.1.0")), NoSuchObject())
+    testing.assertEqual(v.get_next(o("1.3")), VarBind(o("1.3"), EndOfMibView()))
+    testing.assertEqual(v.varbinds(), [])
+
+def _test_get_no_such_instance() -> None:
+    # at or below the object (the OID without its last arc) of an existing variable
+    v = sample()
+    for s in ["1.3.6.1.2.1.1.1.1", "1.3.6.1.2.1.1.1", "1.3.6.1.2.1.1.1.0.5", "1.3.6.1.2.1.1.5.4294967295",
+              "1.3.6.1.2.1.2.2.1.2.11", "1.3.6.1.2.1.2.2.1.2", "1.3.6.1.2.1.2.2.1.2.0", "1.3.6.1.4.1.5",
+              "1.3.6.1.4.1.16383.0", "1.3.6.1.4.1"]:
+        testing.assertEqual(v.get(o(s)), NoSuchInstance(), s)
+
+def _test_get_no_such_object() -> None:
+    v = sample()
+    for s in ["1.3.6.1.2.1.1.99.0", "1.3.6.1.2.1.1", "1.3.6.1.2.1.2.2.1.3.1", "1.3.6.1.2.1.2.2.1", "1.3.6",
+              "1.3.6.1.4", "2.999", "0.0", "1.3.6.1.2.1.1.2.0"]:
+        testing.assertEqual(v.get(o(s)), NoSuchObject(), s)
+
+def _test_get_next() -> None:
+    v = sample()
+    cases = [("0.0", "1.3.6.1.2.1.1.1.0"), ("1.3", "1.3.6.1.2.1.1.1.0"), ("1.3.6.1.2.1.1.1", "1.3.6.1.2.1.1.1.0"),
+             ("1.3.6.1.2.1.1.1.0", "1.3.6.1.2.1.1.3.0"), ("1.3.6.1.2.1.1.2", "1.3.6.1.2.1.1.3.0"),
+             ("1.3.6.1.2.1.1.1.0.0", "1.3.6.1.2.1.1.3.0"), ("1.3.6.1.2.1.1.5.0", "1.3.6.1.2.1.2.2.1.2.9"),
+             ("1.3.6.1.2.1.2.2.1.2.9", "1.3.6.1.2.1.2.2.1.2.10"), ("1.3.6.1.2.1.2.2.1.2.9.1", "1.3.6.1.2.1.2.2.1.2.10"),
+             ("1.3.6.1.4.1.16383", "1.3.6.1.4.1.16384")]
+    for start, want in cases:
+        vb = v.get_next(o(start))
+        testing.assertEqual(str(vb.oid), want, start)
+        testing.assertEqual(vb.value, v.get(o(want)), start)
+    for start in ["1.3.6.1.4.1.16384", "1.3.6.1.4.1.16384.0", "1.3.6.1.4.2", "2", "2.999.4294967295"]:
+        testing.assertEqual(v.get_next(o(start)), VarBind(o(start), EndOfMibView()), start)
+
+def _test_get_next_chain() -> None:
+    v = sample()
+    seen: list[str] = []
+    cur = o("0.0")
+    while True:
+        vb = v.get_next(cur)
+        if isinstance(vb.value, EndOfMibView):
+            break
+        seen.append(str(vb.oid))
+        cur = vb.oid
+    testing.assertEqual(seen, SAMPLE_ORDER)
+    testing.assertEqual(str(v.get_next(cur).oid), "1.3.6.1.4.1.16384", "endOfMibView names the requested OID")
+
+def _test_set_value() -> None:
+    v = sample()
+    v.set_value(o("1.3.6.1.2.1.1.5.0"), OctetString(b"renamed"))
+    testing.assertEqual(v.size(), 7)
+    testing.assertEqual(v.get(o("1.3.6.1.2.1.1.5.0")), OctetString(b"renamed"))
+    # new variables before the first, in the middle and after the last
+    v.set_value(o("1.3.6.1.2.1.1.99.0"), Integer(99))
+    v.set_value(o("1.2"), Null())
+    v.set_value(o("1.3.6.1.4.1.16384.1"), Counter32(5))
+    v.set_value(o("1.3.6.1.2.1.2.2.1.2.100"), OctetString(b"eth100"))
+    testing.assertEqual(v.size(), 11)
+    testing.assertEqual(oids(v.varbinds()), [
+        "1.2", "1.3.6.1.2.1.1.1.0", "1.3.6.1.2.1.1.3.0", "1.3.6.1.2.1.1.5.0", "1.3.6.1.2.1.1.99.0",
+        "1.3.6.1.2.1.2.2.1.2.9", "1.3.6.1.2.1.2.2.1.2.10", "1.3.6.1.2.1.2.2.1.2.100", "1.3.6.1.4.1.16383",
+        "1.3.6.1.4.1.16384", "1.3.6.1.4.1.16384.1"])
+    testing.assertEqual(v.get_next(o("1.3.6.1.2.1.1.5.0")), VarBind(o("1.3.6.1.2.1.1.99.0"), Integer(99)))
+    testing.assertEqual(v.get_next(o("1.1")), VarBind(o("1.2"), Null()))
+    # the new variables' objects now give noSuchInstance
+    testing.assertEqual(v.get(o("1.3.6.1.2.1.1.99.1")), NoSuchInstance())
+    testing.assertEqual(v.get(o("1.3.6.1.4.1.16384.2")), NoSuchInstance())
+
+def _test_varbinds_subtree() -> None:
+    v = sample()
+    testing.assertEqual(oids(v.varbinds(o("1.3.6.1.2.1.1"))), SAMPLE_ORDER[:3])
+    testing.assertEqual(oids(v.varbinds(o("1.3.6.1.2.1.1.1.0"))), ["1.3.6.1.2.1.1.1.0"])
+    testing.assertEqual(oids(v.varbinds(o("1.3.6.1.2.1.2.2.1.2"))), SAMPLE_ORDER[3:5])
+    testing.assertEqual(oids(v.varbinds(o("1.3.6.1.4.1.16384"))), ["1.3.6.1.4.1.16384"])
+    testing.assertEqual(oids(v.varbinds(o("1.3"))), SAMPLE_ORDER)
+    testing.assertEqual(v.varbinds(o("1.3.6.1.2.1.1.2")), [])
+    testing.assertEqual(v.varbinds(o("2")), [])
+
+def _test_exceptions_as_data() -> None:
+    # the pathological dataset stores exception values; the view returns them like any value
+    v = MibView([VarBind(o("1.3.6.1.4.1.2.1.0"), NoSuchObject()), VarBind(o("1.3.6.1.4.1.2.2.0"), EndOfMibView())])
+    testing.assertEqual(v.get(o("1.3.6.1.4.1.2.1.0")), NoSuchObject())
+    testing.assertEqual(v.get_next(o("1.3.6.1.4.1.2")), VarBind(o("1.3.6.1.4.1.2.1.0"), NoSuchObject()))
+    testing.assertEqual(v.get_next(o("1.3.6.1.4.1.2.1.0")), VarBind(o("1.3.6.1.4.1.2.2.0"), EndOfMibView()))
+
+
+# load_snmprec ######################################################################################
+
+# Every tag, the hex suffix, the plain forms, a VALUE with '|', CRLF line ends, comments, blank and
+# indented lines, a leading dot, out-of-order records and a repeated OID (the last one wins).
+SNIPPET = """# snmprec snippet
+1.3.6.1.4.1.99.2.0|2|-2147483648
+.1.3.6.1.4.1.99.1.0|2|2147483647
+1.3.6.1.4.1.99.3.0|4x|00ff10\r
+1.3.6.1.4.1.99.4.0|4x|
+
+1.3.6.1.4.1.99.5.0|4|text | with a bar
+   1.3.6.1.4.1.99.6.0|5|
+1.3.6.1.4.1.99.7.0|6|1.3.6.1
+1.3.6.1.4.1.99.8.0|64x|c0000201\r
+  # an indented comment
+1.3.6.1.4.1.99.9.0|64|10.0.0.255
+1.3.6.1.4.1.99.10.0|65|4294967295
+1.3.6.1.4.1.99.11.0|66|0
+1.3.6.1.4.1.99.12.0|67|8640000
+1.3.6.1.4.1.99.13.0|68x|9f78043f800000
+1.3.6.1.4.1.99.14.0|68|raw
+1.3.6.1.4.1.99.15.0|69x|0102
+1.3.6.1.4.1.99.16.0|70|18446744073709551615
+1.3.6.1.4.1.99.17.0|128|
+1.3.6.1.4.1.99.18.0|129|
+1.3.6.1.4.1.99.19.0|130|
+1.3.6.1.4.1.99.20.0|4x|DEADbeef
+1.3.6.1.4.1.99.21.0|4|räksmörgås
+1.3.6.1.4.1.99.22.0|69|nsap
+1.3.6.1.4.1.99.23.0|70|0
+1.3.6.1.4.1.99.11.0|66|4294967295
+"""
+
+def x99(n: int) -> Oid:
+    return Oid.parse("1.3.6.1.4.1.99.%d.0" % n)
+
+def _test_load_snmprec_every_tag() -> None:
+    v = load_snmprec(SNIPPET)
+    want = [
+        VarBind(x99(1), Integer(2147483647)),
+        VarBind(x99(2), Integer(-2147483648)),
+        VarBind(x99(3), OctetString(b"\x00\xff\x10")),
+        VarBind(x99(4), OctetString(b"")),
+        VarBind(x99(5), OctetString(b"text | with a bar")),
+        VarBind(x99(6), Null()),
+        VarBind(x99(7), ObjectIdentifier(o("1.3.6.1"))),
+        VarBind(x99(8), IpAddress(b"\xc0\x00\x02\x01")),
+        VarBind(x99(9), IpAddress(b"\x0a\x00\x00\xff")),
+        VarBind(x99(10), Counter32(4294967295)),
+        VarBind(x99(11), Gauge32(4294967295)),
+        VarBind(x99(12), TimeTicks(8640000)),
+        VarBind(x99(13), Opaque(h("9f78043f800000"))),
+        VarBind(x99(14), Opaque(b"raw")),
+        VarBind(x99(15), UnknownValue(ber.TAG_NSAP, b"\x01\x02")),
+        VarBind(x99(16), Counter64(u64(18446744073709551615))),
+        VarBind(x99(17), NoSuchObject()),
+        VarBind(x99(18), NoSuchInstance()),
+        VarBind(x99(19), EndOfMibView()),
+        VarBind(x99(20), OctetString(b"\xde\xad\xbe\xef")),
+        VarBind(x99(21), OctetString("räksmörgås".encode())),
+        VarBind(x99(22), UnknownValue(ber.TAG_NSAP, b"nsap")),
+        VarBind(x99(23), Counter64(u64(0)))]
+    testing.assertEqual(v.size(), len(want))
+    got = v.varbinds()
+    for i in range(len(want)):
+        testing.assertEqual(got[i], want[i], str(want[i].oid))
+
+def _test_load_snmprec_empty() -> None:
+    testing.assertEqual(load_snmprec("").size(), 0)
+    testing.assertEqual(load_snmprec("# only a comment\n\n   \r\n").size(), 0)
+    testing.assertEqual(load_snmprec("1.3.6.1|2|5").size(), 1, "no newline at the end")
+
+def load_fails(text: str, line: int, what: str) -> None:
+    try:
+        load_snmprec(text)
+    except ValueError as e:
+        prefix = "snmprec line %d: " % line
+        testing.assertTrue(e.error_message.startswith(prefix), what + ": " + e.error_message)
+        return
+    testing.error("no ValueError: " + what)
+
+def _test_load_snmprec_rejects() -> None:
+    bad = [
+        ("1.3.6.1|2", "two fields"), ("1.3.6.1", "one field"), ("|2|5", "no OID"), ("x.y|2|5", "bad OID"),
+        ("1..3|2|5", "empty arc"), ("1.3.6.1||5", "no tag"), ("1.3.6.1|3|5", "unknown tag 3"),
+        ("1.3.6.1|71|5", "unknown tag 71"), ("1.3.6.1|abc|5", "tag not a number"), ("1.3.6.1|-2|5", "negative tag"),
+        ("1.3.6.1|2|x", "INTEGER not a number"), ("1.3.6.1|2|", "empty INTEGER"),
+        ("1.3.6.1|2|2147483648", "INTEGER too large"), ("1.3.6.1|2|-2147483649", "INTEGER too small"),
+        ("1.3.6.1|2|+5", "INTEGER with plus"), ("1.3.6.1|2| 5", "INTEGER with a blank"),
+        ("1.3.6.1|2|1_000", "INTEGER with underscore"), ("1.3.6.1|2x|01", "hex INTEGER"),
+        ("1.3.6.1|4x|0", "odd hex digits"), ("1.3.6.1|4x|zz", "not hex"), ("1.3.6.1|5|x", "NULL with a value"),
+        ("1.3.6.1|5x|", "hex NULL"), ("1.3.6.1|6|", "empty OID value"), ("1.3.6.1|6|1..3", "bad OID value"),
+        ("1.3.6.1|64|1.2.3", "IpAddress of 3 parts"), ("1.3.6.1|64|1.2.3.256", "IpAddress part above 255"),
+        ("1.3.6.1|64|1.2.3.-4", "IpAddress part negative"), ("1.3.6.1|64x|c00002", "IpAddress of 3 octets"),
+        ("1.3.6.1|64x|c000020100", "IpAddress of 5 octets"), ("1.3.6.1|65|-1", "negative Counter32"),
+        ("1.3.6.1|66|4294967296", "Gauge32 too large"), ("1.3.6.1|67|1e3", "TimeTicks not decimal"),
+        ("1.3.6.1|70|18446744073709551616", "Counter64 too large"), ("1.3.6.1|70|-1", "negative Counter64"),
+        ("1.3.6.1|70|", "empty Counter64"), ("1.3.6.1|128|x", "noSuchObject with a value"),
+        ("1.3.6.1|129|0", "noSuchInstance with a value"), ("1.3.6.1|130|x", "endOfMibView with a value"),
+        ("1.3.6.1|2:writecache|5", "variation module"), ("1.3.6.1|4x:writecache|00", "variation module with hex")]
+    for text, what in bad:
+        load_fails(text, 1, what)
+    load_fails("# header\n\n1.3.6.1|2|1\r\n1.3.6.1.1|2|zz\n1.3.6.1.2|2|2\n", 4, "line number after comments and CRLF")
+    try:
+        load_snmprec("1.3.6.1|2|1\n1.3.6.1.1|99|1\n")
+        testing.error("unknown tag accepted")
+    except ValueError as e:
+        testing.assertEqual(e.error_message, "snmprec line 2: unknown tag 99")
+
+
+# Write rules and SET ###############################################################################
+
+# interop/dataset/write-rules.tsv as generated by gen_snmprec.py
+LAB_RULES = """# GENERATED by interop/dataset/gen_snmprec.py --actsnmp (interop/dataset/regen.sh)
+# oid\ttags\tmin\tmax\twritable
+.1.3.6.1.4.1.8072.9999.1.20.1.0\t2\t-\t-\tyes
+.1.3.6.1.4.1.8072.9999.1.20.2.0\t4\t-\t-\tyes
+.1.3.6.1.4.1.8072.9999.1.20.3.0\t6\t-\t-\tyes
+.1.3.6.1.4.1.8072.9999.1.20.4.0\t64\t-\t-\tyes
+.1.3.6.1.4.1.8072.9999.1.20.5.0\t66\t-\t-\tyes
+.1.3.6.1.4.1.8072.9999.1.20.6.0\t67\t-\t-\tyes
+.1.3.6.1.4.1.8072.9999.1.20.7.0\t2\t-\t-\tno
+.1.3.6.1.4.1.8072.9999.1.20.8.0\t2\t0\t100\tyes
+"""
+
+# the lab's writable objects with their initial values, and a read-only dataset object
+LAB_WRITABLE = """1.3.6.1.4.1.8072.9999.1.1.1.0|2|0
+1.3.6.1.4.1.8072.9999.1.20.1.0|2|42
+1.3.6.1.4.1.8072.9999.1.20.2.0|4x|696e697469616c
+1.3.6.1.4.1.8072.9999.1.20.3.0|6|1.3.6.1
+1.3.6.1.4.1.8072.9999.1.20.4.0|64x|c0000201
+1.3.6.1.4.1.8072.9999.1.20.5.0|66|0
+1.3.6.1.4.1.8072.9999.1.20.6.0|67|0
+1.3.6.1.4.1.8072.9999.1.20.7.0|2|7
+1.3.6.1.4.1.8072.9999.1.20.8.0|2|50
+"""
+
+def lab_rules() -> list[WriteRule]:
+    return load_write_rules(LAB_RULES)
+
+def w(n: int) -> Oid:
+    return bo("20.%d.0" % n)
+
+def _test_load_write_rules() -> None:
+    rules = lab_rules()
+    testing.assertEqual(len(rules), 8)
+    testing.assertEqual(repr(rules[0]), "WriteRule(1.3.6.1.4.1.8072.9999.1.20.1.0, tags=[2], min=None, max=None, writable=True)")
+    testing.assertEqual(rules[3].tags, [ber.TAG_IPADDRESS])
+    testing.assertEqual(rules[5].tags, [ber.TAG_TIMETICKS])
+    testing.assertEqual(repr(rules[6]), "WriteRule(1.3.6.1.4.1.8072.9999.1.20.7.0, tags=[2], min=None, max=None, writable=False)")
+    testing.assertEqual(repr(rules[7]), "WriteRule(1.3.6.1.4.1.8072.9999.1.20.8.0, tags=[2], min=0, max=100, writable=True)")
+    more = load_write_rules("1.3.6.1.4.1.1 2,4,70  -5 -  yes\r\n\n# x\n  1.3.6.1.4.1.2\t65\t-\t7\tno\n")
+    testing.assertEqual([repr(r) for r in more], [
+        "WriteRule(1.3.6.1.4.1.1, tags=[2, 4, 70], min=-5, max=None, writable=True)",
+        "WriteRule(1.3.6.1.4.1.2, tags=[65], min=None, max=7, writable=False)"])
+    testing.assertEqual(len(load_write_rules("# nothing\n")), 0)
+
+def rules_fail(text: str, line: int, what: str) -> None:
+    try:
+        load_write_rules(text)
+    except ValueError as e:
+        prefix = "write rules line %d: " % line
+        testing.assertTrue(e.error_message.startswith(prefix), what + ": " + e.error_message)
+        return
+    testing.error("no ValueError: " + what)
+
+def _test_load_write_rules_rejects() -> None:
+    bad = [("1.3.6.1 2 - -", "four fields"), ("1.3.6.1 2 - - yes extra", "six fields"),
+           ("1.3.6.1 2 - - maybe", "writable not yes/no"), ("1.3.6.1 2 - - YES", "writable in upper case"),
+           ("1.3.6.1 2,x - - yes", "bad tag"), ("1.3.6.1 2, - - yes", "empty tag"), ("1.3.6.1 2 abc - yes", "bad min"),
+           ("1.3.6.1 2 - 1.5 yes", "bad max"), ("1..3 2 - - yes", "bad OID")]
+    for text, what in bad:
+        rules_fail(text, 1, what)
+    rules_fail("# c\n1.3.6.1 2 - - yes\n\n1.3.6.1 2 - -\n", 4, "line number")
+
+def rule_text(r: ?WriteRule) -> str:
+    return repr(r) if r is not None else "None"
+
+def _test_find_rule() -> None:
+    rules = [WriteRule(bo("20"), [2], writable=False), WriteRule(w(1), [2]), WriteRule(bo("2"), [4])]
+    testing.assertEqual(rule_text(find_rule(rules, w(1))), repr(rules[0]), "the first matching rule wins")
+    testing.assertEqual(rule_text(find_rule(rules, bo("2.5.0"))), repr(rules[2]))
+    testing.assertEqual(rule_text(find_rule(rules, bo("2"))), repr(rules[2]), "the prefix itself")
+    testing.assertEqual(rule_text(find_rule(rules, bo("21.1.0"))), "None")
+    testing.assertEqual(rule_text(find_rule(rules, o(BASE))), "None", "above every prefix")
+    testing.assertEqual(rule_text(find_rule([], w(1))), "None")
+
+def lab_view() -> MibView:
+    return load_snmprec(LAB_WRITABLE)
+
+def check(v: MibView, rules: list[WriteRule], vbs: list[VarBind], status: int, index: int, what: str) -> None:
+    s, i = v.check_set(vbs, rules)
+    testing.assertEqual(pdu.error_status_name(s), pdu.error_status_name(status), what)
+    testing.assertEqual(i, index, what + ": error-index")
+
+def _test_set_lab_rules() -> None:
+    # the error statuses the lab's snmpd answers (interop/README.md, write-rules.tsv)
+    v = lab_view()
+    rules = lab_rules()
+    check(v, rules, [VarBind(w(7), Integer(1))], pdu.NOT_WRITABLE, 1, "read-only object")
+    check(v, rules, [VarBind(w(99), Integer(1))], pdu.NOT_WRITABLE, 1, "non-existing object without a rule")
+    check(v, rules, [VarBind(bo("1.1.0"), Integer(1))], pdu.NOT_WRITABLE, 1, "dataset object without a rule")
+    check(v, rules, [VarBind(w(1), OctetString(b"foo"))], pdu.WRONG_TYPE, 1, "string to an INTEGER")
+    check(v, rules, [VarBind(w(2), Integer(1))], pdu.WRONG_TYPE, 1, "INTEGER to a string")
+    check(v, rules, [VarBind(w(5), Counter32(1))], pdu.WRONG_TYPE, 1, "Counter32 to a Gauge32")
+    check(v, rules, [VarBind(w(5), Null())], pdu.WRONG_TYPE, 1, "NULL")
+    check(v, rules, [VarBind(w(8), Integer(101))], pdu.WRONG_VALUE, 1, "above the range")
+    check(v, rules, [VarBind(w(8), Integer(-1))], pdu.WRONG_VALUE, 1, "below the range")
+    check(v, rules, [VarBind(w(8), Integer(0))], pdu.NO_ERROR, 0, "range minimum")
+    check(v, rules, [VarBind(w(8), Integer(100))], pdu.NO_ERROR, 0, "range maximum")
+    check(v, rules, [VarBind(w(4), IpAddress(b"\x01\x02\x03"))], pdu.WRONG_LENGTH, 1, "IpAddress of 3 octets")
+    check(v, rules, [VarBind(w(1), Integer(2147483648))], pdu.WRONG_VALUE, 1, "INTEGER outside Integer32")
+    check(v, rules, [VarBind(w(5), Gauge32(4294967296))], pdu.WRONG_VALUE, 1, "Gauge32 above 2^32-1")
+    check(v, rules, [VarBind(w(6), TimeTicks(-1))], pdu.WRONG_VALUE, 1, "negative TimeTicks")
+    check(v, rules, [VarBind(w(3), ObjectIdentifier(Oid([])))], pdu.WRONG_VALUE, 1, "OID that cannot be encoded")
+    # values that decoding made of invalid content (RFC 3416 4.2.5: after wrongType and wrongLength)
+    bad_gauge = values.MalformedValue(ber.TAG_GAUGE32, h("01 00 00 00 00"), "unsigned integer exceeds 2^32-1")
+    check(v, rules, [VarBind(w(5), bad_gauge)], pdu.WRONG_ENCODING, 1, "Gauge32 content above 2^32-1")
+    check(v, rules, [VarBind(w(3), values.MalformedValue(ber.TAG_OID, h("2b 86"), "truncated"))],
+          pdu.WRONG_ENCODING, 1, "truncated OID content")
+    check(v, rules, [VarBind(w(1), bad_gauge)], pdu.WRONG_TYPE, 1, "wrongType before wrongEncoding")
+    # RFC 3416 4.2.5 order: notWritable before wrongType
+    check(v, rules, [VarBind(w(7), OctetString(b"x"))], pdu.NOT_WRITABLE, 1, "read-only and wrong type")
+    # the first failing varbind decides
+    check(v, rules, [VarBind(w(1), Integer(1)), VarBind(w(2), OctetString(b"s")), VarBind(w(8), Integer(200)),
+                     VarBind(w(7), Integer(1))], pdu.WRONG_VALUE, 3, "third varbind")
+    testing.assertEqual(v.get(w(1)), Integer(42), "check_set changes nothing")
+
+def _test_apply_set() -> None:
+    v = lab_view()
+    rules = lab_rules()
+    vbs = [VarBind(w(1), Integer(-7)), VarBind(w(2), OctetString(b"")), VarBind(w(3), ObjectIdentifier(o("1.3.6.1.4.1.1"))),
+           VarBind(w(4), IpAddress(b"\x0a\x00\x00\x01")), VarBind(w(5), Gauge32(4294967295)),
+           VarBind(w(6), TimeTicks(123)), VarBind(w(8), Integer(99))]
+    status, index = v.apply_set(vbs, rules)
+    testing.assertEqual((status, index), (0, 0))
+    for vb in vbs:
+        testing.assertEqual(v.get(vb.oid), vb.value, str(vb.oid))
+    testing.assertEqual(v.size(), 9, "no variable added")
+    # atomic: the failing second varbind leaves the first unchanged
+    status2, index2 = v.apply_set([VarBind(w(1), Integer(5)), VarBind(w(7), Integer(1))], rules)
+    testing.assertEqual((status2, index2), (pdu.NOT_WRITABLE, 2))
+    testing.assertEqual(v.get(w(1)), Integer(-7))
+    testing.assertEqual(v.get(w(7)), Integer(7))
+    # the same variable twice: committed in order
+    status3, index3 = v.apply_set([VarBind(w(1), Integer(1)), VarBind(w(1), Integer(2))], rules)
+    testing.assertEqual((status3, index3), (0, 0))
+    testing.assertEqual(v.get(w(1)), Integer(2))
+    status4, index4 = v.apply_set([], rules)
+    testing.assertEqual((status4, index4), (0, 0), "an empty SET")
+
+def _test_set_no_creation() -> None:
+    v = lab_view()
+    rules = [WriteRule(bo("30"), [2, 4])]
+    check(v, rules, [VarBind(bo("30.1.0"), Integer(1))], pdu.NO_CREATION, 1, "writable prefix, missing variable")
+    check(v, rules, [VarBind(bo("30.1.0"), Counter32(1))], pdu.WRONG_TYPE, 1, "wrongType comes before noCreation")
+    check(v, [WriteRule(o(BASE), [2])], [VarBind(bo("20.1.0"), Integer(1)), VarBind(bo("20.9.0"), Integer(1))],
+          pdu.NO_CREATION, 2, "the whole dataset writable")
+    status, index = v.apply_set([VarBind(bo("30.1.0"), Integer(1))], rules)
+    testing.assertEqual((status, index), (pdu.NO_CREATION, 1))
+    testing.assertEqual(v.get(bo("30.1.0")), NoSuchObject())
+
+def _test_set_lengths_and_bounds() -> None:
+    v = MibView([VarBind(bo("40.1.0"), OctetString(b"ab")), VarBind(bo("40.2.0"), Opaque(b"")),
+                 VarBind(bo("40.3.0"), Counter64(u64(0))), VarBind(bo("40.4.0"), Counter32(0))])
+    rules = [WriteRule(bo("40.1.0"), [4], 1, 4), WriteRule(bo("40.2.0"), [68]), WriteRule(bo("40.3.0"), [70], 5, 10),
+             WriteRule(bo("40.4.0"), [65], 10)]
+    s = bo("40.1.0")
+    check(v, rules, [VarBind(s, OctetString(b""))], pdu.WRONG_LENGTH, 1, "string shorter than min")
+    check(v, rules, [VarBind(s, OctetString(b"a"))], pdu.NO_ERROR, 0, "string of min length")
+    check(v, rules, [VarBind(s, OctetString(b"abcd"))], pdu.NO_ERROR, 0, "string of max length")
+    check(v, rules, [VarBind(s, OctetString(b"abcde"))], pdu.WRONG_LENGTH, 1, "string longer than max")
+    q = bo("40.2.0")
+    check(v, rules, [VarBind(q, Opaque(b"\x00" * 65535))], pdu.NO_ERROR, 0, "Opaque of 65535 octets")
+    check(v, rules, [VarBind(q, Opaque(b"\x00" * 65536))], pdu.WRONG_LENGTH, 1, "Opaque over the SMI limit")
+    c = bo("40.3.0")
+    check(v, rules, [VarBind(c, Counter64(u64(5)))], pdu.NO_ERROR, 0, "Counter64 at min")
+    check(v, rules, [VarBind(c, Counter64(u64(4)))], pdu.WRONG_VALUE, 1, "Counter64 below min")
+    check(v, rules, [VarBind(c, Counter64(u64(11)))], pdu.WRONG_VALUE, 1, "Counter64 above max")
+    check(v, rules, [VarBind(c, Counter64(u64(18446744073709551615)))], pdu.WRONG_VALUE, 1, "Counter64 above every int")
+    unbounded = [WriteRule(c, [70])]
+    check(v, unbounded, [VarBind(c, Counter64(u64(18446744073709551615)))], pdu.NO_ERROR, 0, "Counter64 maximum")
+    only_min = [WriteRule(c, [70], 9223372036854775807)]
+    check(v, only_min, [VarBind(c, Counter64(u64(18446744073709551615)))], pdu.NO_ERROR, 0, "Counter64 above a min")
+    k = bo("40.4.0")
+    check(v, rules, [VarBind(k, Counter32(9))], pdu.WRONG_VALUE, 1, "Counter32 below min")
+    check(v, rules, [VarBind(k, Counter32(4294967295))], pdu.NO_ERROR, 0, "Counter32 maximum without max")
+    # min and max do not apply to other types
+    other = [WriteRule(bo("40"), [6, 64, 128], 100, 200)]
+    v.set_value(bo("40.5.0"), Integer(0))
+    check(v, other, [VarBind(bo("40.5.0"), ObjectIdentifier(o("1.3")))], pdu.NO_ERROR, 0, "OID ignores min/max")
+    check(v, other, [VarBind(bo("40.5.0"), IpAddress(b"\x01\x02\x03\x04"))], pdu.NO_ERROR, 0, "IpAddress ignores min/max")
+    check(v, other, [VarBind(bo("40.5.0"), NoSuchObject())], pdu.NO_ERROR, 0, "an allowed exception tag")
+
+
+# The lab dataset (env test: reads the committed files) #############################################
+
+def unquote(s: str) -> bytes:
+    # the canonical STRING form: printable ASCII in double quotes, with \" and \\ escaped
+    out: list[str] = []
+    i = 1
+    while i < len(s) - 1:
+        c = s[i]
+        if c == "\\":
+            i += 1
+            c = s[i]
+        out.append(c)
+        i += 1
+    return "".join(out).encode()
+
+def canon_value(text: str) -> Value:
+    """The Value a line of interop/expected/canon/dataset.txt shows (only the types the dataset has)"""
+    kind, _, rest = text.partition(": ")
+    if kind == "INTEGER":
+        return Integer(int(rest))
+    if kind == "STRING":
+        return OctetString(unquote(rest))
+    if kind == "Hex-STRING":
+        return OctetString(h(rest))
+    if kind == "OID":
+        return ObjectIdentifier(Oid.parse(rest))
+    if kind == "IpAddress":
+        return IpAddress(b"".join([ber.BYTE_TABLE[int(p)] for p in rest.split(".")]))
+    if kind == "Counter32":
+        return Counter32(int(rest))
+    if kind == "Gauge32":
+        return Gauge32(int(rest))
+    if kind == "Timeticks":
+        return TimeTicks(int(rest))
+    if kind == "Counter64":
+        return Counter64(u64(rest))
+    if kind == "Opaque":
+        return Opaque(h(rest))
+    raise ValueError("unexpected canonical value " + text)
+
+def check_dataset(snmprec: str, rules_text: str, canon: str) -> None:
+    v = load_snmprec(snmprec)
+    testing.assertEqual(v.size(), 6045)
+    base = o(BASE)
+    # GETNEXT from the base walks exactly the canonical lines, in their order, with their values
+    lines = [line for line in canon.split("\n") if line != ""]
+    testing.assertEqual(len(lines), 6038)
+    cur = base
+    for line in lines:
+        name, _, shown = line.partition(" = ")
+        vb = v.get_next(cur)
+        testing.assertEqual(vb.oid.dotted(), name)
+        testing.assertEqual(vb.value, canon_value(shown), name)
+        cur = vb.oid
+    next_vb = v.get_next(cur)
+    testing.assertFalse(next_vb.oid.startswith(base), "the walk leaves the base after the last canonical line")
+    testing.assertEqual(str(next_vb.oid), "1.3.6.1.6.3.10.2.1.1.0", "the snmpEngineID.0 sentinel follows")
+    testing.assertEqual(next_vb.value, OctetString(h("80001f8880616374736e6d7061")))
+    testing.assertEqual(v.get_next(next_vb.oid), VarBind(next_vb.oid, EndOfMibView()))
+    testing.assertEqual(len(v.varbinds(base)), 6038)
+    # the snmpsim system group, without sysUpTime.0
+    testing.assertEqual(v.get(o("1.3.6.1.2.1.1.1.0")), OctetString(b"actsnmp interop lab snmpsim agent"))
+    testing.assertEqual(v.get(o("1.3.6.1.2.1.1.2.0")), ObjectIdentifier(o("1.3.6.1.4.1.20408")))
+    testing.assertEqual(v.get(o("1.3.6.1.2.1.1.7.0")), Integer(72))
+    testing.assertEqual(v.get(o("1.3.6.1.2.1.1.3.0")), NoSuchObject())
+    testing.assertEqual(v.get_next(o("1.3.6.1.2.1.1.2.0")).oid, o("1.3.6.1.2.1.1.4.0"))
+    # a few values, and the sparse column B.10.1.7 (only every third row)
+    testing.assertEqual(v.get(bo("1.19.0")), Integer(-2147483648))
+    testing.assertEqual(v.get(bo("8.7.0")), Counter64(u64(18446744073709551615)))
+    testing.assertEqual(v.get(bo("9.2.0")), Opaque(h("9f78043f800000")))
+    testing.assertEqual(v.get(bo("3.1.0")), ObjectIdentifier(o("0.0")))
+    testing.assertEqual(v.get(bo("2.2.0")), OctetString(b""))
+    testing.assertEqual(v.get(bo("12.1.2.2000")), OctetString(b"big-02000"))
+    testing.assertEqual(v.get(bo("10.1.7.3")), Integer(-3))
+    testing.assertEqual(v.get(bo("10.1.7.1")), NoSuchInstance())
+    testing.assertEqual(v.get_next(bo("10.1.7.1")).oid, bo("10.1.7.3"))
+    testing.assertEqual(v.get(bo("99.0")), NoSuchObject())
+    # the committed write rules, applied to the dataset
+    rules = load_write_rules(rules_text)
+    testing.assertEqual(len(rules), 8)
+    status, index = v.apply_set([VarBind(bo("20.2.0"), OctetString(b"changed")), VarBind(bo("20.8.0"), Integer(7))], rules)
+    testing.assertEqual((status, index), (0, 0))
+    testing.assertEqual(v.get(bo("20.2.0")), OctetString(b"changed"))
+    status2, index2 = v.apply_set([VarBind(bo("20.1.0"), Integer(1)), VarBind(bo("1.1.0"), Integer(1))], rules)
+    testing.assertEqual((status2, index2), (pdu.NOT_WRITABLE, 2))
+    testing.assertEqual(v.get(bo("20.1.0")), Integer(42))
+
+actor _test_lab_dataset(t: testing.EnvT):
+    """Load interop/dataset/actsnmp.snmprec and write-rules.tsv, compare with interop/expected/canon/dataset.txt"""
+    t.timeout(60.0)
+    try:
+        check_dataset(read_text(t, "interop/dataset/actsnmp.snmprec"), read_text(t, "interop/dataset/write-rules.tsv"),
+                      read_text(t, "interop/expected/canon/dataset.txt"))
+        t.success()
+    except AssertionError as e:
+        t.failure(e)
+    except Exception as e:
+        t.error(e)

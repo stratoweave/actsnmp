@@ -1,0 +1,1175 @@
+"""Tests for transport
+
+The MemNet tests depend only on message order, except where a test waits
+NOTHING_WAIT seconds to see that nothing arrives or exercises delays. The
+UDP tests use loopback and skip IPv6 when the host has none.
+"""
+
+import net
+import testing
+import time
+import transport
+from transport import Datagram, MemNet, NetFaults, NetStats, ServerTransport, Transport
+from transport import is_unreachable, mem_pair, normalize_address
+from testutil import pseudo_random, value_fails
+
+# Seconds a test waits to see that nothing (more) is delivered
+NOTHING_WAIT = 0.2
+
+# Watchdog for the UDP tests, below the timeout they ask the runner for
+UDP_WATCHDOG = 8.0
+
+proc def _outcome(check: proc() -> None) -> ?Exception:
+    # Run check; return what it raised, or None when it passed
+    try:
+        check()
+    except Exception as e:
+        return e
+    return None
+
+proc def _report(t: testing.AsyncT, error: ?Exception) -> None:
+    if error is not None:
+        t.failure(error)
+    else:
+        t.success()
+
+proc def _report_env(t: testing.EnvT, error: ?Exception) -> None:
+    if error is not None:
+        t.failure(error)
+    else:
+        t.success()
+
+def _numbered(n: int) -> list[bytes]:
+    return [str(i).encode() for i in range(n)]
+
+def _counts(sent: int=0, delivered: int=0, unroutable: int=0, oversize: int=0, dropped: int=0, corrupted: int=0,
+            spoofed: int=0, duplicated: int=0, reordered: int=0, delayed: int=0) -> str:
+    # The repr of the NetStats with these counters, to compare with repr(MemNet.stats())
+    return repr(NetStats(sent, delivered, unroutable, oversize, dropped, corrupted, spoofed, duplicated, reordered,
+                         delayed))
+
+def _elapsed(start_ns: int) -> float:
+    return float(time.monotonic_ns() - start_ns) / 1e9
+
+proc def _skip_env(t: testing.EnvT, reason: str) -> None:
+    # t.skip() reports the skip, then raises AbortTest to end the test body;
+    # in a callback that exception has nowhere to go
+    try:
+        t.skip(reason)
+    except testing.AbortTest:
+        pass
+
+def _ipv6_unavailable(error: str) -> bool:
+    # The errors a host without usable IPv6 loopback gives when binding ::1 or ::
+    for text in ["address family not supported", "protocol family unavailable", "cannot assign requested address",
+                 "address not available"]:
+        if text in error:
+            return True
+    return False
+
+
+# Pure helpers #####################################################################################
+
+def _test_normalize_address() -> None:
+    testing.assertEqual(normalize_address("::ffff:127.0.0.1"), "127.0.0.1")
+    testing.assertEqual(normalize_address("::FFFF:192.0.2.1"), "192.0.2.1")
+    testing.assertEqual(normalize_address("::ffff:10.20.30.40"), "10.20.30.40")
+    for a in ["127.0.0.1", "::1", "::", "::ffff:", "::ffff:1.2.3", "::ffff:1.2.3.4.5", "::ffff:fe80::1",
+              "fe80::ffff:1.2.3.4", "::ffff:0:1.2.3.4", "", "host.example", "2001:db8::1"]:
+        testing.assertEqual(normalize_address(a), a)
+
+def _test_is_unreachable() -> None:
+    testing.assertTrue(is_unreachable(transport.REFUSED))
+    testing.assertTrue(is_unreachable("UDP receive error: connection refused"))
+    testing.assertFalse(is_unreachable("Failed to send UDP datagram: message too long"))
+    testing.assertFalse(is_unreachable("UDP setup for 127.0.0.1:0 failed: port 0 is outside 1..65535"))
+    testing.assertFalse(is_unreachable(""))
+
+def _test_net_faults_defaults_and_matching() -> None:
+    f = NetFaults()
+    testing.assertEqual(f.drop_first_n, 0)
+    testing.assertEqual(f.drop_every_nth, 0)
+    testing.assertFalse(f.duplicate)
+    testing.assertEqual(f.delay, 0.0)
+    testing.assertFalse(f.reorder)
+    testing.assertEqual(f.corrupt_byte, -1)
+    testing.assertFalse(f.spoof_source)
+    testing.assertTrue(f.matches("10.0.0.1", 161))
+    testing.assertTrue(f.matches("", 0))
+    g = NetFaults(to_address="10.0.0.2", to_port=40000)
+    testing.assertTrue(g.matches("10.0.0.2", 40000))
+    testing.assertFalse(g.matches("10.0.0.2", 40001))
+    testing.assertFalse(g.matches("10.0.0.1", 40000))
+    testing.assertTrue(NetFaults(to_port=161).matches("any", 161))
+    testing.assertFalse(NetFaults(to_port=161).matches("any", 162))
+    testing.assertTrue(NetFaults(to_address="a").matches("a", 1))
+    testing.assertFalse(NetFaults(to_address="a").matches("b", 1))
+    h = NetFaults(drop_first_n=3, drop_every_nth=2, duplicate=True, delay=0.5, reorder=True, corrupt_byte=0,
+                  spoof_source=True)
+    testing.assertEqual([h.drop_first_n, h.drop_every_nth, h.corrupt_byte], [3, 2, 0])
+    testing.assertTrue(h.duplicate and h.reorder and h.spoof_source)
+    testing.assertEqual(h.delay, 0.5)
+    testing.assertEqual(NetFaults(delay=3600.0).delay, 3600.0)
+
+def _test_net_faults_validation() -> None:
+    value_fails(lambda: NetFaults(drop_first_n=-1), "negative drop_first_n")
+    value_fails(lambda: NetFaults(drop_every_nth=-1), "negative drop_every_nth")
+    value_fails(lambda: NetFaults(corrupt_byte=-2), "corrupt_byte -2")
+    value_fails(lambda: NetFaults(delay=-0.001), "negative delay")
+    value_fails(lambda: NetFaults(delay=3600.5), "delay above 3600")
+    value_fails(lambda: NetFaults(delay=float("nan")), "NaN delay")
+    value_fails(lambda: NetFaults(delay=float("inf")), "infinite delay")
+    value_fails(lambda: NetFaults(to_port=-1), "negative to_port")
+    value_fails(lambda: NetFaults(to_port=65536), "to_port 65536")
+
+def _test_datagram_repr() -> None:
+    testing.assertEqual(repr(Datagram(b"\x01\xfe", "10.0.0.2", 40000, "::1", 161)),
+                        "Datagram(10.0.0.2:40000 -> [::1]:161, 01fe)")
+
+
+# MemNet: delivery #################################################################################
+
+actor _test_mem_roundtrip(t: testing.AsyncT):
+    """A datagram and its reply cross a mem_pair with the sources of the two ends"""
+    mn = MemNet()
+    p = mem_pair(mn)
+    var log: list[(bytes, str, int)] = []
+
+    def check() -> None:
+        testing.assertEqual(log, [(b"ping", "10.0.0.2", 40000), (b"pong", "10.0.0.1", 161)])
+        testing.assertEqual(repr(mn.stats()), _counts(sent=2, delivered=2))
+        testing.assertEqual(p.server.local_port(), 161)
+
+    def on_server(data: bytes, address: str, port: int) -> None:
+        log.append((data, address, port))
+        p.server.send_to(b"pong", address, port)
+
+    def on_client(data: bytes, address: str, port: int) -> None:
+        log.append((data, address, port))
+        _report(t, _outcome(check))
+
+    def on_error(message: str, fatal: bool) -> None:
+        t.failure(AssertionError("unexpected error: " + message))
+
+    p.server.set_receiver(on_server)
+    p.client.set_receiver(on_client, on_error)
+    p.client.send(b"ping")
+
+
+actor _test_mem_order(t: testing.AsyncT):
+    """Many datagrams in both directions keep their order"""
+    mn = MemNet()
+    p = mem_pair(mn, "192.0.2.2", 5000, "192.0.2.1", 1161)
+    count = 100
+    var at_server: list[bytes] = []
+    var at_client: list[bytes] = []
+
+    def check() -> None:
+        testing.assertEqual(at_server, _numbered(count))
+        testing.assertEqual(at_client, [b"re:" + d for d in _numbered(count)])
+
+    def on_server(data: bytes, address: str, port: int) -> None:
+        at_server.append(data)
+        p.server.send_to(b"re:" + data, address, port)
+
+    def on_client(data: bytes, address: str, port: int) -> None:
+        at_client.append(data)
+        if len(at_client) == count:
+            _report(t, _outcome(check))
+
+    def on_error(message: str, fatal: bool) -> None:
+        t.failure(AssertionError("unexpected error: " + message))
+
+    p.server.set_receiver(on_server)
+    p.client.set_receiver(on_client, on_error)
+    for d in _numbered(count):
+        p.client.send(d)
+
+
+actor _test_mem_many_peers(t: testing.AsyncT):
+    """One server, three clients on ephemeral ports: replies reach the right client"""
+    mn = MemNet()
+    srv = mn.server("10.0.0.1", 161)
+    clients = [mn.client("10.0.0.%d" % (i + 2), 0, "10.0.0.1", 161) for i in range(3)]
+    var at_server: list[(bytes, str, int)] = []
+    var at_clients: list[(int, bytes, str, int)] = []
+
+    def check() -> None:
+        testing.assertEqual(sorted(at_server), [(b"c0", "10.0.0.2", 49152), (b"c1", "10.0.0.3", 49153),
+                                                (b"c2", "10.0.0.4", 49154)])
+        testing.assertEqual(sorted(at_clients), [(0, b"to 10.0.0.2", "10.0.0.1", 161),
+                                                 (1, b"to 10.0.0.3", "10.0.0.1", 161),
+                                                 (2, b"to 10.0.0.4", "10.0.0.1", 161)])
+
+    def on_server(data: bytes, address: str, port: int) -> None:
+        at_server.append((data, address, port))
+        srv.send_to(b"to " + address.encode(), address, port)
+
+    def on_error(message: str, fatal: bool) -> None:
+        t.failure(AssertionError("unexpected error: " + message))
+
+    def receiver(i: int) -> action(bytes, str, int) -> None:
+        def on_client(data: bytes, address: str, port: int) -> None:
+            at_clients.append((i, data, address, port))
+            if len(at_clients) == 3:
+                _report(t, _outcome(check))
+        return on_client
+
+    srv.set_receiver(on_server)
+    for i in range(3):
+        clients[i].set_receiver(receiver(i), on_error)
+        clients[i].send(("c%d" % i).encode())
+
+
+actor _test_mem_bind_rules(t: testing.AsyncT):
+    """Ephemeral port allocation, address conflicts and invalid arguments"""
+    mn = MemNet()
+
+    # Each call uses the result, so it is synchronous and a ValueError in
+    # MemNet reaches the caller
+    def server_fails(address: str, port: int) -> bool:
+        try:
+            s = mn.server(address, port)
+        except ValueError:
+            return True
+        return False
+
+    def client_fails(address: str, port: int, peer_port: int) -> bool:
+        try:
+            c = mn.client(address, port, "10.0.0.1", peer_port)
+        except ValueError:
+            return True
+        return False
+
+    def pair_fails() -> bool:
+        try:
+            p = mem_pair(mn, server_addr="10.0.0.1", server_port=161)
+        except ValueError:
+            return True
+        return False
+
+    def check() -> None:
+        testing.assertEqual(mn.server("10.0.0.1", 0).local_port(), 49152)
+        testing.assertEqual(mn.server("10.0.0.1", 0).local_port(), 49153)
+        testing.assertEqual(mn.server("10.0.0.9", 0).local_port(), 49154)
+        testing.assertEqual(mn.server("10.0.0.1", 161).local_port(), 161)
+        testing.assertEqual(mn.server("10.0.0.2", 161).local_port(), 161)
+        testing.assertTrue(server_fails("10.0.0.1", 161), "address in use")
+        testing.assertTrue(server_fails("10.0.0.1", 49152), "ephemeral address in use")
+        testing.assertTrue(client_fails("10.0.0.1", 161, 161), "client on an address in use")
+        testing.assertTrue(server_fails("", 161), "empty address")
+        testing.assertTrue(server_fails("10.0.0.3", -1), "port -1")
+        testing.assertTrue(server_fails("10.0.0.3", 65536), "port 65536")
+        testing.assertTrue(client_fails("10.0.0.3", 1, 0), "peer port 0")
+        testing.assertTrue(client_fails("10.0.0.3", 1, 65536), "peer port 65536")
+        testing.assertTrue(pair_fails(), "mem_pair on an address in use")
+        testing.assertFalse(server_fails("10.0.0.3", 65535), "port 65535")
+        p = mem_pair(mn, "10.0.0.5", 0, "10.0.0.6", 0)
+        testing.assertEqual(p.server.local_port(), 49155)
+        testing.assertEqual(mn.stats().sent, 0)
+
+    _report(t, _outcome(check))
+
+
+actor _test_mem_buffered_until_receiver(t: testing.AsyncT):
+    """Datagrams that arrive before set_receiver are kept (up to MAX_BUFFERED) and delivered in order"""
+    mn = MemNet()
+    sender = mn.server("10.0.0.9", 9)
+    late = mn.server("10.0.0.1", 161)
+    marker = mn.server("10.0.0.3", 3)
+    total = transport.MAX_BUFFERED + 5
+    var got: list[bytes] = []
+
+    def check() -> None:
+        testing.assertEqual(got, _numbered(transport.MAX_BUFFERED) + [b"after"])
+        testing.assertEqual(repr(mn.stats()), _counts(sent=total + 2, delivered=total + 2))
+
+    def on_late(data: bytes, address: str, port: int) -> None:
+        got.append(data)
+        if data == b"after":
+            _report(t, _outcome(check))
+
+    def on_marker(data: bytes, address: str, port: int) -> None:
+        # MemNet delivered every earlier datagram to late before this one
+        late.set_receiver(on_late)
+        sender.send_to(b"after", "10.0.0.1", 161)
+
+    marker.set_receiver(on_marker)
+    for d in _numbered(total):
+        sender.send_to(d, "10.0.0.1", 161)
+    sender.send_to(b"marker", "10.0.0.3", 3)
+
+
+actor _test_mem_replace_receiver(t: testing.AsyncT):
+    """set_receiver replaces the callbacks; later datagrams go to the new ones"""
+    mn = MemNet()
+    p = mem_pair(mn)
+    var log: list[str] = []
+
+    def check() -> None:
+        testing.assertEqual(log, ["first a", "second b"])
+
+    def on_error(message: str, fatal: bool) -> None:
+        t.failure(AssertionError("unexpected error: " + message))
+
+    def second(data: bytes, address: str, port: int) -> None:
+        log.append("second " + data.decode())
+        _report(t, _outcome(check))
+
+    def first(data: bytes, address: str, port: int) -> None:
+        log.append("first " + data.decode())
+        p.client.set_receiver(second, on_error)
+        p.server.send_to(b"b", "10.0.0.2", 40000)
+
+    def on_server(data: bytes, address: str, port: int) -> None:
+        p.server.send_to(b"a", address, port)
+
+    p.server.set_receiver(on_server)
+    p.client.set_receiver(first, on_error)
+    p.client.send(b"go")
+
+
+actor _test_mem_inject_and_history(t: testing.AsyncT):
+    """MemNet.send injects from any source; history records datagrams as sent, before faults"""
+    mn = MemNet(NetFaults(corrupt_byte=0, to_port=40000))
+    p = mem_pair(mn)
+    var got: list[(bytes, str, int)] = []
+
+    def check() -> None:
+        testing.assertEqual(got, [(b"\xbehi", "192.0.2.66", 6666)])
+        hist = mn.history()
+        testing.assertEqual(len(hist), 1)
+        testing.assertEqual(repr(hist[0]), "Datagram(192.0.2.66:6666 -> 10.0.0.2:40000, 416869)")
+
+    def on_client(data: bytes, address: str, port: int) -> None:
+        got.append((data, address, port))
+        _report(t, _outcome(check))
+
+    def on_error(message: str, fatal: bool) -> None:
+        t.failure(AssertionError("unexpected error: " + message))
+
+    p.client.set_receiver(on_client, on_error)
+    mn.send(b"Ahi", "192.0.2.66", 6666, "10.0.0.2", 40000)
+
+
+actor _test_mem_unroutable(t: testing.AsyncT):
+    """Datagrams for an unbound address are dropped; a client sender gets a non-fatal REFUSED and stays usable"""
+    mn = MemNet()
+    srv = mn.server("10.0.0.1", 161)
+    cl = mn.client("10.0.0.2", 40000, "10.0.0.7", 7)
+    var errors: list[(str, bool)] = []
+
+    def check() -> None:
+        testing.assertEqual(errors, [(transport.REFUSED, False)])
+        testing.assertEqual(repr(mn.stats()), _counts(sent=3, unroutable=2, delivered=1))
+
+    def on_late(data: bytes, address: str, port: int) -> None:
+        if data == b"again":
+            _report(t, _outcome(check))
+
+    def on_error(message: str, fatal: bool) -> None:
+        errors.append((message, fatal))
+        # Bind the missing peer, then send again over the same transport
+        s = mn.server("10.0.0.7", 7)
+        s.set_receiver(on_late)
+        cl.send(b"again")
+
+    def on_client(data: bytes, address: str, port: int) -> None:
+        t.failure(AssertionError("unexpected datagram"))
+
+    def on_server(data: bytes, address: str, port: int) -> None:
+        t.failure(AssertionError("unexpected datagram at the server"))
+
+    srv.set_receiver(on_server)
+    cl.set_receiver(on_client, on_error)
+    # From the server's address straight into MemNet, so it comes first; a
+    # server has no error callback, so its REFUSED goes nowhere
+    mn.send(b"nobody", "10.0.0.1", 161, "10.9.9.9", 9)
+    cl.send(b"first")
+
+
+actor _test_mem_errors_and_data_in_order(t: testing.AsyncT):
+    """A client gets errors and datagrams in the order MemNet produced them; a server ignores errors"""
+    mn = MemNet()
+    srv = mn.server("10.0.0.1", 161)
+    cl = mn.client("10.0.0.2", 40000, "10.0.0.1", 161)
+    var log: list[str] = []
+
+    def check() -> None:
+        testing.assertEqual(log, ["error " + transport.REFUSED, "data one", "error " + transport.REFUSED, "data two"])
+
+    def on_data(data: bytes, address: str, port: int) -> None:
+        log.append("data " + data.decode())
+        if data == b"two":
+            _report(t, _outcome(check))
+
+    def on_error(message: str, fatal: bool) -> None:
+        log.append("error " + message)
+
+    def on_server(data: bytes, address: str, port: int) -> None:
+        log.append("server got " + data.decode())
+
+    cl.set_receiver(on_data, on_error)
+    srv.set_receiver(on_server)
+    # Straight into MemNet in this order; from an unbound destination the
+    # sender (the client, or the server) gets REFUSED
+    mn.send(b"lost", "10.0.0.2", 40000, "10.0.0.9", 9)
+    mn.send(b"one", "10.0.0.9", 9, "10.0.0.2", 40000)
+    mn.send(b"lost", "10.0.0.1", 161, "10.0.0.9", 9)
+    mn.send(b"lost", "10.0.0.2", 40000, "10.0.0.9", 9)
+    mn.send(b"two", "10.0.0.9", 9, "10.0.0.2", 40000)
+
+
+actor _test_mem_spoofed_copy_not_refused(t: testing.AsyncT):
+    """A forged copy for an unbound address never makes MemNet send REFUSED to the forged source"""
+    mn = MemNet(NetFaults(spoof_source=True))
+    sender = mn.client("10.0.0.2", 40000, "10.0.0.7", 7)
+    bystander = mn.client("10.0.0.2", 40001, "10.0.0.7", 7)
+    var log: list[str] = []
+
+    def check() -> None:
+        testing.assertEqual(log, ["sender " + transport.REFUSED])
+        testing.assertEqual(repr(mn.stats()), _counts(sent=1, spoofed=1, unroutable=2))
+
+    def conclude() -> None:
+        _report(t, _outcome(check))
+
+    def on_data(data: bytes, address: str, port: int) -> None:
+        log.append("data")
+
+    def on_sender_error(message: str, fatal: bool) -> None:
+        log.append("sender " + message)
+        after now NOTHING_WAIT: conclude()
+
+    def on_bystander_error(message: str, fatal: bool) -> None:
+        log.append("bystander " + message)
+
+    sender.set_receiver(on_data, on_sender_error)
+    bystander.set_receiver(on_data, on_bystander_error)
+    sender.send(b"x")
+
+
+actor _test_mem_oversize(t: testing.AsyncT):
+    """A datagram above MAX_DATAGRAM is dropped with a non-fatal error; MAX_DATAGRAM itself passes"""
+    mn = MemNet()
+    p = mem_pair(mn)
+    var errors: list[(str, bool)] = []
+
+    def check(size: int) -> None:
+        testing.assertEqual(size, transport.MAX_DATAGRAM)
+        testing.assertEqual(errors, [("Failed to send UDP datagram: message too long", False)])
+        testing.assertEqual(repr(mn.stats()), _counts(sent=2, oversize=1, delivered=1))
+
+    def on_server(data: bytes, address: str, port: int) -> None:
+        _report(t, _outcome(lambda: check(len(data))))
+
+    def on_client(data: bytes, address: str, port: int) -> None:
+        t.failure(AssertionError("unexpected datagram"))
+
+    def on_error(message: str, fatal: bool) -> None:
+        errors.append((message, fatal))
+        p.client.send(pseudo_random(transport.MAX_DATAGRAM, 2))
+
+    p.server.set_receiver(on_server)
+    p.client.set_receiver(on_client, on_error)
+    p.client.send(pseudo_random(transport.MAX_DATAGRAM + 1, 1))
+
+
+actor _test_mem_close(t: testing.AsyncT):
+    """close() is idempotent; nothing is delivered to or sent from a closed endpoint"""
+    mn = MemNet()
+    p = mem_pair(mn)
+    var log: list[str] = []
+
+    def check() -> None:
+        testing.assertEqual(log, [])
+        # "to closed server" and the injected "to closed client"
+        testing.assertEqual(mn.stats().sent, 2)
+
+    def conclude() -> None:
+        _report(t, _outcome(check))
+
+    def on_server(data: bytes, address: str, port: int) -> None:
+        log.append("server got " + data.decode())
+
+    def on_client(data: bytes, address: str, port: int) -> None:
+        log.append("client got " + data.decode())
+
+    def on_error(message: str, fatal: bool) -> None:
+        if not transport.is_unreachable(message):
+            log.append("client error " + message)
+
+    p.server.set_receiver(on_server)
+    p.client.set_receiver(on_client, on_error)
+    p.server.close()
+    p.server.close()
+    p.server.set_receiver(on_server)
+    p.server.send_to(b"from closed server", "10.0.0.2", 40000)
+    p.client.send(b"to closed server")
+    p.client.close()
+    p.client.close()
+    p.client.set_receiver(on_client, on_error)
+    p.client.send(b"from closed client")
+    mn.send(b"to closed client", "10.0.0.1", 161, "10.0.0.2", 40000)
+    after now NOTHING_WAIT: conclude()
+
+
+actor _test_mem_wrapped_transport(t: testing.AsyncT):
+    """A Transport built from other procs wraps one: here it records what is sent"""
+    mn = MemNet()
+    p = mem_pair(mn)
+    inner = p.client
+    var recorded: list[bytes] = []
+
+    def record(data: bytes) -> None:
+        recorded.append(data)
+        inner.send(data)
+
+    wrapped = Transport(record, inner.set_receiver, inner.close)
+
+    def check() -> None:
+        testing.assertEqual(recorded, [b"one", b"two"])
+
+    def on_server(data: bytes, address: str, port: int) -> None:
+        if data == b"two":
+            p.server.send_to(b"done", address, port)
+
+    def on_client(data: bytes, address: str, port: int) -> None:
+        wrapped.close()
+        _report(t, _outcome(check))
+
+    def on_error(message: str, fatal: bool) -> None:
+        t.failure(AssertionError("unexpected error: " + message))
+
+    p.server.set_receiver(on_server)
+    wrapped.set_receiver(on_client, on_error)
+    wrapped.send(b"one")
+    wrapped.send(b"two")
+
+
+# MemNet: faults ###################################################################################
+
+actor _fault_run(t: testing.AsyncT, faults: NetFaults, sends: list[bytes], expected: list[(bytes, int)],
+                 counts: str, min_elapsed: float=0.0):
+    # Send sends from the client of a mem_pair with faults. The server must
+    # receive expected (data, source port), in order and nothing else, the
+    # last one at least min_elapsed seconds after the sends; counts is the
+    # expected repr of the stats (see _counts)
+    mn = MemNet(faults)
+    p = mem_pair(mn)
+    start = time.monotonic_ns()
+    var got: list[(bytes, int)] = []
+    var last_elapsed = 0.0
+
+    def check() -> None:
+        testing.assertEqual(got, expected)
+        testing.assertEqual(repr(mn.stats()), counts)
+        testing.assertTrue(last_elapsed >= min_elapsed, "last datagram after %f s" % last_elapsed)
+
+    def conclude() -> None:
+        _report(t, _outcome(check))
+
+    def on_server(data: bytes, address: str, port: int) -> None:
+        got.append((data, port))
+        if len(got) == len(expected):
+            last_elapsed = _elapsed(start)
+            after now NOTHING_WAIT: conclude()
+
+    def on_error(message: str, fatal: bool) -> None:
+        t.failure(AssertionError("unexpected error: " + message))
+
+    def on_client(data: bytes, address: str, port: int) -> None:
+        t.failure(AssertionError("unexpected datagram at the client"))
+
+    p.server.set_receiver(on_server)
+    p.client.set_receiver(on_client, on_error)
+    for d in sends:
+        p.client.send(d)
+
+
+def _from_client(data: list[bytes]) -> list[(bytes, int)]:
+    return [(d, 40000) for d in data]
+
+actor _test_fault_drop_first_n(t: testing.AsyncT):
+    """drop_first_n drops datagrams 1..n"""
+    _fault_run(t, NetFaults(drop_first_n=2), _numbered(5), _from_client([b"2", b"3", b"4"]),
+               _counts(sent=5, dropped=2, delivered=3))
+
+actor _test_fault_drop_every_nth(t: testing.AsyncT):
+    """drop_every_nth drops the datagrams whose number is a multiple of n"""
+    _fault_run(t, NetFaults(drop_every_nth=3), _numbered(7), _from_client([b"0", b"1", b"3", b"4", b"6"]),
+               _counts(sent=7, dropped=2, delivered=5))
+
+actor _test_fault_drops_combined(t: testing.AsyncT):
+    """drop_first_n and drop_every_nth count the same datagram numbers"""
+    _fault_run(t, NetFaults(drop_first_n=1, drop_every_nth=2), _numbered(8), _from_client([b"2", b"4", b"6"]),
+               _counts(sent=8, dropped=5, delivered=3))
+
+actor _test_fault_duplicate(t: testing.AsyncT):
+    """duplicate delivers every datagram twice, in order"""
+    _fault_run(t, NetFaults(duplicate=True), _numbered(3), _from_client([b"0", b"0", b"1", b"1", b"2", b"2"]),
+               _counts(sent=3, duplicated=3, delivered=6))
+
+actor _test_fault_corrupt_byte(t: testing.AsyncT):
+    """corrupt_byte inverts the octet at the offset; shorter datagrams pass unchanged"""
+    _fault_run(t, NetFaults(corrupt_byte=1), [b"\x10\x20\x30", b"\x40", b""],
+               _from_client([b"\x10\xdf\x30", b"\x40", b""]), _counts(sent=3, corrupted=1, delivered=3))
+
+actor _test_fault_spoof_source(t: testing.AsyncT):
+    """spoof_source delivers a copy from source port + 1 right before each datagram"""
+    _fault_run(t, NetFaults(spoof_source=True), [b"a", b"b"],
+               [(b"a", 40001), (b"a", 40000), (b"b", 40001), (b"b", 40000)],
+               _counts(sent=2, spoofed=2, delivered=4))
+
+actor _test_fault_order_of_application(t: testing.AsyncT):
+    """Drops come first; corruption applies to every copy; the forged copy comes first, then the datagram twice"""
+    _fault_run(t, NetFaults(drop_first_n=1, corrupt_byte=0, spoof_source=True, duplicate=True), [b"\x00a", b"\x00b"],
+               [(b"\xffb", 40001), (b"\xffb", 40000), (b"\xffb", 40000)],
+               _counts(sent=2, dropped=1, corrupted=1, spoofed=1, duplicated=1, delivered=3))
+
+actor _test_fault_reorder_pairs(t: testing.AsyncT):
+    """reorder swaps every two consecutive datagrams"""
+    _fault_run(t, NetFaults(reorder=True), _numbered(4), _from_client([b"1", b"0", b"3", b"2"]),
+               _counts(sent=4, reordered=2, delivered=4))
+
+actor _test_fault_reorder_odd_tail(t: testing.AsyncT):
+    """A held datagram that nothing overtakes is delivered after REORDER_HOLD"""
+    _fault_run(t, NetFaults(reorder=True), _numbered(3), _from_client([b"1", b"0", b"2"]),
+               _counts(sent=3, reordered=1, delivered=3), transport.REORDER_HOLD)
+
+actor _test_fault_reorder_with_copies(t: testing.AsyncT):
+    """reorder moves a datagram together with its duplicate"""
+    _fault_run(t, NetFaults(reorder=True, duplicate=True), _numbered(2), _from_client([b"1", b"1", b"0", b"0"]),
+               _counts(sent=2, duplicated=2, reordered=1, delivered=4))
+
+actor _test_fault_delay(t: testing.AsyncT):
+    """delay delivers every datagram that many seconds later, in order"""
+    _fault_run(t, NetFaults(delay=0.1), _numbered(20), _from_client(_numbered(20)),
+               _counts(sent=20, delayed=20, delivered=20), 0.1)
+
+actor _test_fault_delay_with_reorder(t: testing.AsyncT):
+    """delay and reorder combine: the pair is swapped, then delayed"""
+    _fault_run(t, NetFaults(reorder=True, delay=0.05), _numbered(2), _from_client([b"1", b"0"]),
+               _counts(sent=2, reordered=1, delayed=2, delivered=2), 0.05)
+
+
+actor _test_fault_selector(t: testing.AsyncT):
+    """Faults apply only to datagrams for to_address and to_port: here only the client gets duplicates"""
+    mn = MemNet(NetFaults(duplicate=True, to_address="10.0.0.2", to_port=40000))
+    p = mem_pair(mn)
+    var at_server: list[bytes] = []
+    var at_client: list[bytes] = []
+
+    def check() -> None:
+        testing.assertEqual(at_server, [b"a", b"end"])
+        testing.assertEqual(at_client, [b"b", b"b"])
+        testing.assertEqual(repr(mn.stats()), _counts(sent=3, duplicated=1, delivered=4))
+
+    def conclude() -> None:
+        _report(t, _outcome(check))
+
+    def on_server(data: bytes, address: str, port: int) -> None:
+        at_server.append(data)
+        if data == b"end":
+            p.server.send_to(b"b", address, port)
+
+    def on_client(data: bytes, address: str, port: int) -> None:
+        at_client.append(data)
+        if len(at_client) == 2:
+            after now NOTHING_WAIT: conclude()
+
+    def on_error(message: str, fatal: bool) -> None:
+        t.failure(AssertionError("unexpected error: " + message))
+
+    p.server.set_receiver(on_server)
+    p.client.set_receiver(on_client, on_error)
+    p.client.send(b"a")
+    p.client.send(b"end")
+
+
+actor _test_fault_set_faults(t: testing.AsyncT):
+    """set_faults replaces the faults and restarts the numbering; None turns them off"""
+    mn = MemNet(NetFaults(drop_first_n=1))
+    p = mem_pair(mn)
+    var got: list[bytes] = []
+
+    def check() -> None:
+        testing.assertEqual(got, [b"1", b"3", b"4"])
+        testing.assertEqual(repr(mn.stats()), _counts(sent=5, dropped=2, delivered=3))
+
+    def on_server(data: bytes, address: str, port: int) -> None:
+        got.append(data)
+        if data == b"1":
+            mn.set_faults(NetFaults(drop_first_n=1))
+            p.client.send(b"2")
+            p.client.send(b"3")
+        elif data == b"3":
+            mn.set_faults(None)
+            p.client.send(b"4")
+        else:
+            _report(t, _outcome(check))
+
+    def on_error(message: str, fatal: bool) -> None:
+        t.failure(AssertionError("unexpected error: " + message))
+
+    def on_client(data: bytes, address: str, port: int) -> None:
+        pass
+
+    p.server.set_receiver(on_server)
+    p.client.set_receiver(on_client, on_error)
+    p.client.send(b"0")
+    p.client.send(b"1")
+
+
+actor _test_fault_set_faults_releases_held(t: testing.AsyncT):
+    """set_faults delivers a datagram that reorder holds back at once, before anything sent later"""
+    mn = MemNet(NetFaults(reorder=True))
+    srv = mn.server("10.0.0.1", 161)
+    var got: list[bytes] = []
+
+    def check() -> None:
+        testing.assertEqual(got, [b"0", b"2", b"1"])
+        testing.assertEqual(repr(mn.stats()), _counts(sent=3, reordered=1, delivered=3))
+
+    def conclude() -> None:
+        _report(t, _outcome(check))
+
+    def on_server(data: bytes, address: str, port: int) -> None:
+        got.append(data)
+        if len(got) == 3:
+            after now NOTHING_WAIT: conclude()
+
+    srv.set_receiver(on_server)
+    # The test talks to MemNet directly, so these happen in this order
+    mn.send(b"0", "10.0.0.2", 40000, "10.0.0.1", 161)
+    mn.set_faults(NetFaults(reorder=True))
+    mn.send(b"1", "10.0.0.2", 40000, "10.0.0.1", 161)
+    mn.send(b"2", "10.0.0.2", 40000, "10.0.0.1", 161)
+
+
+actor _test_fault_set_faults_releases_delayed(t: testing.AsyncT):
+    """set_faults delivers delayed datagrams at once, in order, before anything sent later"""
+    mn = MemNet(NetFaults(delay=60.0))
+    srv = mn.server("10.0.0.1", 161)
+    start = time.monotonic_ns()
+    var got: list[bytes] = []
+
+    def check() -> None:
+        testing.assertEqual(got, _numbered(4))
+        testing.assertEqual(repr(mn.stats()), _counts(sent=4, delayed=3, delivered=4))
+        testing.assertTrue(_elapsed(start) < 30.0)
+
+    def on_server(data: bytes, address: str, port: int) -> None:
+        got.append(data)
+        if len(got) == 4:
+            _report(t, _outcome(check))
+
+    srv.set_receiver(on_server)
+    for d in _numbered(3):
+        mn.send(d, "10.0.0.2", 40000, "10.0.0.1", 161)
+    mn.set_faults(None)
+    mn.send(b"3", "10.0.0.2", 40000, "10.0.0.1", 161)
+
+
+# UDP ##############################################################################################
+
+actor _udp_roundtrip(t: testing.EnvT, listen_address: str, connect_address: str, optional_ipv6: bool):
+    # Server on listen_address port 0; client to connect_address; one
+    # datagram each way, sent before the client is connected
+    t.timeout(UDP_WATCHDOG + 2.0)
+    ucap = net.UDPCap(net.NetCap(t.env.cap))
+    var done = False
+    var srv: ?ServerTransport = None
+    var cl: ?Transport = None
+    var srv_port = 0
+    var server_saw: list[(bytes, str)] = []
+
+    def finish(error: ?Exception) -> None:
+        if done:
+            return
+        done = True
+        c = cl
+        if c is not None:
+            c.close()
+            c.close()
+        s = srv
+        if s is not None:
+            s.close()
+            s.close()
+        _report_env(t, error)
+
+    def on_client(data: bytes, address: str, port: int) -> None:
+        def check() -> None:
+            testing.assertEqual(server_saw, [(b"one", connect_address), (b"two", connect_address)])
+            testing.assertEqual(data, b"pong")
+            testing.assertEqual(address, connect_address)
+            testing.assertEqual(port, srv_port)
+        finish(_outcome(check))
+
+    def on_client_error(message: str, fatal: bool) -> None:
+        finish(AssertionError("client error: " + message))
+
+    def on_server(data: bytes, address: str, port: int) -> None:
+        server_saw.append((data, address))
+        s = srv
+        if s is not None:
+            if data == b"two":
+                s.send_to(b"pong", address, port)
+
+    def on_ready(s: ServerTransport, error: ?str) -> None:
+        if error is not None:
+            if optional_ipv6 and _ipv6_unavailable(error):
+                done = True
+                _skip_env(t, "no IPv6: " + error)
+                return
+            finish(AssertionError("listen: " + error))
+            return
+        srv = s
+        srv_port = s.local_port()
+        if srv_port <= 0:
+            finish(AssertionError("no local port"))
+            return
+        s.set_receiver(on_server)
+        c = transport.udp_transport(net.UDPConnectCap(ucap), connect_address, srv_port)
+        cl = c
+        c.set_receiver(on_client, on_client_error)
+        c.send(b"one")
+        c.send(b"two")
+
+    def watchdog() -> None:
+        finish(AssertionError("UDP roundtrip timed out"))
+
+    after now UDP_WATCHDOG: watchdog()
+    transport.udp_server_transport(net.UDPListenCap(ucap), listen_address, 0, on_ready, t.log_handler)
+
+
+actor _test_udp_ipv4_roundtrip(t: testing.EnvT):
+    """UDP client and server over 127.0.0.1 with an ephemeral server port"""
+    _udp_roundtrip(t, "127.0.0.1", "127.0.0.1", False)
+
+actor _test_udp_ipv6_roundtrip(t: testing.EnvT):
+    """UDP client and server over ::1 with an ephemeral server port"""
+    _udp_roundtrip(t, "::1", "::1", True)
+
+actor _test_udp_dual_stack_source_normalized(t: testing.EnvT):
+    """A server on :: sees an IPv4 client as plain 127.0.0.1, and its reply to that address arrives"""
+    _udp_roundtrip(t, "::", "127.0.0.1", True)
+
+
+actor _test_udp_unreachable_then_usable(t: testing.EnvT):
+    """ICMP port unreachable is a non-fatal error; the same transport then reaches a server on that port"""
+    t.timeout(UDP_WATCHDOG + 2.0)
+    ucap = net.UDPCap(net.NetCap(t.env.cap))
+    var done = False
+    var port = 0
+    var cl: ?Transport = None
+    var srv: ?ServerTransport = None
+    var refused = 0
+    var listen_tries = 0
+    var errors: list[(str, bool)] = []
+
+    def finish(error: ?Exception) -> None:
+        if done:
+            return
+        done = True
+        c = cl
+        if c is not None:
+            c.close()
+        s = srv
+        if s is not None:
+            s.close()
+        _report_env(t, error)
+
+    def on_client(data: bytes, address: str, rport: int) -> None:
+        def check() -> None:
+            testing.assertEqual(data, b"again")
+            testing.assertEqual([address, str(rport)], ["127.0.0.1", str(port)])
+            testing.assertTrue(len(errors) >= 1)
+            for e in errors:
+                testing.assertTrue(is_unreachable(e.0), "unexpected error " + e.0)
+                testing.assertFalse(e.1, "fatal error " + e.0)
+        finish(_outcome(check))
+
+    def on_echo(data: bytes, address: str, rport: int) -> None:
+        s = srv
+        if s is not None:
+            s.send_to(data, address, rport)
+
+    def on_second_ready(s: ServerTransport, error: ?str) -> None:
+        if done:
+            return
+        if error is not None:
+            # The first listener's socket may not be released yet
+            if "address already in use" in error and listen_tries < 40:
+                after now 0.05: listen_again()
+                return
+            finish(AssertionError("second listen: " + error))
+            return
+        srv = s
+        s.set_receiver(on_echo)
+        c = cl
+        if c is not None:
+            c.send(b"again")
+
+    def listen_again() -> None:
+        listen_tries += 1
+        transport.udp_server_transport(net.UDPListenCap(ucap), "127.0.0.1", port, on_second_ready, t.log_handler)
+
+    def on_client_error(message: str, fatal: bool) -> None:
+        errors.append((message, fatal))
+        refused += 1
+        if refused == 1:
+            listen_again()
+
+    def probe(n: int) -> None:
+        # Repeat until the first listener is gone and the kernel refuses
+        c = cl
+        if c is not None:
+            if not done and refused == 0 and n <= 100:
+                c.send(b"probe")
+                after now 0.05: probe(n + 1)
+
+    def on_first_ready(s: ServerTransport, error: ?str) -> None:
+        if error is not None:
+            finish(AssertionError("first listen: " + error))
+            return
+        port = s.local_port()
+        s.close()
+        c = transport.udp_transport(net.UDPConnectCap(ucap), "127.0.0.1", port)
+        cl = c
+        c.set_receiver(on_client, on_client_error)
+        probe(0)
+
+    def watchdog() -> None:
+        finish(AssertionError("timed out; errors: " + str(errors)))
+
+    after now UDP_WATCHDOG: watchdog()
+    transport.udp_server_transport(net.UDPListenCap(ucap), "127.0.0.1", 0, on_first_ready, t.log_handler)
+
+
+actor _test_udp_hostname_queues_until_connected(t: testing.EnvT):
+    """Datagrams sent while the client resolves a host name are queued and sent in order"""
+    t.timeout(UDP_WATCHDOG + 2.0)
+    ucap = net.UDPCap(net.NetCap(t.env.cap))
+    var done = False
+    var cl: ?Transport = None
+    var srv: ?ServerTransport = None
+    var got: list[bytes] = []
+    var sources: list[str] = []
+
+    def finish(error: ?Exception) -> None:
+        if done:
+            return
+        done = True
+        c = cl
+        if c is not None:
+            c.close()
+        s = srv
+        if s is not None:
+            s.close()
+        _report_env(t, error)
+
+    def on_server(data: bytes, address: str, port: int) -> None:
+        got.append(data)
+        sources.append(address)
+        if len(got) == 20:
+            def check() -> None:
+                testing.assertEqual(got, _numbered(20))
+                for a in sources:
+                    testing.assertIn(a, ["127.0.0.1", "::1"])
+            finish(_outcome(check))
+
+    def on_client(data: bytes, address: str, port: int) -> None:
+        finish(AssertionError("unexpected datagram"))
+
+    def on_client_error(message: str, fatal: bool) -> None:
+        finish(AssertionError("client error: " + message))
+
+    def on_ready(s: ServerTransport, error: ?str) -> None:
+        if error is not None:
+            if _ipv6_unavailable(error):
+                done = True
+                _skip_env(t, "no IPv6: " + error)
+                return
+            finish(AssertionError("listen: " + error))
+            return
+        srv = s
+        s.set_receiver(on_server)
+        c = transport.udp_transport(net.UDPConnectCap(ucap), "localhost", s.local_port())
+        cl = c
+        c.set_receiver(on_client, on_client_error)
+        for d in _numbered(20):
+            c.send(d)
+
+    def watchdog() -> None:
+        finish(AssertionError("timed out; got " + str(got)))
+
+    after now UDP_WATCHDOG: watchdog()
+    # "::" takes the A and the AAAA answer for localhost alike
+    transport.udp_server_transport(net.UDPListenCap(ucap), "::", 0, on_ready, t.log_handler)
+
+
+actor _udp_setup_failure(t: testing.EnvT, address: str, port: int, expect: str):
+    # The transport reports a fatal error (when the receiver is registered or
+    # later), then again for every send and every new receiver, and never
+    # anything else
+    t.timeout(UDP_WATCHDOG + 2.0)
+    ucap = net.UDPCap(net.NetCap(t.env.cap))
+    c = transport.udp_transport(net.UDPConnectCap(ucap), address, port)
+    var done = False
+    var errors: list[(str, bool)] = []
+
+    def check() -> None:
+        testing.assertEqual(len(errors), 3)
+        for e in errors:
+            testing.assertEqual(e, errors[0])
+            testing.assertTrue(e.1, "not fatal: " + e.0)
+            testing.assertIn(expect, e.0)
+            testing.assertFalse(is_unreachable(e.0))
+
+    def conclude() -> None:
+        finish(_outcome(check))
+
+    def finish(error: ?Exception) -> None:
+        if not done:
+            done = True
+            c.close()
+            _report_env(t, error)
+
+    def on_data(data: bytes, address: str, port: int) -> None:
+        finish(AssertionError("unexpected datagram"))
+
+    def on_error(message: str, fatal: bool) -> None:
+        errors.append((message, fatal))
+        if len(errors) == 1:
+            c.send(b"fails fast")
+        elif len(errors) == 2:
+            c.set_receiver(on_data, on_error)
+        else:
+            after now NOTHING_WAIT: conclude()
+
+    def watchdog() -> None:
+        finish(AssertionError("timed out; errors: " + str(errors)))
+
+    after now UDP_WATCHDOG: watchdog()
+    c.set_receiver(on_data, on_error)
+
+actor _test_udp_invalid_port_is_fatal(t: testing.EnvT):
+    """Port 0 cannot be connected to: a fatal error, repeated for each send"""
+    _udp_setup_failure(t, "127.0.0.1", 0, "port 0 is outside 1..65535")
+
+actor _test_udp_port_too_high_is_fatal(t: testing.EnvT):
+    """Port 65536 cannot be connected to: a fatal error, repeated for each send"""
+    _udp_setup_failure(t, "::1", 65536, "UDP setup for [::1]:65536 failed")
+
+actor _test_udp_name_resolution_failure_is_fatal(t: testing.EnvT):
+    """A name that cannot be resolved is a fatal error, repeated for each send"""
+    _udp_setup_failure(t, "", 161, "UDP setup for :161 failed")
+
+
+actor _test_udp_server_failures(t: testing.EnvT):
+    """A port outside 0..65535 and a port in use make on_ready report an error with an unusable transport"""
+    t.timeout(UDP_WATCHDOG + 2.0)
+    ucap = net.UDPCap(net.NetCap(t.env.cap))
+    var done = False
+    var first: ?ServerTransport = None
+    var log: list[str] = []
+
+    def finish(error: ?Exception) -> None:
+        if done:
+            return
+        done = True
+        f = first
+        if f is not None:
+            f.close()
+        _report_env(t, error)
+
+    def on_busy(s: ServerTransport, error: ?str) -> None:
+        def check() -> None:
+            testing.assertNotNone(error)
+            testing.assertIn("address already in use", error!)
+            testing.assertEqual(s.local_port(), 0)
+            testing.assertEqual(len(log), 1)
+            testing.assertIn("port outside 0..65535", log[0])
+        s.send_to(b"ignored", "127.0.0.1", 9)
+        s.close()
+        s.close()
+        finish(_outcome(check))
+
+    def on_first(s: ServerTransport, error: ?str) -> None:
+        if error is not None:
+            finish(AssertionError("listen: " + error))
+            return
+        first = s
+        transport.udp_server_transport(net.UDPListenCap(ucap), "127.0.0.1", s.local_port(), on_busy, t.log_handler)
+
+    def on_bad_port(s: ServerTransport, error: ?str) -> None:
+        if error is not None:
+            log.append(error)
+        if len(log) != 1 or s.local_port() != 0:
+            finish(AssertionError("port 70000 was accepted"))
+            return
+        s.send_to(b"ignored", "127.0.0.1", 9)
+        s.close()
+        transport.udp_server_transport(net.UDPListenCap(ucap), "127.0.0.1", 0, on_first, t.log_handler)
+
+    def watchdog() -> None:
+        finish(AssertionError("timed out; log: " + str(log)))
+
+    after now UDP_WATCHDOG: watchdog()
+    transport.udp_server_transport(net.UDPListenCap(ucap), "127.0.0.1", 70000, on_bad_port, t.log_handler)
+
+
+actor _test_udp_close_idempotent(t: testing.EnvT):
+    """close() twice is fine, also before connecting; nothing is delivered or sent after close()"""
+    t.timeout(UDP_WATCHDOG + 2.0)
+    ucap = net.UDPCap(net.NetCap(t.env.cap))
+    var log: list[str] = []
+    var srv: ?ServerTransport = None
+
+    def on_server(data: bytes, address: str, port: int) -> None:
+        # "early" may or may not have left before the close
+        if data != b"early":
+            log.append("server got " + data.decode())
+
+    def on_data(data: bytes, address: str, port: int) -> None:
+        log.append("data " + data.decode())
+
+    def on_error(message: str, fatal: bool) -> None:
+        log.append("error " + message)
+
+    def check() -> None:
+        testing.assertEqual(log, [])
+
+    def finish() -> None:
+        s = srv
+        if s is not None:
+            s.close()
+        _report_env(t, _outcome(check))
+
+    def on_ready(s: ServerTransport, error: ?str) -> None:
+        if error is not None:
+            _report_env(t, AssertionError("listen: " + error))
+            return
+        srv = s
+        s.set_receiver(on_server)
+        port = s.local_port()
+        # Dropped and logged: a port that is not valid, an address that is not an IP address
+        s.send_to(b"bad port", "127.0.0.1", 0)
+        s.send_to(b"bad address", "not-an-ip", 9)
+        # Closed right away, before its socket is connected
+        early = transport.udp_transport(net.UDPConnectCap(ucap), "127.0.0.1", port)
+        early.set_receiver(on_data, on_error)
+        early.send(b"early")
+        early.close()
+        early.close()
+        early.send(b"after close")
+        # Closed first, then used
+        c = transport.udp_transport(net.UDPConnectCap(ucap), "127.0.0.1", port)
+        c.close()
+        c.set_receiver(on_data, on_error)
+        c.send(b"after close")
+        c.close()
+        after now NOTHING_WAIT: finish()
+
+    transport.udp_server_transport(net.UDPListenCap(ucap), "127.0.0.1", 0, on_ready, t.log_handler)

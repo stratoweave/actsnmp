@@ -1,0 +1,324 @@
+"""The authoritative SNMPv3 engine of an agent or a notification receiver
+
+An SNMPv3 engine is authoritative for the requests and informs sent to it
+(RFC 3414 section 1.5.1): they carry its engine ID, boots and time, and its
+users' keys are localized to that engine ID. AuthoritativeEngine holds that
+state and runs the incoming side of RFC 3412 section 7.2 and RFC 3414
+section 3.2 for such messages. A message ends up in one of three ways:
+  * accepted: the ScopedPDU goes to the application, which answers with
+    respond();
+  * refused with a Report to send back: engine ID discovery, unknown user,
+    unsupported security level, wrong digest, not in time window,
+    decryption error, PDU type the application does not handle;
+  * dropped, with only a counter incremented.
+Only messages for this engine belong here: those whose
+msgAuthoritativeEngineID is ours or empty (discovery). SNMPv3 traps carry
+the sender's engine ID, so a notification receiver processes them
+elsewhere (the sender is authoritative for them).
+
+The engine is pure and has no clock: methods that need the time take the
+current monotonic time in seconds (now), and snmpEngineTime is the whole
+seconds since the engine started. Callers serialize access (one actor owns
+the engine) and supply the salt counter for encrypted responses.
+
+Reports (as net-snmp sends them): msgID echoed, flags noAuthNoPriv, our
+engine ID, boots and time, the request's user name, a ScopedPDU in clear
+with our engine ID and the default context, and a Report-PDU with
+error-status and error-index 0 and one varbind, the incremented counter as
+Counter32. The request-id is the request's when its PDU could be read, else
+0. notInTimeWindows is the exception: it is sent at authNoPriv,
+authenticated with the requesting user's key, so the manager can trust the
+boots and time it carries (RFC 3414 section 3.2 step 7a).
+
+Whether a Report is sent follows RFC 3412 section 7.1 step 3b: for a PDU
+that could be read, only Confirmed-class PDUs (GET, GETNEXT, GETBULK, SET,
+INFORM) get one, whatever the reportableFlag says; for a PDU that could not
+be read (encrypted and not decrypted) the reportableFlag decides.
+"""
+
+import message
+import pdu
+import usm
+import values
+from message import ScopedPdu, UsmSecurityParameters, V3Message
+from pdu import Pdu
+from security import Usm
+from usm import LocalizedUser
+from values import Counter32, VarBind
+
+# Our msgMaxSize: the largest UDP payload over IPv4, what net-snmp and pysnmp send
+DEFAULT_MAX_SIZE = 65507
+
+# The counters the engine keeps (RFC 3414 usmStats and RFC 3412 snmpMPDStats)
+COUNTERS: list[str] = [
+    usm.USM_STATS_UNSUPPORTED_SEC_LEVELS, usm.USM_STATS_NOT_IN_TIME_WINDOWS, usm.USM_STATS_UNKNOWN_USER_NAMES,
+    usm.USM_STATS_UNKNOWN_ENGINE_IDS, usm.USM_STATS_WRONG_DIGESTS, usm.USM_STATS_DECRYPTION_ERRORS,
+    usm.SNMP_UNKNOWN_SECURITY_MODELS, usm.SNMP_INVALID_MSGS, usm.SNMP_UNKNOWN_PDU_HANDLERS]
+
+_CONFIRMED_CLASS: list[int] = [pdu.GET, pdu.GETNEXT, pdu.GETBULK, pdu.SET, pdu.INFORM]
+_COUNTER32_MASK = 0xffffffff
+
+
+class Incoming(object):
+    """What AuthoritativeEngine.incoming() made of a message
+
+    scoped is the ScopedPDU of an accepted message and None otherwise.
+    report is the Report datagram to send back to the source of a refused
+    message, or None. counter is "" for an accepted message, else the name
+    of the counter the message incremented (usmStatsWrongDigests, ...),
+    whether a Report goes back or not. level is the security level of the
+    message (its msgFlags FLAG_AUTH and FLAG_PRIV bits). user holds the
+    keys of the message's user localized to our engine ID once the user was
+    found (always for an accepted message), else None; pass it to
+    AuthoritativeEngine.respond(). repr() shows no keys.
+    """
+    scoped: ?ScopedPdu
+    report: ?bytes
+    counter: str
+    level: int
+    user: ?LocalizedUser
+
+    def __init__(self, scoped: ?ScopedPdu, report: ?bytes, counter: str, level: int, user: ?LocalizedUser):
+        self.scoped = scoped
+        self.report = report
+        self.counter = counter
+        self.level = level
+        self.user = user
+
+    def __repr__(self) -> str:
+        s = self.scoped
+        r = self.report
+        if s is not None:
+            outcome = "accepted " + repr(s)
+        elif r is not None:
+            outcome = "report=<%d octets>" % len(r)
+        else:
+            outcome = "dropped"
+        u = self.user
+        who = repr(u.user) if u is not None else "None"
+        return ("Incoming(" + outcome + ", counter=" + repr(self.counter) + ", level=" + usm.level_text(self.level)
+                + ", user=" + who + ")")
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
+
+def _pdu_of(msg: V3Message, scoped: ?ScopedPdu) -> ?Pdu:
+    # The PDU of a message as far as it could be read: decrypted, or plaintext
+    if scoped is not None:
+        return scoped.pdu
+    s = msg.scoped
+    if s is not None:
+        return s.pdu
+    return None
+
+def _reportable(msg: V3Message, p: ?Pdu) -> bool:
+    # RFC 3412 section 7.1 step 3b
+    if p is not None:
+        return p.pdu_type in _CONFIRMED_CLASS
+    return (msg.flags & message.FLAG_REPORTABLE) != 0
+
+
+class AuthoritativeEngine(object):
+    """The authoritative side of SNMPv3 with USM: engine ID, boots and time, users, counters
+
+    engine_id is our snmpEngineID (5 to 32 octets, RFC 3411), boots our
+    snmpEngineBoots and start the monotonic time (seconds) the engine
+    started, from which snmpEngineTime counts (clock()). Persist boots and
+    start the next run with boots + 1 (RFC 3414 section 2.2.2).
+    users maps user names to their credentials; their keys are localized
+    to engine_id when first needed and cached. stats holds every counter of
+    COUNTERS, starting at 0. pdu_types are the PDU types the application
+    handles: a command responder takes GET, GETNEXT, GETBULK and SET (the
+    default), a notification receiver INFORM; other PDU types count as
+    snmpUnknownPDUHandlers (RFC 3412 section 4.2.2). max_size is the
+    msgMaxSize of what we send.
+
+    Security levels are exact: a user may only send at the level of its
+    credentials (noAuthNoPriv, authNoPriv or authPriv). Anything else,
+    lower or higher, is usmStatsUnsupportedSecLevels, like the lab's
+    snmptrapd authUser setup and snmpsim.
+    """
+    engine_id: bytes
+    boots: int
+    start: float
+    users: dict[bytes, Usm]
+    pdu_types: list[int]
+    max_size: int
+    stats: dict[str, int]
+    _keys: dict[bytes, LocalizedUser]
+
+    def __init__(self, engine_id: bytes, boots: int, start: float, users: list[Usm]=[],
+                 pdu_types: list[int]=[pdu.GET, pdu.GETNEXT, pdu.GETBULK, pdu.SET], max_size: int=DEFAULT_MAX_SIZE):
+        """Create the engine; the parameters are described in the class documentation
+
+        Raises ValueError for an engine ID that is not 5 to 32 octets, boots
+        outside 1..2^31-1 or max_size outside 484..2^31-1.
+        """
+        if len(engine_id) < usm.MIN_ENGINE_ID_LEN or len(engine_id) > usm.MAX_ENGINE_ID_LEN:
+            raise ValueError("an engine ID has 5 to 32 octets, got %d" % len(engine_id))
+        if boots < 1 or boots > usm.MAX_BOOTS:
+            raise ValueError("snmpEngineBoots must be 1..2147483647, got %d" % boots)
+        if max_size < message.MIN_MAX_SIZE or max_size > values.INTEGER32_MAX:
+            raise ValueError("msgMaxSize must be 484..2147483647, got %d" % max_size)
+        self.engine_id = engine_id
+        self.boots = boots
+        self.start = start
+        self.users = {}
+        self.pdu_types = pdu_types
+        self.max_size = max_size
+        self.stats = {name: 0 for name in COUNTERS}
+        self._keys = {}
+        for u in users:
+            self.add_user(u)
+
+    def add_user(self, u: Usm) -> None:
+        """Add a user, or replace the user of the same name (its cached keys are dropped)"""
+        name = u.user.encode()
+        self.users[name] = u
+        if name in self._keys:
+            del self._keys[name]
+
+    def localized(self, user: bytes) -> ?LocalizedUser:
+        """Return the keys of user localized to our engine ID, or None for an unknown user
+
+        Localizing runs on the first call for a user and is cached.
+        """
+        k = self._keys.get(user)
+        if k is not None:
+            return k
+        u = self.users.get(user)
+        if u is not None:
+            loc = u.localized(self.engine_id)
+            self._keys[user] = loc
+            return loc
+        return None
+
+    def clock(self, now: float) -> (int, int):
+        """Return (snmpEngineBoots, snmpEngineTime) at monotonic time now
+
+        snmpEngineTime counts the seconds since start; when it passes
+        2^31-1 it wraps to 0 and boots goes up by one, latching at
+        2^31-1 (RFC 3414 section 2.2.2).
+        """
+        return usm.EngineTime(self.engine_id, self.boots, 0, 0, self.start).estimate(now)
+
+    def incoming(self, data: bytes, msg: V3Message, now: float) -> Incoming:
+        """Run the security checks of an incoming message sent to this engine
+
+        data is the datagram as received, msg its message.decode() and now
+        the current monotonic time. The checks, in RFC order (RFC 3412
+        section 7.2, RFC 3414 section 3.2), and what failing them gives:
+          1. security model not USM: snmpUnknownSecurityModels, dropped;
+          2. privFlag without authFlag: snmpInvalidMsgs, dropped;
+          3. msgAuthoritativeEngineID not ours (an empty one is a discovery
+             request): usmStatsUnknownEngineIDs, Report;
+          4. unknown user: usmStatsUnknownUserNames, Report;
+          5. level other than the user's: usmStatsUnsupportedSecLevels,
+             Report;
+          6. MAC: usmStatsWrongDigests, Report;
+          7. authenticated messages: msgAuthoritativeEngineBoots/Time outside
+             the 150 s window of our clock: usmStatsNotInTimeWindows,
+             Report at authNoPriv;
+          8. decryption: usmStatsDecryptionErrors, Report; but a
+             well-formed ciphertext that decrypts to something that is not
+             a ScopedPDU (a wrong privacy key) is dropped without one, as
+             net-snmp does;
+          9. a PDU type not in pdu_types: snmpUnknownPDUHandlers, Report.
+        Reports are only sent where the module documentation says. Never
+        raises for anything in the message.
+        """
+        level = msg.flags & usm.LEVEL_AUTH_PRIV
+        if msg.security_model != message.SEC_MODEL_USM:
+            return self._drop(usm.SNMP_UNKNOWN_SECURITY_MODELS, level, None)
+        if level == message.FLAG_PRIV:
+            return self._drop(usm.SNMP_INVALID_MSGS, level, None)
+        if msg.usm.engine_id != self.engine_id:
+            return self._refuse(msg, usm.USM_STATS_UNKNOWN_ENGINE_IDS, None, None, None, now)
+        user = self.localized(msg.usm.user)
+        if user is not None:
+            return self._incoming_user(data, msg, user, now)
+        return self._refuse(msg, usm.USM_STATS_UNKNOWN_USER_NAMES, None, None, None, now)
+
+    def _incoming_user(self, data: bytes, msg: V3Message, user: LocalizedUser, now: float) -> Incoming:
+        # Steps 5 to 9 of incoming() for a known user
+        level = msg.flags & usm.LEVEL_AUTH_PRIV
+        if user.level() != level:
+            return self._refuse(msg, usm.USM_STATS_UNSUPPORTED_SEC_LEVELS, user, None, None, now)
+        try:
+            usm.authenticate(data, msg, user)
+        except usm.UsmIncomingError as e:
+            return self._refuse(msg, e.kind, user, None, None, now)
+        if level != 0:
+            boots, time = self.clock(now)
+            if not usm.check_time_authoritative(boots, time, msg.usm.boots, msg.usm.time):
+                return self._refuse(msg, usm.USM_STATS_NOT_IN_TIME_WINDOWS, user, user, None, now)
+        try:
+            scoped = usm.decrypt_scoped(msg, user)
+        except usm.UsmIncomingError as e:
+            if e.undecodable:
+                return self._drop(e.kind, level, user)
+            return self._refuse(msg, e.kind, user, None, None, now)
+        if scoped.pdu.pdu_type not in self.pdu_types:
+            return self._refuse(msg, usm.SNMP_UNKNOWN_PDU_HANDLERS, user, None, scoped, now)
+        return Incoming(scoped, None, "", level, user)
+
+    def _count(self, counter: str) -> int:
+        n = self.stats[counter] + 1
+        self.stats[counter] = n
+        return n
+
+    def _drop(self, counter: str, level: int, user: ?LocalizedUser) -> Incoming:
+        self._count(counter)
+        return Incoming(None, None, counter, level, user)
+
+    def _refuse(self, msg: V3Message, counter: str, user: ?LocalizedUser, signer: ?LocalizedUser,
+                scoped: ?ScopedPdu, now: float) -> Incoming:
+        # Count, and build the Report if one is due. signer is the user whose key authenticates the
+        # Report (notInTimeWindows), None for a noAuthNoPriv Report; scoped is the decrypted
+        # ScopedPDU when there is one.
+        n = self._count(counter)
+        level = msg.flags & usm.LEVEL_AUTH_PRIV
+        p = _pdu_of(msg, scoped)
+        if not _reportable(msg, p):
+            return Incoming(None, None, counter, level, user)
+        request_id = p.request_id if p is not None else 0
+        report = Pdu(pdu.REPORT, request_id, 0, 0, [VarBind(usm.report_oid(counter), Counter32(n & _COUNTER32_MASK))])
+        flags = message.FLAG_AUTH if signer is not None else 0
+        data = self._encode(msg, flags, ScopedPdu(self.engine_id, b"", report), signer, u64(0), now)
+        return Incoming(None, data, counter, level, user)
+
+    def _encode(self, req: V3Message, flags: int, scoped: ScopedPdu, user: ?LocalizedUser, salt: u64,
+                now: float) -> bytes:
+        # A message from us in reply to req: its msgID and user name, our engine ID, boots and time
+        boots, time = self.clock(now)
+        hdr = V3Message(req.msg_id, self.max_size, flags,
+                        UsmSecurityParameters(self.engine_id, boots, time, req.usm.user))
+        return usm.protect(hdr, message.encode_scoped(scoped), user, salt)
+
+    def respond(self, req: V3Message, user: ?LocalizedUser, response: Pdu, context_engine_id: bytes,
+                context_name: bytes, now: float, salt: u64) -> bytes:
+        """Return the datagram that answers an accepted request (or inform) with the PDU response
+
+        req is the request's message and user the Incoming.user that
+        incoming() returned for it; context_engine_id and context_name are
+        normally the request's. The message has the request's msgID, user name
+        and security level (authenticated and encrypted like the request,
+        without the reportableFlag), our engine ID, boots and time at now, and
+        our msgMaxSize. salt must be fresh for every encrypted message: pass
+        the next value of a 64-bit counter.
+
+        The caller checks the size: a datagram longer than the request's
+        msgMaxSize (or our own) must be replaced by a tooBig response.
+        Raises errors.EncodeError when the PDU cannot be encoded, or when
+        the request was authenticated and user is None or another user.
+        """
+        scoped = ScopedPdu(context_engine_id, context_name, response)
+        return self._encode(req, req.flags & usm.LEVEL_AUTH_PRIV, scoped, user, salt, now)
+
+    def __repr__(self) -> str:
+        return ("AuthoritativeEngine(engine_id=" + self.engine_id.hex() + ", boots=%d, users=%d)"
+                % (self.boots, len(self.users)))
+
+    def __str__(self) -> str:
+        return self.__repr__()

@@ -1,0 +1,616 @@
+"""Tests for engine
+
+Fed the captured net-snmp requests, the engine must answer with net-snmp's
+Reports byte for byte. The other tests build requests with usm.protect().
+"""
+
+import testing
+import message
+import pdu
+import usm
+import usmcrypto
+from engine import AuthoritativeEngine, Incoming
+from message import ScopedPdu, UsmSecurityParameters, V3Message
+from oid import Oid
+from pdu import Pdu
+from security import Usm
+from usm import LocalizedUser
+from values import Counter32, OctetString, VarBind
+from testutil import h, encode_fails, value_fails
+
+# The engine of the test vectors and captures, users with "authpassword"/"privpassword"
+ENGINE = "80001f88800102030405060708"
+SYS_DESCR = "1.3.6.1.2.1.1.1.0"
+
+# Discovery and time synchronisation with net-snmp (captured exchanges)
+DISCOVERY_REQUEST = """30 3a 02 01 03 30 0f 02 02 03 e9 02 03 00 ff e3 04 01 04 02 01 03 04 10 30 0e 04 00 02 01 00
+02 01 00 04 00 04 00 04 00 30 12 04 00 04 00 a0 0c 02 02 13 89 02 01 00 02 01 00 30 00"""
+DISCOVERY_REPORT = """30 65 02 01 03 30 0f 02 02 03 e9 02 03 00 ff e3 04 01 00 02 01 03 04 1d 30 1b
+04 0d 80 00 1f 88 80 01 02 03 04 05 06 07 08 02 01 01 02 01 31 04 00 04 00 04 00
+30 30 04 0d 80 00 1f 88 80 01 02 03 04 05 06 07 08 04 00 a8 1d 02 02 13 89 02 01 00 02 01 00
+30 11 30 0f 06 0a 2b 06 01 06 03 0f 01 01 04 00 41 01 0b"""
+SYNC_REQUEST = """30 7e 02 01 03 30 0f 02 02 03 ea 02 03 00 ff e3 04 01 07 02 01 03 04 37 30 35
+04 0d 80 00 1f 88 80 01 02 03 04 05 06 07 08 02 01 00 02 01 00 04 06 73 68 61 61 65 73
+04 0c 2a f6 0c 65 3f 8b 27 f6 a6 9b 48 38 04 08 70 30 3b cd 62 60 e5 b8
+04 2f e6 e8 3a 37 32 8a ae 89 ea bf c4 3d 2c 80 9a 34 1c e1 1f 7e 26 bd 7d e9 7a d5 ba fc c1 82
+25 81 e1 87 f4 a3 f6 e3 bc d2 0f 31 33 a0 09 f3 e0"""
+SYNC_REPORT = """30 76 02 01 03 30 0f 02 02 03 ea 02 03 00 ff e3 04 01 01 02 01 03 04 2f 30 2d
+04 0d 80 00 1f 88 80 01 02 03 04 05 06 07 08 02 01 01 02 01 31 04 06 73 68 61 61 65 73
+04 0c f9 ea 5b a4 26 55 e1 4b 7b cc 50 e6 04 00
+30 2f 04 0d 80 00 1f 88 80 01 02 03 04 05 06 07 08 04 00 a8 1c 02 01 00 02 01 00 02 01 00
+30 11 30 0f 06 0a 2b 06 01 06 03 0f 01 01 02 00 41 01 01"""
+
+# Captures: snmpget against snmpd 5.9.3 (boots 1, time 307 and 90)
+NS_DISCOVERY_REQUEST = """303e020103301102047e2724ee020300ffe30401040201030410300e04000201
+00020100040004000400301404000400a00e02047fd703ac0201000201003000"""
+NS_DISCOVERY_REPORT = """306a020103301102047e2724ee020300ffe3040100020103041e301c040d8000
+1f88800102030405060708020101020201330400040004003032040d80001f88
+8001020304050607080400a81f02047fd703ac0201000201003011300f060a2b
+060106030f01010400410101"""
+NS_SHAAES_GET = """308183020103301102047e2724ed020300ffe304010702010304383036040d80
+001f88800102030405060708020101020201330406736861616573040cc410a1
+3c02ddf2e4c746624404081ab1c1139c3a22650431cfab219671423932850d0f
+d0d1556ddf50ac3353011367715b9e188b13a8c1e33ecfd1697865793176483b
+469c86ba8aaa"""
+NS_MD5DES_GET = """308189020103301102042b4f41c3020300ffe304010702010304373035040d80
+001f8880010203040506070802010102015a04066d6435646573040c069ccb74
+c6f521d8895a0151040800000001601ee48a0438d5ba42f90d1c4902e4d0e9e4
+a6e97bac8b7627395912b02f14e3610276e6738ae6a5da07119c01d044df61df
+7b7323a4f25efa460e8e55fd"""
+
+NO_AUTH = 0x00
+AUTH_NO_PRIV = 0x01
+AUTH_PRIV = 0x03
+REPORTABLE = 0x04
+
+def engine_id() -> bytes:
+    return h(ENGINE)
+
+def decode3(data: bytes) -> V3Message:
+    c, m = message.decode(data)
+    if m is not None:
+        return m
+    raise AssertionError("not an SNMPv3 message: " + data.hex())
+
+def spec_users() -> list[Usm]:
+    """noAuthNoPriv, authNoPriv and two authPriv users with the net-snmp verification passwords"""
+    return [Usm.from_passwords("noauth"),
+            Usm.from_passwords("shaonly", usm.AUTH_SHA1, "authpassword"),
+            Usm.from_passwords("shaaes", usm.AUTH_SHA1, "authpassword", usm.PRIV_AES128, "privpassword"),
+            Usm.from_passwords("md5des", usm.AUTH_MD5, "authpassword", usm.PRIV_DES, "privpassword")]
+
+def spec_engine(start: float=1000.0, pdu_types: list[int]=[pdu.GET, pdu.GETNEXT, pdu.GETBULK, pdu.SET]) -> AuthoritativeEngine:
+    """Our engine with the spec users, boots 1; at now = start + t its time is t"""
+    return AuthoritativeEngine(engine_id(), 1, start, spec_users(), pdu_types)
+
+def client_keys(e: AuthoritativeEngine, name: str) -> LocalizedUser:
+    """The manager's copy of a user's keys, localized independently of the engine's cache"""
+    return e.users[name.encode()].localized(engine_id())
+
+def get_pdu(request_id: int) -> Pdu:
+    return Pdu(pdu.GET, request_id, varbinds=[VarBind(Oid.parse(SYS_DESCR))])
+
+def request(keys: ?LocalizedUser, user: bytes, flags: int, boots: int, time: int, p: Pdu, msg_id: int=7,
+            to_engine: ?bytes=None, salt: u64=u64(1), context: bytes=b"") -> bytes:
+    """A request as a manager sends it; keys may be None for noAuthNoPriv"""
+    eid = to_engine if to_engine is not None else engine_id()
+    hdr = V3Message(msg_id, 65507, flags, UsmSecurityParameters(eid, boots, time, user))
+    return usm.protect(hdr, message.encode_scoped(ScopedPdu(eid, context, p)), keys, salt)
+
+def run(e: AuthoritativeEngine, data: bytes, now: float) -> Incoming:
+    return e.incoming(data, decode3(data), now)
+
+def report_of(r: Incoming) -> bytes:
+    rep = r.report
+    if rep is not None:
+        return rep
+    raise AssertionError("no report: " + repr(r))
+
+def check_report(e: AuthoritativeEngine, r: Incoming, now: float, counter: str, value: int, request_id: int,
+                 msg_id: int, user: bytes, signer: ?LocalizedUser=None) -> None:
+    """r is a refusal with a Report of counter = value, authenticated by signer's key if given"""
+    testing.assertTrue(r.scoped is None, "refused")
+    testing.assertEqual(r.counter, counter)
+    testing.assertEqual(e.stats[counter], value)
+    rep = report_of(r)
+    m = decode3(rep)
+    testing.assertEqual(m.flags, AUTH_NO_PRIV if signer is not None else NO_AUTH, counter + ": report flags")
+    testing.assertEqual(m.msg_id, msg_id, counter + ": msgID")
+    testing.assertEqual(m.max_size, 65507)
+    boots, time = e.clock(now)
+    testing.assertEqual(m.usm.engine_id, e.engine_id)
+    testing.assertEqual((m.usm.boots, m.usm.time), (boots, time), counter + ": our boots and time")
+    testing.assertEqual(m.usm.user, user, counter + ": user name echoed")
+    testing.assertEqual(m.usm.priv_params, b"")
+    want = Pdu(pdu.REPORT, request_id, 0, 0, [VarBind(usm.report_oid(counter), Counter32(value))])
+    testing.assertEqual(usm.unprotect(rep, m, signer), ScopedPdu(e.engine_id, b"", want), counter + ": report")
+
+def check_silent(e: AuthoritativeEngine, r: Incoming, counter: str, value: int) -> None:
+    """r is a refusal without a Report that incremented counter to value"""
+    testing.assertTrue(r.scoped is None, "refused")
+    testing.assertTrue(r.report is None, counter + ": no report")
+    testing.assertEqual(r.counter, counter)
+    testing.assertEqual(e.stats[counter], value)
+
+def accepted(r: Incoming) -> ScopedPdu:
+    s = r.scoped
+    if s is not None:
+        testing.assertTrue(r.report is None)
+        testing.assertEqual(r.counter, "")
+        return s
+    raise AssertionError("not accepted: " + repr(r))
+
+
+# Construction, clock and users #####################################################################
+
+def _test_construction() -> None:
+    e = spec_engine()
+    testing.assertEqual(e.engine_id, engine_id())
+    testing.assertEqual(e.boots, 1)
+    testing.assertEqual(e.max_size, 65507)
+    testing.assertEqual(sorted(list(e.stats.keys())), sorted([
+        "usmStatsUnsupportedSecLevels", "usmStatsNotInTimeWindows", "usmStatsUnknownUserNames",
+        "usmStatsUnknownEngineIDs", "usmStatsWrongDigests", "usmStatsDecryptionErrors",
+        "snmpUnknownSecurityModels", "snmpInvalidMsgs", "snmpUnknownPDUHandlers"]))
+    testing.assertEqual(sum(list(e.stats.values()), None), 0)
+    testing.assertEqual(sorted(list(e.users.keys())), [b"md5des", b"noauth", b"shaaes", b"shaonly"])
+    testing.assertEqual(e.pdu_types, [pdu.GET, pdu.GETNEXT, pdu.GETBULK, pdu.SET])
+    testing.assertEqual(repr(e), "AuthoritativeEngine(engine_id=80001f88800102030405060708, boots=1, users=4)")
+    testing.assertEqual(AuthoritativeEngine(b"\x80\x00\x00\x00\x01", usm.MAX_BOOTS, 0.0, max_size=484).max_size, 484)
+    testing.assertEqual(len(AuthoritativeEngine(b"\x01" * 32, 1, 0.0).users), 0)
+    value_fails(lambda: AuthoritativeEngine(b"\x80\x00\x00\x01", 1, 0.0), "engine ID of 4 octets")
+    value_fails(lambda: AuthoritativeEngine(b"\x01" * 33, 1, 0.0), "engine ID of 33 octets")
+    value_fails(lambda: AuthoritativeEngine(b"", 1, 0.0), "empty engine ID")
+    value_fails(lambda: AuthoritativeEngine(engine_id(), 0, 0.0), "boots 0")
+    value_fails(lambda: AuthoritativeEngine(engine_id(), usm.MAX_BOOTS + 1, 0.0), "boots above 2^31-1")
+    value_fails(lambda: AuthoritativeEngine(engine_id(), 1, 0.0, max_size=483), "msgMaxSize 483")
+    value_fails(lambda: AuthoritativeEngine(engine_id(), 1, 0.0, max_size=2147483648), "msgMaxSize 2^31")
+
+def _test_clock() -> None:
+    e = AuthoritativeEngine(engine_id(), 5, 1000.0)
+    testing.assertEqual(e.clock(1000.0), (5, 0))
+    testing.assertEqual(e.clock(1000.99), (5, 0))
+    testing.assertEqual(e.clock(1001.0), (5, 1))
+    testing.assertEqual(e.clock(1049.5), (5, 49))
+    testing.assertEqual(e.clock(999.0), (5, 0), "before start")
+    testing.assertEqual(e.clock(1000.0 + 2147483647.0), (5, 2147483647))
+    testing.assertEqual(e.clock(1000.0 + 2147483648.0), (6, 0), "time wraps, boots goes up")
+    testing.assertEqual(e.clock(1000.0 + 2147483648.0 * 2.0 + 7.0), (7, 7))
+    latched = AuthoritativeEngine(engine_id(), usm.MAX_BOOTS - 1, 0.0)
+    testing.assertEqual(latched.clock(2147483648.0 + 3.0), (usm.MAX_BOOTS, 3))
+    testing.assertEqual(latched.clock(2147483648.0 * 3.0), (usm.MAX_BOOTS, 0), "boots latch at 2^31-1")
+
+def _test_users() -> None:
+    e = spec_engine()
+    testing.assertTrue(e.localized(b"nobody") is None)
+    for name in ["noauth", "shaonly", "shaaes", "md5des"]:
+        k = e.localized(name.encode())
+        if k is not None:
+            want = client_keys(e, name)
+            testing.assertEqual((k.user, k.auth, k.priv, k.auth_key, k.priv_key, k.engine_id),
+                                (want.user, want.auth, want.priv, want.auth_key, want.priv_key, want.engine_id), name)
+        else:
+            testing.error("no keys for " + name)
+    # replacing a user drops its cached keys: the old keys no longer authenticate
+    old = client_keys(e, "shaonly")
+    e.add_user(Usm.from_passwords("shaonly", usm.AUTH_SHA1, "another password"))
+    testing.assertEqual(len(e.users), 4)
+    r = run(e, request(old, b"shaonly", AUTH_NO_PRIV | REPORTABLE, 1, 0, get_pdu(5)), 1000.0)
+    check_report(e, r, 1000.0, usm.USM_STATS_WRONG_DIGESTS, 1, 5, 7, b"shaonly")
+    new = client_keys(e, "shaonly")
+    accepted(run(e, request(new, b"shaonly", AUTH_NO_PRIV | REPORTABLE, 1, 0, get_pdu(6)), 1000.0))
+    e.add_user(Usm.from_passwords("added", usm.AUTH_MD5, "authpassword"))
+    accepted(run(e, request(client_keys(e, "added"), b"added", AUTH_NO_PRIV | REPORTABLE, 1, 0, get_pdu(7)), 1000.0))
+
+
+# The net-snmp captures #############################################################################
+
+def _test_discovery_capture() -> None:
+    # net-snmp at boots 1, time 49 answered with usmStatsUnknownEngineIDs = 11
+    e = spec_engine(0.0)
+    e.stats[usm.USM_STATS_UNKNOWN_ENGINE_IDS] = 10
+    r = run(e, h(DISCOVERY_REQUEST), 49.7)
+    testing.assertEqual(report_of(r).hex(), h(DISCOVERY_REPORT).hex())
+    testing.assertEqual(r.counter, usm.USM_STATS_UNKNOWN_ENGINE_IDS)
+    testing.assertEqual(r.level, NO_AUTH)
+    testing.assertTrue(r.user is None)
+    testing.assertEqual(e.stats[usm.USM_STATS_UNKNOWN_ENGINE_IDS], 11)
+
+def _test_report_counter_wraps() -> None:
+    # the stats keep counting; the Counter32 in the Report wraps at 2^32
+    e = spec_engine(0.0)
+    e.stats[usm.USM_STATS_UNKNOWN_ENGINE_IDS] = 4294967295
+    rep = report_of(run(e, h(DISCOVERY_REQUEST), 1.0))
+    s = usm.unprotect(rep, decode3(rep), None)
+    testing.assertEqual(s.pdu.varbinds, [VarBind(usm.report_oid(usm.USM_STATS_UNKNOWN_ENGINE_IDS), Counter32(0))])
+    testing.assertEqual(e.stats[usm.USM_STATS_UNKNOWN_ENGINE_IDS], 4294967296)
+
+def _test_discovery_capture_net_snmp() -> None:
+    e = spec_engine(100.0)
+    r = run(e, h(NS_DISCOVERY_REQUEST), 407.0)
+    testing.assertEqual(report_of(r).hex(), h(NS_DISCOVERY_REPORT).hex())
+
+def _test_time_sync_capture() -> None:
+    # an authPriv request with boots/time 0/0 gets notInTimeWindows at
+    # authNoPriv, MAC'd with shaaes's key, request-id 0 (the PDU stayed encrypted)
+    e = spec_engine(0.0)
+    r = run(e, h(SYNC_REQUEST), 49.0)
+    testing.assertEqual(report_of(r).hex(), h(SYNC_REPORT).hex())
+    testing.assertEqual(r.counter, usm.USM_STATS_NOT_IN_TIME_WINDOWS)
+    testing.assertEqual(r.level, AUTH_PRIV)
+    u = r.user
+    testing.assertEqual(u.user if u is not None else b"", b"shaaes")
+
+def _test_accept_captures() -> None:
+    e = spec_engine(0.0)
+    s = accepted(run(e, h(NS_SHAAES_GET), 307.0))
+    testing.assertEqual(s, ScopedPdu(engine_id(), b"", get_pdu(0x7fd703ab)))
+    # DES with net-snmp's padding after the ScopedPDU
+    s2 = accepted(run(e, h(NS_MD5DES_GET), 90.0))
+    testing.assertEqual(s2, ScopedPdu(engine_id(), b"", get_pdu(0x01a95adc)))
+    testing.assertEqual(sum(list(e.stats.values()), None), 0)
+
+def _test_respond_to_capture() -> None:
+    e = spec_engine(0.0)
+    data = h(NS_SHAAES_GET)
+    req = decode3(data)
+    r = run(e, data, 307.0)
+    s = accepted(r)
+    resp = Pdu(pdu.RESPONSE, s.pdu.request_id, varbinds=[VarBind(Oid.parse(SYS_DESCR), OctetString(b"actsnmp"))])
+    out = e.respond(req, r.user, resp, s.context_engine_id, s.context_name, 316.0, u64(0x1122334455667788))
+    m = decode3(out)
+    testing.assertEqual(m.msg_id, 0x7e2724ed)
+    testing.assertEqual(m.flags, AUTH_PRIV, "same level, no reportableFlag")
+    testing.assertEqual((m.usm.boots, m.usm.time), (1, 316))
+    testing.assertEqual(m.usm.user, b"shaaes")
+    testing.assertEqual(m.usm.priv_params, h("1122334455667788"), "the salt")
+    testing.assertEqual(usm.unprotect(out, m, client_keys(e, "shaaes")), ScopedPdu(engine_id(), b"", resp))
+
+
+# Refusals ##########################################################################################
+
+def _test_unknown_engine_id() -> None:
+    e = spec_engine()
+    shaaes = client_keys(e, "shaaes")
+    other = h("80001f8880aabbccdd")
+    other_keys = e.users[b"shaaes"].localized(other)
+    # authPriv to a stale engine ID: noAuthNoPriv report, request-id 0, user echoed
+    r = run(e, request(other_keys, b"shaaes", AUTH_PRIV | REPORTABLE, 1, 0, get_pdu(9), to_engine=other), 1010.0)
+    check_report(e, r, 1010.0, usm.USM_STATS_UNKNOWN_ENGINE_IDS, 1, 0, 7, b"shaaes")
+    testing.assertTrue(r.user is None)
+    # plaintext: the request-id is echoed
+    r2 = run(e, request(None, b"noauth", NO_AUTH | REPORTABLE, 0, 0, get_pdu(10), 11, to_engine=other), 1010.0)
+    check_report(e, r2, 1010.0, usm.USM_STATS_UNKNOWN_ENGINE_IDS, 2, 10, 11, b"noauth")
+    # discovery: empty engine ID and user, empty varbinds
+    r3 = run(e, request(None, b"", NO_AUTH | REPORTABLE, 0, 0, Pdu(pdu.GET, 12), 13, to_engine=b""), 1010.0)
+    check_report(e, r3, 1010.0, usm.USM_STATS_UNKNOWN_ENGINE_IDS, 3, 12, 13, b"")
+    # the right engine ID with the same keys works
+    accepted(run(e, request(shaaes, b"shaaes", AUTH_PRIV | REPORTABLE, 1, 10, get_pdu(14)), 1010.0))
+
+def _test_unknown_user() -> None:
+    e = spec_engine()
+    r = run(e, request(None, b"nobody", NO_AUTH | REPORTABLE, 0, 0, get_pdu(21), 22), 1000.0)
+    check_report(e, r, 1000.0, usm.USM_STATS_UNKNOWN_USER_NAMES, 1, 21, 22, b"nobody")
+    stranger = LocalizedUser(b"stranger", usm.AUTH_SHA1, usm.PRIV_AES128, b"\x01" * 20, b"\x02" * 16, engine_id())
+    r2 = run(e, request(stranger, b"stranger", AUTH_PRIV | REPORTABLE, 1, 0, get_pdu(23), 24), 1000.0)
+    check_report(e, r2, 1000.0, usm.USM_STATS_UNKNOWN_USER_NAMES, 2, 0, 24, b"stranger")
+    # the empty user name of a discovery request sent with our engine ID
+    r3 = run(e, request(None, b"", NO_AUTH | REPORTABLE, 0, 0, Pdu(pdu.GET, 25), 26), 1000.0)
+    check_report(e, r3, 1000.0, usm.USM_STATS_UNKNOWN_USER_NAMES, 3, 25, 26, b"")
+    # user names are case sensitive
+    r4 = run(e, request(None, b"NOAUTH", NO_AUTH | REPORTABLE, 0, 0, get_pdu(27), 28), 1000.0)
+    check_report(e, r4, 1000.0, usm.USM_STATS_UNKNOWN_USER_NAMES, 4, 27, 28, b"NOAUTH")
+
+def _test_unsupported_levels() -> None:
+    # users may only use their own level, higher or lower is refused
+    e = spec_engine()
+    shaaes = client_keys(e, "shaaes")
+    shaonly = client_keys(e, "shaonly")
+    md5des = client_keys(e, "md5des")
+    noauth_as_sha = LocalizedUser(b"noauth", usm.AUTH_SHA1, usm.PRIV_AES128, b"\x01" * 20, b"\x02" * 16, engine_id())
+    shaonly_with_priv = LocalizedUser(b"shaonly", usm.AUTH_SHA1, usm.PRIV_AES128, shaonly.auth_key, b"\x03" * 16,
+                                      engine_id())
+    cases = [
+        # (keys, user, flags, request-id in the report)
+        (shaonly_with_priv, b"shaonly", AUTH_PRIV, 0),       # higher than the user's level, encrypted
+        (noauth_as_sha, b"noauth", AUTH_NO_PRIV, 31),        # higher, plaintext
+        (noauth_as_sha, b"noauth", AUTH_PRIV, 0),
+        (shaaes, b"shaaes", AUTH_NO_PRIV, 31),               # lower
+        (None, b"shaaes", NO_AUTH, 31),
+        (md5des, b"md5des", AUTH_NO_PRIV, 31),
+        (None, b"shaonly", NO_AUTH, 31)]
+    n = 0
+    for keys, user, flags, request_id in cases:
+        n += 1
+        r = run(e, request(keys, user, flags | REPORTABLE, 1, 0, get_pdu(31), 40 + n), 1000.0)
+        check_report(e, r, 1000.0, usm.USM_STATS_UNSUPPORTED_SEC_LEVELS, n, request_id, 40 + n, user)
+
+def _test_wrong_digest() -> None:
+    e = spec_engine()
+    good = client_keys(e, "shaonly")
+    wrong = LocalizedUser(b"shaonly", usm.AUTH_SHA1, usm.PRIV_NONE, b"\x05" * 20, b"", engine_id())
+    r = run(e, request(wrong, b"shaonly", AUTH_NO_PRIV | REPORTABLE, 1, 0, get_pdu(51), 52), 1000.0)
+    check_report(e, r, 1000.0, usm.USM_STATS_WRONG_DIGESTS, 1, 51, 52, b"shaonly")
+    u = r.user
+    testing.assertEqual(u.user if u is not None else b"", b"shaonly", "the user was found")
+    # a flipped MAC octet, and an authPriv message with a wrong auth key (PDU unreadable: request-id 0)
+    data = request(good, b"shaonly", AUTH_NO_PRIV | REPORTABLE, 1, 0, get_pdu(53), 54)
+    m = decode3(data)
+    p = m.auth_offset + 3
+    bad = data[:p] + bytes([data[p] ^ 0x40]) + data[p + 1:]
+    check_report(e, run(e, bad, 1000.0), 1000.0, usm.USM_STATS_WRONG_DIGESTS, 2, 53, 54, b"shaonly")
+    shaaes = client_keys(e, "shaaes")
+    wrong2 = LocalizedUser(b"shaaes", usm.AUTH_SHA1, usm.PRIV_AES128, b"\x05" * 20, shaaes.priv_key, engine_id())
+    r3 = run(e, request(wrong2, b"shaaes", AUTH_PRIV | REPORTABLE, 1, 0, get_pdu(55), 56), 1000.0)
+    check_report(e, r3, 1000.0, usm.USM_STATS_WRONG_DIGESTS, 3, 0, 56, b"shaaes")
+    # SHA-256 keys for a SHA user: a 24-octet MAC where 12 are expected
+    sha256 = LocalizedUser(b"shaonly", usm.AUTH_SHA256, usm.PRIV_NONE, b"\x05" * 32, b"", engine_id())
+    r4 = run(e, request(sha256, b"shaonly", AUTH_NO_PRIV | REPORTABLE, 1, 0, get_pdu(57), 58), 1000.0)
+    check_report(e, r4, 1000.0, usm.USM_STATS_WRONG_DIGESTS, 4, 57, 58, b"shaonly")
+
+def _test_time_window_edges() -> None:
+    e = spec_engine(1000.0)
+    now = 1500.0            # boots 1, time 500
+    shaonly = client_keys(e, "shaonly")
+    shaaes = client_keys(e, "shaaes")
+    for t in [350, 351, 499, 500, 501, 649, 650]:
+        accepted(run(e, request(shaonly, b"shaonly", AUTH_NO_PRIV | REPORTABLE, 1, t, get_pdu(t)), now))
+        accepted(run(e, request(shaaes, b"shaaes", AUTH_PRIV | REPORTABLE, 1, t, get_pdu(t)), now))
+    n = 0
+    for boots, t in [(1, 349), (1, 651), (1, 0), (0, 500), (2, 500), (1, 2147483647), (2147483647, 500)]:
+        n += 1
+        r = run(e, request(shaonly, b"shaonly", AUTH_NO_PRIV | REPORTABLE, boots, t, get_pdu(70 + n), 80 + n), now)
+        # authNoPriv: the PDU is readable, so the report echoes its request-id
+        check_report(e, r, now, usm.USM_STATS_NOT_IN_TIME_WINDOWS, n, 70 + n, 80 + n, b"shaonly", shaonly)
+    n += 1
+    r2 = run(e, request(shaaes, b"shaaes", AUTH_PRIV | REPORTABLE, 1, 651, get_pdu(99), 100), now)
+    check_report(e, r2, now, usm.USM_STATS_NOT_IN_TIME_WINDOWS, n, 0, 100, b"shaaes", shaaes)
+    # noAuthNoPriv messages have no time window
+    for boots, t in [(0, 0), (9, 123456), (2147483647, 2147483647)]:
+        accepted(run(e, request(None, b"noauth", NO_AUTH | REPORTABLE, boots, t, get_pdu(5)), now))
+
+def _test_time_progression() -> None:
+    e = spec_engine(0.0)
+    keys = client_keys(e, "md5des")
+    data = request(keys, b"md5des", AUTH_PRIV | REPORTABLE, 1, 10, get_pdu(1))
+    accepted(run(e, data, 10.0))
+    accepted(run(e, data, 160.9))           # 150 s later the message is still inside
+    r = run(e, data, 161.0)
+    check_report(e, r, 161.0, usm.USM_STATS_NOT_IN_TIME_WINDOWS, 1, 0, 7, b"md5des", keys)
+    m = decode3(report_of(r))
+    testing.assertEqual((m.usm.boots, m.usm.time), (1, 161), "the report carries our current time")
+    # a manager that adopts the reported values gets through
+    accepted(run(e, request(keys, b"md5des", AUTH_PRIV | REPORTABLE, m.usm.boots, m.usm.time, get_pdu(2)), 161.5))
+    # after a time wrap our boots went up: old boots are outside
+    wrapped = 2147483648.0 + 5.0
+    r2 = run(e, request(keys, b"md5des", AUTH_PRIV | REPORTABLE, 1, 2147483647, get_pdu(3)), wrapped)
+    check_report(e, r2, wrapped, usm.USM_STATS_NOT_IN_TIME_WINDOWS, 2, 0, 7, b"md5des", keys)
+    accepted(run(e, request(keys, b"md5des", AUTH_PRIV | REPORTABLE, 2, 5, get_pdu(4)), wrapped))
+
+def _test_boots_latched() -> None:
+    # RFC 3414 3.2 step 7a: at boots 2^31-1 every authenticated message is outside the window
+    e = AuthoritativeEngine(engine_id(), usm.MAX_BOOTS, 0.0, spec_users())
+    keys = client_keys(e, "shaonly")
+    r = run(e, request(keys, b"shaonly", AUTH_NO_PRIV | REPORTABLE, usm.MAX_BOOTS, 10, get_pdu(1)), 10.0)
+    check_report(e, r, 10.0, usm.USM_STATS_NOT_IN_TIME_WINDOWS, 1, 1, 7, b"shaonly", keys)
+    accepted(run(e, request(None, b"noauth", NO_AUTH | REPORTABLE, 0, 0, get_pdu(2)), 10.0))
+
+def authpriv_raw(keys: LocalizedUser, salt: bytes, ciphertext: bytes, boots: int, time: int) -> bytes:
+    """An authPriv request with arbitrary msgPrivacyParameters and encryptedPDU, MAC'd with SHA-1 keys"""
+    n = usm.auth_mac_len(keys.auth)
+    params = UsmSecurityParameters(keys.engine_id, boots, time, keys.user, b"\x00" * n, salt)
+    r = message.encode_v3(V3Message(61, 65507, AUTH_PRIV | REPORTABLE, params), ciphertext)
+    mac = usmcrypto.hmac(usmcrypto.HASH_SHA1, keys.auth_key, r.msg)[:n]
+    return r.msg[:r.auth_offset] + mac + r.msg[r.auth_offset + n:]
+
+def _test_decryption_errors() -> None:
+    e = spec_engine()
+    keys = client_keys(e, "shaaes")
+    plain = message.encode_scoped(ScopedPdu(engine_id(), b"", get_pdu(1)))
+    # structural errors get a report (the PDU stayed encrypted: request-id 0)
+    r = run(e, authpriv_raw(keys, b"\x00" * 7, plain, 1, 0), 1000.0)
+    check_report(e, r, 1000.0, usm.USM_STATS_DECRYPTION_ERRORS, 1, 0, 61, b"shaaes")
+    r2 = run(e, authpriv_raw(keys, b"", plain, 1, 0), 1000.0)
+    check_report(e, r2, 1000.0, usm.USM_STATS_DECRYPTION_ERRORS, 2, 0, 61, b"shaaes")
+    # a wrong privacy key decrypts to garbage: counted and dropped without a report, as net-snmp does
+    wrong = LocalizedUser(b"shaaes", usm.AUTH_SHA1, usm.PRIV_AES128, keys.auth_key, b"\x07" * 16, engine_id())
+    r3 = run(e, request(wrong, b"shaaes", AUTH_PRIV | REPORTABLE, 1, 0, get_pdu(2)), 1000.0)
+    check_silent(e, r3, usm.USM_STATS_DECRYPTION_ERRORS, 3)
+    u = r3.user
+    testing.assertEqual(u.user if u is not None else b"", b"shaaes")
+    # DES: a ciphertext that is not a multiple of 8 octets
+    des = client_keys(e, "md5des")
+    hdr = V3Message(62, 65507, AUTH_PRIV | REPORTABLE, UsmSecurityParameters(engine_id(), 1, 0, b"md5des"))
+    good = usm.protect(hdr, plain, des, u64(5))
+    m = decode3(good)
+    ct = m.encrypted
+    if ct is not None:
+        params = UsmSecurityParameters(engine_id(), 1, 0, b"md5des", b"\x00" * 12, m.usm.priv_params)
+        raw = message.encode_v3(V3Message(62, 65507, AUTH_PRIV | REPORTABLE, params), ct[:len(ct) - 1])
+        mac = usmcrypto.hmac(usmcrypto.HASH_MD5, des.auth_key, raw.msg)[:12]
+        bad = raw.msg[:raw.auth_offset] + mac + raw.msg[raw.auth_offset + 12:]
+        check_report(e, run(e, bad, 1000.0), 1000.0, usm.USM_STATS_DECRYPTION_ERRORS, 4, 0, 62, b"md5des")
+    else:
+        testing.error("no ciphertext")
+
+def _test_unknown_pdu_handlers() -> None:
+    # a notification receiver handles INFORM only
+    e = spec_engine(pdu_types=[pdu.INFORM])
+    keys = client_keys(e, "shaaes")
+    inform = Pdu(pdu.INFORM, 77, varbinds=[VarBind(Oid.parse(SYS_DESCR))])
+    s = accepted(run(e, request(keys, b"shaaes", AUTH_PRIV | REPORTABLE, 1, 0, inform), 1000.0))
+    testing.assertEqual(s.pdu, inform)
+    # a GET is decrypted, so the report echoes its request-id
+    r = run(e, request(keys, b"shaaes", AUTH_PRIV | REPORTABLE, 1, 0, get_pdu(78), 79), 1000.0)
+    check_report(e, r, 1000.0, usm.SNMP_UNKNOWN_PDU_HANDLERS, 1, 78, 79, b"shaaes")
+    n = 1
+    for t in [pdu.TRAP_V2, pdu.RESPONSE, pdu.REPORT]:
+        n += 1
+        r2 = run(e, request(keys, b"shaaes", AUTH_PRIV | REPORTABLE, 1, 0, Pdu(t, 80)), 1000.0)
+        check_silent(e, r2, usm.SNMP_UNKNOWN_PDU_HANDLERS, n)
+    # the default command responder does not take INFORM
+    d = spec_engine()
+    r3 = run(d, request(None, b"noauth", NO_AUTH | REPORTABLE, 0, 0, inform, 81), 1000.0)
+    check_report(d, r3, 1000.0, usm.SNMP_UNKNOWN_PDU_HANDLERS, 1, 77, 81, b"noauth")
+    for t in [pdu.GET, pdu.GETNEXT, pdu.GETBULK, pdu.SET]:
+        accepted(run(d, request(None, b"noauth", NO_AUTH | REPORTABLE, 0, 0, Pdu(t, 82)), 1000.0))
+
+def _test_reportable_rules() -> None:
+    e = spec_engine()
+    keys = client_keys(e, "shaaes")
+    other = h("80001f8880aabbccdd")
+    other_keys = e.users[b"shaaes"].localized(other)
+    # encrypted PDU: the reportableFlag decides
+    r = run(e, request(other_keys, b"shaaes", AUTH_PRIV, 1, 0, get_pdu(1), to_engine=other), 1000.0)
+    check_silent(e, r, usm.USM_STATS_UNKNOWN_ENGINE_IDS, 1)
+    r2 = run(e, request(keys, b"shaaes", AUTH_PRIV, 1, 999, get_pdu(2)), 1000.0)
+    check_silent(e, r2, usm.USM_STATS_NOT_IN_TIME_WINDOWS, 1)
+    r3 = run(e, request(keys, b"shaaes", AUTH_PRIV | REPORTABLE, 1, 999, get_pdu(3)), 1000.0)
+    check_report(e, r3, 1000.0, usm.USM_STATS_NOT_IN_TIME_WINDOWS, 2, 0, 7, b"shaaes", keys)
+    # readable PDU: Confirmed class gets a report even without the flag (RFC 3412 7.1 step 3b) ...
+    r4 = run(e, request(None, b"nobody", NO_AUTH, 0, 0, get_pdu(4)), 1000.0)
+    check_report(e, r4, 1000.0, usm.USM_STATS_UNKNOWN_USER_NAMES, 1, 4, 7, b"nobody")
+    r5 = run(e, request(None, b"nobody", NO_AUTH, 0, 0, Pdu(pdu.INFORM, 5)), 1000.0)
+    check_report(e, r5, 1000.0, usm.USM_STATS_UNKNOWN_USER_NAMES, 2, 5, 7, b"nobody")
+    # ... and the other classes never get one, even with the flag
+    n = 2
+    for t in [pdu.TRAP_V2, pdu.RESPONSE, pdu.REPORT]:
+        n += 1
+        r6 = run(e, request(None, b"nobody", NO_AUTH | REPORTABLE, 0, 0, Pdu(t, 6)), 1000.0)
+        check_silent(e, r6, usm.USM_STATS_UNKNOWN_USER_NAMES, n)
+    shaonly = client_keys(e, "shaonly")
+    trap = Pdu(pdu.TRAP_V2, 7)
+    r7 = run(e, request(shaonly, b"shaonly", AUTH_NO_PRIV | REPORTABLE, 1, 999, trap), 1000.0)
+    check_silent(e, r7, usm.USM_STATS_NOT_IN_TIME_WINDOWS, 3)
+    # an accepted message does not depend on the flag
+    accepted(run(e, request(keys, b"shaaes", AUTH_PRIV, 1, 0, get_pdu(8)), 1000.0))
+
+def _test_dropped_messages() -> None:
+    e = spec_engine()
+    keys = client_keys(e, "shaaes")
+    data = request(keys, b"shaaes", AUTH_PRIV | REPORTABLE, 1, 0, get_pdu(1))
+    m = decode3(data)
+    other_model = V3Message(m.msg_id, m.max_size, m.flags, m.usm, None, m.encrypted, 2, m.auth_offset)
+    check_silent(e, e.incoming(data, other_model, 1000.0), usm.SNMP_UNKNOWN_SECURITY_MODELS, 1)
+    n = 0
+    for flags in [0x02, 0x06]:
+        n += 1
+        only_priv = V3Message(m.msg_id, m.max_size, flags, m.usm, None, m.encrypted, auth_offset=m.auth_offset)
+        r = e.incoming(data, only_priv, 1000.0)
+        check_silent(e, r, usm.SNMP_INVALID_MSGS, n)
+        testing.assertEqual(r.level, 0x02)
+        testing.assertEqual(repr(r), "Incoming(dropped, counter='snmpInvalidMsgs', level=privWithoutAuth, user=None)")
+    testing.assertEqual(e.stats[usm.USM_STATS_UNKNOWN_ENGINE_IDS], 0, "nothing else counted")
+
+def _test_incoming_repr_hides_keys() -> None:
+    e = spec_engine()
+    keys = client_keys(e, "shaaes")
+    r = run(e, request(keys, b"shaaes", AUTH_PRIV | REPORTABLE, 1, 0, get_pdu(1)), 1000.0)
+    text = repr(r)
+    testing.assertTrue(text.startswith("Incoming(accepted ScopedPdu("), text)
+    testing.assertTrue(text.endswith(", counter='', level=authPriv, user=b'shaaes')"), text)
+    testing.assertFalse(keys.auth_key.hex() in text, "no auth key")
+    testing.assertFalse(keys.priv_key.hex() in text, "no priv key")
+    r2 = run(e, request(None, b"nobody", NO_AUTH | REPORTABLE, 0, 0, get_pdu(2)), 1000.0)
+    testing.assertTrue(repr(r2).startswith("Incoming(report=<"), repr(r2))
+    testing.assertTrue(str(r2).endswith("counter='usmStatsUnknownUserNames', level=noAuthNoPriv, user=None)"), str(r2))
+
+
+# respond() #########################################################################################
+
+LAB_AUTHS: list[(str, int)] = [("md5", usm.AUTH_MD5), ("sha", usm.AUTH_SHA1), ("sha224", usm.AUTH_SHA224),
+                               ("sha256", usm.AUTH_SHA256), ("sha384", usm.AUTH_SHA384), ("sha512", usm.AUTH_SHA512)]
+LAB_PRIVS: list[(str, int)] = [("des", usm.PRIV_DES), ("aes", usm.PRIV_AES128), ("aes192", usm.PRIV_AES192),
+                               ("aes256", usm.PRIV_AES256), ("aes192c", usm.PRIV_AES192C),
+                               ("aes256c", usm.PRIV_AES256C), ("3des", usm.PRIV_3DES)]
+
+def lab_users(auth_name: str) -> list[Usm]:
+    """The interop lab's users of one auth protocol (interop/config/users.tsv): u_<auth> and u_<auth>_<priv>"""
+    for name, auth in LAB_AUTHS:
+        if name == auth_name:
+            users = [Usm.from_passwords("u_" + name, auth, "authpass123")]
+            for pname, priv in LAB_PRIVS:
+                users.append(Usm.from_passwords("u_" + name + "_" + pname, auth, "authpass123", priv, "privpass123"))
+            return users
+    raise ValueError("no lab auth protocol " + auth_name)
+
+def respond_round_trip(users: list[Usm]) -> None:
+    # Every user sends a request at its level; the engine accepts it, and its response opens with
+    # usm.unprotect() and the manager's own copy of the keys. A group of lab_users() needs 15 to 20
+    # password-to-key runs: the tests calling this extend their timeout.
+    lab_engine = h("80001f8880616374736e6d7061")
+    e = AuthoritativeEngine(lab_engine, 3, 500.0, users, [pdu.GET, pdu.INFORM])
+    now = 600.25
+    boots, time = e.clock(now)
+    for i in range(len(users)):
+        u = users[i]
+        keys = u.localized(lab_engine)
+        what = repr(u)
+        level = u.level()
+        req = Pdu(pdu.GET, 1000 + i, varbinds=[VarBind(Oid.parse(SYS_DESCR))])
+        data = request(keys, u.user.encode(), level | REPORTABLE, boots, time, req, 50 + i, lab_engine, u64(i),
+                       b"ctx")
+        r = run(e, data, now)
+        s = accepted(r)
+        testing.assertEqual(s, ScopedPdu(lab_engine, b"ctx", req), what)
+        testing.assertEqual(r.level, level, what)
+        resp = Pdu(pdu.RESPONSE, s.pdu.request_id, varbinds=[VarBind(Oid.parse(SYS_DESCR), OctetString(("lab %d" % i).encode()))])
+        out = e.respond(decode3(data), r.user, resp, s.context_engine_id, s.context_name, now + 1.0,
+                        u64(0x0102030405060708) + u64(i))
+        m = decode3(out)
+        testing.assertEqual(m.flags, level, what + ": flags")
+        testing.assertEqual(m.msg_id, 50 + i, what + ": msgID")
+        testing.assertEqual(m.max_size, 65507)
+        testing.assertEqual((m.usm.engine_id, m.usm.boots, m.usm.time), (lab_engine, boots, time + 1), what)
+        testing.assertEqual(m.usm.user, u.user.encode(), what)
+        testing.assertEqual(usm.unprotect(out, m, keys), ScopedPdu(lab_engine, b"ctx", resp), what)
+        if level == AUTH_PRIV:
+            other = e.respond(decode3(data), r.user, resp, s.context_engine_id, s.context_name, now + 1.0,
+                              u64(0x0102030405060708) + u64(i + 1000))
+            testing.assertNotEqual(other, out, what + ": another salt")
+    testing.assertEqual(sum(list(e.stats.values()), None), 0)
+
+def _test_respond_noauth() -> None:
+    respond_round_trip([Usm.from_passwords("u_noauth")])
+
+def _test_respond_md5(t: testing.SyncT) -> None:
+    t.timeout(60.0)
+    respond_round_trip(lab_users("md5"))
+
+def _test_respond_sha(t: testing.SyncT) -> None:
+    t.timeout(60.0)
+    respond_round_trip(lab_users("sha"))
+
+def _test_respond_sha224(t: testing.SyncT) -> None:
+    t.timeout(60.0)
+    respond_round_trip(lab_users("sha224"))
+
+def _test_respond_sha256(t: testing.SyncT) -> None:
+    t.timeout(60.0)
+    respond_round_trip(lab_users("sha256"))
+
+def _test_respond_sha384(t: testing.SyncT) -> None:
+    t.timeout(60.0)
+    respond_round_trip(lab_users("sha384"))
+
+def _test_respond_sha512(t: testing.SyncT) -> None:
+    t.timeout(60.0)
+    respond_round_trip(lab_users("sha512"))
+
+def _test_respond_rejects() -> None:
+    e = spec_engine()
+    keys = client_keys(e, "shaaes")
+    data = request(keys, b"shaaes", AUTH_PRIV | REPORTABLE, 1, 0, get_pdu(1))
+    req = decode3(data)
+    resp = Pdu(pdu.RESPONSE, 1)
+    encode_fails(lambda: e.respond(req, None, resp, engine_id(), b"", 1000.0, u64(1)), "authPriv without keys")
+    elsewhere = e.users[b"shaaes"].localized(h("80001f8880aabbccdd"))
+    encode_fails(lambda: e.respond(req, elsewhere, resp, engine_id(), b"", 1000.0, u64(1)), "keys of another engine")
+    shaonly = e.localized(b"shaonly")
+    encode_fails(lambda: e.respond(req, shaonly, resp, engine_id(), b"", 1000.0, u64(1)), "keys of another user")
+    encode_fails(lambda: e.respond(req, keys, Pdu(pdu.RESPONSE, 2147483648), engine_id(), b"", 1000.0, u64(1)),
+                 "request-id outside Integer32")
+    # a noAuthNoPriv request needs no keys
+    plain = decode3(request(None, b"noauth", NO_AUTH | REPORTABLE, 0, 0, get_pdu(2)))
+    out = e.respond(plain, None, Pdu(pdu.RESPONSE, 2), engine_id(), b"", 1000.0, u64(1))
+    testing.assertEqual(usm.unprotect(out, decode3(out), None), ScopedPdu(engine_id(), b"", Pdu(pdu.RESPONSE, 2)))

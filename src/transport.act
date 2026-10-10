@@ -1,0 +1,835 @@
+"""Datagram transports: UDP sockets, and an in-memory network for tests
+
+A Transport carries datagrams between its owner (a Client) and ONE peer. A
+ServerTransport carries them between its owner (an Agent or a
+NotificationReceiver) and any number of peers. Actors cannot implement
+protocols, so both are classes whose attributes are procs, wrapping an actor
+that does the work (the pipe.Pipe precedent). Anything that provides the
+procs is a transport: a test can wrap one, for example to record or rewrite
+what is sent, by building a new Transport from its own procs and those of
+the wrapped one. A proc that is an action (an actor's method, a def nested
+in an actor) runs as a message to its actor when another actor calls it,
+and a result it returns is lost; build local_port from a plain lambda.
+
+Implementations:
+
+- udp_transport(): a connected net.UDPConnection to one agent.
+- udp_server_transport(): a net.UDPListener, on an ephemeral port if asked.
+- MemNet, with MemNet.client(), MemNet.server() and mem_pair(): a
+  deterministic in-process datagram network with packet-level fault
+  injection (NetFaults). Retries, late and duplicate replies, reordering,
+  corruption and spoofing can be tested without sockets.
+
+Contract common to all implementations:
+
+- A transport never waits for its owner. Callbacks are asynchronous calls,
+  made in the order in which the datagrams and errors arrived.
+- Datagrams that arrive before a receiver is registered are kept, at most
+  MAX_BUFFERED of them, and handed over in order when one is registered.
+- close() is idempotent. After it, nothing more is delivered and sending
+  does nothing.
+- Errors go to the error callback of a Transport, never raised; each says
+  whether it is fatal (the transport cannot send) or a hint.
+- Source addresses are text as the network reports them: IP addresses for
+  UDP, where an IPv4-mapped IPv6 address (::ffff:192.0.2.1, which a socket
+  bound to "::" reports for IPv4 peers) is given as plain IPv4 (192.0.2.1);
+  see normalize_address().
+"""
+
+import logging
+import net
+import ber
+
+# Datagrams kept for a receiver that is not registered yet; more are dropped
+MAX_BUFFERED = 64
+
+# Datagrams udp_transport() queues while its socket connects; more are
+# dropped with a non-fatal error
+MAX_QUEUED = 256
+
+# Largest datagram MemNet carries: the IPv4 UDP maximum, as in net-snmp
+MAX_DATAGRAM = 65507
+
+# Seconds MemNet holds a datagram back for NetFaults.reorder when no
+# later datagram overtakes it
+REORDER_HOLD = 0.05
+
+# The error a connected UDP socket reports for ICMP port unreachable; MemNet
+# reports the same text to a client that sends to an address nobody is bound to
+REFUSED = "UDP receive error: connection refused"
+
+# MemNet's ephemeral ports, as in the IANA dynamic range
+_EPHEMERAL_FIRST = 49152
+_EPHEMERAL_COUNT = 16384
+
+
+def normalize_address(address: str) -> str:
+    """Return address without an IPv4-mapped IPv6 prefix
+
+    "::ffff:192.0.2.1" (in any letter case) gives "192.0.2.1". Any other text
+    is returned unchanged.
+    """
+    if len(address) > 7 and address[:7].lower() == "::ffff:":
+        v4 = address[7:]
+        if net.is_ipv4(v4):
+            return v4
+    return address
+
+def is_unreachable(error: str) -> bool:
+    """Return True if a transport error reports an unreachable peer port
+
+    A connected UDP socket reports ICMP port unreachable as "connection
+    refused" (REFUSED); MemNet does the same when nothing is bound to the
+    destination. The error is not fatal: the transport stays usable.
+    """
+    return "connection refused" in error
+
+def _peer_text(address: str, port: int) -> str:
+    # address:port, with an IPv6 address in brackets
+    if ":" in address:
+        return "[" + address + "]:" + str(port)
+    return address + ":" + str(port)
+
+def _tidy(error: str) -> str:
+    # net.UDPConnection joins the A and AAAA lookup errors with two spaces,
+    # usually repeating the same text; keep each distinct part once
+    parts: list[str] = []
+    for part in error.split("  "):
+        if part != "" and part not in parts:
+            parts.append(part)
+    return "; ".join(parts)
+
+
+class Transport(object):
+    """Datagrams to and from one peer: the manager side
+
+    send(data) sends one datagram to the peer. It never blocks and never
+    raises; problems are reported to the error callback.
+
+    set_receiver(on_data, on_error) registers the callbacks, replacing any
+    earlier ones:
+
+    - on_data(data, src_address, src_port) for every datagram. The source is
+      not guaranteed to be the peer: a UDP socket only accepts the peer (the
+      kernel filters), but MemNet delivers everything addressed to the
+      transport, so that the owner's own source checks can be tested.
+    - on_error(message, fatal) for every error. fatal False is a hint and
+      the transport stays usable: ICMP port unreachable (see
+      is_unreachable()), a datagram that could not be sent, a full send
+      queue. fatal True means the transport cannot send because setting it
+      up failed (name resolution, socket, port); every later send(), and
+      every later set_receiver(), reports the same error again at once.
+
+    close() releases the socket. It is idempotent; afterwards nothing is
+    delivered and send() does nothing.
+    """
+    @property
+    send: proc(bytes) -> None
+    @property
+    set_receiver: proc(action(bytes, str, int) -> None, action(str, bool) -> None) -> None
+    @property
+    close: proc() -> None
+
+    def __init__(self,
+                 send: proc(bytes) -> None,
+                 set_receiver: proc(action(bytes, str, int) -> None, action(str, bool) -> None) -> None,
+                 close: proc() -> None):
+        self.send = send
+        self.set_receiver = set_receiver
+        self.close = close
+
+
+class ServerTransport(object):
+    """Datagrams to and from any number of peers: the agent side
+
+    send_to(data, address, port) sends one datagram. address must be an IP
+    address (no name resolution); reply to the src_address and src_port the
+    datagram came with. There is no error callback: udp_server_transport()
+    logs send failures.
+
+    set_receiver(on_data) registers the callback, replacing any earlier one;
+    on_data(data, src_address, src_port) is called for every datagram.
+
+    close() releases the socket. It is idempotent; afterwards nothing is
+    delivered and send_to() does nothing.
+
+    local_port() is the port the transport is bound to (useful after binding
+    port 0), or 0 when binding failed.
+    """
+    @property
+    send_to: proc(bytes, str, int) -> None
+    @property
+    set_receiver: proc(action(bytes, str, int) -> None) -> None
+    @property
+    close: proc() -> None
+    @property
+    local_port: proc() -> int
+
+    def __init__(self,
+                 send_to: proc(bytes, str, int) -> None,
+                 set_receiver: proc(action(bytes, str, int) -> None) -> None,
+                 close: proc() -> None,
+                 local_port: proc() -> int):
+        self.send_to = send_to
+        self.set_receiver = set_receiver
+        self.close = close
+        self.local_port = local_port
+
+
+class _Inbox(object):
+    # The data callback of an endpoint, and the datagrams that arrived
+    # before one was registered. Owned by one endpoint actor.
+    @property
+    on_data: ?action(bytes, str, int) -> None
+    early: list[(bytes, str, int)]
+
+    def __init__(self):
+        self.on_data = None
+        self.early = []
+
+    proc def put(self, data: bytes, src_address: str, src_port: int) -> None:
+        on_data = self.on_data
+        if on_data is not None:
+            on_data(data, src_address, src_port)
+        elif len(self.early) < MAX_BUFFERED:
+            self.early.append((data, src_address, src_port))
+
+    proc def register(self, on_data: action(bytes, str, int) -> None) -> None:
+        self.on_data = on_data
+        for d in self.early:
+            on_data(d.0, d.1, d.2)
+        self.early = []
+
+    mut def clear(self) -> None:
+        self.on_data = None
+        self.early = []
+
+
+# UDP ##############################################################################################
+
+def udp_transport(cap: net.UDPConnectCap, address: str, port: int) -> Transport:
+    """Return a Transport over a UDP socket connected to address and port
+
+    address is an IP address or a host name. For a name, net.UDPConnection
+    uses whichever of the A and AAAA answers arrives first, so prefer IP
+    addresses. Datagrams sent before the socket is connected are queued (at
+    most MAX_QUEUED) and sent once it is. A setup failure (name resolution,
+    socket, a port outside 1..65535) is a fatal error. The kernel drops
+    datagrams from any source other than address and port; ICMP port
+    unreachable arrives as a non-fatal error.
+    """
+    ep = _UdpClient(cap, address, port)
+    def _send(data: bytes) -> None:
+        ep.send(data)
+    def _set_receiver(on_data: action(bytes, str, int) -> None, on_error: action(str, bool) -> None) -> None:
+        ep.set_receiver(on_data, on_error)
+    def _close() -> None:
+        ep.close()
+    return Transport(_send, _set_receiver, _close)
+
+
+actor _UdpClient(cap: net.UDPConnectCap, address: str, port: int):
+    # The actor behind udp_transport()
+    var _conn: ?net.UDPConnection = None
+    var _connected = False
+    var _failure: ?str = None
+    var _closed = False
+    var _queue: list[bytes] = []
+    var _on_error: ?action(str, bool) -> None = None
+    var _inbox = _Inbox()
+
+    proc def _report(message: str, fatal: bool) -> None:
+        on_error = _on_error
+        if on_error is not None:
+            on_error(message, fatal)
+
+    proc def _fail(error: str) -> None:
+        message = "UDP setup for " + _peer_text(address, port) + " failed: " + error
+        _failure = message
+        _queue = []
+        _report(message, True)
+
+    def send(data: bytes) -> None:
+        if _closed:
+            return
+        failure = _failure
+        if failure is not None:
+            _report(failure, True)
+            return
+        conn = _conn
+        if conn is not None:
+            if _connected:
+                conn.write(data)
+                return
+        if len(_queue) < MAX_QUEUED:
+            _queue.append(data)
+        else:
+            _report("UDP send queue for " + _peer_text(address, port) + " is full; datagram dropped", False)
+
+    def set_receiver(on_data: action(bytes, str, int) -> None, on_error: action(str, bool) -> None) -> None:
+        if _closed:
+            return
+        _on_error = on_error
+        failure = _failure
+        if failure is not None:
+            on_error(failure, True)
+        _inbox.register(on_data)
+
+    def close() -> None:
+        if _closed:
+            return
+        _closed = True
+        _queue = []
+        _on_error = None
+        _inbox.clear()
+        conn = _conn
+        if conn is not None:
+            conn.close()
+
+    def _on_connect(c: net.UDPConnection) -> None:
+        if _closed:
+            c.close()
+            return
+        _connected = True
+        for data in _queue:
+            c.write(data)
+        _queue = []
+
+    def _on_receive(c: net.UDPConnection, data: bytes, src_address: str, src_port: int) -> None:
+        if not _closed:
+            _inbox.put(data, normalize_address(src_address), src_port)
+
+    def _on_net_error(c: net.UDPConnection, error: str) -> None:
+        if _closed:
+            return
+        if _connected:
+            _report(error, False)
+        else:
+            c.close()
+            _fail(_tidy(error))
+
+    if port > 0 and port <= 65535:
+        _conn = net.UDPConnection(cap, address, port, _on_connect, _on_receive, _on_net_error)
+    else:
+        _fail("port %d is outside 1..65535" % port)
+
+
+def udp_server_transport(cap: net.UDPListenCap, address: str, port: int,
+                         on_ready: action(ServerTransport, ?str) -> None,
+                         log_handler: ?logging.Handler=None) -> None:
+    """Listen for UDP datagrams on address and port, then call on_ready once
+
+    port 0 picks an ephemeral port; the transport's local_port() tells which.
+    on_ready(transport, None) means the transport is listening;
+    on_ready(transport, error) means it could not (address in use, invalid
+    address or port), and that transport's local_port() is 0 and it ignores
+    sends. A socket bound to "::" also receives IPv4 datagrams (unless the
+    host disables that); their sources are given as plain IPv4, and replies
+    to plain IPv4 addresses work. Errors after listening (a datagram that
+    could not be sent, an address that is not an IP address) are logged to
+    log_handler as warnings.
+    """
+    _UdpServer(cap, address, port, on_ready, log_handler)
+
+
+def _udp_server_transport(ep: _UdpServer, local_port: int) -> ServerTransport:
+    # The transports' procs are closures built at module level, which call
+    # the actor asynchronously in the caller's context.
+    def _send_to(data: bytes, dst_address: str, dst_port: int) -> None:
+        ep.send_to(data, dst_address, dst_port)
+    def _set_receiver(on_data: action(bytes, str, int) -> None) -> None:
+        ep.set_receiver(on_data)
+    def _close() -> None:
+        ep.close()
+    return ServerTransport(_send_to, _set_receiver, _close, lambda: local_port)
+
+
+actor _UdpServer(cap: net.UDPListenCap, address: str, port: int,
+                 on_ready: action(ServerTransport, ?str) -> None,
+                 log_handler: ?logging.Handler):
+    # The actor behind udp_server_transport()
+    _log = logging.Logger(log_handler)
+    var _listener: ?net.UDPListener = None
+    var _closed = False
+    var _inbox = _Inbox()
+
+    def send_to(data: bytes, dst_address: str, dst_port: int) -> None:
+        listener = _listener
+        if listener is not None:
+            if _closed:
+                return
+            if dst_port > 0 and dst_port <= 65535:
+                listener.send(data, dst_address, dst_port)
+            else:
+                _log.warning("UDP datagram for an invalid port dropped", {"address": dst_address, "port": dst_port})
+
+    def set_receiver(on_data: action(bytes, str, int) -> None) -> None:
+        if not _closed:
+            _inbox.register(on_data)
+
+    def close() -> None:
+        if _closed:
+            return
+        _closed = True
+        _inbox.clear()
+        listener = _listener
+        if listener is not None:
+            listener.close()
+
+    proc def _ready(local_port: int, error: ?str) -> None:
+        on_ready(_udp_server_transport(self, local_port), error)
+
+    def _on_listen(l: net.UDPListener, error: ?str) -> None:
+        if error is not None:
+            _listener = None
+            l.close()
+            _ready(0, "UDP listen on " + _peer_text(address, port) + " failed: " + error)
+            return
+        _ready(l.local_port(), None)
+
+    def _on_receive(l: net.UDPListener, data: bytes, src_address: str, src_port: int) -> None:
+        if not _closed:
+            _inbox.put(data, normalize_address(src_address), src_port)
+
+    def _on_net_error(l: net.UDPListener, error: str) -> None:
+        if not _closed:
+            _log.warning("UDP error", {"local": _peer_text(address, port), "error": error})
+
+    if port >= 0 and port <= 65535:
+        _listener = net.UDPListener(cap, address, port, _on_listen, _on_receive, _on_net_error)
+    else:
+        _ready(0, "UDP listen on " + _peer_text(address, port) + " failed: port outside 0..65535")
+
+
+# In-memory network ################################################################################
+
+class NetFaults(object):
+    """Packet-level faults that a MemNet applies to the datagrams it carries
+
+    Faults apply to the datagrams whose destination matches to_address and
+    to_port ("" and 0 match any). Those are numbered 1, 2, 3, ... in the order
+    they are sent; the numbering restarts when MemNet.set_faults() is called.
+    For each one, in this order:
+
+    - drop_first_n: datagrams 1..n are dropped.
+    - drop_every_nth: datagrams whose number is a multiple of n are dropped
+      (0 = off).
+    - corrupt_byte: the octet at this offset is inverted (XOR 0xff); a
+      datagram that is not longer than the offset is left alone (-1 = off).
+    - spoof_source: a forged copy, from the same address but source port + 1
+      (65535 wraps to 1), is delivered right before the datagram. A spoofed
+      datagram never triggers a "connection refused" error.
+    - duplicate: the datagram is delivered twice.
+    - reorder: of every two consecutive datagrams the first is held back and
+      delivered right after the second (with its copies). A held datagram
+      that no other overtakes within REORDER_HOLD seconds is delivered then.
+    - delay: the datagram (with its copies) is delivered this many seconds
+      after it was sent, 0.0 to 3600.0. Delayed datagrams keep their order.
+
+    The constructor raises ValueError for a negative count, an offset below
+    -1, a delay outside 0..3600 or a port outside 0..65535.
+    """
+    drop_first_n: int
+    drop_every_nth: int
+    duplicate: bool
+    delay: float
+    reorder: bool
+    corrupt_byte: int
+    spoof_source: bool
+    to_address: str
+    to_port: int
+
+    def __init__(self, drop_first_n: int=0, drop_every_nth: int=0, duplicate: bool=False, delay: float=0.0,
+                 reorder: bool=False, corrupt_byte: int=-1, spoof_source: bool=False,
+                 to_address: str="", to_port: int=0):
+        if drop_first_n < 0 or drop_every_nth < 0:
+            raise ValueError("NetFaults drop counts must not be negative")
+        if corrupt_byte < -1:
+            raise ValueError("NetFaults corrupt_byte must be -1 (off) or an offset")
+        if not (delay >= 0.0 and delay <= 3600.0):
+            raise ValueError("NetFaults delay must be 0.0 to 3600.0 seconds")
+        if to_port < 0 or to_port > 65535:
+            raise ValueError("NetFaults to_port must be 0 (any) to 65535")
+        self.drop_first_n = drop_first_n
+        self.drop_every_nth = drop_every_nth
+        self.duplicate = duplicate
+        self.delay = delay
+        self.reorder = reorder
+        self.corrupt_byte = corrupt_byte
+        self.spoof_source = spoof_source
+        self.to_address = to_address
+        self.to_port = to_port
+
+    def matches(self, address: str, port: int) -> bool:
+        """Return True if the faults apply to datagrams for address and port"""
+        return (self.to_address == "" or self.to_address == address) and (self.to_port == 0 or self.to_port == port)
+
+
+class Datagram(object):
+    """One datagram as it was sent into a MemNet (see MemNet.history())"""
+    data: bytes
+    src_address: str
+    src_port: int
+    dst_address: str
+    dst_port: int
+
+    def __init__(self, data: bytes, src_address: str, src_port: int, dst_address: str, dst_port: int):
+        self.data = data
+        self.src_address = src_address
+        self.src_port = src_port
+        self.dst_address = dst_address
+        self.dst_port = dst_port
+
+    def __repr__(self) -> str:
+        route = _peer_text(self.src_address, self.src_port) + " -> " + _peer_text(self.dst_address, self.dst_port)
+        return "Datagram(" + route + ", " + self.data.hex() + ")"
+
+
+class NetStats(object):
+    """Counters of a MemNet (see MemNet.stats())
+
+    sent: datagrams sent into the network.
+    delivered: datagrams handed to an endpoint, copies included.
+    unroutable: datagrams, copies included, for an address and port that no
+        endpoint is bound to; they are dropped.
+    oversize: datagrams longer than MAX_DATAGRAM; they are dropped.
+    dropped, corrupted, spoofed, duplicated, reordered, delayed: datagrams
+        that drop_first_n or drop_every_nth dropped, that were corrupted,
+        that got a forged copy, that were duplicated, that were overtaken by
+        a later datagram, and that were delayed (copies included).
+    """
+    sent: int
+    delivered: int
+    unroutable: int
+    oversize: int
+    dropped: int
+    corrupted: int
+    spoofed: int
+    duplicated: int
+    reordered: int
+    delayed: int
+
+    def __init__(self, sent: int, delivered: int, unroutable: int, oversize: int, dropped: int,
+                 corrupted: int, spoofed: int, duplicated: int, reordered: int, delayed: int):
+        self.sent = sent
+        self.delivered = delivered
+        self.unroutable = unroutable
+        self.oversize = oversize
+        self.dropped = dropped
+        self.corrupted = corrupted
+        self.spoofed = spoofed
+        self.duplicated = duplicated
+        self.reordered = reordered
+        self.delayed = delayed
+
+    def __repr__(self) -> str:
+        counts = [("sent", self.sent), ("delivered", self.delivered), ("unroutable", self.unroutable),
+                  ("oversize", self.oversize), ("dropped", self.dropped), ("corrupted", self.corrupted),
+                  ("spoofed", self.spoofed), ("duplicated", self.duplicated), ("reordered", self.reordered),
+                  ("delayed", self.delayed)]
+        return "NetStats(" + ", ".join([c.0 + "=" + str(c.1) for c in counts]) + ")"
+
+
+class _Binding(object):
+    # An endpoint bound to an address and port; token tells bindings of the
+    # same address and port apart, so a late release cannot remove a new one
+    ep: _MemEndpoint
+    token: int
+
+    def __init__(self, ep: _MemEndpoint, token: int):
+        self.ep = ep
+        self.token = token
+
+
+def _forged_port(port: int) -> int:
+    return port + 1 if port < 65535 else 1
+
+
+actor MemNet(faults: ?NetFaults=None):
+    """A deterministic in-process datagram network with fault injection
+
+    Endpoints are bound to an address and a port 1..65535. An address is any
+    non-empty text, typically an IP address; it is not resolved or
+    normalized. Get endpoints with client() and server(), or both at once
+    with mem_pair().
+
+    A datagram is delivered to the endpoint bound to its destination.
+    Datagrams for an address and port that no endpoint is bound to are
+    dropped, and a client endpoint that sent one gets a REFUSED error, as a
+    connected UDP socket does for ICMP port unreachable. Datagrams longer
+    than MAX_DATAGRAM are dropped, with a non-fatal error to a client
+    sender. Without faults every datagram is delivered once, and those from
+    one sender in the order they were sent.
+
+    faults (see NetFaults) apply to every datagram sent afterwards;
+    set_faults() replaces them. stats() and history() tell what happened.
+    """
+    var _faults: ?NetFaults = faults
+    var _bindings: dict[(str, int), _Binding] = {}
+    var _next_token = 1
+    var _next_port = _EPHEMERAL_FIRST
+    var _history: list[Datagram] = []
+    var _numbered = 0
+    var _held: ?list[(Datagram, bool)] = None
+    var _hold_seq = 0
+    var _delay_queue: list[(int, list[(Datagram, bool)])] = []
+    var _delay_seq = 0
+    var _sent = 0
+    var _delivered = 0
+    var _unroutable = 0
+    var _oversize = 0
+    var _dropped = 0
+    var _corrupted = 0
+    var _spoofed = 0
+    var _duplicated = 0
+    var _reordered = 0
+    var _delayed = 0
+
+    proc def _bind(address: str, port: int) -> (int, int):
+        # Pick the port (a free ephemeral one for 0) and a token; raise ValueError if not possible
+        if address == "":
+            raise ValueError("MemNet address must not be empty")
+        if port < 0 or port > 65535:
+            raise ValueError("MemNet port %d is outside 0..65535" % port)
+        token = _next_token
+        _next_token += 1
+        if port != 0:
+            if (address, port) in _bindings:
+                raise ValueError("MemNet address " + _peer_text(address, port) + " is in use")
+            return (port, token)
+        for _ in range(_EPHEMERAL_COUNT):
+            p = _next_port
+            _next_port = p + 1 if p < 65535 else _EPHEMERAL_FIRST
+            if (address, p) not in _bindings:
+                return (p, token)
+        raise ValueError("MemNet address " + address + " has no free port")
+
+    def client(address: str, port: int, peer_address: str, peer_port: int) -> Transport:
+        """Return a Transport bound to address and port that sends to peer_address and peer_port
+
+        port 0 picks a free port from 49152 up. The transport receives every
+        datagram addressed to it, whatever its source (unlike a connected UDP
+        socket), so that the owner's source checks can be tested. Raises
+        ValueError for an empty address, a port outside 0..65535 (peer_port:
+        1..65535) or an address and port that is in use; the caller sees it
+        because using the result makes the call synchronous.
+        """
+        if peer_port <= 0 or peer_port > 65535:
+            raise ValueError("MemNet peer port %d is outside 1..65535" % peer_port)
+        p, token = _bind(address, port)
+        ep = _MemEndpoint(self, address, p, token, peer_address, peer_port)
+        _bindings[(address, p)] = _Binding(ep, token)
+        return _mem_client_transport(ep)
+
+    def server(address: str, port: int) -> ServerTransport:
+        """Return a ServerTransport bound to address and port
+
+        port 0 picks a free port from 49152 up; local_port() tells which.
+        Raises ValueError for an empty address, a port outside 0..65535 or an
+        address and port that is in use (see client()).
+        """
+        p, token = _bind(address, port)
+        ep = _MemEndpoint(self, address, p, token, "", 0)
+        _bindings[(address, p)] = _Binding(ep, token)
+        return _mem_server_transport(ep, p)
+
+    def send(data: bytes, src_address: str, src_port: int, dst_address: str, dst_port: int) -> None:
+        """Send a datagram into the network as if from src_address and src_port
+
+        The endpoints send through this. A test can use it to inject a
+        datagram from any source, bound or not.
+        """
+        _sent += 1
+        d = Datagram(data, src_address, src_port, dst_address, dst_port)
+        _history.append(d)
+        if len(data) > MAX_DATAGRAM:
+            _oversize += 1
+            _error_to(src_address, src_port, "Failed to send UDP datagram: message too long")
+            return
+        f = _faults
+        if f is not None:
+            if f.matches(dst_address, dst_port):
+                _apply(f, d)
+                return
+        _deliver(d, True)
+
+    def release(address: str, port: int, token: int) -> None:
+        """Unbind an endpoint; endpoints call this when they are closed"""
+        b = _bindings.get((address, port))
+        if b is not None:
+            if b.token == token:
+                del _bindings[(address, port)]
+
+    def set_faults(faults: ?NetFaults) -> None:
+        """Replace the faults (None: no faults)
+
+        Datagrams that delay or reorder holds back are delivered at once, in
+        order, and the numbering of datagrams restarts at 1.
+        """
+        _release_delayed(_delay_seq)
+        held = _held
+        if held is not None:
+            _held = None
+            _deliver_all(held)
+        _faults = faults
+        _numbered = 0
+
+    def stats() -> NetStats:
+        """Return a snapshot of the counters"""
+        return NetStats(_sent, _delivered, _unroutable, _oversize, _dropped,
+                        _corrupted, _spoofed, _duplicated, _reordered, _delayed)
+
+    def history() -> list[Datagram]:
+        """Return every datagram sent so far, in order, as it was sent (before faults)"""
+        return _history.copy()
+
+    proc def _error_to(address: str, port: int, message: str) -> None:
+        b = _bindings.get((address, port))
+        if b is not None:
+            b.ep.deliver_error(message)
+
+    proc def _deliver(d: Datagram, genuine: bool) -> None:
+        b = _bindings.get((d.dst_address, d.dst_port))
+        if b is not None:
+            _delivered += 1
+            b.ep.deliver(d.data, d.src_address, d.src_port)
+        else:
+            _unroutable += 1
+            if genuine:
+                _error_to(d.src_address, d.src_port, REFUSED)
+
+    def _deliver_all(unit: list[(Datagram, bool)]) -> None:
+        for u in unit:
+            _deliver(u.0, u.1)
+
+    def _release_delayed(seq: int) -> None:
+        # Deliver the delayed datagrams up to number seq. Every timer releases
+        # all those queued before its own as well, so that the order holds
+        # even when timers that are due at the same time fire in any order.
+        while len(_delay_queue) > 0 and _delay_queue[0].0 <= seq:
+            entry = _delay_queue.pop(0)
+            _deliver_all(entry.1)
+
+    proc def _schedule(unit: list[(Datagram, bool)], delay: float) -> None:
+        if delay > 0.0:
+            _delayed += len(unit)
+            _delay_seq += 1
+            _delay_queue.append((_delay_seq, unit))
+            after now delay: _release_delayed(_delay_seq)
+        else:
+            _deliver_all(unit)
+
+    def _release_held(seq: int, delay: float) -> None:
+        held = _held
+        if held is not None:
+            if seq == _hold_seq:
+                _held = None
+                _schedule(held, delay)
+
+    proc def _apply(f: NetFaults, d: Datagram) -> None:
+        _numbered += 1
+        n = _numbered
+        if n <= f.drop_first_n or (f.drop_every_nth > 0 and n % f.drop_every_nth == 0):
+            _dropped += 1
+            return
+        data = d.data
+        i = f.corrupt_byte
+        if i >= 0 and i < len(data):
+            data = data[:i] + ber.BYTE_TABLE[data[i] ^ 0xff] + data[i + 1:]
+            _corrupted += 1
+        genuine = Datagram(data, d.src_address, d.src_port, d.dst_address, d.dst_port)
+        unit: list[(Datagram, bool)] = []
+        if f.spoof_source:
+            _spoofed += 1
+            unit.append((Datagram(data, d.src_address, _forged_port(d.src_port), d.dst_address, d.dst_port), False))
+        unit.append((genuine, True))
+        if f.duplicate:
+            _duplicated += 1
+            unit.append((genuine, True))
+        if not f.reorder:
+            _schedule(unit, f.delay)
+            return
+        held = _held
+        if held is not None:
+            _held = None
+            _reordered += 1
+            _schedule(unit + held, f.delay)
+            return
+        _held = unit
+        _hold_seq += 1
+        after now REORDER_HOLD: _release_held(_hold_seq, f.delay)
+
+
+actor _MemEndpoint(network: MemNet, address: str, port: int, token: int, peer_address: str, peer_port: int):
+    # One endpoint of a MemNet: a client (send to the peer, errors reported)
+    # or a server (send_to anyone, peer_port 0)
+    var _closed = False
+    var _inbox = _Inbox()
+    var _on_error: ?action(str, bool) -> None = None
+
+    def send(data: bytes) -> None:
+        if not _closed:
+            network.send(data, address, port, peer_address, peer_port)
+
+    def send_to(data: bytes, dst_address: str, dst_port: int) -> None:
+        if not _closed:
+            network.send(data, address, port, dst_address, dst_port)
+
+    def set_receiver(on_data: action(bytes, str, int) -> None, on_error: action(str, bool) -> None) -> None:
+        if not _closed:
+            _on_error = on_error
+            _inbox.register(on_data)
+
+    def set_data_receiver(on_data: action(bytes, str, int) -> None) -> None:
+        if not _closed:
+            _inbox.register(on_data)
+
+    def close() -> None:
+        if _closed:
+            return
+        _closed = True
+        _on_error = None
+        _inbox.clear()
+        network.release(address, port, token)
+
+    def deliver(data: bytes, src_address: str, src_port: int) -> None:
+        if not _closed:
+            _inbox.put(data, src_address, src_port)
+
+    def deliver_error(message: str) -> None:
+        on_error = _on_error
+        if on_error is not None:
+            on_error(message, False)
+
+
+def _mem_client_transport(ep: _MemEndpoint) -> Transport:
+    # Built at module level like _udp_server_transport()
+    def _send(data: bytes) -> None:
+        ep.send(data)
+    def _set_receiver(on_data: action(bytes, str, int) -> None, on_error: action(str, bool) -> None) -> None:
+        ep.set_receiver(on_data, on_error)
+    def _close() -> None:
+        ep.close()
+    return Transport(_send, _set_receiver, _close)
+
+def _mem_server_transport(ep: _MemEndpoint, local_port: int) -> ServerTransport:
+    def _send_to(data: bytes, dst_address: str, dst_port: int) -> None:
+        ep.send_to(data, dst_address, dst_port)
+    def _set_receiver(on_data: action(bytes, str, int) -> None) -> None:
+        ep.set_data_receiver(on_data)
+    def _close() -> None:
+        ep.close()
+    return ServerTransport(_send_to, _set_receiver, _close, lambda: local_port)
+
+
+def mem_pair(network: MemNet, client_addr: str="10.0.0.2", client_port: int=40000,
+             server_addr: str="10.0.0.1", server_port: int=161) -> (client: Transport, server: ServerTransport):
+    """Return a client Transport and a ServerTransport on network that talk to each other
+
+    The server is bound first (port 0 picks a free port), then the client,
+    which sends to the server. Raises ValueError like MemNet.client() and
+    MemNet.server().
+    """
+    server = network.server(server_addr, server_port)
+    client = network.client(client_addr, client_port, server_addr, server.local_port())
+    return (client=client, server=server)
