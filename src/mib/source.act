@@ -1,0 +1,2324 @@
+"""MIB sources: lenient text decoding, module-header scanning, the MIB search path and the
+embedded base modules.
+
+`decode_lenient` decodes UTF-8 and maps undecodable bytes through CP1252. `scan_headers`
+finds every `NAME DEFINITIONS ::= BEGIN` in a file, with each module's byte extent, final
+END, raw LAST-UPDATED and sha256; it works on lexer tokens, so comments and strings never
+produce false headers. Several modules per file and junk around them are fine.
+
+`MibPath` is an ordered list of directories plus pins and aliases. The first directory that
+contains a module wins; within one directory the newest LAST-UPDATED wins, then the lowest
+path. A pin (module name -> file) overrides both. The base modules in `BASE_MODULES`
+(SNMPv2-SMI, SNMPv2-TC, SNMPv2-CONF, RFC1155-SMI, RFC-1212, RFC-1215) are embedded and win
+over files of the same name, so they resolve even when the search path has broken copies.
+
+File access needs a `file.FileCap`; the functions that read files are `proc`s. Everything
+else is pure and can be tested on in-memory bytes (`MibPath.add_file`).
+"""
+
+import file
+import mib.diag
+import mib.lexer
+import usmcrypto
+
+# --- text decoding --------------------------------------------------------------------------
+
+# CP1252 code points for 0x80..0x9F; 0 marks the five undefined slots (Latin-1 is used there).
+CP1252_HIGH: list[int] = [
+    0x20AC, 0, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,
+    0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0, 0x017D, 0,
+    0, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
+    0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0, 0x017E, 0x0178,
+]
+
+
+def cp1252_char(c: int) -> str:
+    """The character for byte `c` (0..255) in CP1252, falling back to Latin-1 for the undefined slots."""
+    if c >= 0x80 and c < 0xa0:
+        u = CP1252_HIGH[c - 0x80]
+        if u != 0:
+            return chr(u)
+    return chr(c)
+
+
+def _utf8_len(c: int) -> int:
+    if c >= 0xc2 and c < 0xe0:
+        return 2
+    if c >= 0xe0 and c < 0xf0:
+        return 3
+    if c >= 0xf0 and c < 0xf5:
+        return 4
+    return 0
+
+
+def is_ascii(b: bytes) -> bool:
+    """True when every byte is < 0x80."""
+    for c in b:
+        if c >= 0x80:
+            return False
+    return True
+
+
+def is_utf8(b: bytes) -> bool:
+    """True when `b` is valid UTF-8."""
+    try:
+        b.decode()
+        return True
+    except ValueError:
+        return False
+
+
+def decode_lenient(b: bytes) -> str:
+    """Decode bytes as UTF-8; every byte that is not part of a valid UTF-8 sequence is mapped
+    through CP1252. Never raises."""
+    try:
+        return b.decode()
+    except ValueError:
+        pass
+    out: list[str] = []
+    n = len(b)
+    i = 0
+    run = 0
+    while i < n:
+        c = b[i]
+        if c < 0x80:
+            i += 1
+            continue
+        if run < i:
+            out.append(b[run:i].decode())
+        ln = _utf8_len(c)
+        done = False
+        if ln > 0 and i + ln <= n:
+            ok = True
+            for j in range(1, ln):
+                if (b[i + j] & 0xc0) != 0x80:
+                    ok = False
+            if ok:
+                try:
+                    out.append(b[i:i + ln].decode())
+                    i += ln
+                    done = True
+                except ValueError:
+                    pass
+        if not done:
+            out.append(cp1252_char(c))
+            i += 1
+        run = i
+    if run < n:
+        out.append(b[run:n].decode())
+    return "".join(out)
+
+
+# --- dates ------------------------------------------------------------------------------------
+
+def _digits(s: str) -> bool:
+    if s == "":
+        return False
+    for ch in s:
+        if ch < "0" or ch > "9":
+            return False
+    return True
+
+
+def date_key(raw: str) -> str:
+    """Normalise an SMI ExtUTCTime (`YYMMDDHHMMZ` / `YYYYMMDDHHMMZ`) to `YYYYMMDDHHMM`, or ""
+    when it is not a valid date.
+
+    A lowercase or missing `Z` and `YYYY-MM-DD` dates are accepted. A 2-digit year means 19YY,
+    or 20YY when 19YY would be before 1988.
+    """
+    s = raw.strip()
+    if s.endswith("Z") or s.endswith("z"):
+        s = s[:len(s) - 1]
+    if len(s) == 10 and s[4] == "-" and s[7] == "-":
+        s = s[0:4] + s[5:7] + s[8:10] + "0000"
+    if not _digits(s):
+        return ""
+    if len(s) == 10:
+        yy = int(s[0:2])
+        y = 1900 + yy
+        if y < 1988:
+            y = 2000 + yy
+        s = str(y) + s[2:]
+    if len(s) != 12:
+        return ""
+    mo = int(s[4:6])
+    d = int(s[6:8])
+    hh = int(s[8:10])
+    mi = int(s[10:12])
+    if mo < 1 or mo > 12 or d < 1 or d > 31 or hh > 23 or mi > 59:
+        return ""
+    return s
+
+
+# --- module headers ---------------------------------------------------------------------------
+
+class ModuleHeader(object):
+    """One `NAME DEFINITIONS ::= BEGIN` found in a file.
+
+    Byte extent `[start, end)` follows interop/mibs/index.py, so `sha256` matches the corpus
+    index: the first module starts at offset 0, a later one at the start of its header line;
+    the last module ends at the end of the file, an earlier one after its last END.
+    Token indexes refer to the token list the header was found in: `name_tok` is the module
+    name, `body_tok` the first token after BEGIN, `end_tok` the module's final END (-1 if it
+    has none) and `stop_tok` the first token that belongs to the next module (or the EOF token).
+    """
+    name: str
+    line: int
+    col: int
+    start: int
+    end: int
+    name_tok: int
+    body_tok: int
+    end_tok: int
+    stop_tok: int
+    pib: bool
+    last_updated: str
+    sha256: str
+
+    def __init__(self, name: str, line: int, col: int, name_tok: int, body_tok: int, pib: bool):
+        self.name = name
+        self.line = line
+        self.col = col
+        self.start = 0
+        self.end = 0
+        self.name_tok = name_tok
+        self.body_tok = body_tok
+        self.end_tok = -1
+        self.stop_tok = body_tok
+        self.pib = pib
+        self.last_updated = ""
+        self.sha256 = ""
+
+    def __repr__(self) -> str:
+        return "ModuleHeader(" + self.name + " line " + str(self.line) + ")"
+
+
+def header_at(toks: list[mib.lexer.Token], j: int) -> int:
+    """If a module header starts at token j, return the index of the first token after its
+    BEGIN, else -1. Accepts `NAME [module-oid] [PIB-]DEFINITIONS [IMPLICIT|EXPLICIT|AUTOMATIC
+    TAGS] ::= BEGIN` where NAME is an identifier of either case."""
+    n = len(toks)
+    if j >= n or not mib.lexer.is_ident(toks[j].kind):
+        return -1
+    k = j + 1
+    if k < n and toks[k].kind == mib.lexer.P_LBRACE:
+        depth = 0
+        while k < n:
+            kk = toks[k].kind
+            if kk == mib.lexer.P_LBRACE:
+                depth += 1
+            elif kk == mib.lexer.P_RBRACE:
+                depth -= 1
+                if depth == 0:
+                    k += 1
+                    break
+            elif kk == mib.lexer.K_EOF or kk == mib.lexer.K_ASSIGN:
+                return -1
+            k += 1
+    if k >= n:
+        return -1
+    kd = toks[k].kind
+    if kd != mib.lexer.KW_DEFINITIONS and kd != mib.lexer.KW_PIB_DEFINITIONS:
+        return -1
+    k += 1
+    if k + 1 < n and toks[k].kind == mib.lexer.K_UIDENT and toks[k + 1].kind == mib.lexer.K_UIDENT:
+        k += 2      # IMPLICIT TAGS / EXPLICIT TAGS / AUTOMATIC TAGS (IMPLICIT is a keyword)
+    elif k + 1 < n and toks[k].kind == mib.lexer.KW_IMPLICIT and toks[k + 1].kind == mib.lexer.K_UIDENT:
+        k += 2
+    if k + 1 < n and toks[k].kind == mib.lexer.K_ASSIGN and toks[k + 1].kind == mib.lexer.KW_BEGIN:
+        return k + 2
+    return -1
+
+
+def _line_start(data: bytes, off: int) -> int:
+    """Offset of the start of the line containing `off`, if only blanks precede `off` on it; else off."""
+    j = off
+    while j > 0:
+        c = data[j - 1]
+        if c == 10 or c == 13:
+            return j
+        if c != 32 and c != 9 and c != 12:
+            return off
+        j -= 1
+    return 0
+
+
+def string_value(data: bytes, t: mib.lexer.Token) -> bytes:
+    """The content of a K_STR token without its quotes, with doubled quotes unescaped."""
+    s = t.start + 1
+    e = t.end - 1 if (t.end - t.start >= 2 and data[t.end - 1] == 34) else t.end
+    if e < s:
+        e = s
+    raw = data[s:e]
+    if (t.flags & mib.lexer.F_ESCAPED_QUOTE) != 0:
+        return raw.replace(b"\"\"", b"\"")
+    return raw
+
+
+def find_headers(data: bytes, toks: list[mib.lexer.Token]) -> list[ModuleHeader]:
+    """All module headers in a token list, with extents, END tokens and LAST-UPDATED (no hashes)."""
+    hs: list[ModuleHeader] = []
+    n = len(toks)
+    j = 0
+    while j < n:
+        k = toks[j].kind
+        if k == mib.lexer.K_UIDENT or k == mib.lexer.K_LIDENT:
+            b = header_at(toks, j)
+            if b >= 0:
+                t = toks[j]
+                pib = False
+                for q in range(j + 1, b):
+                    if toks[q].kind == mib.lexer.KW_PIB_DEFINITIONS:
+                        pib = True
+                hs.append(ModuleHeader(mib.lexer.text(data, t), t.line, t.col, j, b, pib))
+                j = b
+                continue
+        j += 1
+    nd = len(data)
+    for i, h in enumerate(hs):
+        h.stop_tok = hs[i + 1].name_tok if i + 1 < len(hs) else n - 1
+        h.start = 0 if i == 0 else _line_start(data, toks[h.name_tok].start)
+        last_end = -1
+        lu = -1
+        for q in range(h.body_tok, h.stop_tok):
+            kq = toks[q].kind
+            if kq == mib.lexer.KW_END:
+                last_end = q
+            elif kq == mib.lexer.KW_LAST_UPDATED and lu < 0 and q + 1 < n and toks[q + 1].kind == mib.lexer.K_STR:
+                lu = q + 1
+        h.end_tok = last_end
+        if i + 1 < len(hs):
+            h.end = toks[last_end].end if last_end >= 0 else _line_start(data, toks[hs[i + 1].name_tok].start)
+        else:
+            h.end = nd
+        if lu >= 0:
+            h.last_updated = decode_lenient(string_value(data, toks[lu])).strip()
+    return hs
+
+
+def sha256_hex(b: bytes) -> str:
+    """Lowercase hex SHA-256 of `b` (the content-index hash)."""
+    return usmcrypto.hash(usmcrypto.HASH_SHA256, b).hex()
+
+
+def scan_headers(data: bytes, with_hash: bool = True) -> list[ModuleHeader]:
+    """Lex `data` and return its module headers (see `ModuleHeader`), with sha256 of each
+    module's text when `with_hash`."""
+    d = mib.diag.Diagnostics("", 0)
+    toks = mib.lexer.lex(data, d)
+    hs = find_headers(data, toks)
+    if with_hash:
+        for h in hs:
+            h.sha256 = sha256_hex(data[h.start:h.end])
+    return hs
+
+
+# --- aliases and base modules ----------------------------------------------------------------
+
+# Names that always stand for another module (typos, RFC-number names, Cisco's SMIv1
+# down-conversions of the base modules), whether or not a file of that name exists.
+ALWAYS_ALIASES: dict[str, str] = {
+    "SNMPv2-SMI-v1": "SNMPv2-SMI",
+    "SNMPv2-TC-v1": "SNMPv2-TC",
+    "RFC-1213": "RFC1213-MIB",
+    "RFC1213": "RFC1213-MIB",
+    "RFC1212": "RFC-1212",
+    "RFC1212-CONCISE-MIB": "RFC-1212",
+    "RFC1212-MIB": "RFC-1212",
+    "RFC1215": "RFC-1215",
+    "RFC1215-DEFINING-TRAPS": "RFC-1215",
+    "RFC-1155-SMI": "RFC1155-SMI",
+    "RFC-1155": "RFC1155-SMI",
+    "RFC1065-SMI": "RFC1155-SMI",
+    "RFC-1158": "RFC1158-MIB",
+    "RFC1158-MIB-II": "RFC1158-MIB",
+    "RFC1903-MIB": "SNMPv2-TC",
+    "SNMOv2-CONF": "SNMPv2-CONF",
+    "RFC-1512": "FDDI-SMT73-MIB",
+    "RFC1493-MIB": "BRIDGE-MIB",
+    "RFC-1493": "BRIDGE-MIB",
+    "RFC1285": "RFC1285-MIB",
+    "RFC1286": "RFC1286-MIB",
+}
+
+# net-snmp's module_map: obsolete module names that are replaced only when no module of
+# that name is found in the search path.
+FALLBACK_ALIASES: dict[str, str] = {
+    "RFC1066-MIB": "RFC1156-MIB",
+    "RFC1156-MIB": "RFC1158-MIB",
+    "RFC1158-MIB": "RFC1213-MIB",
+    "RFC1231-MIB": "TOKENRING-MIB",
+    "RFC1271-MIB": "RMON-MIB",
+    "RFC1286-MIB": "BRIDGE-MIB",
+    "RFC1315-MIB": "FRAME-RELAY-DTE-MIB",
+    "RFC1316-MIB": "CHARACTER-MIB",
+    "RFC1406-MIB": "DS1-MIB",
+}
+
+# --- embedded base modules ------------------------------------------------------------------
+# Verbatim from interop/mibs/golden/mibs (IETF texts; RFC-1215 from net-snmp).
+
+SNMPV2_SMI_TEXT = r"""SNMPv2-SMI DEFINITIONS ::= BEGIN
+
+-- the path to the root
+
+org            OBJECT IDENTIFIER ::= { iso 3 }  --  "iso" = 1
+dod            OBJECT IDENTIFIER ::= { org 6 }
+internet       OBJECT IDENTIFIER ::= { dod 1 }
+
+directory      OBJECT IDENTIFIER ::= { internet 1 }
+
+mgmt           OBJECT IDENTIFIER ::= { internet 2 }
+mib-2          OBJECT IDENTIFIER ::= { mgmt 1 }
+transmission   OBJECT IDENTIFIER ::= { mib-2 10 }
+
+experimental   OBJECT IDENTIFIER ::= { internet 3 }
+
+private        OBJECT IDENTIFIER ::= { internet 4 }
+enterprises    OBJECT IDENTIFIER ::= { private 1 }
+
+security       OBJECT IDENTIFIER ::= { internet 5 }
+
+snmpV2         OBJECT IDENTIFIER ::= { internet 6 }
+
+-- transport domains
+snmpDomains    OBJECT IDENTIFIER ::= { snmpV2 1 }
+
+-- transport proxies
+snmpProxys     OBJECT IDENTIFIER ::= { snmpV2 2 }
+
+-- module identities
+snmpModules    OBJECT IDENTIFIER ::= { snmpV2 3 }
+
+-- Extended UTCTime, to allow dates with four-digit years
+-- (Note that this definition of ExtUTCTime is not to be IMPORTed
+--  by MIB modules.)
+ExtUTCTime ::= OCTET STRING(SIZE(11 | 13))
+    -- format is YYMMDDHHMMZ or YYYYMMDDHHMMZ
+
+    --   where: YY   - last two digits of year (only years
+    --                 between 1900-1999)
+    --          YYYY - last four digits of the year (any year)
+    --          MM   - month (01 through 12)
+    --          DD   - day of month (01 through 31)
+    --          HH   - hours (00 through 23)
+    --          MM   - minutes (00 through 59)
+    --          Z    - denotes GMT (the ASCII character Z)
+    --
+    -- For example, "9502192015Z" and "199502192015Z" represent
+    -- 8:15pm GMT on 19 February 1995. Years after 1999 must use
+    -- the four digit year format. Years 1900-1999 may use the
+    -- two or four digit format.
+
+-- definitions for information modules
+
+MODULE-IDENTITY MACRO ::=
+BEGIN
+    TYPE NOTATION ::=
+                  "LAST-UPDATED" value(Update ExtUTCTime)
+                  "ORGANIZATION" Text
+                  "CONTACT-INFO" Text
+                  "DESCRIPTION" Text
+                  RevisionPart
+
+    VALUE NOTATION ::=
+                  value(VALUE OBJECT IDENTIFIER)
+
+    RevisionPart ::=
+                  Revisions
+                | empty
+    Revisions ::=
+                  Revision
+                | Revisions Revision
+    Revision ::=
+                  "REVISION" value(Update ExtUTCTime)
+                  "DESCRIPTION" Text
+
+    -- a character string as defined in section 3.1.1
+    Text ::= value(IA5String)
+END
+
+OBJECT-IDENTITY MACRO ::=
+BEGIN
+    TYPE NOTATION ::=
+                  "STATUS" Status
+                  "DESCRIPTION" Text
+
+                  ReferPart
+
+    VALUE NOTATION ::=
+                  value(VALUE OBJECT IDENTIFIER)
+
+    Status ::=
+                  "current"
+                | "deprecated"
+                | "obsolete"
+
+    ReferPart ::=
+                  "REFERENCE" Text
+                | empty
+
+    -- a character string as defined in section 3.1.1
+    Text ::= value(IA5String)
+END
+
+-- names of objects
+-- (Note that these definitions of ObjectName and NotificationName
+--  are not to be IMPORTed by MIB modules.)
+
+ObjectName ::=
+    OBJECT IDENTIFIER
+
+NotificationName ::=
+    OBJECT IDENTIFIER
+
+-- syntax of objects
+
+-- the "base types" defined here are:
+--   3 built-in ASN.1 types: INTEGER, OCTET STRING, OBJECT IDENTIFIER
+--   8 application-defined types: Integer32, IpAddress, Counter32,
+--              Gauge32, Unsigned32, TimeTicks, Opaque, and Counter64
+
+ObjectSyntax ::=
+    CHOICE {
+        simple
+            SimpleSyntax,
+          -- note that SEQUENCEs for conceptual tables and
+          -- rows are not mentioned here...
+
+        application-wide
+            ApplicationSyntax
+    }
+
+-- built-in ASN.1 types
+
+SimpleSyntax ::=
+    CHOICE {
+        -- INTEGERs with a more restrictive range
+        -- may also be used
+        integer-value               -- includes Integer32
+            INTEGER (-2147483648..2147483647),
+        -- OCTET STRINGs with a more restrictive size
+        -- may also be used
+        string-value
+            OCTET STRING (SIZE (0..65535)),
+        objectID-value
+            OBJECT IDENTIFIER
+    }
+
+-- indistinguishable from INTEGER, but never needs more than
+-- 32-bits for a two's complement representation
+Integer32 ::=
+        INTEGER (-2147483648..2147483647)
+
+-- application-wide types
+
+ApplicationSyntax ::=
+    CHOICE {
+        ipAddress-value
+            IpAddress,
+        counter-value
+            Counter32,
+        timeticks-value
+            TimeTicks,
+        arbitrary-value
+            Opaque,
+        big-counter-value
+            Counter64,
+        unsigned-integer-value  -- includes Gauge32
+            Unsigned32
+    }
+
+-- in network-byte order
+
+-- (this is a tagged type for historical reasons)
+IpAddress ::=
+    [APPLICATION 0]
+        IMPLICIT OCTET STRING (SIZE (4))
+
+-- this wraps
+Counter32 ::=
+    [APPLICATION 1]
+        IMPLICIT INTEGER (0..4294967295)
+
+-- this doesn't wrap
+Gauge32 ::=
+    [APPLICATION 2]
+        IMPLICIT INTEGER (0..4294967295)
+
+-- an unsigned 32-bit quantity
+-- indistinguishable from Gauge32
+Unsigned32 ::=
+    [APPLICATION 2]
+        IMPLICIT INTEGER (0..4294967295)
+
+-- hundredths of seconds since an epoch
+TimeTicks ::=
+    [APPLICATION 3]
+        IMPLICIT INTEGER (0..4294967295)
+
+-- for backward-compatibility only
+Opaque ::=
+    [APPLICATION 4]
+        IMPLICIT OCTET STRING
+
+-- for counters that wrap in less than one hour with only 32 bits
+Counter64 ::=
+    [APPLICATION 6]
+        IMPLICIT INTEGER (0..18446744073709551615)
+
+-- definition for objects
+
+OBJECT-TYPE MACRO ::=
+BEGIN
+    TYPE NOTATION ::=
+                  "SYNTAX" Syntax
+                  UnitsPart
+                  "MAX-ACCESS" Access
+                  "STATUS" Status
+                  "DESCRIPTION" Text
+                  ReferPart
+
+                  IndexPart
+                  DefValPart
+
+    VALUE NOTATION ::=
+                  value(VALUE ObjectName)
+
+    Syntax ::=   -- Must be one of the following:
+                       -- a base type (or its refinement),
+                       -- a textual convention (or its refinement), or
+                       -- a BITS pseudo-type
+                   type
+                | "BITS" "{" NamedBits "}"
+
+    NamedBits ::= NamedBit
+                | NamedBits "," NamedBit
+
+    NamedBit ::=  identifier "(" number ")" -- number is nonnegative
+
+    UnitsPart ::=
+                  "UNITS" Text
+                | empty
+
+    Access ::=
+                  "not-accessible"
+                | "accessible-for-notify"
+                | "read-only"
+                | "read-write"
+                | "read-create"
+
+    Status ::=
+                  "current"
+                | "deprecated"
+                | "obsolete"
+
+    ReferPart ::=
+                  "REFERENCE" Text
+                | empty
+
+    IndexPart ::=
+                  "INDEX"    "{" IndexTypes "}"
+                | "AUGMENTS" "{" Entry      "}"
+                | empty
+    IndexTypes ::=
+                  IndexType
+                | IndexTypes "," IndexType
+    IndexType ::=
+                  "IMPLIED" Index
+                | Index
+
+    Index ::=
+                    -- use the SYNTAX value of the
+                    -- correspondent OBJECT-TYPE invocation
+                  value(ObjectName)
+    Entry ::=
+                    -- use the INDEX value of the
+                    -- correspondent OBJECT-TYPE invocation
+                  value(ObjectName)
+
+    DefValPart ::= "DEFVAL" "{" Defvalue "}"
+                | empty
+
+    Defvalue ::=  -- must be valid for the type specified in
+                  -- SYNTAX clause of same OBJECT-TYPE macro
+                  value(ObjectSyntax)
+                | "{" BitsValue "}"
+
+    BitsValue ::= BitNames
+                | empty
+
+    BitNames ::=  BitName
+                | BitNames "," BitName
+
+    BitName ::= identifier
+
+    -- a character string as defined in section 3.1.1
+    Text ::= value(IA5String)
+END
+
+-- definitions for notifications
+
+NOTIFICATION-TYPE MACRO ::=
+BEGIN
+    TYPE NOTATION ::=
+                  ObjectsPart
+                  "STATUS" Status
+                  "DESCRIPTION" Text
+                  ReferPart
+
+    VALUE NOTATION ::=
+                  value(VALUE NotificationName)
+
+    ObjectsPart ::=
+                  "OBJECTS" "{" Objects "}"
+                | empty
+    Objects ::=
+                  Object
+
+                | Objects "," Object
+    Object ::=
+                  value(ObjectName)
+
+    Status ::=
+                  "current"
+                | "deprecated"
+                | "obsolete"
+
+    ReferPart ::=
+                  "REFERENCE" Text
+                | empty
+
+    -- a character string as defined in section 3.1.1
+    Text ::= value(IA5String)
+END
+
+-- definitions of administrative identifiers
+
+zeroDotZero    OBJECT-IDENTITY
+    STATUS     current
+    DESCRIPTION
+            "A value used for null identifiers."
+    ::= { 0 0 }
+
+END
+"""
+
+SNMPV2_TC_TEXT = r"""SNMPv2-TC DEFINITIONS ::= BEGIN
+
+IMPORTS
+    TimeTicks         FROM SNMPv2-SMI;
+
+-- definition of textual conventions
+
+TEXTUAL-CONVENTION MACRO ::=
+
+BEGIN
+    TYPE NOTATION ::=
+                  DisplayPart
+                  "STATUS" Status
+                  "DESCRIPTION" Text
+                  ReferPart
+                  "SYNTAX" Syntax
+
+    VALUE NOTATION ::=
+                   value(VALUE Syntax)      -- adapted ASN.1
+
+    DisplayPart ::=
+                  "DISPLAY-HINT" Text
+                | empty
+
+    Status ::=
+                  "current"
+                | "deprecated"
+                | "obsolete"
+
+    ReferPart ::=
+                  "REFERENCE" Text
+                | empty
+
+    -- a character string as defined in [2]
+    Text ::= value(IA5String)
+
+    Syntax ::=   -- Must be one of the following:
+                       -- a base type (or its refinement), or
+                       -- a BITS pseudo-type
+                  type
+                | "BITS" "{" NamedBits "}"
+
+    NamedBits ::= NamedBit
+                | NamedBits "," NamedBit
+
+    NamedBit ::=  identifier "(" number ")" -- number is nonnegative
+
+END
+
+DisplayString ::= TEXTUAL-CONVENTION
+    DISPLAY-HINT "255a"
+    STATUS       current
+    DESCRIPTION
+            "Represents textual information taken from the NVT ASCII
+
+            character set, as defined in pages 4, 10-11 of RFC 854.
+
+            To summarize RFC 854, the NVT ASCII repertoire specifies:
+
+              - the use of character codes 0-127 (decimal)
+
+              - the graphics characters (32-126) are interpreted as
+                US ASCII
+
+              - NUL, LF, CR, BEL, BS, HT, VT and FF have the special
+                meanings specified in RFC 854
+
+              - the other 25 codes have no standard interpretation
+
+              - the sequence 'CR LF' means newline
+
+              - the sequence 'CR NUL' means carriage-return
+
+              - an 'LF' not preceded by a 'CR' means moving to the
+                same column on the next line.
+
+              - the sequence 'CR x' for any x other than LF or NUL is
+                illegal.  (Note that this also means that a string may
+                end with either 'CR LF' or 'CR NUL', but not with CR.)
+
+            Any object defined using this syntax may not exceed 255
+            characters in length."
+    SYNTAX       OCTET STRING (SIZE (0..255))
+
+PhysAddress ::= TEXTUAL-CONVENTION
+    DISPLAY-HINT "1x:"
+    STATUS       current
+    DESCRIPTION
+            "Represents media- or physical-level addresses."
+    SYNTAX       OCTET STRING
+
+MacAddress ::= TEXTUAL-CONVENTION
+    DISPLAY-HINT "1x:"
+    STATUS       current
+    DESCRIPTION
+            "Represents an 802 MAC address represented in the
+            `canonical' order defined by IEEE 802.1a, i.e., as if it
+            were transmitted least significant bit first, even though
+            802.5 (in contrast to other 802.x protocols) requires MAC
+            addresses to be transmitted most significant bit first."
+    SYNTAX       OCTET STRING (SIZE (6))
+
+TruthValue ::= TEXTUAL-CONVENTION
+    STATUS       current
+    DESCRIPTION
+            "Represents a boolean value."
+    SYNTAX       INTEGER { true(1), false(2) }
+
+TestAndIncr ::= TEXTUAL-CONVENTION
+    STATUS       current
+    DESCRIPTION
+            "Represents integer-valued information used for atomic
+            operations.  When the management protocol is used to specify
+            that an object instance having this syntax is to be
+            modified, the new value supplied via the management protocol
+            must precisely match the value presently held by the
+            instance.  If not, the management protocol set operation
+            fails with an error of `inconsistentValue'.  Otherwise, if
+            the current value is the maximum value of 2^31-1 (2147483647
+            decimal), then the value held by the instance is wrapped to
+            zero; otherwise, the value held by the instance is
+            incremented by one.  (Note that regardless of whether the
+            management protocol set operation succeeds, the variable-
+            binding in the request and response PDUs are identical.)
+
+            The value of the ACCESS clause for objects having this
+            syntax is either `read-write' or `read-create'.  When an
+            instance of a columnar object having this syntax is created,
+            any value may be supplied via the management protocol.
+
+            When the network management portion of the system is re-
+            initialized, the value of every object instance having this
+            syntax must either be incremented from its value prior to
+            the re-initialization, or (if the value prior to the re-
+            initialization is unknown) be set to a pseudo-randomly
+            generated value."
+    SYNTAX       INTEGER (0..2147483647)
+
+AutonomousType ::= TEXTUAL-CONVENTION
+    STATUS       current
+    DESCRIPTION
+            "Represents an independently extensible type identification
+            value.  It may, for example, indicate a particular sub-tree
+            with further MIB definitions, or define a particular type of
+            protocol or hardware."
+    SYNTAX       OBJECT IDENTIFIER
+
+InstancePointer ::= TEXTUAL-CONVENTION
+    STATUS       obsolete
+    DESCRIPTION
+            "A pointer to either a specific instance of a MIB object or
+            a conceptual row of a MIB table in the managed device.  In
+            the latter case, by convention, it is the name of the
+            particular instance of the first accessible columnar object
+            in the conceptual row.
+
+            The two uses of this textual convention are replaced by
+            VariablePointer and RowPointer, respectively."
+    SYNTAX       OBJECT IDENTIFIER
+
+VariablePointer ::= TEXTUAL-CONVENTION
+    STATUS       current
+    DESCRIPTION
+            "A pointer to a specific object instance.  For example,
+            sysContact.0 or ifInOctets.3."
+    SYNTAX       OBJECT IDENTIFIER
+
+RowPointer ::= TEXTUAL-CONVENTION
+    STATUS       current
+    DESCRIPTION
+            "Represents a pointer to a conceptual row.  The value is the
+            name of the instance of the first accessible columnar object
+            in the conceptual row.
+
+            For example, ifIndex.3 would point to the 3rd row in the
+            ifTable (note that if ifIndex were not-accessible, then
+            ifDescr.3 would be used instead)."
+    SYNTAX       OBJECT IDENTIFIER
+
+RowStatus ::= TEXTUAL-CONVENTION
+    STATUS       current
+    DESCRIPTION
+            "The RowStatus textual convention is used to manage the
+            creation and deletion of conceptual rows, and is used as the
+            value of the SYNTAX clause for the status column of a
+            conceptual row (as described in Section 7.7.1 of [2].)
+
+            The status column has six defined values:
+
+                 - `active', which indicates that the conceptual row is
+                 available for use by the managed device;
+
+                 - `notInService', which indicates that the conceptual
+                 row exists in the agent, but is unavailable for use by
+                 the managed device (see NOTE below); 'notInService' has
+                 no implication regarding the internal consistency of
+                 the row, availability of resources, or consistency with
+                 the current state of the managed device;
+
+                 - `notReady', which indicates that the conceptual row
+                 exists in the agent, but is missing information
+                 necessary in order to be available for use by the
+                 managed device (i.e., one or more required columns in
+                 the conceptual row have not been instanciated);
+
+                 - `createAndGo', which is supplied by a management
+                 station wishing to create a new instance of a
+                 conceptual row and to have its status automatically set
+                 to active, making it available for use by the managed
+                 device;
+
+                 - `createAndWait', which is supplied by a management
+                 station wishing to create a new instance of a
+                 conceptual row (but not make it available for use by
+                 the managed device); and,
+                 - `destroy', which is supplied by a management station
+                 wishing to delete all of the instances associated with
+                 an existing conceptual row.
+
+            Whereas five of the six values (all except `notReady') may
+            be specified in a management protocol set operation, only
+            three values will be returned in response to a management
+            protocol retrieval operation:  `notReady', `notInService' or
+            `active'.  That is, when queried, an existing conceptual row
+            has only three states:  it is either available for use by
+            the managed device (the status column has value `active');
+            it is not available for use by the managed device, though
+            the agent has sufficient information to attempt to make it
+            so (the status column has value `notInService'); or, it is
+            not available for use by the managed device, and an attempt
+            to make it so would fail because the agent has insufficient
+            information (the state column has value `notReady').
+
+                                     NOTE WELL
+
+                 This textual convention may be used for a MIB table,
+                 irrespective of whether the values of that table's
+                 conceptual rows are able to be modified while it is
+                 active, or whether its conceptual rows must be taken
+                 out of service in order to be modified.  That is, it is
+                 the responsibility of the DESCRIPTION clause of the
+                 status column to specify whether the status column must
+                 not be `active' in order for the value of some other
+                 column of the same conceptual row to be modified.  If
+                 such a specification is made, affected columns may be
+                 changed by an SNMP set PDU if the RowStatus would not
+                 be equal to `active' either immediately before or after
+                 processing the PDU.  In other words, if the PDU also
+                 contained a varbind that would change the RowStatus
+                 value, the column in question may be changed if the
+                 RowStatus was not equal to `active' as the PDU was
+                 received, or if the varbind sets the status to a value
+                 other than 'active'.
+
+            Also note that whenever any elements of a row exist, the
+            RowStatus column must also exist.
+
+            To summarize the effect of having a conceptual row with a
+            status column having a SYNTAX clause value of RowStatus,
+            consider the following state diagram:
+
+                                         STATE
+              +--------------+-----------+-------------+-------------
+              |      A       |     B     |      C      |      D
+              |              |status col.|status column|
+              |status column |    is     |      is     |status column
+    ACTION    |does not exist|  notReady | notInService|  is active
+--------------+--------------+-----------+-------------+-------------
+set status    |noError    ->D|inconsist- |inconsistent-|inconsistent-
+column to     |       or     |   entValue|        Value|        Value
+createAndGo   |inconsistent- |           |             |
+              |         Value|           |             |
+--------------+--------------+-----------+-------------+-------------
+set status    |noError  see 1|inconsist- |inconsistent-|inconsistent-
+column to     |       or     |   entValue|        Value|        Value
+createAndWait |wrongValue    |           |             |
+--------------+--------------+-----------+-------------+-------------
+set status    |inconsistent- |inconsist- |noError      |noError
+column to     |         Value|   entValue|             |
+active        |              |           |             |
+              |              |     or    |             |
+              |              |           |             |
+              |              |see 2   ->D|see 8     ->D|          ->D
+--------------+--------------+-----------+-------------+-------------
+set status    |inconsistent- |inconsist- |noError      |noError   ->C
+column to     |         Value|   entValue|             |
+notInService  |              |           |             |
+              |              |     or    |             |      or
+              |              |           |             |
+              |              |see 3   ->C|          ->C|see 6
+--------------+--------------+-----------+-------------+-------------
+set status    |noError       |noError    |noError      |noError   ->A
+column to     |              |           |             |      or
+destroy       |           ->A|        ->A|          ->A|see 7
+--------------+--------------+-----------+-------------+-------------
+set any other |see 4         |noError    |noError      |see 5
+column to some|              |           |             |
+value         |              |      see 1|          ->C|          ->D
+--------------+--------------+-----------+-------------+-------------
+
+            (1) goto B or C, depending on information available to the
+            agent.
+
+            (2) if other variable bindings included in the same PDU,
+            provide values for all columns which are missing but
+            required, and all columns have acceptable values, then
+            return noError and goto D.
+
+            (3) if other variable bindings included in the same PDU,
+            provide legal values for all columns which are missing but
+            required, then return noError and goto C.
+
+            (4) at the discretion of the agent, the return value may be
+            either:
+
+                 inconsistentName:  because the agent does not choose to
+                 create such an instance when the corresponding
+                 RowStatus instance does not exist, or
+
+                 inconsistentValue:  if the supplied value is
+                 inconsistent with the state of some other MIB object's
+                 value, or
+
+                 noError: because the agent chooses to create the
+                 instance.
+
+            If noError is returned, then the instance of the status
+            column must also be created, and the new state is B or C,
+            depending on the information available to the agent.  If
+            inconsistentName or inconsistentValue is returned, the row
+            remains in state A.
+
+            (5) depending on the MIB definition for the column/table,
+            either noError or inconsistentValue may be returned.
+
+            (6) the return value can indicate one of the following
+            errors:
+
+                 wrongValue: because the agent does not support
+                 notInService (e.g., an agent which does not support
+                 createAndWait), or
+
+                 inconsistentValue: because the agent is unable to take
+                 the row out of service at this time, perhaps because it
+                 is in use and cannot be de-activated.
+
+            (7) the return value can indicate the following error:
+
+                 inconsistentValue: because the agent is unable to
+                 remove the row at this time, perhaps because it is in
+                 use and cannot be de-activated.
+
+            (8) the transition to D can fail, e.g., if the values of the
+            conceptual row are inconsistent, then the error code would
+            be inconsistentValue.
+
+            NOTE: Other processing of (this and other varbinds of) the
+            set request may result in a response other than noError
+            being returned, e.g., wrongValue, noCreation, etc.
+
+                              Conceptual Row Creation
+
+            There are four potential interactions when creating a
+            conceptual row:  selecting an instance-identifier which is
+            not in use; creating the conceptual row; initializing any
+            objects for which the agent does not supply a default; and,
+            making the conceptual row available for use by the managed
+            device.
+
+            Interaction 1: Selecting an Instance-Identifier
+
+            The algorithm used to select an instance-identifier varies
+            for each conceptual row.  In some cases, the instance-
+            identifier is semantically significant, e.g., the
+            destination address of a route, and a management station
+            selects the instance-identifier according to the semantics.
+
+            In other cases, the instance-identifier is used solely to
+            distinguish conceptual rows, and a management station
+            without specific knowledge of the conceptual row might
+            examine the instances present in order to determine an
+            unused instance-identifier.  (This approach may be used, but
+            it is often highly sub-optimal; however, it is also a
+            questionable practice for a naive management station to
+            attempt conceptual row creation.)
+
+            Alternately, the MIB module which defines the conceptual row
+            might provide one or more objects which provide assistance
+            in determining an unused instance-identifier.  For example,
+            if the conceptual row is indexed by an integer-value, then
+            an object having an integer-valued SYNTAX clause might be
+            defined for such a purpose, allowing a management station to
+            issue a management protocol retrieval operation.  In order
+            to avoid unnecessary collisions between competing management
+            stations, `adjacent' retrievals of this object should be
+            different.
+
+            Finally, the management station could select a pseudo-random
+            number to use as the index.  In the event that this index
+
+            was already in use and an inconsistentValue was returned in
+            response to the management protocol set operation, the
+            management station should simply select a new pseudo-random
+            number and retry the operation.
+
+            A MIB designer should choose between the two latter
+            algorithms based on the size of the table (and therefore the
+            efficiency of each algorithm).  For tables in which a large
+            number of entries are expected, it is recommended that a MIB
+            object be defined that returns an acceptable index for
+            creation.  For tables with small numbers of entries, it is
+            recommended that the latter pseudo-random index mechanism be
+            used.
+
+            Interaction 2: Creating the Conceptual Row
+
+            Once an unused instance-identifier has been selected, the
+            management station determines if it wishes to create and
+            activate the conceptual row in one transaction or in a
+            negotiated set of interactions.
+
+            Interaction 2a: Creating and Activating the Conceptual Row
+
+            The management station must first determine the column
+            requirements, i.e., it must determine those columns for
+            which it must or must not provide values.  Depending on the
+            complexity of the table and the management station's
+            knowledge of the agent's capabilities, this determination
+            can be made locally by the management station.  Alternately,
+            the management station issues a management protocol get
+            operation to examine all columns in the conceptual row that
+            it wishes to create.  In response, for each column, there
+            are three possible outcomes:
+
+                 - a value is returned, indicating that some other
+                 management station has already created this conceptual
+                 row.  We return to interaction 1.
+
+                 - the exception `noSuchInstance' is returned,
+                 indicating that the agent implements the object-type
+                 associated with this column, and that this column in at
+                 least one conceptual row would be accessible in the MIB
+                 view used by the retrieval were it to exist. For those
+                 columns to which the agent provides read-create access,
+                 the `noSuchInstance' exception tells the management
+                 station that it should supply a value for this column
+                 when the conceptual row is to be created.
+
+                 - the exception `noSuchObject' is returned, indicating
+                 that the agent does not implement the object-type
+                 associated with this column or that there is no
+                 conceptual row for which this column would be
+                 accessible in the MIB view used by the retrieval.  As
+                 such, the management station can not issue any
+                 management protocol set operations to create an
+                 instance of this column.
+
+            Once the column requirements have been determined, a
+            management protocol set operation is accordingly issued.
+            This operation also sets the new instance of the status
+            column to `createAndGo'.
+
+            When the agent processes the set operation, it verifies that
+            it has sufficient information to make the conceptual row
+            available for use by the managed device.  The information
+            available to the agent is provided by two sources:  the
+            management protocol set operation which creates the
+            conceptual row, and, implementation-specific defaults
+            supplied by the agent (note that an agent must provide
+            implementation-specific defaults for at least those objects
+            which it implements as read-only).  If there is sufficient
+            information available, then the conceptual row is created, a
+            `noError' response is returned, the status column is set to
+            `active', and no further interactions are necessary (i.e.,
+            interactions 3 and 4 are skipped).  If there is insufficient
+            information, then the conceptual row is not created, and the
+            set operation fails with an error of `inconsistentValue'.
+            On this error, the management station can issue a management
+            protocol retrieval operation to determine if this was
+            because it failed to specify a value for a required column,
+            or, because the selected instance of the status column
+            already existed.  In the latter case, we return to
+            interaction 1.  In the former case, the management station
+            can re-issue the set operation with the additional
+            information, or begin interaction 2 again using
+            `createAndWait' in order to negotiate creation of the
+            conceptual row.
+
+                                     NOTE WELL
+
+                 Regardless of the method used to determine the column
+                 requirements, it is possible that the management
+                 station might deem a column necessary when, in fact,
+                 the agent will not allow that particular columnar
+                 instance to be created or written.  In this case, the
+                 management protocol set operation will fail with an
+                 error such as `noCreation' or `notWritable'.  In this
+                 case, the management station decides whether it needs
+                 to be able to set a value for that particular columnar
+                 instance.  If not, the management station re-issues the
+                 management protocol set operation, but without setting
+                 a value for that particular columnar instance;
+                 otherwise, the management station aborts the row
+                 creation algorithm.
+
+            Interaction 2b: Negotiating the Creation of the Conceptual
+            Row
+
+            The management station issues a management protocol set
+            operation which sets the desired instance of the status
+            column to `createAndWait'.  If the agent is unwilling to
+            process a request of this sort, the set operation fails with
+            an error of `wrongValue'.  (As a consequence, such an agent
+            must be prepared to accept a single management protocol set
+            operation, i.e., interaction 2a above, containing all of the
+            columns indicated by its column requirements.)  Otherwise,
+            the conceptual row is created, a `noError' response is
+            returned, and the status column is immediately set to either
+            `notInService' or `notReady', depending on whether it has
+            sufficient information to (attempt to) make the conceptual
+            row available for use by the managed device.  If there is
+            sufficient information available, then the status column is
+            set to `notInService'; otherwise, if there is insufficient
+            information, then the status column is set to `notReady'.
+            Regardless, we proceed to interaction 3.
+
+            Interaction 3: Initializing non-defaulted Objects
+
+            The management station must now determine the column
+            requirements.  It issues a management protocol get operation
+            to examine all columns in the created conceptual row.  In
+            the response, for each column, there are three possible
+            outcomes:
+
+                 - a value is returned, indicating that the agent
+                 implements the object-type associated with this column
+                 and had sufficient information to provide a value.  For
+                 those columns to which the agent provides read-create
+                 access (and for which the agent allows their values to
+                 be changed after their creation), a value return tells
+                 the management station that it may issue additional
+                 management protocol set operations, if it desires, in
+                 order to change the value associated with this column.
+
+                 - the exception `noSuchInstance' is returned,
+                 indicating that the agent implements the object-type
+                 associated with this column, and that this column in at
+                 least one conceptual row would be accessible in the MIB
+                 view used by the retrieval were it to exist. However,
+                 the agent does not have sufficient information to
+                 provide a value, and until a value is provided, the
+                 conceptual row may not be made available for use by the
+                 managed device.  For those columns to which the agent
+                 provides read-create access, the `noSuchInstance'
+                 exception tells the management station that it must
+                 issue additional management protocol set operations, in
+                 order to provide a value associated with this column.
+
+                 - the exception `noSuchObject' is returned, indicating
+                 that the agent does not implement the object-type
+                 associated with this column or that there is no
+                 conceptual row for which this column would be
+                 accessible in the MIB view used by the retrieval.  As
+                 such, the management station can not issue any
+                 management protocol set operations to create an
+                 instance of this column.
+
+            If the value associated with the status column is
+            `notReady', then the management station must first deal with
+            all `noSuchInstance' columns, if any.  Having done so, the
+            value of the status column becomes `notInService', and we
+            proceed to interaction 4.
+
+            Interaction 4: Making the Conceptual Row Available
+
+            Once the management station is satisfied with the values
+            associated with the columns of the conceptual row, it issues
+            a management protocol set operation to set the status column
+            to `active'.  If the agent has sufficient information to
+            make the conceptual row available for use by the managed
+            device, the management protocol set operation succeeds (a
+            `noError' response is returned).  Otherwise, the management
+            protocol set operation fails with an error of
+            `inconsistentValue'.
+
+                                     NOTE WELL
+
+                 A conceptual row having a status column with value
+                 `notInService' or `notReady' is unavailable to the
+                 managed device.  As such, it is possible for the
+                 managed device to create its own instances during the
+                 time between the management protocol set operation
+                 which sets the status column to `createAndWait' and the
+                 management protocol set operation which sets the status
+                 column to `active'.  In this case, when the management
+                 protocol set operation is issued to set the status
+                 column to `active', the values held in the agent
+                 supersede those used by the managed device.
+
+            If the management station is prevented from setting the
+            status column to `active' (e.g., due to management station
+            or network failure) the conceptual row will be left in the
+            `notInService' or `notReady' state, consuming resources
+            indefinitely.  The agent must detect conceptual rows that
+            have been in either state for an abnormally long period of
+            time and remove them.  It is the responsibility of the
+            DESCRIPTION clause of the status column to indicate what an
+            abnormally long period of time would be.  This period of
+            time should be long enough to allow for human response time
+            (including `think time') between the creation of the
+            conceptual row and the setting of the status to `active'.
+            In the absence of such information in the DESCRIPTION
+            clause, it is suggested that this period be approximately 5
+            minutes in length.  This removal action applies not only to
+            newly-created rows, but also to previously active rows which
+            are set to, and left in, the notInService state for a
+            prolonged period exceeding that which is considered normal
+            for such a conceptual row.
+
+                             Conceptual Row Suspension
+
+            When a conceptual row is `active', the management station
+            may issue a management protocol set operation which sets the
+            instance of the status column to `notInService'.  If the
+            agent is unwilling to do so, the set operation fails with an
+            error of `wrongValue' or `inconsistentValue'.  Otherwise,
+            the conceptual row is taken out of service, and a `noError'
+            response is returned.  It is the responsibility of the
+            DESCRIPTION clause of the status column to indicate under
+            what circumstances the status column should be taken out of
+            service (e.g., in order for the value of some other column
+            of the same conceptual row to be modified).
+
+                              Conceptual Row Deletion
+
+            For deletion of conceptual rows, a management protocol set
+            operation is issued which sets the instance of the status
+            column to `destroy'.  This request may be made regardless of
+            the current value of the status column (e.g., it is possible
+            to delete conceptual rows which are either `notReady',
+            `notInService' or `active'.)  If the operation succeeds,
+            then all instances associated with the conceptual row are
+            immediately removed."
+    SYNTAX       INTEGER {
+                     -- the following two values are states:
+                     -- these values may be read or written
+                     active(1),
+                     notInService(2),
+                     -- the following value is a state:
+                     -- this value may be read, but not written
+                     notReady(3),
+                     -- the following three values are
+                     -- actions: these values may be written,
+                     --   but are never read
+                     createAndGo(4),
+                     createAndWait(5),
+                     destroy(6)
+                 }
+
+TimeStamp ::= TEXTUAL-CONVENTION
+    STATUS       current
+    DESCRIPTION
+            "The value of the sysUpTime object at which a specific
+            occurrence happened.  The specific occurrence must be
+
+            defined in the description of any object defined using this
+            type.
+
+            If sysUpTime is reset to zero as a result of a re-
+            initialization of the network management (sub)system, then
+            the values of all TimeStamp objects are also reset.
+            However, after approximately 497 days without a re-
+            initialization, the sysUpTime object will reach 2^^32-1 and
+            then increment around to zero; in this case, existing values
+            of TimeStamp objects do not change.  This can lead to
+            ambiguities in the value of TimeStamp objects."
+    SYNTAX       TimeTicks
+
+TimeInterval ::= TEXTUAL-CONVENTION
+    STATUS       current
+    DESCRIPTION
+            "A period of time, measured in units of 0.01 seconds."
+    SYNTAX       INTEGER (0..2147483647)
+
+DateAndTime ::= TEXTUAL-CONVENTION
+    DISPLAY-HINT "2d-1d-1d,1d:1d:1d.1d,1a1d:1d"
+    STATUS       current
+    DESCRIPTION
+            "A date-time specification.
+
+            field  octets  contents                  range
+            -----  ------  --------                  -----
+              1      1-2   year*                     0..65536
+              2       3    month                     1..12
+              3       4    day                       1..31
+              4       5    hour                      0..23
+              5       6    minutes                   0..59
+              6       7    seconds                   0..60
+                           (use 60 for leap-second)
+              7       8    deci-seconds              0..9
+              8       9    direction from UTC        '+' / '-'
+              9      10    hours from UTC*           0..13
+             10      11    minutes from UTC          0..59
+
+            * Notes:
+            - the value of year is in network-byte order
+            - daylight saving time in New Zealand is +13
+
+            For example, Tuesday May 26, 1992 at 1:30:15 PM EDT would be
+            displayed as:
+
+                             1992-5-26,13:30:15.0,-4:0
+
+            Note that if only local time is known, then timezone
+            information (fields 8-10) is not present."
+    SYNTAX       OCTET STRING (SIZE (8 | 11))
+
+StorageType ::= TEXTUAL-CONVENTION
+    STATUS       current
+    DESCRIPTION
+            "Describes the memory realization of a conceptual row.  A
+            row which is volatile(2) is lost upon reboot.  A row which
+            is either nonVolatile(3), permanent(4) or readOnly(5), is
+            backed up by stable storage.  A row which is permanent(4)
+            can be changed but not deleted.  A row which is readOnly(5)
+            cannot be changed nor deleted.
+
+            If the value of an object with this syntax is either
+            permanent(4) or readOnly(5), it cannot be written.
+            Conversely, if the value is either other(1), volatile(2) or
+            nonVolatile(3), it cannot be modified to be permanent(4) or
+            readOnly(5).  (All illegal modifications result in a
+            'wrongValue' error.)
+
+            Every usage of this textual convention is required to
+            specify the columnar objects which a permanent(4) row must
+            at a minimum allow to be writable."
+    SYNTAX       INTEGER {
+                     other(1),       -- eh?
+                     volatile(2),    -- e.g., in RAM
+                     nonVolatile(3), -- e.g., in NVRAM
+                     permanent(4),   -- e.g., partially in ROM
+                     readOnly(5)     -- e.g., completely in ROM
+                 }
+
+TDomain ::= TEXTUAL-CONVENTION
+    STATUS       current
+    DESCRIPTION
+          "Denotes a kind of transport service.
+
+          Some possible values, such as snmpUDPDomain, are defined in
+          the SNMPv2-TM MIB module.  Other possible values are defined
+          in other MIB modules."
+    REFERENCE    "The SNMPv2-TM MIB module is defined in RFC 1906."
+    SYNTAX       OBJECT IDENTIFIER
+
+TAddress ::= TEXTUAL-CONVENTION
+    STATUS       current
+    DESCRIPTION
+          "Denotes a transport service address.
+
+          A TAddress value is always interpreted within the context of a
+          TDomain value.  Thus, each definition of a TDomain value must
+          be accompanied by a definition of a textual convention for use
+          with that TDomain.  Some possible textual conventions, such as
+          SnmpUDPAddress for snmpUDPDomain, are defined in the SNMPv2-TM
+          MIB module.  Other possible textual conventions are defined in
+          other MIB modules."
+    REFERENCE    "The SNMPv2-TM MIB module is defined in RFC 1906."
+    SYNTAX       OCTET STRING (SIZE (1..255))
+
+END
+"""
+
+SNMPV2_CONF_TEXT = r"""SNMPv2-CONF DEFINITIONS ::= BEGIN
+
+IMPORTS ObjectName, NotificationName, ObjectSyntax
+                                               FROM SNMPv2-SMI;
+
+-- definitions for conformance groups
+
+OBJECT-GROUP MACRO ::=
+BEGIN
+    TYPE NOTATION ::=
+                  ObjectsPart
+                  "STATUS" Status
+                  "DESCRIPTION" Text
+                  ReferPart
+
+    VALUE NOTATION ::=
+                  value(VALUE OBJECT IDENTIFIER)
+
+    ObjectsPart ::=
+                  "OBJECTS" "{" Objects "}"
+    Objects ::=
+                  Object
+                | Objects "," Object
+    Object ::=
+
+                  value(ObjectName)
+
+    Status ::=
+                  "current"
+                | "deprecated"
+                | "obsolete"
+
+    ReferPart ::=
+                  "REFERENCE" Text
+                | empty
+
+    -- a character string as defined in [2]
+    Text ::= value(IA5String)
+END
+
+-- more definitions for conformance groups
+
+NOTIFICATION-GROUP MACRO ::=
+BEGIN
+    TYPE NOTATION ::=
+                  NotificationsPart
+                  "STATUS" Status
+                  "DESCRIPTION" Text
+                  ReferPart
+
+    VALUE NOTATION ::=
+                  value(VALUE OBJECT IDENTIFIER)
+
+    NotificationsPart ::=
+                  "NOTIFICATIONS" "{" Notifications "}"
+    Notifications ::=
+                  Notification
+                | Notifications "," Notification
+    Notification ::=
+                  value(NotificationName)
+
+    Status ::=
+                  "current"
+                | "deprecated"
+                | "obsolete"
+
+    ReferPart ::=
+                  "REFERENCE" Text
+                | empty
+
+    -- a character string as defined in [2]
+    Text ::= value(IA5String)
+END
+
+-- definitions for compliance statements
+
+MODULE-COMPLIANCE MACRO ::=
+BEGIN
+    TYPE NOTATION ::=
+                  "STATUS" Status
+                  "DESCRIPTION" Text
+                  ReferPart
+                  ModulePart
+
+    VALUE NOTATION ::=
+                  value(VALUE OBJECT IDENTIFIER)
+
+    Status ::=
+                  "current"
+                | "deprecated"
+                | "obsolete"
+
+    ReferPart ::=
+                  "REFERENCE" Text
+                | empty
+
+    ModulePart ::=
+                  Modules
+    Modules ::=
+                  Module
+                | Modules Module
+    Module ::=
+                  -- name of module --
+                  "MODULE" ModuleName
+                  MandatoryPart
+                  CompliancePart
+
+    ModuleName ::=
+                  -- identifier must start with uppercase letter
+                  identifier ModuleIdentifier
+                  -- must not be empty unless contained
+                  -- in MIB Module
+                | empty
+    ModuleIdentifier ::=
+                  value(OBJECT IDENTIFIER)
+                | empty
+
+    MandatoryPart ::=
+                  "MANDATORY-GROUPS" "{" Groups "}"
+                | empty
+
+    Groups ::=
+
+                  Group
+                | Groups "," Group
+    Group ::=
+                  value(OBJECT IDENTIFIER)
+
+    CompliancePart ::=
+                  Compliances
+                | empty
+
+    Compliances ::=
+                  Compliance
+                | Compliances Compliance
+    Compliance ::=
+                  ComplianceGroup
+                | Object
+
+    ComplianceGroup ::=
+                  "GROUP" value(OBJECT IDENTIFIER)
+                  "DESCRIPTION" Text
+
+    Object ::=
+                  "OBJECT" value(ObjectName)
+                  SyntaxPart
+                  WriteSyntaxPart
+                  AccessPart
+                  "DESCRIPTION" Text
+
+    -- must be a refinement for object's SYNTAX clause
+    SyntaxPart ::= "SYNTAX" Syntax
+                | empty
+
+    -- must be a refinement for object's SYNTAX clause
+    WriteSyntaxPart ::= "WRITE-SYNTAX" Syntax
+                | empty
+
+    Syntax ::=    -- Must be one of the following:
+                       -- a base type (or its refinement),
+                       -- a textual convention (or its refinement), or
+                       -- a BITS pseudo-type
+                  type
+                | "BITS" "{" NamedBits "}"
+
+    NamedBits ::= NamedBit
+                | NamedBits "," NamedBit
+
+    NamedBit ::= identifier "(" number ")" -- number is nonnegative
+
+    AccessPart ::=
+                  "MIN-ACCESS" Access
+                | empty
+    Access ::=
+                  "not-accessible"
+                | "accessible-for-notify"
+                | "read-only"
+                | "read-write"
+                | "read-create"
+
+    -- a character string as defined in [2]
+    Text ::= value(IA5String)
+END
+
+-- definitions for capabilities statements
+
+AGENT-CAPABILITIES MACRO ::=
+BEGIN
+    TYPE NOTATION ::=
+                  "PRODUCT-RELEASE" Text
+                  "STATUS" Status
+                  "DESCRIPTION" Text
+                  ReferPart
+                  ModulePart
+
+    VALUE NOTATION ::=
+                  value(VALUE OBJECT IDENTIFIER)
+
+    Status ::=
+                  "current"
+                | "obsolete"
+
+    ReferPart ::=
+                  "REFERENCE" Text
+                | empty
+
+    ModulePart ::=
+                  Modules
+                | empty
+    Modules ::=
+                  Module
+                | Modules Module
+    Module ::=
+                  -- name of module --
+                  "SUPPORTS" ModuleName
+                  "INCLUDES" "{" Groups "}"
+                  VariationPart
+
+    ModuleName ::=
+
+                  -- identifier must start with uppercase letter
+                  identifier ModuleIdentifier
+    ModuleIdentifier ::=
+                  value(OBJECT IDENTIFIER)
+                | empty
+
+    Groups ::=
+                  Group
+                | Groups "," Group
+    Group ::=
+                  value(OBJECT IDENTIFIER)
+
+    VariationPart ::=
+                  Variations
+                | empty
+    Variations ::=
+                  Variation
+                | Variations Variation
+
+    Variation ::=
+                  ObjectVariation
+                | NotificationVariation
+
+    NotificationVariation ::=
+                  "VARIATION" value(NotificationName)
+                  AccessPart
+                  "DESCRIPTION" Text
+
+    ObjectVariation ::=
+                  "VARIATION" value(ObjectName)
+                  SyntaxPart
+                  WriteSyntaxPart
+                  AccessPart
+                  CreationPart
+                  DefValPart
+                  "DESCRIPTION" Text
+
+    -- must be a refinement for object's SYNTAX clause
+    SyntaxPart ::= "SYNTAX" Syntax
+                | empty
+
+    WriteSyntaxPart ::= "WRITE-SYNTAX" Syntax
+                | empty
+
+    Syntax ::=    -- Must be one of the following:
+                       -- a base type (or its refinement),
+                       -- a textual convention (or its refinement), or
+                       -- a BITS pseudo-type
+
+                  type
+                | "BITS" "{" NamedBits "}"
+
+    NamedBits ::= NamedBit
+                | NamedBits "," NamedBit
+
+    NamedBit ::= identifier "(" number ")" -- number is nonnegative
+
+    AccessPart ::=
+                  "ACCESS" Access
+                | empty
+
+    Access ::=
+                  "not-implemented"
+                -- only "not-implemented" for notifications
+                | "accessible-for-notify"
+                | "read-only"
+                | "read-write"
+                | "read-create"
+                -- following is for backward-compatibility only
+                | "write-only"
+
+    CreationPart ::=
+                  "CREATION-REQUIRES" "{" Cells "}"
+                | empty
+    Cells ::=
+                  Cell
+                | Cells "," Cell
+    Cell ::=
+                  value(ObjectName)
+
+    DefValPart ::= "DEFVAL" "{" Defvalue "}"
+                | empty
+
+    Defvalue ::=  -- must be valid for the object's syntax
+                  -- in this macro's SYNTAX clause, if present,
+                  -- or if not, in object's OBJECT-TYPE macro
+                  value(ObjectSyntax)
+                | "{" BitsValue "}"
+
+    BitsValue ::= BitNames
+                | empty
+
+    BitNames ::=  BitName
+                | BitNames "," BitName
+
+    BitName ::= identifier
+
+    -- a character string as defined in [2]
+    Text ::= value(IA5String)
+END
+
+END
+"""
+
+RFC1155_SMI_TEXT = r"""RFC1155-SMI DEFINITIONS ::= BEGIN
+
+EXPORTS -- EVERYTHING
+        internet, directory, mgmt,
+        experimental, private, enterprises,
+        OBJECT-TYPE, ObjectName, ObjectSyntax, SimpleSyntax,
+        ApplicationSyntax, NetworkAddress, IpAddress,
+        Counter, Gauge, TimeTicks, Opaque;
+
+ -- the path to the root
+
+ internet      OBJECT IDENTIFIER ::= { iso org(3) dod(6) 1 }
+
+ directory     OBJECT IDENTIFIER ::= { internet 1 }
+
+ mgmt          OBJECT IDENTIFIER ::= { internet 2 }
+
+ experimental  OBJECT IDENTIFIER ::= { internet 3 }
+
+ private       OBJECT IDENTIFIER ::= { internet 4 }
+ enterprises   OBJECT IDENTIFIER ::= { private 1 }
+
+ -- definition of object types
+
+ OBJECT-TYPE MACRO ::=
+ BEGIN
+     TYPE NOTATION ::= "SYNTAX" type (TYPE ObjectSyntax)
+                       "ACCESS" Access
+                       "STATUS" Status
+     VALUE NOTATION ::= value (VALUE ObjectName)
+
+     Access ::= "read-only"
+                     | "read-write"
+                     | "write-only"
+                     | "not-accessible"
+     Status ::= "mandatory"
+                     | "optional"
+                     | "obsolete"
+ END
+
+    -- names of objects in the MIB
+
+    ObjectName ::=
+        OBJECT IDENTIFIER
+
+    -- syntax of objects in the MIB
+
+    ObjectSyntax ::=
+        CHOICE {
+            simple
+                SimpleSyntax,
+    -- note that simple SEQUENCEs are not directly
+    -- mentioned here to keep things simple (i.e.,
+    -- prevent mis-use).  However, application-wide
+    -- types which are IMPLICITly encoded simple
+    -- SEQUENCEs may appear in the following CHOICE
+
+            application-wide
+                ApplicationSyntax
+        }
+
+       SimpleSyntax ::=
+           CHOICE {
+               number
+                   INTEGER,
+               string
+                   OCTET STRING,
+               object
+                   OBJECT IDENTIFIER,
+               empty
+                   NULL
+           }
+
+       ApplicationSyntax ::=
+           CHOICE {
+               address
+                   NetworkAddress,
+               counter
+                   Counter,
+               gauge
+                   Gauge,
+               ticks
+                   TimeTicks,
+               arbitrary
+                   Opaque
+
+       -- other application-wide types, as they are
+       -- defined, will be added here
+           }
+
+       -- application-wide types
+
+       NetworkAddress ::=
+           CHOICE {
+               internet
+                   IpAddress
+           }
+
+       IpAddress ::=
+           [APPLICATION 0]          -- in network-byte order
+               IMPLICIT OCTET STRING (SIZE (4))
+
+       Counter ::=
+           [APPLICATION 1]
+               IMPLICIT INTEGER (0..4294967295)
+
+       Gauge ::=
+           [APPLICATION 2]
+               IMPLICIT INTEGER (0..4294967295)
+
+       TimeTicks ::=
+           [APPLICATION 3]
+               IMPLICIT INTEGER (0..4294967295)
+
+       Opaque ::=
+           [APPLICATION 4]          -- arbitrary ASN.1 value,
+               IMPLICIT OCTET STRING   --   "double-wrapped"
+
+       END
+"""
+
+RFC_1212_TEXT = r"""RFC-1212 DEFINITIONS ::= BEGIN
+
+          IMPORTS
+              ObjectName
+                  FROM RFC1155-SMI;
+--            DisplayString
+--                FROM RFC1158-MIB;
+
+          OBJECT-TYPE MACRO ::=
+          BEGIN
+              TYPE NOTATION ::=
+                                          -- must conform to
+                                          -- RFC1155's ObjectSyntax
+                                "SYNTAX" type(ObjectSyntax)
+                                "ACCESS" Access
+                                "STATUS" Status
+                                DescrPart
+                                ReferPart
+                                IndexPart
+                                DefValPart
+              VALUE NOTATION ::= value (VALUE ObjectName)
+
+              Access ::= "read-only"
+                              | "read-write"
+                              | "write-only"
+                              | "not-accessible"
+              Status ::= "mandatory"
+                              | "optional"
+                              | "obsolete"
+                              | "deprecated"
+
+              DescrPart ::=
+                         "DESCRIPTION" value (description
+                         DisplayString)
+                              | empty
+
+              ReferPart ::=
+                         "REFERENCE" value (reference DisplayString)
+                              | empty
+
+              IndexPart ::=
+                         "INDEX" "{" IndexTypes "}"
+                              | empty
+              IndexTypes ::=
+                         IndexType | IndexTypes "," IndexType
+              IndexType ::=
+                                  -- if indexobject, use the SYNTAX
+                                  -- value of the correspondent
+                                  -- OBJECT-TYPE invocation
+                         value (indexobject ObjectName)
+                                  -- otherwise use named SMI type
+                                  -- must conform to IndexSyntax below
+                              | type (indextype)
+
+              DefValPart ::=
+                         "DEFVAL" "{" value (defvalue ObjectSyntax)
+                         "}"
+                              | empty
+
+          END
+
+          IndexSyntax ::=
+              CHOICE {
+                  number
+                      INTEGER (0..MAX),
+                  string
+                      OCTET STRING,
+                  object
+                      OBJECT IDENTIFIER,
+                  address
+                      NetworkAddress,
+                  ipAddress
+                      IpAddress
+              }
+
+END
+"""
+
+RFC_1215_TEXT = r"""
+RFC-1215 DEFINITIONS ::= BEGIN
+
+-- This  module is a empty module.  It has been created solely for the 
+-- purpose of allowing other modules to correctly import the TRAP-TYPE 
+-- clause from RFC-1215 where it should be imported from.  It's a
+-- built in type in the UCD-SNMP code, and in fact RFC-1215 doesn't
+-- actually define a mib at all; it only defines macros.  However,
+-- importing the TRAP-TYPE is conventionally done from an import
+-- clause pointing to RFC-1215.
+--
+--   Wes 7/17/98
+
+TRAP-TYPE MACRO ::=
+BEGIN
+    TYPE NOTATION ::= "ENTERPRISE" value
+                      (enterprise OBJECT IDENTIFIER)
+                      VarPart
+                      DescrPart
+                      ReferPart
+    VALUE NOTATION ::= value (VALUE INTEGER)
+    VarPart ::=
+               "VARIABLES" "{" VarTypes "}"
+               | empty
+    VarTypes ::=
+               VarType | VarTypes "," VarType
+    VarType ::=
+               value (vartype ObjectName)
+    DescrPart ::=
+               "DESCRIPTION" value (description DisplayString)
+               | empty
+    ReferPart ::=
+               "REFERENCE" value (reference DisplayString)
+               | empty
+END
+ 
+
+END
+"""
+
+BASE_MODULES: dict[str, str] = {
+    "SNMPv2-SMI": SNMPV2_SMI_TEXT,
+    "SNMPv2-TC": SNMPV2_TC_TEXT,
+    "SNMPv2-CONF": SNMPV2_CONF_TEXT,
+    "RFC1155-SMI": RFC1155_SMI_TEXT,
+    "RFC-1212": RFC_1212_TEXT,
+    "RFC-1215": RFC_1215_TEXT,
+}
+
+
+BUILTIN_PREFIX = "<builtin>/"
+
+
+def is_base_module(name: str) -> bool:
+    """True for the SMI base modules the compiler embeds."""
+    return name in BASE_MODULES
+
+
+def base_module_bytes(name: str) -> bytes:
+    """The embedded text of a base module (raises KeyError for other names)."""
+    return BASE_MODULES[name].encode()
+
+
+# --- the content index and the search path ----------------------------------------------------
+
+class ModuleEntry(object):
+    """One module instance in the content index: which file holds it and where.
+
+    `dir_index` is the position of the file's directory in the search path (-1 for pinned
+    files outside the path and for built-in modules). `date` is `date_key(last_updated)`.
+    """
+    name: str
+    path: str
+    dir_index: int
+    start: int
+    end: int
+    line: int
+    last_updated: str
+    date: str
+    sha256: str
+    builtin: bool
+
+    def __init__(self, name: str, path: str, dir_index: int, start: int, end: int, line: int,
+                 last_updated: str, sha256: str, builtin: bool):
+        self.name = name
+        self.path = path
+        self.dir_index = dir_index
+        self.start = start
+        self.end = end
+        self.line = line
+        self.last_updated = last_updated
+        self.date = date_key(last_updated)
+        self.sha256 = sha256
+        self.builtin = builtin
+
+    def __repr__(self) -> str:
+        return "ModuleEntry(" + self.name + " " + self.path + ":" + str(self.line) + ")"
+
+
+def _better(a: ModuleEntry, b: ModuleEntry) -> bool:
+    """Whether `a` is preferred over `b` within the search path: lower directory index, then
+    newer LAST-UPDATED, then lower path, then earlier in the file."""
+    if a.dir_index != b.dir_index:
+        return a.dir_index < b.dir_index
+    if a.date != b.date:
+        return a.date > b.date
+    if a.path != b.path:
+        return a.path < b.path
+    return a.start < b.start
+
+
+class MibPath(object):
+    """An ordered MIB search path with a content index of every module in it.
+
+    Add pins and aliases, then fill the index with `index_path()` (reads the directories) or
+    `add_file()` (in-memory bytes). Hashing every module costs about as much as lexing it;
+    `hash_files=False` skips it. `find(name)` tries the always-aliases, pins, the built-in
+    base modules, the path order rules and finally the fallback aliases.
+    """
+    dirs: list[str]
+    pins: dict[str, str]
+    aliases: dict[str, str]
+    fallback_aliases: dict[str, str]
+    entries: dict[str, list[ModuleEntry]]
+    files: list[str]
+    use_builtins: bool
+    hash_files: bool
+
+    def __init__(self, dirs: list[str], use_builtins: bool = True, hash_files: bool = True):
+        self.dirs = dirs
+        self.pins = {}
+        self.aliases = {}
+        for k, v in ALWAYS_ALIASES.items():
+            self.aliases[k] = v
+        self.fallback_aliases = {}
+        for k, v in FALLBACK_ALIASES.items():
+            self.fallback_aliases[k] = v
+        self.entries = {}
+        self.files = []
+        self.use_builtins = use_builtins
+        self.hash_files = hash_files
+
+    def add_alias(self, name: str, target: str, fallback: bool = False) -> None:
+        """Make `name` stand for `target`: always, or only when `name` is not found (`fallback`)."""
+        if fallback:
+            self.fallback_aliases[name] = target
+        else:
+            self.aliases[name] = target
+
+    def pin(self, name: str, path: str) -> None:
+        """Always take module `name` from the file `path` (which `index_path` reads if needed)."""
+        self.pins[name] = path
+
+    def add_file(self, path: str, data: bytes, dir_index: int, diags: ?mib.diag.Diagnostics = None) -> list[ModuleEntry]:
+        """Index the modules in one file's bytes. Returns the new entries. The sha256 of each
+        module text is computed unless the path was built with `hash_files=False` (then
+        `sha256` is "" and identical copies are not told apart)."""
+        hs = scan_headers(data, self.hash_files)
+        new: list[ModuleEntry] = []
+        for h in hs:
+            e = ModuleEntry(h.name, path, dir_index, h.start, h.end, h.line, h.last_updated, h.sha256, False)
+            new.append(e)
+            lst = self.entries.get(h.name)
+            if lst is not None:
+                lst.append(e)
+            else:
+                self.entries[h.name] = [e]
+        self.files.append(path)
+        if len(hs) == 0 and diags is not None:
+            diags.file = path
+            diags.report("source.no-module", 1, 1, "no MIB module header found in " + path)
+        return new
+
+    def candidates(self, name: str) -> list[ModuleEntry]:
+        """All indexed instances of `name` (no aliasing), best first."""
+        lst = self.entries.get(name)
+        if lst is None:
+            return []
+        out = list(lst)
+        # insertion sort: the lists are tiny
+        for i in range(1, len(out)):
+            j = i
+            while j > 0 and _better(out[j], out[j - 1]):
+                tmp = out[j]
+                out[j] = out[j - 1]
+                out[j - 1] = tmp
+                j -= 1
+        return out
+
+    def builtin_entry(self, name: str) -> ModuleEntry:
+        data = base_module_bytes(name)
+        return ModuleEntry(name, BUILTIN_PREFIX + name, -1, 0, len(data), 1, "", sha256_hex(data), True)
+
+    def find(self, name: str, diags: ?mib.diag.Diagnostics = None) -> ?ModuleEntry:
+        """The module instance that `name` resolves to, or None.
+
+        With `diags`, reports `source.alias` when an alias was used, `source.builtin-override`
+        when files named like a base module are ignored, and `source.duplicate-module` when
+        one directory holds several copies.
+        """
+        nm = name
+        depth = 0
+        while depth < 8:
+            depth += 1
+            target = self.aliases.get(nm)
+            if target is not None:
+                if diags is not None:
+                    diags.report("source.alias", 1, 1, "module " + nm + " is read as " + target)
+                nm = target
+            pinned = self.pins.get(nm)
+            if pinned is not None:
+                for e in self.entries.get_def(nm, []):
+                    if e.path == pinned:
+                        return e
+                return None
+            if self.use_builtins and is_base_module(nm):
+                if diags is not None and nm in self.entries:
+                    diags.report("source.builtin-override", 1, 1,
+                                 "the built-in " + nm + " is used; " + self.entries[nm][0].path + " is ignored")
+                return self.builtin_entry(nm)
+            cands = self.candidates(nm)
+            if len(cands) > 0:
+                best = cands[0]
+                if diags is not None and len(cands) > 1 and cands[1].dir_index == best.dir_index and cands[1].sha256 != best.sha256:
+                    diags.report("source.duplicate-module", 1, 1,
+                                 "module " + nm + " is defined " + str(len(cands)) + " times; using " + best.path +
+                                 (" (LAST-UPDATED " + best.last_updated + ")" if best.last_updated != "" else ""))
+                return best
+            fb = self.fallback_aliases.get(nm)
+            if fb is not None:
+                if diags is not None:
+                    diags.report("source.alias", 1, 1, "module " + nm + " not found; using " + fb)
+                nm = fb
+            else:
+                return None
+        return None
+
+    def module_names(self) -> list[str]:
+        """Every module name in the index, sorted (built-ins included when enabled)."""
+        s: set[str] = set()
+        for k in self.entries.keys():
+            s.add(k)
+        if self.use_builtins:
+            for k in BASE_MODULES.keys():
+                s.add(k)
+        return sorted(list(s))
+
+    def index_rows(self) -> list[ModuleEntry]:
+        """The content index: every indexed instance, by name then preference."""
+        out: list[ModuleEntry] = []
+        for nm in sorted(list(self.entries.keys())):
+            out.extend(self.candidates(nm))
+        return out
+
+
+proc def read_bytes(fcap: file.FileCap, path: str) -> bytes:
+    """Read a whole file (raises OSError/FileNotFoundError)."""
+    rf = file.ReadFile(file.ReadFileCap(fcap), path)
+    data = rf.read()
+    rf.close()
+    return data
+
+
+proc def entry_bytes(fcap: file.FileCap, e: ModuleEntry) -> bytes:
+    """The bytes of the file that holds `e` (the embedded text for built-ins)."""
+    if e.builtin:
+        return base_module_bytes(e.name)
+    return read_bytes(fcap, e.path)
+
+
+proc def index_path(mp: MibPath, fcap: file.FileCap, diags: mib.diag.Diagnostics) -> int:
+    """Scan every regular file in the search path's directories (and pinned files) into the
+    index. Unreadable directories and files are reported (`source.unreadable`) and skipped.
+    Hidden files (names starting with '.') are ignored. Returns the number of files read."""
+    fs = file.FS(fcap)
+    nfiles = 0
+    for di, d in enumerate(mp.dirs):
+        names: list[str] = []
+        try:
+            names = fs.listdir(d)
+        except OSError as exc:
+            names = []
+            diags.file = d
+            diags.report("source.unreadable", 1, 1, "cannot list directory " + d + ": " + exc.error_message)
+        for nm in sorted(names):
+            if nm.startswith("."):
+                continue
+            path = file.join_path([d, nm])
+            isf = False
+            try:
+                isf = fs.stat(path).is_file()
+            except OSError:
+                isf = False
+            if not isf:
+                continue
+            data = b""
+            ok = True
+            try:
+                data = read_bytes(fcap, path)
+            except OSError as exc:
+                ok = False
+                diags.file = path
+                diags.report("source.unreadable", 1, 1, "cannot read " + path + ": " + exc.error_message)
+            if ok:
+                mp.add_file(path, data, di, diags)
+                nfiles += 1
+    for pname, ppath in mp.pins.items():
+        if ppath not in mp.files:
+            data = b""
+            ok = True
+            try:
+                data = read_bytes(fcap, ppath)
+            except OSError as exc:
+                ok = False
+                diags.file = ppath
+                diags.report("source.unreadable", 1, 1, "cannot read pinned file " + ppath + " for " + pname + ": " + exc.error_message)
+            if ok:
+                mp.add_file(ppath, data, -1, diags)
+                nfiles += 1
+    return nfiles

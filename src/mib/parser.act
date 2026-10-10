@@ -1,0 +1,2102 @@
+"""Lenient recursive-descent parser for SMIv1/SMIv2 MIB modules.
+
+`parse_bytes(data, file)` parses every module in a file and returns a `ParseResult` with the
+`mib.ast.Module`s and every diagnostic. `parse_file` reads the file first, `parse_entry`
+parses the file behind a `mib.source.MibPath` index entry, and `parse_text` and
+`parse_base_module` are for tests and the embedded base modules.
+
+Besides syntax, the parser reports module-level facts it can judge alone: the SMI language
+guess (`Module.lang`, libsmi's rule), MODULE-IDENTITY presence and placement, ACCESS versus
+MAX-ACCESS style, TRAP-TYPE in SMIv2, missing DESCRIPTION in SMIv2 OBJECT-TYPEs, and the
+LAST-UPDATED/REVISION dates. Everything that needs other modules (imports, types, OIDs,
+value ranges, STATUS/ACCESS values) is left to the resolver.
+
+Every real-world quirk the parser accepts is accepted with a diagnostic, never silently. Clause bodies are order tolerant; missing, duplicated and
+out-of-order clauses are diagnosed after the fact. Lists tolerate missing, doubled and
+trailing commas. A syntax error drops only the declaration it is in (level 1,
+`parse.syntax`); the parser then resynchronises at the next declaration start, which is
+recognised by its shape (`x MACRO-KEYWORD clause`, `x OBJECT IDENTIFIER ::=`,
+`X MACRO ::=`, or `X ::= <type>` judged by the token after `::=`), never by name case.
+The lint of a dropped declaration is discarded with it. When the skipped tokens carry no
+SMI content at all (no `::=`, string, brace, clause keyword or `name MACRO-KEYWORD`), they
+are stray text such as prose left outside comments, and the diagnostic is `parse.junk`
+(level 2) instead.
+
+Further leniencies, each found in the MIB corpus (`mib.test_corpus`,
+`interop/mibs/compare/parse_vs_oracles.py`) and each with its own code: a misspelled clause
+keyword (`DESCRIPITION`, `DEFVALUE`, `Description`), a DESCRIPTION without its keyword, adjacent
+strings in one clause, unescaped quotes inside a text, an unquoted one-word clause value
+(`LAST-UPDATED TBD`), `STRING` for OCTET STRING, `SEQUENCE OF <base type>`, SEQUENCE items
+without a type or with a misplaced comma, quoted names and numbers in INDEX, `INCLUDES` twice,
+unquoted dotted numbers in DEFVAL, malformed enumeration labels (`n/a(2)`, two words), stray
+words inside an enumeration, range bounds beyond 64 bits (the constraint is dropped, level 1),
+and lint for `BITS` without named bits and uppercase SEQUENCE items.
+
+The parser knows the SMI base modules (SNMPv2-SMI, SNMPv2-TC, SNMPv2-CONF, RFC1155-SMI,
+RFC1065-SMI, RFC-1212, RFC-1215, and Cisco's -v1 copies): there MACRO definitions,
+CHOICE, tagged types and EXPORTS are normal. Elsewhere they are skipped with a diagnostic.
+"""
+
+import file
+import mib.ast
+import mib.diag
+import mib.lexer
+import mib.source
+
+K_EOF = mib.lexer.K_EOF
+K_LIDENT = mib.lexer.K_LIDENT
+K_UIDENT = mib.lexer.K_UIDENT
+K_NUM = mib.lexer.K_NUM
+K_NEGNUM = mib.lexer.K_NEGNUM
+K_STR = mib.lexer.K_STR
+K_HEX = mib.lexer.K_HEX
+K_BIN = mib.lexer.K_BIN
+K_ASSIGN = mib.lexer.K_ASSIGN
+K_DOTDOT = mib.lexer.K_DOTDOT
+P_LBRACE = 123
+P_RBRACE = 125
+P_LPAREN = 40
+P_RPAREN = 41
+P_COMMA = 44
+P_SEMI = 59
+P_BAR = 124
+P_LBRACK = 91
+P_RBRACK = 93
+P_MINUS = 45
+P_DOT = 46
+
+KW_MODULE_IDENTITY = mib.lexer.KW_MODULE_IDENTITY
+KW_OBJECT_IDENTITY = mib.lexer.KW_OBJECT_IDENTITY
+KW_OBJECT_TYPE = mib.lexer.KW_OBJECT_TYPE
+KW_NOTIFICATION_TYPE = mib.lexer.KW_NOTIFICATION_TYPE
+KW_TRAP_TYPE = mib.lexer.KW_TRAP_TYPE
+KW_TEXTUAL_CONVENTION = mib.lexer.KW_TEXTUAL_CONVENTION
+KW_OBJECT_GROUP = mib.lexer.KW_OBJECT_GROUP
+KW_NOTIFICATION_GROUP = mib.lexer.KW_NOTIFICATION_GROUP
+KW_MODULE_COMPLIANCE = mib.lexer.KW_MODULE_COMPLIANCE
+KW_AGENT_CAPABILITIES = mib.lexer.KW_AGENT_CAPABILITIES
+KW_LAST_UPDATED = mib.lexer.KW_LAST_UPDATED
+KW_ORGANIZATION = mib.lexer.KW_ORGANIZATION
+KW_CONTACT_INFO = mib.lexer.KW_CONTACT_INFO
+KW_DESCRIPTION = mib.lexer.KW_DESCRIPTION
+KW_REVISION = mib.lexer.KW_REVISION
+KW_STATUS = mib.lexer.KW_STATUS
+KW_REFERENCE = mib.lexer.KW_REFERENCE
+KW_SYNTAX = mib.lexer.KW_SYNTAX
+KW_UNITS = mib.lexer.KW_UNITS
+KW_MAX_ACCESS = mib.lexer.KW_MAX_ACCESS
+KW_ACCESS = mib.lexer.KW_ACCESS
+KW_INDEX = mib.lexer.KW_INDEX
+KW_AUGMENTS = mib.lexer.KW_AUGMENTS
+KW_DEFVAL = mib.lexer.KW_DEFVAL
+KW_OBJECTS = mib.lexer.KW_OBJECTS
+KW_NOTIFICATIONS = mib.lexer.KW_NOTIFICATIONS
+KW_ENTERPRISE = mib.lexer.KW_ENTERPRISE
+KW_VARIABLES = mib.lexer.KW_VARIABLES
+KW_DISPLAY_HINT = mib.lexer.KW_DISPLAY_HINT
+KW_MODULE = mib.lexer.KW_MODULE
+KW_MANDATORY_GROUPS = mib.lexer.KW_MANDATORY_GROUPS
+KW_GROUP = mib.lexer.KW_GROUP
+KW_WRITE_SYNTAX = mib.lexer.KW_WRITE_SYNTAX
+KW_MIN_ACCESS = mib.lexer.KW_MIN_ACCESS
+KW_PRODUCT_RELEASE = mib.lexer.KW_PRODUCT_RELEASE
+KW_SUPPORTS = mib.lexer.KW_SUPPORTS
+KW_INCLUDES = mib.lexer.KW_INCLUDES
+KW_VARIATION = mib.lexer.KW_VARIATION
+KW_CREATION_REQUIRES = mib.lexer.KW_CREATION_REQUIRES
+KW_SUBJECT_CATEGORIES = mib.lexer.KW_SUBJECT_CATEGORIES
+KW_SPPI_FIRST = mib.lexer.KW_SPPI_FIRST
+KW_CLAUSE_LAST = mib.lexer.KW_CLAUSE_LAST
+KW_END = mib.lexer.KW_END
+KW_IMPORTS = mib.lexer.KW_IMPORTS
+KW_EXPORTS = mib.lexer.KW_EXPORTS
+KW_FROM = mib.lexer.KW_FROM
+KW_MACRO = mib.lexer.KW_MACRO
+KW_BEGIN = mib.lexer.KW_BEGIN
+KW_OBJECT = mib.lexer.KW_OBJECT
+KW_IDENTIFIER = mib.lexer.KW_IDENTIFIER
+KW_SEQUENCE = mib.lexer.KW_SEQUENCE
+KW_OF = mib.lexer.KW_OF
+KW_CHOICE = mib.lexer.KW_CHOICE
+KW_SIZE = mib.lexer.KW_SIZE
+KW_INTEGER = mib.lexer.KW_INTEGER
+KW_OCTET = mib.lexer.KW_OCTET
+KW_STRING = mib.lexer.KW_STRING
+KW_BITS = mib.lexer.KW_BITS
+KW_IMPLICIT = mib.lexer.KW_IMPLICIT
+KW_IMPLIED = mib.lexer.KW_IMPLIED
+KW_APPLICATION = mib.lexer.KW_APPLICATION
+KW_UNIVERSAL = mib.lexer.KW_UNIVERSAL
+KW_IPADDRESS = mib.lexer.keyword_kind("IpAddress")
+KW_INTEGER32 = mib.lexer.keyword_kind("Integer32")
+KW_UNSIGNED32 = mib.lexer.keyword_kind("Unsigned32")
+KW_GAUGE32 = mib.lexer.keyword_kind("Gauge32")
+KW_COUNTER32 = mib.lexer.keyword_kind("Counter32")
+KW_COUNTER64 = mib.lexer.keyword_kind("Counter64")
+KW_TIMETICKS = mib.lexer.keyword_kind("TimeTicks")
+KW_OPAQUE = mib.lexer.keyword_kind("Opaque")
+
+# Modules where MACRO, CHOICE, tagged types and EXPORTS are legitimate.
+BASE_MODULE_NAMES: set[str] = {"SNMPv2-SMI", "SNMPv2-TC", "SNMPv2-CONF", "RFC1155-SMI", "RFC1065-SMI",
+                               "RFC-1212", "RFC-1215", "SNMPv2-SMI-v1", "SNMPv2-TC-v1"}
+
+# Canonical clause order per macro (RFC 2578/2579/2580, RFC 1212/1215). Clauses with the
+# same rank are alternatives (ACCESS / MAX-ACCESS, INDEX / AUGMENTS).
+def _ranks(kws: list[list[int]]) -> dict[int, int]:
+    d: dict[int, int] = {}
+    for i, grp in enumerate(kws):
+        for k in grp:
+            d[k] = i
+    return d
+
+def _mk_orders() -> dict[int, dict[int, int]]:
+    o: dict[int, dict[int, int]] = {}
+    o[KW_MODULE_IDENTITY] = _ranks([[KW_SUBJECT_CATEGORIES], [KW_LAST_UPDATED], [KW_ORGANIZATION], [KW_CONTACT_INFO], [KW_DESCRIPTION], [KW_REVISION]])
+    o[KW_OBJECT_IDENTITY] = _ranks([[KW_STATUS], [KW_DESCRIPTION], [KW_REFERENCE]])
+    o[KW_OBJECT_TYPE] = _ranks([[KW_SYNTAX], [KW_UNITS], [KW_MAX_ACCESS, KW_ACCESS], [KW_STATUS], [KW_DESCRIPTION], [KW_REFERENCE], [KW_INDEX, KW_AUGMENTS], [KW_DEFVAL]])
+    o[KW_NOTIFICATION_TYPE] = _ranks([[KW_OBJECTS], [KW_STATUS], [KW_DESCRIPTION], [KW_REFERENCE]])
+    o[KW_TRAP_TYPE] = _ranks([[KW_ENTERPRISE], [KW_VARIABLES], [KW_DESCRIPTION], [KW_REFERENCE]])
+    o[KW_TEXTUAL_CONVENTION] = _ranks([[KW_DISPLAY_HINT], [KW_STATUS], [KW_DESCRIPTION], [KW_REFERENCE], [KW_SYNTAX]])
+    o[KW_OBJECT_GROUP] = _ranks([[KW_OBJECTS], [KW_STATUS], [KW_DESCRIPTION], [KW_REFERENCE]])
+    o[KW_NOTIFICATION_GROUP] = _ranks([[KW_NOTIFICATIONS], [KW_STATUS], [KW_DESCRIPTION], [KW_REFERENCE]])
+    o[KW_MODULE_COMPLIANCE] = _ranks([[KW_STATUS], [KW_DESCRIPTION], [KW_REFERENCE], [KW_MODULE]])
+    o[KW_AGENT_CAPABILITIES] = _ranks([[KW_PRODUCT_RELEASE], [KW_STATUS], [KW_DESCRIPTION], [KW_REFERENCE], [KW_SUPPORTS]])
+    return o
+
+CLAUSE_ORDER = _mk_orders()
+
+# Mandatory clauses per macro (DESCRIPTION of OBJECT-TYPE is handled separately: SMIv2 only).
+def _mk_required() -> dict[int, list[int]]:
+    r: dict[int, list[int]] = {}
+    r[KW_MODULE_IDENTITY] = [KW_LAST_UPDATED, KW_ORGANIZATION, KW_CONTACT_INFO, KW_DESCRIPTION]
+    r[KW_OBJECT_IDENTITY] = [KW_STATUS, KW_DESCRIPTION]
+    r[KW_OBJECT_TYPE] = [KW_SYNTAX, KW_STATUS]
+    r[KW_NOTIFICATION_TYPE] = [KW_STATUS, KW_DESCRIPTION]
+    r[KW_TRAP_TYPE] = [KW_ENTERPRISE]
+    r[KW_TEXTUAL_CONVENTION] = [KW_STATUS, KW_DESCRIPTION, KW_SYNTAX]
+    r[KW_OBJECT_GROUP] = [KW_OBJECTS, KW_STATUS, KW_DESCRIPTION]
+    r[KW_NOTIFICATION_GROUP] = [KW_NOTIFICATIONS, KW_STATUS, KW_DESCRIPTION]
+    r[KW_MODULE_COMPLIANCE] = [KW_STATUS, KW_DESCRIPTION]
+    r[KW_AGENT_CAPABILITIES] = [KW_PRODUCT_RELEASE, KW_STATUS, KW_DESCRIPTION]
+    return r
+
+REQUIRED_CLAUSES = _mk_required()
+
+# Clauses that may appear more than once in a macro body.
+REPEATABLE: set[int] = {KW_REVISION, KW_MODULE, KW_SUPPORTS}
+
+# Clauses whose value is a quoted string, and clauses whose value is braced (for recognising
+# misspelled clause keywords by the shape of the value that follows).
+STRING_CLAUSES: set[int] = {KW_DESCRIPTION, KW_REFERENCE, KW_UNITS, KW_DISPLAY_HINT, KW_LAST_UPDATED,
+                            KW_ORGANIZATION, KW_CONTACT_INFO, KW_REVISION, KW_PRODUCT_RELEASE}
+BRACED_CLAUSES: set[int] = {KW_INDEX, KW_AUGMENTS, KW_DEFVAL, KW_OBJECTS, KW_NOTIFICATIONS, KW_VARIABLES}
+
+
+def _edit_distance(a: str, b: str) -> int:
+    """Levenshtein distance of two short strings."""
+    prev: list[int] = list(range(len(b) + 1))
+    for i in range(len(a)):
+        cur: list[int] = [i + 1]
+        for j in range(len(b)):
+            cost = 0 if a[i] == b[j] else 1
+            v = prev[j] + cost
+            if prev[j + 1] + 1 < v:
+                v = prev[j + 1] + 1
+            if cur[j] + 1 < v:
+                v = cur[j] + 1
+            cur.append(v)
+        prev = cur
+    return prev[len(b)]
+
+
+class ParseError(Exception):
+    """A syntax error inside a declaration; `tok` is the index of the offending token."""
+    tok: int
+
+    def __init__(self, msg: str, tok: int):
+        self.error_message = msg
+        self.tok = tok
+
+
+class ParseResult(object):
+    """The modules parsed from one input, plus every diagnostic (lexer and parser)."""
+    file: str
+    modules: list[mib.ast.Module]
+    diags: list[mib.diag.Diagnostic]
+
+    def __init__(self, file: str, modules: list[mib.ast.Module], diags: list[mib.diag.Diagnostic]):
+        self.file = file
+        self.modules = modules
+        self.diags = diags
+
+    def module(self, name: str) -> ?mib.ast.Module:
+        """The first module called `name`, or None."""
+        for m in self.modules:
+            if m.name == name:
+                return m
+        return None
+
+    def errors(self) -> list[mib.diag.Diagnostic]:
+        """Diagnostics of level 0-2."""
+        return [d for d in self.diags if d.level <= 2]
+
+    def count(self, max_level: int = 6) -> int:
+        n = 0
+        for d in self.diags:
+            if d.level <= max_level:
+                n += 1
+        return n
+
+
+def _ident_ok(name: str) -> bool:
+    """True when an identifier has none of the spelling issues `_ident_issues` reports."""
+    return len(name) == 0 or (len(name) <= 64 and "_" not in name and not name.endswith("-") and not (name[0] >= "0" and name[0] <= "9"))
+
+
+def _ident_issues(name: str) -> list[str]:
+    """Lint codes for an identifier's spelling (case aside)."""
+    out: list[str] = []
+    if _ident_ok(name):
+        return out
+    if "_" in name:
+        out.append("parse.underscore-in-identifier")
+    if name.endswith("-"):
+        out.append("parse.identifier-trailing-hyphen")
+    if len(name) > 0 and name[0] >= "0" and name[0] <= "9":
+        out.append("parse.identifier-leading-digit")
+    if len(name) > 64:
+        out.append("parse.identifier-too-long")
+    return out
+
+
+class Parser(object):
+    """Parser state over one file's tokens. Use `parse_bytes()`; the methods are internal."""
+    data: bytes
+    toks: list[mib.lexer.Token]
+    n: int
+    pos: int
+    limit: int
+    diags: mib.diag.Diagnostics
+    file: str
+    base: bool
+    pib: bool
+    vendor_macros: set[str]
+
+    def __init__(self, data: bytes, toks: list[mib.lexer.Token], diags: mib.diag.Diagnostics, file: str):
+        self.data = data
+        self.toks = toks
+        self.n = len(toks)
+        self.pos = 0
+        self.limit = len(toks) - 1
+        self.diags = diags
+        self.file = file
+        self.base = False
+        self.pib = False
+        self.vendor_macros = set()
+
+    # --- token access ---------------------------------------------------------------------
+
+    def kind(self, j: int) -> int:
+        """Kind of token j; K_EOF at or beyond the current module's limit."""
+        if j >= self.limit:
+            return K_EOF
+        return self.toks[j].kind
+
+    def peek(self) -> int:
+        return self.kind(self.pos)
+
+    def peek_at(self, d: int) -> int:
+        return self.kind(self.pos + d)
+
+    def tok(self, j: int) -> mib.lexer.Token:
+        if j >= self.n:
+            return self.toks[self.n - 1]
+        return self.toks[j]
+
+    def text(self, j: int) -> str:
+        """Source text of token j. Identifiers, keywords, numbers and punctuation are ASCII by
+        construction; other tokens go through the lenient decoder."""
+        t = self.tok(j)
+        k = t.kind
+        if k != K_STR and k != mib.lexer.K_OTHER:
+            return self.data[t.start:t.end].decode()
+        return mib.lexer.text(self.data, t)
+
+    def describe(self, j: int) -> str:
+        k = self.kind(j)
+        if k == K_EOF:
+            return "end of module" if j < self.n - 1 else "end of file"
+        if k == K_STR:
+            return "a quoted string"
+        t = self.text(j)
+        if len(t) > 40:
+            t = t[:40] + "..."
+        return "'" + t + "'"
+
+    def fail(self, what: str) -> ParseError:
+        return ParseError("expected " + what + ", got " + self.describe(self.pos), self.pos)
+
+    def expect(self, k: int, what: str) -> int:
+        if self.peek() != k:
+            raise self.fail(what)
+        self.pos += 1
+        return self.pos - 1
+
+    def report(self, code: str, j: int, msg: str) -> None:
+        t = self.tok(j)
+        self.diags.report(code, t.line, t.col, msg)
+
+    def lint_ident(self, j: int, name: str) -> None:
+        if _ident_ok(name):
+            return
+        for code in _ident_issues(name):
+            self.report(code, j, "identifier '" + name + "'")
+
+    def lint_descriptor(self, j: int, name: str) -> None:
+        if self.kind(j) == K_UIDENT or (len(name) > 0 and name[0] >= "A" and name[0] <= "Z"):
+            self.report("parse.bad-identifier-case", j, "descriptor '" + name + "' should start with a lowercase letter")
+        self.lint_ident(j, name)
+
+    def lint_type_name(self, j: int, name: str) -> None:
+        if len(name) > 0 and not (name[0] >= "A" and name[0] <= "Z"):
+            self.report("parse.bad-identifier-case", j, "type name '" + name + "' should start with an uppercase letter")
+        self.lint_ident(j, name)
+
+    # --- values ---------------------------------------------------------------------------
+
+    def make_text(self, j: int) -> mib.ast.Text:
+        t = self.tok(j)
+        raw = mib.source.string_value(self.data, t)
+        if (t.flags & mib.lexer.F_NON_ASCII) == 0:
+            return mib.ast.Text(raw.decode(), t.line, t.col)
+        s = mib.source.decode_lenient(raw)
+        enc = "UTF-8" if mib.source.is_utf8(raw) else "not UTF-8; decoded as CP1252"
+        self.report("lex.string-non-ascii", j, "non-ASCII bytes in a string (" + enc + ")")
+        return mib.ast.Text(s, t.line, t.col)
+
+    def name_at(self, j: int) -> mib.ast.Name:
+        t = self.tok(j)
+        return mib.ast.Name(self.text(j), "", t.line, t.col)
+
+    def parse_ref(self, what: str) -> mib.ast.Name:
+        """An identifier, optionally module-qualified (`IF-MIB.ifIndex`)."""
+        k = self.peek()
+        if k != K_LIDENT and k != K_UIDENT:
+            raise self.fail(what)
+        j = self.pos
+        self.pos += 1
+        if self.peek() == P_DOT and mib.lexer.is_ident(self.peek_at(1)):
+            m = self.text(j)
+            self.pos += 2
+            t = self.tok(j)
+            return mib.ast.Name(self.text(self.pos - 1), m, t.line, t.col)
+        return self.name_at(j)
+
+    def number_value(self, j: int, negative: bool) -> mib.ast.Value:
+        t = self.tok(j)
+        txt = self.text(j)
+        digits = txt[1:] if txt.startswith("-") else txt
+        if len(digits) > 1 and digits[0] == "0":
+            self.report("parse.number-leading-zero", j, "number with leading zeros: " + txt)
+        v = mib.ast.Value(mib.ast.VAL_NUMBER, ("-" + digits) if negative else digits, t.line, t.col)
+        return v
+
+    def signed_number(self, what: str) -> mib.ast.Value:
+        """NUMBER, NEGNUMBER, '-' NUMBER (level 5), or a hex/binary string."""
+        k = self.peek()
+        j = self.pos
+        if k == K_NUM:
+            self.pos += 1
+            return self.number_value(j, False)
+        if k == K_NEGNUM:
+            self.pos += 1
+            return self.number_value(j, True)
+        if k == P_MINUS and self.peek_at(1) == K_NUM:
+            self.report("parse.neg-number-space", j, "'-' separated from its number")
+            self.pos += 2
+            v = self.number_value(j + 1, True)
+            return v
+        if k == K_HEX or k == K_BIN:
+            self.pos += 1
+            return self.hexbin_value(j)
+        raise self.fail(what)
+
+    def hexbin_value(self, j: int) -> mib.ast.Value:
+        t = self.tok(j)
+        txt = self.text(j)
+        digits = txt[1:len(txt) - 2]
+        kind = mib.ast.VAL_HEX if self.kind(j) == K_HEX else mib.ast.VAL_BIN
+        return mib.ast.Value(kind, digits, t.line, t.col)
+
+    def oid_number(self, j: int) -> int:
+        txt = self.text(j)
+        if len(txt) > 1 and txt[0] == "0":
+            self.report("parse.number-leading-zero", j, "number with leading zeros: " + txt)
+        if len(txt) > 18:
+            stripped = txt.lstrip("0")
+            if len(stripped) > 18:
+                self.report("parse.number-too-large", j, "OID sub-identifier " + txt + " does not fit in 64 bits")
+                return mib.ast.OID_TOO_BIG
+            return int(stripped) if stripped != "" else 0
+        return int(txt)
+
+    def parse_oid_value(self) -> mib.ast.OidValue:
+        """A braced OID value; components are numbers, names, name(number) and Module.name."""
+        lb = self.expect(P_LBRACE, "'{{'")
+        t0 = self.tok(lb)
+        comps: list[mib.ast.OidComponent] = []
+        while True:
+            k = self.peek()
+            j = self.pos
+            if k == P_RBRACE:
+                self.pos += 1
+                break
+            t = self.tok(j)
+            if k == K_NUM:
+                self.pos += 1
+                comps.append(mib.ast.OidComponent("", "", self.oid_number(j), t.line, t.col))
+            elif k == K_LIDENT or k == K_UIDENT:
+                nm = self.text(j)
+                mod = ""
+                self.pos += 1
+                if self.peek() == P_DOT and mib.lexer.is_ident(self.peek_at(1)):
+                    mod = nm
+                    nm = self.text(self.pos + 1)
+                    self.pos += 2
+                num = mib.ast.OID_NO_NUMBER
+                if self.peek() == P_LPAREN:
+                    self.pos += 1
+                    nt = self.expect(K_NUM, "a number in name(number)")
+                    num = self.oid_number(nt)
+                    self.expect(P_RPAREN, "')'")
+                comps.append(mib.ast.OidComponent(nm, mod, num, t.line, t.col))
+            else:
+                raise self.fail("an OID component or '}}'")
+        return mib.ast.OidValue(comps, t0.line, t0.col)
+
+    # --- lists ----------------------------------------------------------------------------
+
+    def parse_name_list(self, what: str, clause: str) -> list[mib.ast.Name]:
+        """A braced name list with lenient commas (missing: level 2; trailing or doubled:
+        level 3). Returns the names; an empty list is the caller's business."""
+        self.expect(P_LBRACE, "'{{' after " + clause)
+        out: list[mib.ast.Name] = []
+        comma = False
+        while True:
+            k = self.peek()
+            j = self.pos
+            if k == P_RBRACE:
+                if comma and len(out) > 0:
+                    self.report("parse.trailing-comma", j, "trailing comma in " + clause + " list")
+                self.pos += 1
+                return out
+            if k == P_COMMA:
+                if comma or len(out) == 0:
+                    self.report("parse.double-comma", j, "empty element in " + clause + " list")
+                comma = True
+                self.pos += 1
+                continue
+            if k == K_LIDENT or k == K_UIDENT:
+                if len(out) > 0 and not comma:
+                    self.report("parse.missing-comma", j, "missing comma in " + clause + " list")
+                out.append(self.parse_ref(what))
+                comma = False
+                continue
+            raise self.fail(what + " or '}}' in " + clause)
+        return out
+
+    # --- syntax ---------------------------------------------------------------------------
+
+    def parse_named_numbers(self, bits: bool, opened: bool = False) -> list[mib.ast.NamedNumber]:
+        """A braced `label(n)` list for enumerations and BITS, with lenient commas and labels.
+        `opened` is True when the opening brace is missing (already reported)."""
+        what = "BITS" if bits else "enumeration"
+        if not opened:
+            self.expect(P_LBRACE, "'{{'")
+        out: list[mib.ast.NamedNumber] = []
+        comma = False
+        while True:
+            k = self.peek()
+            j = self.pos
+            if k == P_SEMI and len(out) > 0 and mib.lexer.is_name(self.peek_at(1)) and self.peek_at(2) == P_LPAREN:
+                self.report("parse.missing-comma", j, "';' instead of ',' in " + what + " list")
+                comma = True
+                self.pos += 1
+                continue
+            if k == P_RBRACE:
+                if comma and len(out) > 0:
+                    self.report("parse.trailing-comma", j, "trailing comma in " + what + " list")
+                self.pos += 1
+                return out
+            if k == P_COMMA:
+                if comma or len(out) == 0:
+                    self.report("parse.double-comma", j, "empty element in " + what + " list")
+                comma = True
+                self.pos += 1
+                continue
+            if (k == K_LIDENT or k == K_UIDENT or k == K_NUM or k == K_STR) and self.peek_at(1) == P_LPAREN:
+                if len(out) > 0 and not comma:
+                    self.report("parse.missing-comma", j, "missing comma in " + what + " list")
+                label = ""
+                if k == K_STR:
+                    label = self.make_text(j).value
+                    self.report("parse.label-quoted", j, "quoted label \"" + label + "\"")
+                else:
+                    label = self.text(j)
+                    if k == K_UIDENT:
+                        self.report("parse.label-case", j, "label '" + label + "' should start with a lowercase letter")
+                    self.lint_ident(j, label)
+                self.pos += 1
+                self.expect(P_LPAREN, "'(' after label '" + label + "'")
+                vk = self.peek()
+                vj = self.pos
+                v = self.signed_number("a number for '" + label + "'")
+                if vk == K_HEX or vk == K_BIN:
+                    self.report("parse.enum-hex-value", vj, "hexadecimal/binary value for '" + label + "'")
+                self.expect(P_RPAREN, "')' after the value of '" + label + "'")
+                t = self.tok(j)
+                if _too_large(v):
+                    self.report("parse.number-too-large", vj, "value of '" + label + "' does not fit in 64 bits; the label is dropped")
+                else:
+                    out.append(mib.ast.NamedNumber(label, v, t.line, t.col))
+                comma = False
+                continue
+            if (k == K_LIDENT or k == K_UIDENT) and mib.lexer.is_name(self.peek_at(1)) and self.peek_at(2) == P_LPAREN and self.tok(j + 1).line != self.tok(j).line:
+                # a word left over from a wrapped comment, on its own line before the next label
+                self.report("parse.junk", j, "stray word '" + self.text(j) + "' in " + what + " list skipped")
+                self.pos += 1
+                continue
+            q = self.malformed_label_end(j)
+            if q > j:
+                # `n/a(2)`, `mixed environment(3)`, `1200-baud(4)`: the label is the source text
+                if len(out) > 0 and not comma:
+                    self.report("parse.missing-comma", j, "missing comma in " + what + " list")
+                t0 = self.tok(j)
+                label = mib.source.decode_lenient(self.data[t0.start:self.tok(q - 1).end])
+                self.report("parse.label-malformed", j, "malformed label '" + label + "' kept as written")
+                self.pos = q + 1
+                v = self.signed_number("a number for '" + label + "'")
+                self.expect(P_RPAREN, "')' after the value of '" + label + "'")
+                out.append(mib.ast.NamedNumber(label, v, t0.line, t0.col))
+                comma = False
+                continue
+            raise self.fail("a label or '}}' in " + what)
+        return out
+
+    def malformed_label_end(self, j: int) -> int:
+        """In an enumeration at token j: the index of the '(' that ends a label written as
+        several tokens on one line (`n/a(2)`, `WPA&WPA2(9)`, `mixed environment(3)`), or j
+        when there is no such label. The tokens may be names, numbers, '-', '.', '/' and
+        other stray characters; a ',', a brace, a parenthesis or a string ends the search."""
+        line = self.tok(j).line
+        q = j
+        while q < j + 8:
+            k = self.kind(q)
+            if k == P_LPAREN:
+                return q if q > j and self.kind(q + 1) != P_RPAREN else j
+            if self.tok(q).line != line:
+                return j
+            if not (mib.lexer.is_name(k) or k == K_NUM or k == K_NEGNUM or k == P_MINUS or k == P_DOT or k == mib.lexer.K_OTHER or k == K_DOTDOT or k == 58):
+                return j
+            q += 1
+        return j
+
+    def range_value(self) -> mib.ast.Value:
+        k = self.peek()
+        j = self.pos
+        if k == K_UIDENT or k == K_LIDENT:
+            nm = self.text(j)
+            self.pos += 1
+            t = self.tok(j)
+            if nm == "MIN" or nm == "MAX":
+                self.report("parse.range-min-max", j, nm + " in a range means the base type's limit")
+            else:
+                self.report("parse.range-symbolic", j, "symbolic range bound '" + nm + "'")
+            return mib.ast.Value(mib.ast.VAL_NAME, nm, t.line, t.col)
+        return self.signed_number("a range bound")
+
+    def parse_ranges(self) -> list[mib.ast.RangeItem]:
+        out: list[mib.ast.RangeItem] = []
+        while True:
+            lo = self.range_value()
+            hi: ?mib.ast.Value = None
+            if self.peek() == K_DOTDOT:
+                self.pos += 1
+                hi = self.range_value()
+            out.append(mib.ast.RangeItem(lo, hi))
+            k = self.peek()
+            if k == P_BAR:
+                self.pos += 1
+            elif k == P_COMMA:
+                self.report("parse.range-separator", self.pos, "',' instead of '|' between ranges")
+                self.pos += 1
+            else:
+                return out
+        return out
+
+    def parse_constraint(self) -> mib.ast.Constraint:
+        lp = self.expect(P_LPAREN, "'('")
+        t = self.tok(lp)
+        if self.peek() == KW_SIZE:
+            self.pos += 1
+            self.expect(P_LPAREN, "'(' after SIZE")
+            rs = self.parse_ranges()
+            self.expect(P_RPAREN, "')' to close SIZE")
+            self.expect(P_RPAREN, "')'")
+            return mib.ast.Constraint(mib.ast.CON_SIZE, rs, t.line, t.col)
+        rs = self.parse_ranges()
+        self.expect(P_RPAREN, "')' to close the range")
+        return mib.ast.Constraint(mib.ast.CON_RANGE, rs, t.line, t.col)
+
+    def parse_tag(self) -> mib.ast.Tag:
+        self.expect(P_LBRACK, "'['")
+        cls = ""
+        k = self.peek()
+        if k == KW_APPLICATION or k == KW_UNIVERSAL or (k == K_UIDENT and self.text(self.pos) == "PRIVATE"):
+            cls = self.text(self.pos)
+            self.pos += 1
+        nt = self.expect(K_NUM, "a tag number")
+        self.expect(P_RBRACK, "']'")
+        mode = ""
+        if self.peek() == KW_IMPLICIT:
+            mode = "IMPLICIT"
+            self.pos += 1
+        elif self.peek() == K_UIDENT and self.text(self.pos) == "EXPLICIT":
+            mode = "EXPLICIT"
+            self.pos += 1
+        return mib.ast.Tag(cls, self.oid_number(nt), mode)
+
+    def skip_balanced(self) -> None:
+        """At an opening brace or parenthesis: skip to the matching close (tolerating mismatched kinds)."""
+        depth = 0
+        while self.pos < self.limit:
+            k = self.toks[self.pos].kind
+            self.pos += 1
+            if k == P_LBRACE or k == P_LPAREN:
+                depth += 1
+            elif k == P_RBRACE or k == P_RPAREN:
+                depth -= 1
+                if depth <= 0:
+                    return
+
+    def parse_syntax(self, in_sequence: bool = False) -> mib.ast.Syntax:
+        """A type: ASN.1 built-ins, type references (also qualified), BITS, SEQUENCE OF,
+        tags, and a subtype (range, SIZE or named numbers)."""
+        tag: ?mib.ast.Tag = None
+        if self.peek() == P_LBRACK:
+            tag = self.parse_tag()
+        k = self.peek()
+        j = self.pos
+        t = self.tok(j)
+        s = mib.ast.Syntax(mib.ast.SYN_REF, "", t.line, t.col)
+        s.tag = tag
+        if k == KW_INTEGER:
+            self.pos += 1
+            s.kind = mib.ast.SYN_INTEGER
+        elif k == KW_OCTET:
+            self.pos += 1
+            self.expect(KW_STRING, "STRING after OCTET")
+            s.kind = mib.ast.SYN_OCTET_STRING
+        elif k == KW_OBJECT:
+            self.pos += 1
+            self.expect(KW_IDENTIFIER, "IDENTIFIER after OBJECT")
+            s.kind = mib.ast.SYN_OBJECT_IDENTIFIER
+        elif k == KW_BITS:
+            self.pos += 1
+            s.kind = mib.ast.SYN_BITS
+        elif k == KW_SEQUENCE and self.peek_at(1) == P_LBRACE:
+            # `SYNTAX SEQUENCE { a INTEGER, ... }`: an inline row structure; the items are
+            # checked like a SEQUENCE type and dropped (the columns are declared anyway)
+            self.pos += 1
+            self.report("parse.inline-sequence", j, "inline SEQUENCE {{ ... }} read as a structure node")
+            self.parse_sequence_items(mib.ast.SequenceType("", t.line, t.col))
+            s.kind = mib.ast.SYN_SEQUENCE
+            return s
+        elif k == KW_SEQUENCE:
+            self.pos += 1
+            self.expect(KW_OF, "OF after SEQUENCE")
+            nk = self.peek()
+            if nk == KW_INTEGER or nk == KW_OCTET or nk == KW_OBJECT or nk == KW_BITS or mib.lexer.is_type_kw(nk):
+                # `SEQUENCE OF INTEGER`: a list of a base type, not a table of rows
+                inner = self.parse_syntax()
+                self.report("parse.sequence-of-base-type", j, "SEQUENCE OF the base type " + inner.dump() + " (not a row type)")
+                s.kind = mib.ast.SYN_SEQUENCE_OF
+                s.name = inner.dump()
+                return s
+            if nk != K_UIDENT and nk != K_LIDENT:
+                raise self.fail("a row type name after SEQUENCE OF")
+            if nk == K_LIDENT:
+                self.report("parse.bad-identifier-case", self.pos, "row type name '" + self.text(self.pos) + "' should start with an uppercase letter")
+            s.kind = mib.ast.SYN_SEQUENCE_OF
+            s.name = self.text(self.pos)
+            self.pos += 1
+            return s
+        elif k == KW_STRING:
+            self.report("parse.string-type", j, "STRING read as OCTET STRING")
+            self.pos += 1
+            s.kind = mib.ast.SYN_OCTET_STRING
+        elif k == KW_CHOICE:
+            self.pos += 1
+            s.kind = mib.ast.SYN_CHOICE
+            if self.peek() == P_LBRACE:
+                self.skip_balanced()
+            return s
+        elif k == K_UIDENT or mib.lexer.is_type_kw(k):
+            nm = self.text(j)
+            self.pos += 1
+            if k == K_UIDENT and nm == "NULL":
+                s.kind = mib.ast.SYN_NULL
+                return s
+            if k == K_UIDENT and nm == "BIT" and self.peek() == KW_STRING:
+                self.report("parse.bit-string", j, "ASN.1 BIT STRING read as BITS")
+                self.pos += 1
+                s.kind = mib.ast.SYN_BITS
+            elif k == K_UIDENT and self.peek() == KW_STRING and _edit_distance(nm.upper(), "OCTET") <= 1:
+                self.report("parse.string-type", j, nm + " STRING read as OCTET STRING")
+                self.pos += 1
+                s.kind = mib.ast.SYN_OCTET_STRING
+            else:
+                s.name = nm
+                if self.peek() == P_DOT and mib.lexer.is_ident(self.peek_at(1)):
+                    s.module = s.name
+                    s.name = self.text(self.pos + 1)
+                    self.pos += 2
+        elif k == K_LIDENT:
+            self.report("parse.bad-identifier-case", j, "type name '" + self.text(j) + "' should start with an uppercase letter")
+            self.pos += 1
+            s.name = self.text(j)
+        else:
+            raise self.fail("a type")
+        # subtype
+        k2 = self.peek()
+        if k2 == K_LIDENT and s.kind == mib.ast.SYN_INTEGER and self.peek_at(1) == P_LPAREN and (self.peek_at(2) == K_NUM or self.peek_at(2) == K_NEGNUM) and self.peek_at(3) == P_RPAREN:
+            # `INTEGER  up(1), down(2) }`: the opening brace is missing
+            self.report("parse.brace-missing", self.pos, "'{{' missing before the enumeration")
+            s.named = self.parse_named_numbers(False, True)
+            s.has_named = True
+        elif k2 == P_LBRACE:
+            if s.kind == mib.ast.SYN_BITS:
+                s.named = self.parse_named_numbers(True)
+                s.has_named = True
+            elif s.kind == mib.ast.SYN_INTEGER or s.kind == mib.ast.SYN_REF:
+                if s.kind == mib.ast.SYN_REF and mib.lexer.is_type_kw(k):
+                    self.report("parse.enum-on-non-integer", self.pos, "enumeration on " + s.name + " read as INTEGER")
+                    s.kind = mib.ast.SYN_INTEGER
+                    s.name = ""
+                s.named = self.parse_named_numbers(False)
+                s.has_named = True
+                if self.peek() == P_LPAREN:
+                    self.report("parse.enum-with-range", self.pos, "range after an enumeration")
+                    s.constraint = self.checked_constraint(self.parse_constraint())
+            else:
+                raise self.fail("no '{{' after " + mib.ast.syntax_kind_name(s.kind))
+        elif k2 == P_LPAREN:
+            c = self.parse_constraint()
+            s.constraint = self.checked_constraint(c)
+            if c.kind == mib.ast.CON_RANGE and s.kind == mib.ast.SYN_OCTET_STRING:
+                self.report("parse.range-on-string", j, "range on OCTET STRING read as SIZE")
+                c.kind = mib.ast.CON_SIZE
+            elif c.kind == mib.ast.CON_SIZE and (s.kind == mib.ast.SYN_INTEGER or (s.kind == mib.ast.SYN_REF and _is_integer_kw(k))):
+                self.report("parse.size-on-integer", j, "SIZE on an integer type read as a range")
+                c.kind = mib.ast.CON_RANGE
+        if in_sequence and (s.constraint is not None or s.has_named):
+            self.report("parse.sequence-subtype", j, "subtype in a SEQUENCE item ignored")
+        elif s.kind == mib.ast.SYN_BITS and not s.has_named and not in_sequence and not self.base and k == KW_BITS:
+            self.report("parse.bits-without-names", j, "BITS without named bits")
+        return s
+
+    def checked_constraint(self, c: mib.ast.Constraint) -> ?mib.ast.Constraint:
+        """`c`, or None (with a level-1 diagnostic) when one of its bounds does not fit in
+        64 bits: such a constraint has no meaning, so it is dropped."""
+        for ri in c.ranges:
+            bad = _too_large(ri.lo)
+            h = ri.hi
+            if h is not None and _too_large(h):
+                bad = True
+            if bad:
+                self.diags.report("parse.number-too-large", c.line, c.col, "a range bound does not fit in 64 bits; the constraint is dropped")
+                return None
+        return c
+
+    # --- declarations ---------------------------------------------------------------------
+
+    def is_type_start(self, k: int) -> bool:
+        """Can a token of kind k start the right-hand side of a type assignment?"""
+        if k == KW_TEXTUAL_CONVENTION or k == KW_SEQUENCE or k == KW_CHOICE or k == P_LBRACK:
+            return True
+        if k == KW_INTEGER or k == KW_OCTET or k == KW_OBJECT or k == KW_BITS:
+            return True
+        if mib.lexer.is_type_kw(k) or k == K_UIDENT:
+            return True
+        return False
+
+    def decl_start(self, j: int) -> bool:
+        """Does a declaration start at token j?"""
+        k0 = self.kind(j)
+        if not mib.lexer.is_name(k0):
+            return False
+        k1 = self.kind(j + 1)
+        if k1 == KW_MACRO:
+            return True
+        if k1 == K_ASSIGN:
+            return self.is_type_start(self.kind(j + 2))
+        if not mib.lexer.is_ident(k0):
+            return False
+        if mib.lexer.is_macro_kw(k1) and k1 != KW_TEXTUAL_CONVENTION:
+            k2 = self.kind(j + 2)
+            return mib.lexer.is_clause_kw(k2) or k2 == K_ASSIGN
+        if k1 == KW_OBJECT:
+            return self.kind(j + 2) == KW_IDENTIFIER and self.kind(j + 3) == K_ASSIGN
+        if k1 == K_UIDENT and len(self.vendor_macros) > 0:
+            return self.text(j + 1) in self.vendor_macros
+        return False
+
+    def resync(self, start: int, end_tok: int) -> None:
+        """After an error in the declaration that starts at token `start`: continue at the
+        next declaration start after it, the module's final END, or the module limit.
+
+        The scan starts right after `start`, not at the error, so a declaration that the
+        broken one ran into (an unclosed brace swallowing the next line) is not lost."""
+        j = start + 1
+        while j < self.limit:
+            k = self.toks[j].kind
+            if k == KW_END and (j == end_tok or j + 1 >= self.limit):
+                break
+            if (k == K_LIDENT or k == K_UIDENT or k >= mib.lexer.KW_BASE) and self.decl_start(j):
+                break
+            j += 1
+        self.pos = j
+
+    def is_junk(self, a: int, b: int) -> bool:
+        """Are the tokens [a, b), skipped after a syntax error, stray text rather than a
+        broken declaration? They are when nothing in them carries SMI content: no '::=',
+        no quoted string, no brace, no clause keyword, no IMPORTS/FROM, no `name MACRO-KEYWORD`
+        and no `OBJECT IDENTIFIER`. Prose left outside comments (`_ final assignment by
+        IANA`) and stray words (a lone `NOTIFICATION-GROUP`, `[RFC4750]`, a lone string)
+        qualify; skipping them loses nothing, so they are level 2 (`parse.junk`), not level 1."""
+        if b - a > 200:
+            return False
+        if b - a == 1 and self.toks[a].kind == K_STR:
+            return True
+        q = a
+        while q < b:
+            k = self.toks[q].kind
+            if k == K_ASSIGN or k == K_STR or k == P_LBRACE or k == P_RBRACE or mib.lexer.is_clause_kw(k):
+                return False
+            if k == KW_IMPORTS or k == KW_FROM or k == KW_MACRO or k == KW_BEGIN:
+                return False
+            if mib.lexer.is_macro_kw(k) and q > a and mib.lexer.is_ident(self.toks[q - 1].kind):
+                return False
+            if k == KW_OBJECT and q + 1 < b and self.toks[q + 1].kind == KW_IDENTIFIER:
+                return False
+            q += 1
+        return True
+
+    def parse_imports(self, m: mib.ast.Module) -> None:
+        """IMPORTS ... ; with lenient commas, a possibly missing ';' and ignored built-ins."""
+        self.expect(KW_IMPORTS, "IMPORTS")
+        syms: list[mib.ast.Name] = []
+        comma = False
+        while True:
+            k = self.peek()
+            j = self.pos
+            if k == P_SEMI:
+                self.pos += 1
+                if len(syms) > 0:
+                    raise ParseError("imported symbols without FROM", j)
+                if self.more_imports(self.pos):
+                    self.report("parse.imports-extra-semicolon", j, "';' inside IMPORTS ignored")
+                    comma = False
+                    continue
+                return
+            if k == K_EOF:
+                self.report("parse.imports-missing-semicolon", j, "IMPORTS not terminated by ';'")
+                return
+            if k == KW_FROM:
+                if comma and len(syms) > 0:
+                    self.report("parse.imports-trailing-comma", j - 1, "trailing comma before FROM")
+                self.pos += 1
+                mk = self.peek()
+                if mk != K_UIDENT and mk != K_LIDENT:
+                    raise self.fail("a module name after FROM")
+                mj = self.pos
+                mname = self.text(mj)
+                if mk == K_LIDENT:
+                    self.report("parse.module-name-case", mj, "module name '" + mname + "' should start with an uppercase letter")
+                self.pos += 1
+                if self.peek() == P_LBRACE:
+                    self.report("parse.imports-module-oid", self.pos, "OID after FROM " + mname + " ignored")
+                    self.skip_balanced()
+                mt = self.tok(mj)
+                m.imports.append(mib.ast.ImportGroup(mname, syms, mt.line, mt.col))
+                syms = []
+                comma = False
+                if self.peek() != P_SEMI and self.decl_start(self.pos):
+                    self.report("parse.imports-missing-semicolon", self.pos, "IMPORTS not terminated by ';'")
+                    return
+                continue
+            if k == P_COMMA:
+                if comma:
+                    self.report("parse.double-comma", j, "empty element in IMPORTS")
+                comma = True
+                self.pos += 1
+                continue
+            if k == KW_INTEGER or k == KW_BITS or k == KW_SEQUENCE or (k == K_UIDENT and self.text(j) == "NULL"):
+                self.report("parse.imports-builtin", j, "ASN.1 built-in " + self.text(j) + " must not be imported; ignored")
+                self.pos += 1
+                comma = False
+                continue
+            if (k == KW_OCTET and self.peek_at(1) == KW_STRING) or (k == KW_OBJECT and self.peek_at(1) == KW_IDENTIFIER):
+                self.report("parse.imports-builtin", j, "ASN.1 built-in " + self.text(j) + " " + self.text(j + 1) + " must not be imported; ignored")
+                self.pos += 2
+                comma = False
+                continue
+            if mib.lexer.is_name(k):
+                if len(syms) > 0 and not comma:
+                    self.report("parse.imports-missing-comma", j, "missing comma between imported symbols")
+                syms.append(self.name_at(j))
+                self.pos += 1
+                comma = False
+                continue
+            raise self.fail("an imported symbol, FROM or ';'")
+
+    def more_imports(self, j: int) -> bool:
+        """After a ';' that ends IMPORTS: do more `symbol, ... FROM Module` groups follow?"""
+        n = 0
+        while n < 200:
+            k = self.kind(j)
+            if k == KW_FROM:
+                return n > 0 and mib.lexer.is_ident(self.kind(j + 1))
+            if k == P_COMMA:
+                j += 1
+                continue
+            if not mib.lexer.is_name(k) or mib.lexer.is_clause_kw(k) or k == KW_OBJECT or k == KW_END:
+                return False
+            if mib.lexer.is_ident(k) and mib.lexer.is_macro_kw(self.kind(j + 1)) and mib.lexer.is_clause_kw(self.kind(j + 2)):
+                return False
+            n += 1
+            j += 1
+        return False
+
+    def parse_declaration(self, m: mib.ast.Module) -> ?mib.ast.Def:
+        j = self.pos
+        k0 = self.peek()
+        if not mib.lexer.is_name(k0):
+            raise self.fail("a declaration")
+        k1 = self.peek_at(1)
+        name = self.text(j)
+        if k1 == KW_MACRO:
+            return self.parse_macro_definition(m)
+        if k1 == K_ASSIGN:
+            return self.parse_type_assignment()
+        if not mib.lexer.is_ident(k0):
+            raise ParseError("unexpected keyword " + name + " at the start of a declaration", j)
+        if k1 == KW_OBJECT and self.peek_at(2) == KW_IDENTIFIER:
+            self.lint_descriptor(j, name)
+            self.pos += 3
+            self.expect(K_ASSIGN, "'::=' after OBJECT IDENTIFIER")
+            t = self.tok(j)
+            d = mib.ast.ValueAssignment(name, t.line, t.col)
+            d.oid = self.parse_oid_value()
+            return d
+        if mib.lexer.is_macro_kw(k1) and k1 != KW_TEXTUAL_CONVENTION:
+            return self.parse_macro_invocation(k1)
+        if k1 == K_UIDENT and self.text(j + 1) in self.vendor_macros:
+            return self.parse_unknown_macro()
+        if k1 == KW_SYNTAX:
+            # `name SYNTAX ...`: the OBJECT-TYPE keyword is missing, or glued to the name
+            if name.endswith("OBJECT-TYPE") and len(name) > 11:
+                real = name[:len(name) - 11]
+                self.report("parse.macro-missing", j, "OBJECT-TYPE glued to the name " + real)
+                return self.parse_macro_invocation(KW_OBJECT_TYPE, 1, real)
+            self.report("parse.macro-missing", j + 1, "OBJECT-TYPE keyword missing after " + name)
+            return self.parse_macro_invocation(KW_OBJECT_TYPE, 1)
+        if (k1 == KW_SEQUENCE and self.peek_at(2) == P_LBRACE) or k1 == KW_TEXTUAL_CONVENTION:
+            self.report("parse.assign-missing", j + 1, "'::=' missing after " + name)
+            return self.parse_type_assignment(1)
+        # another ASN.1 assignment, such as `foo INTEGER ::= 5`
+        q = j + 1
+        while q < j + 6 and q < self.limit:
+            kq = self.kind(q)
+            if kq == K_ASSIGN:
+                self.report("parse.non-smi-assignment", j, "ASN.1 assignment of '" + name + "' is not SMI; skipped")
+                self.pos = q + 1
+                if self.peek() == P_LBRACE:
+                    self.skip_balanced()
+                elif self.peek() != K_EOF:
+                    self.pos += 1
+                return None
+            if mib.lexer.is_clause_kw(kq) or kq == P_LBRACE:
+                break
+            q += 1
+        raise ParseError("unexpected " + self.describe(j + 1) + " after '" + name + "'", j + 1)
+
+    def parse_macro_definition(self, m: mib.ast.Module) -> mib.ast.Def:
+        j = self.pos
+        name = self.text(j)
+        t = self.tok(j)
+        self.pos += 2
+        self.expect(K_ASSIGN, "'::=' after MACRO")
+        self.expect(KW_BEGIN, "BEGIN")
+        while self.peek() != KW_END:
+            if self.peek() == K_EOF:
+                raise ParseError("MACRO " + name + " has no END", j)
+            self.pos += 1
+        self.pos += 1
+        if not self.base:
+            self.report("parse.macro-definition", j, "MACRO definition of " + name + " outside the SMI base modules skipped")
+        m.macros.append(name)
+        if not mib.lexer.is_macro_kw(self.kind(j)) and self.kind(j) == K_UIDENT:
+            self.vendor_macros.add(name)
+        return mib.ast.MacroDefinition(name, t.line, t.col)
+
+    def parse_type_assignment(self, skip: int = 2) -> mib.ast.Def:
+        """`Name ::= type`; `skip` is 1 when the '::=' is missing."""
+        j = self.pos
+        name = self.text(j)
+        t = self.tok(j)
+        k0 = self.kind(j)
+        self.pos += skip
+        if not mib.lexer.is_keyword(k0) or not self.base:
+            self.lint_type_name(j, name)
+        k = self.peek()
+        if k == KW_TEXTUAL_CONVENTION:
+            self.pos += 1
+            tc = mib.ast.TextualConvention(name, t.line, t.col)
+            self.parse_macro_body(tc, KW_TEXTUAL_CONVENTION, j)
+            return tc
+        if k == KW_SEQUENCE and self.peek_at(1) == P_LBRACE:
+            self.pos += 1
+            st = mib.ast.SequenceType(name, t.line, t.col)
+            self.parse_sequence_items(st)
+            return st
+        if k == KW_CHOICE:
+            if not self.base:
+                self.report("parse.choice", self.pos, "CHOICE type " + name + " outside the SMI base modules skipped")
+            self.pos += 1
+            if self.peek() == P_LBRACE:
+                self.skip_balanced()
+            return mib.ast.ChoiceType(name, t.line, t.col)
+        ta = mib.ast.TypeAssignment(name, t.line, t.col)
+        s = self.parse_syntax()
+        if s.tag is not None and not self.base:
+            self.report("parse.tagged-type", j, "tagged type " + name + " outside the SMI base modules; the inner type is used")
+        ta.syntax = s
+        return ta
+
+    def parse_sequence_items(self, st: mib.ast.SequenceType) -> None:
+        self.expect(P_LBRACE, "'{{' after SEQUENCE")
+        comma = False
+        while True:
+            k = self.peek()
+            j = self.pos
+            if k == P_RBRACE:
+                if comma and len(st.items) > 0:
+                    self.report("parse.trailing-comma", j, "trailing comma in SEQUENCE " + st.name)
+                self.pos += 1
+                return
+            if k == P_COMMA:
+                if comma or len(st.items) == 0:
+                    self.report("parse.double-comma", j, "empty element in SEQUENCE " + st.name)
+                comma = True
+                self.pos += 1
+                continue
+            if k == K_LIDENT or k == K_UIDENT:
+                if len(st.items) > 0 and not comma:
+                    self.report("parse.missing-comma", j, "missing comma in SEQUENCE " + st.name + " before '" + self.text(j) + "'")
+                nm = self.text(j)
+                if k == K_UIDENT:
+                    self.report("parse.bad-identifier-case", j, "SEQUENCE " + st.name + " item '" + nm + "' should start with a lowercase letter")
+                self.pos += 1
+                t = self.tok(j)
+                nk = self.peek()
+                if nk == P_COMMA and self.is_type_start(self.peek_at(1)) and self.peek_at(1) != KW_SEQUENCE and self.peek_at(1) != KW_TEXTUAL_CONVENTION:
+                    e = self.simple_type_end(self.pos + 1)
+                    ke = self.kind(e)
+                    if ke == P_COMMA or ke == P_RBRACE or ke == P_LPAREN:
+                        # `name,  Type,`: the comma belongs after the type
+                        self.report("parse.misplaced-comma", self.pos, "comma between " + nm + " and its type in SEQUENCE " + st.name)
+                        self.pos += 1
+                        nk = self.peek()
+                if nk == P_COMMA or nk == P_RBRACE or (nk == K_LIDENT and self.typed_item_at(self.pos)):
+                    # `name,` or `name  nextName Type`: the item has no type
+                    self.report("parse.sequence-item-type-missing", j, "SEQUENCE " + st.name + " item " + nm + " has no type")
+                    st.items.append(mib.ast.SequenceItem(nm, mib.ast.Syntax(mib.ast.SYN_REF, "", t.line, t.col), t.line, t.col))
+                    comma = False
+                    continue
+                s = self.parse_syntax(True)
+                st.items.append(mib.ast.SequenceItem(nm, s, t.line, t.col))
+                comma = False
+                continue
+            raise self.fail("a SEQUENCE item or '}}'")
+
+    def simple_type_end(self, q: int) -> int:
+        """The token after a simple type starting at q (`OCTET STRING` and `OBJECT
+        IDENTIFIER` are two tokens, a qualified `M.T` three, anything else one)."""
+        k = self.kind(q)
+        if (k == KW_OCTET and self.kind(q + 1) == KW_STRING) or (k == KW_OBJECT and self.kind(q + 1) == KW_IDENTIFIER):
+            return q + 2
+        if k == K_UIDENT and self.kind(q + 1) == P_DOT and mib.lexer.is_ident(self.kind(q + 2)):
+            return q + 3
+        return q + 1
+
+    def typed_item_at(self, q: int) -> bool:
+        """Is token q a lowercase name followed by a built-in type (`ifMtu INTEGER`), i.e. the
+        start of the next SEQUENCE item rather than a (lowercase) type name?"""
+        k = self.kind(q + 1)
+        if k == KW_INTEGER or k == KW_OCTET or k == KW_OBJECT or k == KW_BITS or mib.lexer.is_type_kw(k):
+            return True
+        if k == K_UIDENT:
+            e = self.simple_type_end(q + 1)
+            ke = self.kind(e)
+            return ke == P_COMMA or ke == P_RBRACE or ke == P_LPAREN
+        return False
+
+    def parse_unknown_macro(self) -> mib.ast.Def:
+        j = self.pos
+        name = self.text(j)
+        macro = self.text(j + 1)
+        t = self.tok(j)
+        self.pos += 2
+        self.report("parse.unknown-macro", j, "invocation of the module's own macro " + macro + "; only the OID is kept")
+        while self.peek() != K_ASSIGN:
+            k = self.peek()
+            if k == K_EOF:
+                raise self.fail("'::='")
+            if k == P_LBRACE or k == P_LPAREN:
+                self.skip_balanced()
+            else:
+                self.pos += 1
+        self.pos += 1
+        d = mib.ast.UnknownMacro(name, macro, t.line, t.col)
+        if self.peek() == P_LBRACE:
+            d.oid = self.parse_oid_value()
+        else:
+            self.pos += 1
+        return d
+
+    def parse_macro_invocation(self, macro: int, skip: int = 2, name_override: str = "") -> mib.ast.Def:
+        """`name MACRO clauses ::= value`. `skip` is the number of tokens before the first
+        clause (1 when the macro keyword is missing); `name_override` replaces the name token's
+        text (for a macro keyword glued to the name)."""
+        j = self.pos
+        name = self.text(j) if name_override == "" else name_override
+        t = self.tok(j)
+        if macro == KW_TRAP_TYPE and self.kind(j) == K_UIDENT:
+            self.report("parse.bad-identifier-case", j, "descriptor '" + name + "' should start with a lowercase letter")
+            self.lint_ident(j, name)
+        else:
+            self.lint_descriptor(j, name)
+        self.pos += skip
+        d: mib.ast.Def = mib.ast.Def(name, t.line, t.col)
+        if macro == KW_OBJECT_TYPE:
+            d = mib.ast.ObjectType(name, t.line, t.col)
+        elif macro == KW_MODULE_IDENTITY:
+            d = mib.ast.ModuleIdentity(name, t.line, t.col)
+        elif macro == KW_OBJECT_IDENTITY:
+            d = mib.ast.ObjectIdentity(name, t.line, t.col)
+        elif macro == KW_NOTIFICATION_TYPE:
+            d = mib.ast.NotificationType(name, t.line, t.col)
+        elif macro == KW_TRAP_TYPE:
+            d = mib.ast.TrapType(name, t.line, t.col)
+        elif macro == KW_OBJECT_GROUP:
+            d = mib.ast.ObjectGroup(name, t.line, t.col)
+        elif macro == KW_NOTIFICATION_GROUP:
+            d = mib.ast.NotificationGroup(name, t.line, t.col)
+        elif macro == KW_MODULE_COMPLIANCE:
+            d = mib.ast.ModuleCompliance(name, t.line, t.col)
+        elif macro == KW_AGENT_CAPABILITIES:
+            d = mib.ast.AgentCapabilities(name, t.line, t.col)
+        self.parse_macro_body(d, macro, j)
+        self.expect(K_ASSIGN, "a clause or '::='")
+        if isinstance(d, mib.ast.TrapType):
+            nk = self.peek()
+            if nk == K_NUM:
+                d.number = self.oid_number(self.pos)
+                self.pos += 1
+            else:
+                raise self.fail("a trap number after '::='")
+        else:
+            d.oid = self.parse_oid_value()
+        return d
+
+    # --- macro bodies -----------------------------------------------------------------------
+
+    def parse_macro_body(self, d: mib.ast.Def, macro: int, dtok: int) -> None:
+        """The order-tolerant clause loop: parse `KEYWORD value` pairs until `::=` (or, for
+        TEXTUAL-CONVENTION, until something that is not a clause), then diagnose order,
+        duplicates and missing clauses."""
+        order = CLAUSE_ORDER[macro]
+        seen: int = 0
+        last_rank = -1
+        order_reported = False
+        while True:
+            k = self.peek()
+            kj = self.pos
+            if mib.lexer.is_clause_kw(k):
+                self.pos += 1
+            elif k == K_STR and macro != KW_TEXTUAL_CONVENTION and (seen & (1 << (KW_DESCRIPTION - mib.lexer.KW_CLAUSE_FIRST))) == 0 and order.get_def(KW_DESCRIPTION, -1) >= 0:
+                # `ACCESS read-only "text" ::=`: the DESCRIPTION keyword is missing
+                self.report("parse.clause-keyword-missing", kj, "quoted string without a clause keyword read as the DESCRIPTION of " + d.name)
+                k = KW_DESCRIPTION
+            elif k == K_UIDENT or k == K_LIDENT:
+                mk = self.misspelled_clause(macro)
+                if mk < 0:
+                    break
+                self.report("parse.clause-misspelled", kj, "'" + self.text(kj) + "' read as the clause keyword " + mib.lexer.kind_name(mk))
+                self.pos += 1
+                k = mk
+            else:
+                break
+            rank = order.get_def(k, -1)
+            if rank < 0:
+                if k == KW_STATUS and macro == KW_TRAP_TYPE:
+                    self.report("parse.trap-status", kj, "STATUS clause in TRAP-TYPE ignored")
+                elif k >= KW_SPPI_FIRST and k <= KW_CLAUSE_LAST:
+                    if not self.pib:
+                        self.report("parse.clause-unexpected", kj, "SPPI clause " + self.text(kj) + " ignored")
+                else:
+                    self.report("parse.clause-unexpected", kj, self.text(kj) + " clause is not part of " + mib.lexer.kind_name(macro) + "; ignored")
+                self.skip_clause_value()
+                continue
+            bit = 1 << ((KW_ACCESS if k == KW_MAX_ACCESS else k) - mib.lexer.KW_CLAUSE_FIRST)
+            if (seen & bit) != 0 and k not in REPEATABLE:
+                self.report("parse.clause-duplicate", kj, "duplicate " + self.text(kj) + " clause; the first one is kept")
+                scratch = _scratch_def(macro)
+                self.parse_clause(scratch, k, kj)
+                continue
+            if rank < last_rank and not order_reported:
+                self.report("parse.clause-order", kj, self.text(kj) + " clause out of order in " + mib.lexer.kind_name(macro) + " " + d.name)
+                order_reported = True
+            if rank > last_rank:
+                last_rank = rank
+            seen |= bit
+            d.clauses.append(mib.lexer.KEYWORDS[k - mib.lexer.KW_BASE])
+            self.parse_clause(d, k, kj)
+        for rq in REQUIRED_CLAUSES[macro]:
+            if (seen & (1 << (rq - mib.lexer.KW_CLAUSE_FIRST))) == 0:
+                if rq == KW_STATUS and macro == KW_OBJECT_TYPE and isinstance(d, mib.ast.ObjectType):
+                    self.report("parse.clause-missing", dtok, "OBJECT-TYPE " + d.name + " has no STATUS")
+                else:
+                    self.report("parse.clause-missing", dtok, mib.lexer.kind_name(macro) + " " + d.name + " has no " + mib.lexer.kind_name(rq) + " clause")
+        if macro == KW_OBJECT_TYPE and (seen & (1 << (KW_ACCESS - mib.lexer.KW_CLAUSE_FIRST))) == 0:
+            self.report("parse.clause-missing", dtok, "OBJECT-TYPE " + d.name + " has no MAX-ACCESS/ACCESS clause")
+        if isinstance(d, mib.ast.ObjectType) and len(d.augments) > 0:
+            if d.has_index:
+                self.report("parse.index-and-augments", dtok, d.name + " has both INDEX and AUGMENTS; AUGMENTS wins")
+            if len(d.augments) > 1:
+                self.report("parse.augments-multiple", dtok, d.name + " AUGMENTS more than one row; the first one is used")
+
+    def at_description(self) -> bool:
+        """Is the next token DESCRIPTION, or a misspelling of it followed by a string
+        (reported, level 2)? Used where DESCRIPTION is a sub-clause (REVISION, GROUP,
+        OBJECT, VARIATION)."""
+        k = self.peek()
+        if k == KW_DESCRIPTION:
+            return True
+        if (k == K_UIDENT or k == K_LIDENT) and self.peek_at(1) == K_STR:
+            w = self.text(self.pos).upper()
+            if abs(len(w) - 11) <= 2 and _edit_distance(w, "DESCRIPTION") <= 2:
+                self.report("parse.clause-misspelled", self.pos, "'" + self.text(self.pos) + "' read as the clause keyword DESCRIPTION")
+                return True
+        return False
+
+    def misspelled_clause(self, macro: int) -> int:
+        """At an identifier inside a macro body: is it a misspelled clause keyword of `macro`
+        (`DESCRIPITION`, `DEFVALUE`, `Description`), followed by a value of the right shape?
+        Returns the clause's kind, or -1. The match is case-insensitive, within edit distance
+        1 (2 for keywords of 6 letters or more), and must be unique."""
+        j = self.pos
+        word = self.text(j).upper()
+        if len(word) < 5 or self.decl_start(j):
+            return -1
+        best = -1
+        bestd = 99
+        nbest = 0
+        for ck in CLAUSE_ORDER[macro].keys():
+            name = mib.lexer.KEYWORDS[ck - mib.lexer.KW_BASE]
+            if abs(len(name) - len(word)) > 2:
+                continue
+            dist = _edit_distance(word, name)
+            if dist <= (2 if len(name) >= 6 else 1):
+                if dist < bestd:
+                    best = ck
+                    bestd = dist
+                    nbest = 1
+                elif dist == bestd:
+                    nbest += 1
+        if best < 0 or nbest > 1:
+            return -1
+        nk = self.kind(j + 1)
+        if best in STRING_CLAUSES:
+            return best if nk == K_STR else -1
+        if best in BRACED_CLAUSES:
+            return best if nk == P_LBRACE else -1
+        if best == KW_SYNTAX:
+            return best if self.is_type_start(nk) else -1
+        if best == KW_STATUS or best == KW_ACCESS or best == KW_MAX_ACCESS:
+            k2 = self.kind(j + 2)
+            return best if nk == K_LIDENT and (k2 == K_ASSIGN or mib.lexer.is_clause_kw(k2)) else -1
+        return -1
+
+    def skip_clause_value(self) -> None:
+        """Skip the value of an ignored clause: a balanced group, or one token."""
+        k = self.peek()
+        if k == P_LBRACE or k == P_LPAREN:
+            self.skip_balanced()
+        elif k != K_EOF and k != K_ASSIGN and not mib.lexer.is_clause_kw(k):
+            self.pos += 1
+            if self.peek() == P_LBRACE or self.peek() == P_LPAREN:
+                self.skip_balanced()
+
+    def opt_string(self, clause: str, concat: bool = True) -> ?mib.ast.Text:
+        """The quoted string after a clause keyword, or None when it is missing.
+
+        A single unquoted word (`LAST-UPDATED TBD`) is taken as the string. With `concat`,
+        adjacent strings (`REFERENCE "a" "b"`) are joined with a line break. Each of these
+        cases is reported at level 2."""
+        k = self.peek()
+        if k == K_STR:
+            sj = self.pos
+            self.pos += 1
+            t = self.make_text(sj)
+            if concat:
+                while True:
+                    pe = self.prose_end(self.pos)
+                    if pe > self.pos and (mib.lexer.is_clause_kw(self.kind(pe)) or self.kind(pe) == K_ASSIGN):
+                        # `DESCRIPTION "text." more text  REVISION ...`: unquoted text after the string
+                        self.report("parse.string-unquoted", self.pos, "unquoted text after the " + clause + " string joined to it")
+                        t = mib.ast.Text(t.value + "\n" + self.raw_text(self.pos, pe), t.line, t.col)
+                        self.pos = pe
+                        break
+                    if self.peek() == K_STR:
+                        self.report("parse.string-concat", self.pos, "adjacent quoted strings after " + clause + " joined")
+                        t2 = self.make_text(self.pos)
+                        self.pos += 1
+                        t = mib.ast.Text(t.value + "\n" + t2.value, t.line, t.col)
+                        continue
+                    q = self.embedded_quote_end()
+                    if q < 0:
+                        break
+                    # `"the "seconds" interval"`: unescaped quotes inside the text
+                    self.report("parse.string-embedded-quote", self.pos, "unescaped quotes inside the " + clause + " text; the pieces are joined")
+                    raw = self.data[self.tok(sj).start + 1:self.tok(q).end - 1]
+                    t = mib.ast.Text(mib.source.decode_lenient(raw), t.line, t.col)
+                    self.pos = q + 1
+            return t
+        if k == K_ASSIGN or mib.lexer.is_clause_kw(k) or k == K_EOF:
+            self.report("parse.string-expected", self.pos, "a quoted string is missing after " + clause)
+            return None
+        pe = self.prose_end(self.pos)
+        if concat and pe > self.pos + 1 and self.kind(pe) == K_STR:
+            nk = self.kind(pe + 1)
+            if nk == K_ASSIGN or nk == KW_OBJECT or mib.lexer.is_clause_kw(nk):
+                # `CONTACT-INFO  E-mail: someone@example.com"`: the opening quote is missing
+                j = self.pos
+                t0 = self.tok(j)
+                self.report("parse.string-unquoted", j, "the opening quote of the " + clause + " text is missing")
+                txt = self.raw_text(j, pe) + mib.source.decode_lenient(mib.source.string_value(self.data, self.tok(pe)))
+                self.pos = pe + 1
+                return mib.ast.Text(txt, t0.line, t0.col)
+        if (k == K_LIDENT or k == K_UIDENT or k == K_NUM) and (self.peek_at(1) == K_ASSIGN or mib.lexer.is_clause_kw(self.peek_at(1))):
+            j = self.pos
+            self.report("parse.string-expected", j, "unquoted value " + self.describe(j) + " after " + clause + " read as a string")
+            self.pos += 1
+            t = self.tok(j)
+            return mib.ast.Text(self.text(j), t.line, t.col)
+        raise self.fail("a quoted string after " + clause)
+
+    def prose_end(self, q: int) -> int:
+        """The first token at or after q that cannot be part of unquoted prose: '::=', a
+        string, a brace, a clause or macro keyword, OBJECT, or the start of a declaration
+        (at most 200 tokens are scanned; q + 200 is returned past that)."""
+        lim = q + 200
+        while q < lim:
+            k = self.kind(q)
+            if k == K_ASSIGN or k == K_STR or k == K_EOF or k == P_LBRACE or k == P_RBRACE or k == KW_OBJECT:
+                return q
+            if mib.lexer.is_clause_kw(k) or mib.lexer.is_macro_kw(k) or k == KW_END:
+                return q
+            if (k == K_LIDENT or k == K_UIDENT) and self.decl_start(q):
+                return q
+            q += 1
+        return q
+
+    def raw_text(self, a: int, b: int) -> str:
+        """The source text from token a up to (not including) token b, decoded leniently."""
+        if b <= a:
+            return ""
+        return mib.source.decode_lenient(self.data[self.tok(a).start:self.tok(b - 1).end])
+
+    def embedded_quote_end(self) -> int:
+        """Right after a string where a clause or '::=' should follow: do a few words and
+        then a string that is followed by a clause, '::=' or OBJECT come next (the text had
+        unescaped quotes, `"the "seconds" interval"`)? Returns the index of that string, or -1."""
+        q = self.pos
+        lim = q + 60
+        while q < lim:
+            k = self.kind(q)
+            if k == K_STR:
+                nk = self.kind(q + 1)
+                if q > self.pos and (nk == K_ASSIGN or nk == KW_OBJECT or mib.lexer.is_clause_kw(nk)):
+                    return q
+                return -1
+            if k == K_ASSIGN or k == K_EOF or k == P_LBRACE or k == P_RBRACE or mib.lexer.is_clause_kw(k) or mib.lexer.is_macro_kw(k):
+                return -1
+            q += 1
+        return -1
+
+    def word(self, clause: str) -> mib.ast.Name:
+        """The identifier value of STATUS, ACCESS, MAX-ACCESS, MIN-ACCESS."""
+        k = self.peek()
+        if k == K_LIDENT or k == K_UIDENT:
+            self.pos += 1
+            return self.name_at(self.pos - 1)
+        raise self.fail("a value after " + clause)
+
+    def parse_index(self, d: mib.ast.ObjectType) -> None:
+        self.expect(P_LBRACE, "'{{' after INDEX")
+        d.has_index = True
+        comma = False
+        while True:
+            k = self.peek()
+            j = self.pos
+            if k == P_RBRACE:
+                if comma and len(d.index) > 0:
+                    self.report("parse.trailing-comma", j, "trailing comma in INDEX")
+                self.pos += 1
+                if len(d.index) == 0:
+                    self.report("parse.empty-list", j, "empty INDEX of " + d.name)
+                return
+            if k == P_COMMA:
+                if comma or len(d.index) == 0:
+                    self.report("parse.double-comma", j, "empty element in INDEX")
+                comma = True
+                self.pos += 1
+                continue
+            if len(d.index) > 0 and not comma and k != K_EOF:
+                self.report("parse.missing-comma", j, "missing comma in INDEX")
+            implied = False
+            if k == KW_IMPLIED:
+                implied = True
+                self.pos += 1
+                k = self.peek()
+            t = self.tok(self.pos)
+            if k == KW_INTEGER or k == KW_OCTET or k == KW_OBJECT or k == KW_IPADDRESS or (k == K_UIDENT and self.text(self.pos) == "NetworkAddress" and self.peek_at(1) != P_DOT):
+                s = self.parse_syntax()
+                d.index.append(mib.ast.IndexItem("", "", implied, s, t.line, t.col))
+            elif k == K_STR:
+                tx = self.make_text(self.pos)
+                self.report("parse.quoted-name", self.pos, "quoted INDEX object name \"" + tx.value + "\"")
+                self.pos += 1
+                d.index.append(mib.ast.IndexItem(tx.value.strip(), "", implied, None, t.line, t.col))
+            elif k == K_NUM:
+                self.report("parse.index-number", self.pos, "number " + self.text(self.pos) + " in INDEX ignored")
+                self.pos += 1
+            else:
+                r = self.parse_ref("an INDEX object")
+                d.index.append(mib.ast.IndexItem(r.name, r.module, implied, None, r.line, r.col))
+            comma = False
+
+    def parse_defval(self) -> mib.ast.DefVal:
+        lb = self.expect(P_LBRACE, "'{{' after DEFVAL")
+        t = self.tok(lb)
+        start = self.tok(self.pos).start
+        v = self.defval_value(0)
+        rb = self.expect(P_RBRACE, "'}}' to close DEFVAL")
+        raw = self.data[start:self.tok(rb).start]
+        return mib.ast.DefVal(v, mib.source.decode_lenient(raw).strip(), t.line, t.col)
+
+    def defval_value(self, depth: int) -> mib.ast.Value:
+        """A DEFVAL value: number, hex/binary string, quoted string, name, name(number),
+        an unquoted dotted IP address, or a braced list of those (nested at most 16 deep)."""
+        k = self.peek()
+        j = self.pos
+        t = self.tok(j)
+        if depth > 16:
+            raise ParseError("DEFVAL braces nested too deeply", j)
+        if k == K_STR:
+            self.pos += 1
+            tx = self.make_text(j)
+            return mib.ast.Value(mib.ast.VAL_STRING, tx.value, t.line, t.col)
+        if k == K_LIDENT or k == K_UIDENT:
+            r = self.parse_ref("a value")
+            v = mib.ast.Value(mib.ast.VAL_NAME, r.name, t.line, t.col)
+            v.module = r.module
+            if self.peek() == P_LPAREN and self.peek_at(1) == K_NUM and self.peek_at(2) == P_RPAREN:
+                nv = self.number_value(self.pos + 1, False)
+                self.pos += 3
+                v.kind = mib.ast.VAL_NAMED_NUMBER
+                v.items = [nv]
+            return v
+        if k == K_NUM and self.peek_at(1) == P_DOT and self.peek_at(2) == K_NUM:
+            # an unquoted IP address (0.0.0.0) or another dotted number (1.0)
+            parts: list[str] = [self.text(j)]
+            self.pos += 1
+            while self.peek() == P_DOT and self.peek_at(1) == K_NUM:
+                parts.append(self.text(self.pos + 1))
+                self.pos += 2
+            ip = ".".join(parts)
+            self.report("parse.defval-unquoted-ip", j, "unquoted dotted number " + ip + " read as a string")
+            return mib.ast.Value(mib.ast.VAL_STRING, ip, t.line, t.col)
+        if k == P_LBRACE:
+            self.pos += 1
+            v = mib.ast.Value(mib.ast.VAL_BRACED, "", t.line, t.col)
+            while True:
+                kk = self.peek()
+                if kk == P_RBRACE:
+                    self.pos += 1
+                    return v
+                if kk == P_COMMA:
+                    self.pos += 1
+                    continue
+                if kk == K_EOF:
+                    raise self.fail("'}}'")
+                v.items.append(self.defval_value(depth + 1))
+            return v
+        return self.signed_number("a DEFVAL value")
+
+    def parse_clause(self, d: mib.ast.Def, k: int, kj: int) -> None:
+        """Parse the value of clause `k` (keyword token at kj, possibly misspelled) into `d`."""
+        kw = mib.lexer.KEYWORDS[k - mib.lexer.KW_BASE]
+        if k == KW_STATUS:
+            d.status = self.word(kw)
+        elif k == KW_DESCRIPTION:
+            d.description = self.opt_string(kw)
+        elif k == KW_REFERENCE:
+            d.reference = self.opt_string(kw)
+        elif k == KW_SYNTAX or k == KW_WRITE_SYNTAX:
+            s = self.parse_syntax()
+            if isinstance(d, mib.ast.ObjectType):
+                d.syntax = s
+            elif isinstance(d, mib.ast.TextualConvention):
+                d.syntax = s
+        elif k == KW_UNITS:
+            u = self.opt_string(kw, False)
+            if isinstance(d, mib.ast.ObjectType):
+                d.units = u
+        elif k == KW_ACCESS or k == KW_MAX_ACCESS or k == KW_MIN_ACCESS:
+            w = self.word(kw)
+            if isinstance(d, mib.ast.ObjectType):
+                d.access = w
+                d.access_kw = kw
+        elif k == KW_INDEX:
+            if isinstance(d, mib.ast.ObjectType):
+                self.parse_index(d)
+            else:
+                self.skip_clause_value()
+        elif k == KW_AUGMENTS:
+            names = self.parse_name_list("a row name", "AUGMENTS")
+            if isinstance(d, mib.ast.ObjectType):
+                d.augments = names
+        elif k == KW_DEFVAL:
+            dv = self.parse_defval()
+            if isinstance(d, mib.ast.ObjectType):
+                d.defval = dv
+        elif k == KW_OBJECTS or k == KW_VARIABLES or k == KW_NOTIFICATIONS:
+            names = self.parse_name_list("an object name", kw)
+            if len(names) == 0:
+                self.report("parse.empty-list", kj, "empty " + kw + " list")
+            if isinstance(d, mib.ast.NotificationType):
+                d.objects = names
+            elif isinstance(d, mib.ast.ObjectGroup):
+                d.objects = names
+            elif isinstance(d, mib.ast.NotificationGroup):
+                d.notifications = names
+            elif isinstance(d, mib.ast.TrapType):
+                d.variables = names
+        elif k == KW_DISPLAY_HINT:
+            h = self.opt_string(kw, False)
+            if isinstance(d, mib.ast.TextualConvention):
+                d.display_hint = h
+        elif k == KW_LAST_UPDATED or k == KW_ORGANIZATION or k == KW_CONTACT_INFO or k == KW_PRODUCT_RELEASE:
+            s = self.opt_string(kw, k == KW_ORGANIZATION or k == KW_CONTACT_INFO)
+            if isinstance(d, mib.ast.ModuleIdentity):
+                if k == KW_LAST_UPDATED:
+                    d.last_updated = s
+                elif k == KW_ORGANIZATION:
+                    d.organization = s
+                elif k == KW_CONTACT_INFO:
+                    d.contact_info = s
+            elif isinstance(d, mib.ast.AgentCapabilities):
+                d.product_release = s
+        elif k == KW_REVISION:
+            date = self.opt_string(kw, False)
+            desc: ?mib.ast.Text = None
+            if self.at_description():
+                self.pos += 1
+                desc = self.opt_string("DESCRIPTION")
+            elif self.peek() == K_STR:
+                self.report("parse.revision-description-missing", self.pos, "REVISION text without the DESCRIPTION keyword")
+                self.pos += 1
+                desc = self.make_text(self.pos - 1)
+            else:
+                self.report("parse.revision-description-missing", kj, "REVISION without DESCRIPTION")
+            if date is not None and isinstance(d, mib.ast.ModuleIdentity):
+                d.revisions.append(mib.ast.Revision(date, desc))
+        elif k == KW_ENTERPRISE:
+            if isinstance(d, mib.ast.TrapType):
+                if self.peek() == P_LBRACE:
+                    self.report("parse.trap-enterprise-braced", self.pos, "ENTERPRISE value in braces")
+                    d.enterprise = self.parse_oid_value()
+                    d.enterprise_braced = True
+                else:
+                    r = self.parse_ref("an enterprise OID name")
+                    d.enterprise = mib.ast.OidValue([mib.ast.OidComponent(r.name, r.module, mib.ast.OID_NO_NUMBER, r.line, r.col)], r.line, r.col)
+            else:
+                self.skip_clause_value()
+        elif k == KW_MODULE:
+            if isinstance(d, mib.ast.ModuleCompliance):
+                d.modules.append(self.parse_compliance_module(kj))
+            else:
+                self.skip_clause_value()
+        elif k == KW_SUPPORTS:
+            if isinstance(d, mib.ast.AgentCapabilities):
+                d.supports.append(self.parse_supports(kj))
+            else:
+                self.skip_clause_value()
+        elif k == KW_SUBJECT_CATEGORIES:
+            self.skip_clause_value()
+        else:
+            self.skip_clause_value()
+
+    def parse_compliance_module(self, kj: int) -> mib.ast.ComplianceModule:
+        """MODULE [Name [OID]] [MANDATORY-GROUPS list] (GROUP .. | OBJECT ..)*"""
+        t = self.tok(kj)
+        cm = mib.ast.ComplianceModule("", t.line, t.col)
+        k = self.peek()
+        if (k == K_UIDENT or k == K_LIDENT) and not (k == K_LIDENT and self.peek_at(1) == KW_MODULE_COMPLIANCE):
+            cm.name = self.text(self.pos)
+            self.pos += 1
+            if self.peek() == P_LBRACE:
+                cm.oid = self.parse_oid_value()
+        while True:
+            k = self.peek()
+            j = self.pos
+            if k == KW_MANDATORY_GROUPS:
+                self.pos += 1
+                for g in self.parse_name_list("a group name", "MANDATORY-GROUPS"):
+                    cm.mandatory_groups.append(g)
+            elif k == KW_GROUP:
+                self.pos += 1
+                gname = self.parse_ref("a group name after GROUP")
+                desc: ?mib.ast.Text = None
+                if self.at_description():
+                    self.pos += 1
+                    desc = self.opt_string("DESCRIPTION")
+                else:
+                    self.report("parse.clause-missing", j, "GROUP " + gname.name + " has no DESCRIPTION")
+                cm.groups.append(mib.ast.ComplianceGroup(gname, desc))
+            elif k == KW_OBJECT and mib.lexer.is_ident(self.peek_at(1)):
+                self.pos += 1
+                oname = self.parse_ref("an object name after OBJECT")
+                ob = mib.ast.ComplianceObject(oname)
+                has_desc = False
+                while True:
+                    kk = self.peek()
+                    if kk == KW_SYNTAX:
+                        self.pos += 1
+                        ob.syntax = self.parse_syntax()
+                    elif kk == KW_WRITE_SYNTAX:
+                        self.pos += 1
+                        ob.write_syntax = self.parse_syntax()
+                    elif kk == KW_MIN_ACCESS:
+                        self.pos += 1
+                        ob.min_access = self.word("MIN-ACCESS")
+                    elif not has_desc and self.at_description():
+                        self.pos += 1
+                        ob.description = self.opt_string("DESCRIPTION")
+                        has_desc = True
+                    else:
+                        break
+                if not has_desc:
+                    self.report("parse.clause-missing", j, "OBJECT " + oname.name + " has no DESCRIPTION")
+                cm.objects.append(ob)
+            else:
+                return cm
+        return cm
+
+    def parse_supports(self, kj: int) -> mib.ast.Supports:
+        """SUPPORTS Module [OID] INCLUDES list (VARIATION ..)*"""
+        t = self.tok(kj)
+        k = self.peek()
+        if k != K_UIDENT and k != K_LIDENT:
+            raise self.fail("a module name after SUPPORTS")
+        sp = mib.ast.Supports(self.text(self.pos), t.line, t.col)
+        self.pos += 1
+        if self.peek() == P_LBRACE:
+            sp.oid = self.parse_oid_value()
+        if self.peek() == KW_INCLUDES:
+            self.pos += 1
+            if self.peek() == KW_INCLUDES:
+                self.report("parse.clause-duplicate", self.pos, "INCLUDES written twice")
+                self.pos += 1
+            sp.includes = self.parse_name_list("a group name", "INCLUDES")
+        else:
+            self.report("parse.clause-missing", kj, "SUPPORTS " + sp.module + " has no INCLUDES")
+        while self.peek() == KW_VARIATION:
+            vj = self.pos
+            self.pos += 1
+            v = mib.ast.Variation(self.parse_ref("an object name after VARIATION"))
+            has_desc = False
+            while True:
+                kk = self.peek()
+                if kk == KW_SYNTAX:
+                    self.pos += 1
+                    v.syntax = self.parse_syntax()
+                elif kk == KW_WRITE_SYNTAX:
+                    self.pos += 1
+                    v.write_syntax = self.parse_syntax()
+                elif kk == KW_ACCESS:
+                    self.pos += 1
+                    v.access = self.word("ACCESS")
+                elif kk == KW_CREATION_REQUIRES:
+                    cj = self.pos
+                    self.pos += 1
+                    v.creation_requires = self.parse_name_list("an object name", "CREATION-REQUIRES")
+                    if len(v.creation_requires) == 0:
+                        self.report("parse.creation-requires-empty", cj, "empty CREATION-REQUIRES")
+                elif kk == KW_DEFVAL:
+                    self.pos += 1
+                    v.defval = self.parse_defval()
+                elif not has_desc and self.at_description():
+                    self.pos += 1
+                    v.description = self.opt_string("DESCRIPTION")
+                    has_desc = True
+                else:
+                    break
+            if not has_desc:
+                self.report("parse.clause-missing", vj, "VARIATION " + v.name.name + " has no DESCRIPTION")
+            sp.variations.append(v)
+        return sp
+
+    # --- modules ----------------------------------------------------------------------------
+
+    def parse_module(self, h: mib.source.ModuleHeader) -> mib.ast.Module:
+        """Parse the module whose header is `h`; tokens from `h.stop_tok` on belong to the next one."""
+        nt = self.toks[h.name_tok]
+        m = mib.ast.Module(h.name, self.file, nt.line, nt.col)
+        m.pib = h.pib
+        m.start = h.start
+        m.end = h.end
+        m.last_updated = h.last_updated
+        m.sha256 = h.sha256
+        self.diags.module = h.name
+        self.base = h.name in BASE_MODULE_NAMES
+        self.pib = h.pib
+        self.vendor_macros = set()
+        self.limit = h.stop_tok
+        if nt.kind == K_LIDENT:
+            self.report("parse.module-name-case", h.name_tok, "module name '" + h.name + "' should start with an uppercase letter")
+        self.lint_ident(h.name_tok, h.name)
+        if h.pib:
+            self.report("parse.sppi-module", h.name_tok, "SPPI module parsed as SMI; SPPI clauses are skipped")
+        self.pos = h.name_tok + 1
+        if self.peek() == P_LBRACE:
+            self.report("parse.module-oid", self.pos, "module OID after " + h.name + " ignored")
+            try:
+                m.oid = self.parse_oid_value()
+            except ParseError:
+                pass
+        self.pos = h.body_tok
+        while True:
+            k = self.peek()
+            j = self.pos
+            if k == K_EOF:
+                self.report("parse.missing-end", self.limit - 1 if self.limit > 0 else 0, "module " + h.name + " has no END")
+                break
+            if k == KW_END:
+                m.has_end = True
+                self.pos += 1
+                if self.pos < self.limit:
+                    self.report("parse.junk", self.pos, "text after the END of " + h.name + " ignored")
+                break
+            if k == P_SEMI:
+                self.report("parse.stray-semicolon", j, "stray ';' ignored")
+                self.pos += 1
+                continue
+            nd = len(self.diags.items)
+            try:
+                if k == KW_IMPORTS:
+                    if len(m.defs) > 0 or len(m.imports) > 0:
+                        self.report("parse.imports-not-first", j, "IMPORTS after other declarations")
+                    self.parse_imports(m)
+                elif k == KW_EXPORTS:
+                    m.has_exports = True
+                    if not self.base:
+                        self.report("parse.exports", j, "EXPORTS skipped")
+                    while self.peek() != P_SEMI and self.peek() != K_EOF:
+                        self.pos += 1
+                    if self.peek() == P_SEMI:
+                        self.pos += 1
+                else:
+                    d = self.parse_declaration(m)
+                    if d is not None:
+                        m.defs.append(d)
+            except ParseError as e:
+                # the lint of a declaration that is dropped is noise: keep only the error
+                del self.diags.items[nd:]
+                tt = self.tok(e.tok)
+                self.resync(j, h.end_tok)
+                if self.is_junk(j, self.pos):
+                    t0 = self.tok(j)
+                    self.diags.report("parse.junk", t0.line, t0.col, "stray text skipped (" + e.error_message + ")")
+                else:
+                    self.diags.report("parse.syntax", tt.line, tt.col, e.error_message + "; declaration skipped")
+        lt = self.tok(self.limit - 1 if self.limit > 0 else 0)
+        m.end_line = lt.line
+        self.check_module(m)
+        self.diags.module = ""
+        return m
+
+    def check_date(self, t: mib.ast.Text, what: str) -> str:
+        """Diagnose one ExtUTCTime value; returns its `date_key` ("" if unusable)."""
+        raw = t.value.strip()
+        key = mib.source.date_key(raw)
+        if key == "":
+            self.diags.report("parse.date-invalid", t.line, t.col, what + " date \"" + raw + "\" is not a valid date")
+            return key
+        if not (len(raw) == 11 or len(raw) == 13) or not raw.endswith("Z"):
+            self.diags.report("parse.date-invalid", t.line, t.col, what + " date \"" + raw + "\" is not in YYYYMMDDHHMMZ form")
+        elif len(raw) == 11:
+            if key.startswith("20"):
+                self.diags.report("parse.date-before-1988", t.line, t.col, what + " date \"" + raw + "\": 19" + raw[0:2] + " predates SMI, read as 20" + raw[0:2])
+            else:
+                self.diags.report("parse.date-two-digit-year", t.line, t.col, what + " date \"" + raw + "\" has a two-digit year")
+        return key
+
+    def check_labels(self, s: ?mib.ast.Syntax) -> None:
+        """SMIv2: report the first hyphenated enumeration/bit label of a type (once per type)."""
+        if s is not None:
+            for nn in s.named:
+                if "-" in nn.label:
+                    self.diags.report("parse.hyphen-in-label", nn.line, nn.col, "label '" + nn.label + "' contains '-' (SMIv1 style)")
+                    return
+
+    def check_dates(self, d: mib.ast.ModuleIdentity) -> None:
+        lu = d.last_updated
+        if lu is not None:
+            self.check_date(lu, "LAST-UPDATED")
+        prev = ""
+        for rv in d.revisions:
+            k = self.check_date(rv.date, "REVISION")
+            if k != "" and prev != "" and k > prev:
+                self.diags.report("parse.revision-order", rv.date.line, rv.date.col, "revisions are not in reverse chronological order")
+            if k != "":
+                prev = k
+
+    def check_module(self, m: mib.ast.Module) -> None:
+        """Module-level checks that need the whole module: the language guess (libsmi's rule),
+        MODULE-IDENTITY placement, ACCESS/MAX-ACCESS style, TRAP-TYPE in
+        SMIv2, and DESCRIPTION in SMIv2 OBJECT-TYPEs."""
+        lang = mib.ast.LANG_UNKNOWN
+        if m.pib:
+            lang = mib.ast.LANG_SPPI
+        elif m.name == "SNMPv2-SMI":
+            lang = mib.ast.LANG_SMIV2
+        else:
+            for g in m.imports:
+                if g.module == "SNMPv2-SMI":
+                    for s in g.symbols:
+                        if len(s.name) > 0 and s.name[0] >= "A" and s.name[0] <= "Z":
+                            lang = mib.ast.LANG_SMIV2
+            if lang == mib.ast.LANG_UNKNOWN:
+                for d in m.defs:
+                    if isinstance(d, mib.ast.TextualConvention) or isinstance(d, mib.ast.ModuleIdentity):
+                        lang = mib.ast.LANG_SMIV2
+                        break
+            if lang == mib.ast.LANG_UNKNOWN:
+                lang = mib.ast.LANG_SMIV1
+        m.lang = lang
+        if self.base:
+            return
+        nmi = 0
+        first_decl = True
+        nacc = 0
+        nmax = 0
+        acc_d: ?mib.ast.ObjectType = None
+        max_d: ?mib.ast.ObjectType = None
+        trap_d: ?mib.ast.TrapType = None
+        ntrap = 0
+        for d in m.defs:
+            if isinstance(d, mib.ast.ModuleIdentity):
+                self.check_dates(d)
+                nmi += 1
+                if nmi == 2:
+                    self.diags.report("parse.module-identity-multiple", d.line, d.col, "second MODULE-IDENTITY " + d.name + "; the first one identifies the module")
+                if nmi == 1 and not first_decl and lang == mib.ast.LANG_SMIV2:
+                    self.diags.report("parse.module-identity-not-first", d.line, d.col, "MODULE-IDENTITY is not the first declaration")
+            elif isinstance(d, mib.ast.ObjectType):
+                if d.access_kw == "ACCESS":
+                    nacc += 1
+                    if acc_d is None:
+                        acc_d = d
+                elif d.access_kw == "MAX-ACCESS":
+                    nmax += 1
+                    if max_d is None:
+                        max_d = d
+                if lang == mib.ast.LANG_SMIV2 and "DESCRIPTION" not in d.clauses:
+                    self.diags.report("parse.description-missing", d.line, d.col, "OBJECT-TYPE " + d.name + " has no DESCRIPTION")
+                if lang == mib.ast.LANG_SMIV2:
+                    self.check_labels(d.syntax)
+            elif isinstance(d, mib.ast.TextualConvention):
+                if lang == mib.ast.LANG_SMIV2:
+                    self.check_labels(d.syntax)
+            elif isinstance(d, mib.ast.TypeAssignment):
+                if lang == mib.ast.LANG_SMIV2 and d.syntax?.tag is None:
+                    self.diags.report("parse.type-assignment-smiv2", d.line, d.col, "plain type assignment " + d.name + " in an SMIv2 module (read as a textual convention)")
+                    self.check_labels(d.syntax)
+            elif isinstance(d, mib.ast.TrapType):
+                ntrap += 1
+                if trap_d is None:
+                    trap_d = d
+            if not isinstance(d, mib.ast.MacroDefinition):
+                first_decl = False
+        if lang == mib.ast.LANG_SMIV2 and nmi == 0:
+            self.diags.report("parse.module-identity-missing", m.line, m.col, "SMIv2 module " + m.name + " has no MODULE-IDENTITY")
+        if nacc > 0 and nmax > 0:
+            a = acc_d
+            if a is not None:
+                self.diags.report("parse.smi-mix", a.line, a.col, "module mixes ACCESS (" + str(nacc) + "x) and MAX-ACCESS (" + str(nmax) + "x)")
+        elif nacc > 0 and lang == mib.ast.LANG_SMIV2:
+            a = acc_d
+            if a is not None:
+                self.diags.report("parse.access-in-smiv2", a.line, a.col, "SMIv1 ACCESS clauses (" + str(nacc) + "x) in an SMIv2 module")
+        elif nmax > 0 and lang == mib.ast.LANG_SMIV1:
+            x = max_d
+            if x is not None:
+                self.diags.report("parse.max-access-in-smiv1", x.line, x.col, "SMIv2 MAX-ACCESS clauses (" + str(nmax) + "x) in an SMIv1 module")
+        if ntrap > 0 and lang == mib.ast.LANG_SMIV2:
+            tr = trap_d
+            if tr is not None:
+                self.diags.report("parse.trap-in-smiv2", tr.line, tr.col, "TRAP-TYPE (" + str(ntrap) + "x) in an SMIv2 module")
+
+
+def _too_large(v: mib.ast.Value) -> bool:
+    """Is a number, hex or binary value outside -(2^64-1) .. 2^64-1? (Cheap length test
+    first: only long digit strings are converted.)"""
+    t = v.text
+    if v.kind == mib.ast.VAL_NUMBER:
+        n = len(t) - 1 if t.startswith("-") else len(t)
+        if n < 20:
+            return False
+    elif v.kind == mib.ast.VAL_HEX:
+        if len(t) <= 16:
+            return False
+    elif v.kind == mib.ast.VAL_BIN:
+        if len(t) <= 64:
+            return False
+    else:
+        return False
+    b = v.big_value()
+    if b is not None:
+        return b > bigint(18446744073709551615) or b < -bigint(18446744073709551615)
+    return False
+
+
+def _is_integer_kw(k: int) -> bool:
+    return k == KW_INTEGER32 or k == KW_UNSIGNED32 or k == KW_GAUGE32 or k == KW_COUNTER32 or k == KW_COUNTER64 or k == KW_TIMETICKS
+
+
+def _scratch_def(macro: int) -> mib.ast.Def:
+    """A throwaway declaration of the right class, to parse (and drop) duplicate clauses."""
+    if macro == KW_OBJECT_TYPE:
+        return mib.ast.ObjectType("", 0, 0)
+    if macro == KW_MODULE_IDENTITY:
+        return mib.ast.ModuleIdentity("", 0, 0)
+    if macro == KW_TRAP_TYPE:
+        return mib.ast.TrapType("", 0, 0)
+    if macro == KW_TEXTUAL_CONVENTION:
+        return mib.ast.TextualConvention("", 0, 0)
+    if macro == KW_NOTIFICATION_TYPE:
+        return mib.ast.NotificationType("", 0, 0)
+    if macro == KW_OBJECT_GROUP:
+        return mib.ast.ObjectGroup("", 0, 0)
+    if macro == KW_NOTIFICATION_GROUP:
+        return mib.ast.NotificationGroup("", 0, 0)
+    if macro == KW_MODULE_COMPLIANCE:
+        return mib.ast.ModuleCompliance("", 0, 0)
+    if macro == KW_AGENT_CAPABILITIES:
+        return mib.ast.AgentCapabilities("", 0, 0)
+    return mib.ast.Def("", 0, 0)
+
+
+def parse_tokens(data: bytes, toks: list[mib.lexer.Token], diags: mib.diag.Diagnostics, file: str, with_hash: bool = True) -> list[mib.ast.Module]:
+    """Parse every module in an already lexed file. Diagnostics go to `diags`."""
+    p = Parser(data, toks, diags, file)
+    hs = mib.source.find_headers(data, toks)
+    if with_hash:
+        for h in hs:
+            h.sha256 = mib.source.sha256_hex(data[h.start:h.end])
+    mods: list[mib.ast.Module] = []
+    if len(hs) == 0:
+        diags.report("parse.no-module", 1, 1, "no 'NAME DEFINITIONS ::= BEGIN' module header found")
+        return mods
+    if hs[0].name_tok > 0:
+        t0 = toks[0]
+        diags.report("parse.junk", t0.line, t0.col, "text before the first module ignored")
+    for h in hs:
+        mods.append(p.parse_module(h))
+    return mods
+
+
+def _assign_modules(mods: list[mib.ast.Module], diags: list[mib.diag.Diagnostic]) -> None:
+    """Stamp the module name on diagnostics (such as lexer ones) reported outside a module context."""
+    for d in diags:
+        if d.module == "":
+            for m in mods:
+                if d.line >= m.line and d.line <= m.end_line:
+                    d.module = m.name
+                    break
+
+
+def parse_bytes(data: bytes, file: str = "<input>", rfc_comments: bool = False, max_level: int = 6, with_hash: bool = False) -> ParseResult:
+    """Lex and parse a whole MIB file given as bytes.
+
+    `file` names the input in diagnostics. `rfc_comments` selects RFC 2578 comment rules
+    (a comment also ends at the next `--`). Diagnostics above `max_level` are dropped.
+    `with_hash` fills `Module.sha256` (it costs about as much as lexing; the content index
+    of `mib.source.MibPath` already has the hash of every indexed module).
+    """
+    d = mib.diag.Diagnostics(file, max_level)
+    toks = mib.lexer.lex(data, d, rfc_comments)
+    mods = parse_tokens(data, toks, d, file, with_hash)
+    _assign_modules(mods, d.items)
+    return ParseResult(file, mods, d.items)
+
+
+def parse_text(text: str, file: str = "<input>", rfc_comments: bool = False) -> ParseResult:
+    """`parse_bytes(text.encode(), ...)`: for tests and embedded module texts."""
+    return parse_bytes(text.encode(), file, rfc_comments)
+
+
+def parse_base_module(name: str) -> mib.ast.Module:
+    """Parse one of the embedded SMI base modules (see `mib.source.BASE_MODULES`)."""
+    r = parse_bytes(mib.source.base_module_bytes(name), mib.source.BUILTIN_PREFIX + name)
+    return r.modules[0]
+
+
+proc def parse_entry(fcap: file.FileCap, e: mib.source.ModuleEntry, rfc_comments: bool = False) -> ParseResult:
+    """Parse the file that holds a content-index entry (the embedded text for built-in
+    base modules). The result has every module of that file; pick one with `module(e.name)`."""
+    data = b""
+    try:
+        data = mib.source.entry_bytes(fcap, e)
+    except OSError as exc:
+        d = mib.diag.Diagnostics(e.path)
+        d.report("source.unreadable", 1, 1, "cannot read " + e.path + ": " + exc.error_message)
+        return ParseResult(e.path, [], d.items)
+    return parse_bytes(data, e.path, rfc_comments, 6, True)
+
+
+proc def parse_file(fcap: file.FileCap, path: str, rfc_comments: bool = False, max_level: int = 6, with_hash: bool = True) -> ParseResult:
+    """Read and parse a MIB file. An unreadable file gives no modules and one
+    `source.unreadable` diagnostic."""
+    data = b""
+    try:
+        data = mib.source.read_bytes(fcap, path)
+    except OSError as e:
+        d = mib.diag.Diagnostics(path, max_level)
+        d.report("source.unreadable", 1, 1, "cannot read " + path + ": " + e.error_message)
+        return ParseResult(path, [], d.items)
+    return parse_bytes(data, path, rfc_comments, max_level, with_hash)

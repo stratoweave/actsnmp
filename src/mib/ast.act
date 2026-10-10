@@ -1,0 +1,1039 @@
+"""AST of SMIv1/SMIv2 MIB modules, produced by `mib.parser`.
+
+The tree is syntactic: names are not resolved, types are not interpreted, and values are
+kept in their written form. The resolver (`mib.resolver`) interprets them. Every node
+carries the 1-based `line` and byte `col` of its first token, so later stages can report
+`file:line:col` without the token list.
+
+The node classes:
+
+- `Module`: name, `imports` (`ImportGroup`s), `defs` (`Def` subclasses, in source order),
+  MACRO names, a syntactic SMI language guess (`lang`), and the module's byte extent and
+  hash in its file.
+- `Def` subclasses, one per declaration form: `ValueAssignment` (`x OBJECT IDENTIFIER ::=`),
+  `TypeAssignment` (`Foo ::= <type>`, also tagged base types), `TextualConvention`,
+  `SequenceType` (row types), `ChoiceType` (skipped body), `MacroDefinition`, and one per
+  macro invocation: `ModuleIdentity`, `ObjectIdentity`, `ObjectType` (SMIv1 and SMIv2
+  merged), `NotificationType`, `TrapType`, `ObjectGroup`, `NotificationGroup`,
+  `ModuleCompliance`, `AgentCapabilities`, plus `UnknownMacro` for invocations of vendor
+  macros defined in the same module. STATUS, DESCRIPTION, REFERENCE and the OID value live
+  in the `Def` base class (None when absent).
+- `Syntax` (a SYNTAX clause or type right-hand side): a kind (`SYN_*`), the type name for
+  references, an optional `Constraint` (range or SIZE), named numbers (enumerations, BITS)
+  and an optional ASN.1 `Tag`.
+- `Value` (range bounds, enumeration values, DEFVAL contents): numbers, hex/binary strings,
+  quoted strings, names and braced lists, all in written form.
+- `OidValue`: the components of a braced OID value, each a number, a name, `name(number)` or a
+  module-qualified name.
+- `Text`: a decoded quoted string (UTF-8, else CP1252) with its position.
+
+Kinds are int constants. `dump_module()` and friends give a deterministic text form for
+tests.
+"""
+
+# --- kinds ----------------------------------------------------------------------------------
+
+SYN_REF = 1                # a type reference: Integer32, Counter, DisplayString, FooEntry, ...
+SYN_INTEGER = 2            # ASN.1 INTEGER
+SYN_OCTET_STRING = 3
+SYN_OBJECT_IDENTIFIER = 4
+SYN_BITS = 5
+SYN_SEQUENCE_OF = 6        # SEQUENCE OF <name>
+SYN_NULL = 7               # ASN.1 NULL (SMIv1 base modules)
+SYN_CHOICE = 8             # CHOICE { ... } (body skipped)
+SYN_SEQUENCE = 9           # an inline SEQUENCE { ... } in a SYNTAX clause (lenient; items dropped)
+
+CON_RANGE = 1              # (lo..hi | ...)
+CON_SIZE = 2               # (SIZE (lo..hi | ...))
+
+VAL_NUMBER = 1             # text: decimal digits, with a leading '-' when negative
+VAL_HEX = 2                # text: the hex digits ('0A'H -> "0A")
+VAL_BIN = 3                # text: the binary digits
+VAL_STRING = 4             # text: the decoded string content
+VAL_NAME = 5               # text: an identifier (also MIN, MAX, TRUE, NULL ...); module: qualifier or ""
+VAL_BRACED = 6             # items: the values inside { ... }
+VAL_NAMED_NUMBER = 7       # text: the name; items: [the number] (name(n) inside braces)
+
+LANG_UNKNOWN = 0
+LANG_SMIV1 = 1
+LANG_SMIV2 = 2
+LANG_SPPI = 3
+
+OID_NO_NUMBER = -1         # OidComponent.number for a bare name
+OID_TOO_BIG = -2           # OidComponent.number when the digits do not fit in 64 bits
+
+
+def syntax_kind_name(k: int) -> str:
+    if k == SYN_REF:
+        return "REF"
+    if k == SYN_INTEGER:
+        return "INTEGER"
+    if k == SYN_OCTET_STRING:
+        return "OCTET STRING"
+    if k == SYN_OBJECT_IDENTIFIER:
+        return "OBJECT IDENTIFIER"
+    if k == SYN_BITS:
+        return "BITS"
+    if k == SYN_SEQUENCE_OF:
+        return "SEQUENCE OF"
+    if k == SYN_NULL:
+        return "NULL"
+    if k == SYN_CHOICE:
+        return "CHOICE"
+    if k == SYN_SEQUENCE:
+        return "SEQUENCE"
+    return "?"
+
+
+def lang_name(lang: int) -> str:
+    if lang == LANG_SMIV1:
+        return "SMIv1"
+    if lang == LANG_SMIV2:
+        return "SMIv2"
+    if lang == LANG_SPPI:
+        return "SPPI"
+    return "unknown"
+
+
+def _q(s: str) -> str:
+    """Quote a string for dumps: '"' + s with newlines shown as \\n + '"'."""
+    return "\"" + s.replace("\r\n", "\\n").replace("\n", "\\n").replace("\r", "\\n") + "\""
+
+
+# --- leaves ---------------------------------------------------------------------------------
+
+class Text(object):
+    """A quoted string: `value` is the decoded content without the quotes (a doubled quote
+    unescaped, line ends as written)."""
+    value: str
+    line: int
+    col: int
+
+    def __init__(self, value: str, line: int, col: int):
+        self.value = value
+        self.line = line
+        self.col = col
+
+    def dedented(self) -> str:
+        """libsmi's layout: continuation lines lose as much leading white space as the second
+        line has (tabs count to the next multiple of 8); line ends become LF."""
+        lines = self.value.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        if len(lines) < 2:
+            return self.value
+        cut = _indent_width(lines[1])
+        out = [lines[0]]
+        for ln in lines[1:]:
+            out.append(_strip_indent(ln, cut))
+        return "\n".join(out)
+
+    def __repr__(self) -> str:
+        return _q(self.value)
+
+
+def _indent_width(s: str) -> int:
+    w = 0
+    for ch in s:
+        if ch == " ":
+            w += 1
+        elif ch == "\t":
+            w = (w // 8 + 1) * 8
+        else:
+            return w
+    return w
+
+
+def _strip_indent(s: str, cut: int) -> str:
+    w = 0
+    i = 0
+    for ch in s:
+        if w >= cut:
+            break
+        if ch == " ":
+            w += 1
+        elif ch == "\t":
+            w = (w // 8 + 1) * 8
+        else:
+            break
+        i += 1
+    return s[i:]
+
+
+class Name(object):
+    """An identifier as written: a reference (`ifIndex`, `IF-MIB.ifIndex`) or a clause word
+    (`current`, `read-only`). `module` is the qualifier or ""."""
+    name: str
+    module: str
+    line: int
+    col: int
+
+    def __init__(self, name: str, module: str, line: int, col: int):
+        self.name = name
+        self.module = module
+        self.line = line
+        self.col = col
+
+    def qualified(self) -> str:
+        return self.module + "." + self.name if self.module != "" else self.name
+
+    def __repr__(self) -> str:
+        return self.qualified()
+
+
+class Value(object):
+    """A value in written form; see the VAL_* kinds for what `text`, `module` and `items` hold."""
+    kind: int
+    text: str
+    module: str
+    items: list[Value]
+    line: int
+    col: int
+
+    def __init__(self, kind: int, text: str, line: int, col: int):
+        self.kind = kind
+        self.text = text
+        self.module = ""
+        self.items = []
+        self.line = line
+        self.col = col
+
+    def is_number(self) -> bool:
+        """A number, hexadecimal or binary string: anything that has an integer value."""
+        return self.kind == VAL_NUMBER or self.kind == VAL_HEX or self.kind == VAL_BIN
+
+    def big_value(self) -> ?bigint:
+        """The integer value of a number, hex or binary string; None for other kinds."""
+        if self.kind == VAL_NUMBER:
+            if self.text.startswith("-"):
+                return -bigint(self.text[1:])
+            return bigint(self.text)
+        if self.kind == VAL_HEX:
+            if self.text == "":
+                return bigint(0)
+            return bigint(self.text, 16)
+        if self.kind == VAL_BIN:
+            v = bigint(0)
+            for ch in self.text:
+                v = v * bigint(2) + (bigint(1) if ch == "1" else bigint(0))
+            return v
+        return None
+
+    def int_value(self) -> ?int:
+        """The integer value when it fits in a signed 64-bit int; None otherwise."""
+        b = self.big_value()
+        if b is not None:
+            if b >= bigint(-9223372036854775807) and b <= bigint(9223372036854775807):
+                return int(b)
+        return None
+
+    def dump(self) -> str:
+        if self.kind == VAL_NUMBER:
+            return self.text
+        if self.kind == VAL_HEX:
+            return "'" + self.text + "'H"
+        if self.kind == VAL_BIN:
+            return "'" + self.text + "'B"
+        if self.kind == VAL_STRING:
+            return _q(self.text)
+        if self.kind == VAL_NAME:
+            return self.module + "." + self.text if self.module != "" else self.text
+        if self.kind == VAL_NAMED_NUMBER:
+            return self.text + "(" + (self.items[0].dump() if len(self.items) > 0 else "") + ")"
+        return "{{" + " ".join([v.dump() for v in self.items]) + "}}"
+
+    def __repr__(self) -> str:
+        return self.dump()
+
+
+class NamedNumber(object):
+    """`label(value)` in an enumeration or BITS list. `value` is a number (possibly negative),
+    or a hex/binary string in lenient input."""
+    label: str
+    value: Value
+    line: int
+    col: int
+
+    def __init__(self, label: str, value: Value, line: int, col: int):
+        self.label = label
+        self.value = value
+        self.line = line
+        self.col = col
+
+    def dump(self) -> str:
+        return self.label + "(" + self.value.dump() + ")"
+
+
+class RangeItem(object):
+    """One `lo..hi` (or a single value: `hi` is None) of a range or SIZE constraint."""
+    lo: Value
+    hi: ?Value
+
+    def __init__(self, lo: Value, hi: ?Value):
+        self.lo = lo
+        self.hi = hi
+
+    def dump(self) -> str:
+        h = self.hi
+        if h is not None:
+            return self.lo.dump() + ".." + h.dump()
+        return self.lo.dump()
+
+
+class Constraint(object):
+    """A range `(...)` or size `(SIZE (...))` constraint (`kind` is CON_RANGE or CON_SIZE)."""
+    kind: int
+    ranges: list[RangeItem]
+    line: int
+    col: int
+
+    def __init__(self, kind: int, ranges: list[RangeItem], line: int, col: int):
+        self.kind = kind
+        self.ranges = ranges
+        self.line = line
+        self.col = col
+
+    def dump(self) -> str:
+        r = " | ".join([x.dump() for x in self.ranges])
+        if self.kind == CON_SIZE:
+            return "(SIZE (" + r + "))"
+        return "(" + r + ")"
+
+
+class Tag(object):
+    """An ASN.1 tag `[APPLICATION 2] IMPLICIT` (base modules). `cls` is "APPLICATION",
+    "UNIVERSAL", "PRIVATE" or "" (context-specific); `mode` is "IMPLICIT", "EXPLICIT" or ""."""
+    cls: str
+    number: int
+    mode: str
+
+    def __init__(self, cls: str, number: int, mode: str):
+        self.cls = cls
+        self.number = number
+        self.mode = mode
+
+    def dump(self) -> str:
+        c = self.cls + " " if self.cls != "" else ""
+        m = " " + self.mode if self.mode != "" else ""
+        return "[" + c + str(self.number) + "]" + m
+
+
+class Syntax(object):
+    """A type as written in a SYNTAX clause or on the right of `::=`.
+
+    `kind` is a SYN_* constant. `name` is the referenced type for SYN_REF and the row type
+    for SYN_SEQUENCE_OF ("" otherwise); `module` qualifies it (`SNMPv2-TC.DisplayString`).
+    `named` holds enumeration labels (INTEGER or a refined TC) or named bits (BITS);
+    `has_named` tells an empty list from no list. `constraint` is a range or SIZE.
+    """
+    kind: int
+    name: str
+    module: str
+    constraint: ?Constraint
+    named: list[NamedNumber]
+    has_named: bool
+    tag: ?Tag
+    line: int
+    col: int
+
+    def __init__(self, kind: int, name: str, line: int, col: int):
+        self.kind = kind
+        self.name = name
+        self.module = ""
+        self.constraint = None
+        self.named = []
+        self.has_named = False
+        self.tag = None
+        self.line = line
+        self.col = col
+
+    def dump(self) -> str:
+        out = ""
+        tg = self.tag
+        if tg is not None:
+            out = tg.dump() + " "
+        if self.kind == SYN_REF:
+            out += self.module + "." + self.name if self.module != "" else self.name
+        elif self.kind == SYN_SEQUENCE_OF:
+            out += "SEQUENCE OF " + self.name
+        else:
+            out += syntax_kind_name(self.kind)
+        if self.has_named:
+            out += " {{" + ", ".join([x.dump() for x in self.named]) + "}}"
+        c = self.constraint
+        if c is not None:
+            out += " " + c.dump()
+        return out
+
+    def __repr__(self) -> str:
+        return self.dump()
+
+
+class OidComponent(object):
+    """One component of an OID value: a number (`name` is ""), a name (`number` is
+    OID_NO_NUMBER), `name(number)`, or `Module.name`."""
+    name: str
+    module: str
+    number: int
+    line: int
+    col: int
+
+    def __init__(self, name: str, module: str, number: int, line: int, col: int):
+        self.name = name
+        self.module = module
+        self.number = number
+        self.line = line
+        self.col = col
+
+    def dump(self) -> str:
+        nm = self.module + "." + self.name if self.module != "" else self.name
+        if self.number == OID_NO_NUMBER:
+            return nm
+        num = "<too big>" if self.number == OID_TOO_BIG else str(self.number)
+        if nm == "":
+            return num
+        return nm + "(" + num + ")"
+
+
+class OidValue(object):
+    """`braces with components`"""
+    components: list[OidComponent]
+    line: int
+    col: int
+
+    def __init__(self, components: list[OidComponent], line: int, col: int):
+        self.components = components
+        self.line = line
+        self.col = col
+
+    def dump(self) -> str:
+        return "{{" + " ".join([c.dump() for c in self.components]) + "}}"
+
+    def __repr__(self) -> str:
+        return self.dump()
+
+
+class DefVal(object):
+    """A DEFVAL clause: the parsed value and the source text between the braces."""
+    value: Value
+    text: str
+    line: int
+    col: int
+
+    def __init__(self, value: Value, text: str, line: int, col: int):
+        self.value = value
+        self.text = text
+        self.line = line
+        self.col = col
+
+
+class IndexItem(object):
+    """One INDEX element: an object reference (`name`, `module`), or an SMIv1 index type
+    (SMIv1 `INDEX` of a type such as INTEGER: `syntax` is set and `name` is "")."""
+    name: str
+    module: str
+    implied: bool
+    syntax: ?Syntax
+    line: int
+    col: int
+
+    def __init__(self, name: str, module: str, implied: bool, syntax: ?Syntax, line: int, col: int):
+        self.name = name
+        self.module = module
+        self.implied = implied
+        self.syntax = syntax
+        self.line = line
+        self.col = col
+
+    def dump(self) -> str:
+        p = "IMPLIED " if self.implied else ""
+        s = self.syntax
+        if s is not None:
+            return p + s.dump()
+        return p + (self.module + "." + self.name if self.module != "" else self.name)
+
+
+class SequenceItem(object):
+    """`name Type` in a SEQUENCE type."""
+    name: str
+    syntax: Syntax
+    line: int
+    col: int
+
+    def __init__(self, name: str, syntax: Syntax, line: int, col: int):
+        self.name = name
+        self.syntax = syntax
+        self.line = line
+        self.col = col
+
+
+class Revision(object):
+    """REVISION "date" DESCRIPTION "text" in MODULE-IDENTITY."""
+    date: Text
+    description: ?Text
+
+    def __init__(self, date: Text, description: ?Text):
+        self.date = date
+        self.description = description
+
+
+class ComplianceGroup(object):
+    """GROUP name DESCRIPTION "..." in a MODULE-COMPLIANCE module section."""
+    name: Name
+    description: ?Text
+
+    def __init__(self, name: Name, description: ?Text):
+        self.name = name
+        self.description = description
+
+
+class ComplianceObject(object):
+    """OBJECT name [SYNTAX] [WRITE-SYNTAX] [MIN-ACCESS] DESCRIPTION in a MODULE-COMPLIANCE module section."""
+    name: Name
+    syntax: ?Syntax
+    write_syntax: ?Syntax
+    min_access: ?Name
+    description: ?Text
+
+    def __init__(self, name: Name):
+        self.name = name
+        self.syntax = None
+        self.write_syntax = None
+        self.min_access = None
+        self.description = None
+
+
+class ComplianceModule(object):
+    """A MODULE section of MODULE-COMPLIANCE. `name` is "" for the current module."""
+    name: str
+    oid: ?OidValue
+    mandatory_groups: list[Name]
+    groups: list[ComplianceGroup]
+    objects: list[ComplianceObject]
+    line: int
+    col: int
+
+    def __init__(self, name: str, line: int, col: int):
+        self.name = name
+        self.oid = None
+        self.mandatory_groups = []
+        self.groups = []
+        self.objects = []
+        self.line = line
+        self.col = col
+
+
+class Variation(object):
+    """VARIATION name ... DESCRIPTION in an AGENT-CAPABILITIES SUPPORTS section."""
+    name: Name
+    syntax: ?Syntax
+    write_syntax: ?Syntax
+    access: ?Name
+    creation_requires: list[Name]
+    defval: ?DefVal
+    description: ?Text
+
+    def __init__(self, name: Name):
+        self.name = name
+        self.syntax = None
+        self.write_syntax = None
+        self.access = None
+        self.creation_requires = []
+        self.defval = None
+        self.description = None
+
+
+class Supports(object):
+    """SUPPORTS Module INCLUDES groups VARIATION* in AGENT-CAPABILITIES."""
+    module: str
+    oid: ?OidValue
+    includes: list[Name]
+    variations: list[Variation]
+    line: int
+    col: int
+
+    def __init__(self, module: str, line: int, col: int):
+        self.module = module
+        self.oid = None
+        self.includes = []
+        self.variations = []
+        self.line = line
+        self.col = col
+
+
+class ImportGroup(object):
+    """`sym, sym, ... FROM Module`: `line`/`col` locate the module name."""
+    module: str
+    symbols: list[Name]
+    line: int
+    col: int
+
+    def __init__(self, module: str, symbols: list[Name], line: int, col: int):
+        self.module = module
+        self.symbols = symbols
+        self.line = line
+        self.col = col
+
+
+# --- declarations ---------------------------------------------------------------------------
+
+class Def(object):
+    """Base class of all declarations.
+
+    `name` is the declared descriptor or type name; `line`/`col` locate it. `status`,
+    `description`, `reference` and `oid` are filled for the forms that have them. `clauses`
+    lists the clause keywords in the order they were written.
+    """
+    name: str
+    line: int
+    col: int
+    status: ?Name
+    description: ?Text
+    reference: ?Text
+    oid: ?OidValue
+    clauses: list[str]
+
+    def __init__(self, name: str, line: int, col: int):
+        self.name = name
+        self.line = line
+        self.col = col
+        self.status = None
+        self.description = None
+        self.reference = None
+        self.oid = None
+        self.clauses = []
+
+    def form(self) -> str:
+        """The declaration form: the macro name, "OBJECT IDENTIFIER", "TYPE", ..."""
+        return "?"
+
+    def is_registration(self) -> bool:
+        """True for macro invocations that register an OID (everything but value assignments,
+        type definitions and MACRO definitions)."""
+        return False
+
+
+class ValueAssignment(Def):
+    """`name OBJECT IDENTIFIER ::= oid-value`"""
+    def form(self) -> str:
+        return "OBJECT IDENTIFIER"
+
+
+class TypeAssignment(Def):
+    """`Name ::= Syntax`: an SMIv1-style plain type, or a tagged base type."""
+    syntax: ?Syntax
+
+    def __init__(self, name: str, line: int, col: int):
+        Def.__init__(self, name, line, col)
+        self.syntax = None
+
+    def form(self) -> str:
+        return "TYPE"
+
+
+class TextualConvention(Def):
+    """`Name ::= TEXTUAL-CONVENTION [DISPLAY-HINT] STATUS DESCRIPTION [REFERENCE] SYNTAX`"""
+    display_hint: ?Text
+    syntax: ?Syntax
+
+    def __init__(self, name: str, line: int, col: int):
+        Def.__init__(self, name, line, col)
+        self.display_hint = None
+        self.syntax = None
+
+    def form(self) -> str:
+        return "TEXTUAL-CONVENTION"
+
+
+class SequenceType(Def):
+    """`Name ::= SEQUENCE of items` (a conceptual row type)."""
+    items: list[SequenceItem]
+
+    def __init__(self, name: str, line: int, col: int):
+        Def.__init__(self, name, line, col)
+        self.items = []
+
+    def form(self) -> str:
+        return "SEQUENCE"
+
+
+class ChoiceType(Def):
+    """`Name ::= CHOICE (body)` (body skipped; base modules)."""
+    def form(self) -> str:
+        return "CHOICE"
+
+
+class MacroDefinition(Def):
+    """`NAME MACRO ::= BEGIN ... END` (body skipped)."""
+    def form(self) -> str:
+        return "MACRO"
+
+
+class ModuleIdentity(Def):
+    last_updated: ?Text
+    organization: ?Text
+    contact_info: ?Text
+    revisions: list[Revision]
+
+    def __init__(self, name: str, line: int, col: int):
+        Def.__init__(self, name, line, col)
+        self.last_updated = None
+        self.organization = None
+        self.contact_info = None
+        self.revisions = []
+
+    def form(self) -> str:
+        return "MODULE-IDENTITY"
+
+    def is_registration(self) -> bool:
+        return True
+
+
+class ObjectIdentity(Def):
+    def form(self) -> str:
+        return "OBJECT-IDENTITY"
+
+    def is_registration(self) -> bool:
+        return True
+
+
+class ObjectType(Def):
+    """OBJECT-TYPE, SMIv1 (RFC 1155/1212) and SMIv2 merged.
+
+    `access_kw` is the clause keyword used ("MAX-ACCESS" or "ACCESS", "" if none).
+    `has_index` is True when an INDEX clause was written (even an empty one). A row may
+    have both `index` and `augments` in broken input (the parser reports it).
+    """
+    syntax: ?Syntax
+    units: ?Text
+    access: ?Name
+    access_kw: str
+    index: list[IndexItem]
+    has_index: bool
+    augments: list[Name]
+    defval: ?DefVal
+
+    def __init__(self, name: str, line: int, col: int):
+        Def.__init__(self, name, line, col)
+        self.syntax = None
+        self.units = None
+        self.access = None
+        self.access_kw = ""
+        self.index = []
+        self.has_index = False
+        self.augments = []
+        self.defval = None
+
+    def form(self) -> str:
+        return "OBJECT-TYPE"
+
+    def is_registration(self) -> bool:
+        return True
+
+
+class NotificationType(Def):
+    objects: list[Name]
+
+    def __init__(self, name: str, line: int, col: int):
+        Def.__init__(self, name, line, col)
+        self.objects = []
+
+    def form(self) -> str:
+        return "NOTIFICATION-TYPE"
+
+    def is_registration(self) -> bool:
+        return True
+
+
+class TrapType(Def):
+    """SMIv1 TRAP-TYPE. `enterprise` is the ENTERPRISE value as an OID value (a single
+    name in the usual form; `enterprise_braced` when written in braces); `number` is the
+    trap number after `::=`. `oid` stays None (the resolver computes E.0.N)."""
+    enterprise: ?OidValue
+    enterprise_braced: bool
+    variables: list[Name]
+    number: int
+
+    def __init__(self, name: str, line: int, col: int):
+        Def.__init__(self, name, line, col)
+        self.enterprise = None
+        self.enterprise_braced = False
+        self.variables = []
+        self.number = -1
+
+    def form(self) -> str:
+        return "TRAP-TYPE"
+
+    def is_registration(self) -> bool:
+        return True
+
+
+class ObjectGroup(Def):
+    objects: list[Name]
+
+    def __init__(self, name: str, line: int, col: int):
+        Def.__init__(self, name, line, col)
+        self.objects = []
+
+    def form(self) -> str:
+        return "OBJECT-GROUP"
+
+    def is_registration(self) -> bool:
+        return True
+
+
+class NotificationGroup(Def):
+    notifications: list[Name]
+
+    def __init__(self, name: str, line: int, col: int):
+        Def.__init__(self, name, line, col)
+        self.notifications = []
+
+    def form(self) -> str:
+        return "NOTIFICATION-GROUP"
+
+    def is_registration(self) -> bool:
+        return True
+
+
+class ModuleCompliance(Def):
+    modules: list[ComplianceModule]
+
+    def __init__(self, name: str, line: int, col: int):
+        Def.__init__(self, name, line, col)
+        self.modules = []
+
+    def form(self) -> str:
+        return "MODULE-COMPLIANCE"
+
+    def is_registration(self) -> bool:
+        return True
+
+
+class AgentCapabilities(Def):
+    product_release: ?Text
+    supports: list[Supports]
+
+    def __init__(self, name: str, line: int, col: int):
+        Def.__init__(self, name, line, col)
+        self.product_release = None
+        self.supports = []
+
+    def form(self) -> str:
+        return "AGENT-CAPABILITIES"
+
+    def is_registration(self) -> bool:
+        return True
+
+
+class UnknownMacro(Def):
+    """An invocation of a non-standard macro defined (by a MACRO definition) in the same
+    module. Only the OID value is kept."""
+    macro: str
+
+    def __init__(self, name: str, macro: str, line: int, col: int):
+        Def.__init__(self, name, line, col)
+        self.macro = macro
+
+    def form(self) -> str:
+        return self.macro
+
+    def is_registration(self) -> bool:
+        return True
+
+
+# --- module ---------------------------------------------------------------------------------
+
+class Module(object):
+    """One MIB module.
+
+    `start`/`end` are its byte extent in `file` and `sha256` the hash of that text, as
+    `mib.source.ModuleHeader` defines them. `lang` is the parser's syntactic guess (libsmi's
+    rule). `oid` is the rarely written ASN.1 module OID after the name, which SMI ignores.
+    `has_end` is False when the final END was missing. `last_updated` is the raw LAST-UPDATED
+    string ("" if none).
+    """
+    name: str
+    file: str
+    line: int
+    col: int
+    oid: ?OidValue
+    pib: bool
+    lang: int
+    imports: list[ImportGroup]
+    defs: list[Def]
+    macros: list[str]
+    has_exports: bool
+    has_end: bool
+    start: int
+    end: int
+    end_line: int
+    last_updated: str
+    sha256: str
+
+    def __init__(self, name: str, file: str, line: int, col: int):
+        self.name = name
+        self.file = file
+        self.line = line
+        self.col = col
+        self.oid = None
+        self.pib = False
+        self.lang = LANG_UNKNOWN
+        self.imports = []
+        self.defs = []
+        self.macros = []
+        self.has_exports = False
+        self.has_end = False
+        self.start = 0
+        self.end = 0
+        self.end_line = line
+        self.last_updated = ""
+        self.sha256 = ""
+
+    def find(self, name: str) -> ?Def:
+        """The first declaration of `name`, or None."""
+        for d in self.defs:
+            if d.name == name:
+                return d
+        return None
+
+    def defs_by_name(self) -> dict[str, Def]:
+        """Declarations by name; the first one wins for duplicates."""
+        out: dict[str, Def] = {}
+        for d in self.defs:
+            if d.name not in out:
+                out[d.name] = d
+        return out
+
+    def imported_symbols(self) -> dict[str, str]:
+        """Imported symbol -> module (the first FROM wins for a symbol imported twice)."""
+        out: dict[str, str] = {}
+        for g in self.imports:
+            for s in g.symbols:
+                if s.name not in out:
+                    out[s.name] = g.module
+        return out
+
+    def import_modules(self) -> list[str]:
+        """The distinct modules named in FROM clauses, in first-seen order."""
+        out: list[str] = []
+        for g in self.imports:
+            if g.module not in out:
+                out.append(g.module)
+        return out
+
+    def module_identity(self) -> ?ModuleIdentity:
+        for d in self.defs:
+            if isinstance(d, ModuleIdentity):
+                return d
+        return None
+
+
+# --- dumps (deterministic text for tests) -------------------------------------------------
+
+def _opt_text(label: str, t: ?Text) -> str:
+    if t is not None:
+        return " " + label + "=" + _q(t.value)
+    return ""
+
+
+def _opt_name(label: str, n: ?Name) -> str:
+    if n is not None:
+        return " " + label + "=" + n.qualified()
+    return ""
+
+
+def _opt_oid(o: ?OidValue) -> str:
+    if o is not None:
+        return " ::= " + o.dump()
+    return ""
+
+
+def _opt_syntax(label: str, s: ?Syntax) -> str:
+    if s is not None:
+        return " " + label + "=" + s.dump()
+    return ""
+
+
+def _names(ns: list[Name]) -> str:
+    return "{{" + ", ".join([x.qualified() for x in ns]) + "}}"
+
+
+def dump_def(d: Def, texts: bool = False) -> str:
+    """One line describing a declaration. Free texts (DESCRIPTION, REFERENCE, ...) are only
+    included when `texts` is True."""
+    out = d.form() + " " + d.name
+    if isinstance(d, ValueAssignment):
+        return out + _opt_oid(d.oid)
+    if isinstance(d, TypeAssignment):
+        return out + _opt_syntax("syntax", d.syntax)
+    if isinstance(d, TextualConvention):
+        out += _opt_text("hint", d.display_hint) + _opt_name("status", d.status) + _opt_syntax("syntax", d.syntax)
+    elif isinstance(d, SequenceType):
+        return out + " {{" + ", ".join([it.name + " " + it.syntax.dump() for it in d.items]) + "}}"
+    elif isinstance(d, ModuleIdentity):
+        out += _opt_text("last-updated", d.last_updated)
+        out += " revisions=[" + ", ".join([r.date.value for r in d.revisions]) + "]"
+        if texts:
+            out += _opt_text("organization", d.organization) + _opt_text("contact", d.contact_info)
+    elif isinstance(d, ObjectType):
+        out += _opt_syntax("syntax", d.syntax) + _opt_text("units", d.units)
+        acc = d.access
+        if acc is not None:
+            out += " " + d.access_kw.lower() + "=" + acc.name
+        out += _opt_name("status", d.status)
+        if d.has_index:
+            out += " index={{" + ", ".join([ix.dump() for ix in d.index]) + "}}"
+        if len(d.augments) > 0:
+            out += " augments=" + _names(d.augments)
+        dv = d.defval
+        if dv is not None:
+            out += " defval=" + dv.value.dump()
+    elif isinstance(d, NotificationType):
+        out += " objects=" + _names(d.objects) + _opt_name("status", d.status)
+    elif isinstance(d, TrapType):
+        e = d.enterprise
+        if e is not None:
+            out += " enterprise=" + e.dump()
+        out += " variables=" + _names(d.variables) + " number=" + str(d.number)
+    elif isinstance(d, ObjectGroup):
+        out += " objects=" + _names(d.objects) + _opt_name("status", d.status)
+    elif isinstance(d, NotificationGroup):
+        out += " notifications=" + _names(d.notifications) + _opt_name("status", d.status)
+    elif isinstance(d, ModuleCompliance):
+        out += _opt_name("status", d.status)
+        for cm in d.modules:
+            out += " module(" + (cm.name if cm.name != "" else "this")
+            if len(cm.mandatory_groups) > 0:
+                out += " mandatory=" + _names(cm.mandatory_groups)
+            for g in cm.groups:
+                out += " group=" + g.name.qualified()
+            for ob in cm.objects:
+                out += " object=" + ob.name.qualified() + _opt_syntax("syntax", ob.syntax) + _opt_syntax("write-syntax", ob.write_syntax) + _opt_name("min-access", ob.min_access)
+            out += ")"
+    elif isinstance(d, AgentCapabilities):
+        out += _opt_text("release", d.product_release) + _opt_name("status", d.status)
+        for sp in d.supports:
+            out += " supports(" + sp.module + " includes=" + _names(sp.includes)
+            for v in sp.variations:
+                out += " variation=" + v.name.qualified() + _opt_syntax("syntax", v.syntax) + _opt_name("access", v.access)
+                if len(v.creation_requires) > 0:
+                    out += " creation=" + _names(v.creation_requires)
+                vd = v.defval
+                if vd is not None:
+                    out += " defval=" + vd.value.dump()
+            out += ")"
+    else:
+        out += _opt_name("status", d.status)
+    if texts:
+        out += _opt_text("description", d.description) + _opt_text("reference", d.reference)
+    return out + _opt_oid(d.oid)
+
+
+def dump_module(m: Module, texts: bool = False) -> str:
+    """A deterministic multi-line dump of a module: header, imports, then one line per declaration."""
+    out: list[str] = []
+    out.append("MODULE " + m.name + " lang=" + lang_name(m.lang) + (" pib" if m.pib else "") + ("" if m.has_end else " no-end"))
+    for g in m.imports:
+        out.append("  IMPORTS " + ", ".join([s.name for s in g.symbols]) + " FROM " + g.module)
+    for d in m.defs:
+        out.append("  " + dump_def(d, texts))
+    return "\n".join(out)

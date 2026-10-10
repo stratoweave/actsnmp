@@ -1,0 +1,284 @@
+"""Tests for mib.lexer"""
+
+import testing
+import mib.diag
+import mib.lexer
+
+
+def short(data: bytes, t: mib.lexer.Token) -> str:
+    """Compact token form: l(x) u(X) n(5) neg(-5) s("..") hex('..'H) bin('..'B) ?(c);
+    keywords and punctuation as written."""
+    txt = mib.lexer.text(data, t)
+    k = t.kind
+    if k == mib.lexer.K_LIDENT:
+        return "l(" + txt + ")"
+    if k == mib.lexer.K_UIDENT:
+        return "u(" + txt + ")"
+    if k == mib.lexer.K_NUM:
+        return "n(" + txt + ")"
+    if k == mib.lexer.K_NEGNUM:
+        return "neg(" + txt + ")"
+    if k == mib.lexer.K_STR:
+        return "s(" + txt + ")"
+    if k == mib.lexer.K_HEX:
+        return "hex(" + txt + ")"
+    if k == mib.lexer.K_BIN:
+        return "bin(" + txt + ")"
+    if k == mib.lexer.K_OTHER:
+        return "?(" + txt + ")"
+    return txt
+
+
+def lexd(data: bytes, rfc: bool = False) -> (list[mib.lexer.Token], mib.diag.Diagnostics):
+    d = mib.diag.Diagnostics("t.mib")
+    return (mib.lexer.lex(data, d, rfc), d)
+
+
+def toks(src: str, rfc: bool = False) -> str:
+    data = src.encode()
+    r = lexd(data, rfc)
+    return " ".join([short(data, t) for t in r.0 if t.kind != mib.lexer.K_EOF])
+
+
+def btoks(data: bytes) -> str:
+    r = lexd(data)
+    return " ".join([short(data, t) for t in r.0 if t.kind != mib.lexer.K_EOF])
+
+
+def diags(src: str, rfc: bool = False) -> str:
+    """`line:col L<level> code` for each diagnostic."""
+    return bdiags(src.encode(), rfc)
+
+
+def bdiags(data: bytes, rfc: bool = False) -> str:
+    r = lexd(data, rfc)
+    return "; ".join([str(d.line) + ":" + str(d.col) + " L" + str(d.level) + " " + d.code for d in r.1.items])
+
+
+def positions(src: str) -> str:
+    """`line:col` of every token, EOF included."""
+    r = lexd(src.encode())
+    return " ".join([str(t.line) + ":" + str(t.col) for t in r.0])
+
+
+# --- basics -------------------------------------------------------------------------------------
+
+def _test_assignment_and_braces() -> None:
+    testing.assertEqual(toks(r"x ::= { iso 3 }"), r"l(x) ::= { l(iso) n(3) }")
+    r = lexd(b"x ::= { iso 3 }")
+    testing.assertEqual([t.kind for t in r.0], [mib.lexer.K_LIDENT, mib.lexer.K_ASSIGN, 123, mib.lexer.K_LIDENT, mib.lexer.K_NUM, 125, mib.lexer.K_EOF])
+
+
+def _test_eof_token() -> None:
+    r = lexd(b"")
+    testing.assertEqual(len(r.0), 1)
+    testing.assertEqual(r.0[0].kind, mib.lexer.K_EOF)
+    r2 = lexd(b"a")
+    testing.assertEqual(r2.0[-1].start, 1)
+
+
+def _test_punctuation() -> None:
+    testing.assertEqual(toks(r"(0..10 | 20) [ ] ; , . : -"), r"( n(0) .. n(10) | n(20) ) [ ] ; , . : -")
+    testing.assertEqual(toks(r"IF-MIB.ifIndex"), r"u(IF-MIB) . l(ifIndex)")
+    testing.assertEqual(toks(r"a ::=b"), r"l(a) ::= l(b)")
+    testing.assertEqual(toks(r"a...b"), r"l(a) .. . l(b)")
+
+
+def _test_keywords_case_sensitive() -> None:
+    testing.assertEqual(toks(r"foo OBJECT-TYPE SYNTAX Integer32"), r"l(foo) OBJECT-TYPE SYNTAX Integer32")
+    r = lexd(b"OBJECT-TYPE object-type Object-Type Integer32 INTEGER")
+    testing.assertEqual(r.0[0].kind, mib.lexer.KW_OBJECT_TYPE)
+    testing.assertEqual(r.0[1].kind, mib.lexer.K_LIDENT)
+    testing.assertEqual(r.0[2].kind, mib.lexer.K_UIDENT)
+    testing.assertTrue(mib.lexer.is_type_kw(r.0[3].kind))
+    testing.assertEqual(r.0[4].kind, mib.lexer.KW_INTEGER)
+    # SMIv1 type names and forbidden ASN.1 words are plain identifiers
+    r2 = lexd(b"Counter Gauge NetworkAddress MAX MIN NULL TRUE")
+    for t in r2.0[:7]:
+        testing.assertEqual(t.kind, mib.lexer.K_UIDENT)
+
+
+def _test_keyword_helpers() -> None:
+    testing.assertEqual(mib.lexer.keyword_kind("SYNTAX"), mib.lexer.KW_SYNTAX)
+    testing.assertEqual(mib.lexer.keyword_kind("syntax"), -1)
+    testing.assertEqual(mib.lexer.kind_name(mib.lexer.KW_MAX_ACCESS), "MAX-ACCESS")
+    testing.assertEqual(mib.lexer.kind_name(123), "{{")
+    testing.assertEqual(mib.lexer.kind_name(mib.lexer.K_ASSIGN), "::=")
+    testing.assertTrue(mib.lexer.is_macro_kw(mib.lexer.KW_TRAP_TYPE))
+    testing.assertTrue(mib.lexer.is_clause_kw(mib.lexer.KW_DEFVAL))
+    testing.assertFalse(mib.lexer.is_clause_kw(mib.lexer.KW_OBJECT))
+    testing.assertTrue(mib.lexer.is_name(mib.lexer.KW_BEGIN))
+    testing.assertFalse(mib.lexer.is_ident(mib.lexer.KW_BEGIN))
+
+
+# --- identifiers --------------------------------------------------------------------------------
+
+def _test_identifiers() -> None:
+    testing.assertEqual(toks(r"mib-2 ds1-mib ifIndex IF-MIB"), r"l(mib-2) l(ds1-mib) l(ifIndex) u(IF-MIB)")
+    # underscores, trailing hyphen, digit-initial: accepted, linted by the parser
+    testing.assertEqual(toks(r"quirk_obj link_up Quirk_Type quirkObj- 3comFoo _x"), r"l(quirk_obj) l(link_up) u(Quirk_Type) l(quirkObj-) l(3comFoo) l(_x)")
+    # a '--' is never part of an identifier
+    testing.assertEqual(toks("Integer32--comment\nx"), r"Integer32 l(x)")
+    testing.assertEqual(toks("Integer32---comment\nx"), r"Integer32 l(x)")
+    testing.assertEqual(toks("a-\nb"), r"l(a-) l(b)")
+    testing.assertEqual(diags(r"quirk_obj quirkObj- 3comFoo"), "")
+
+
+# --- numbers -------------------------------------------------------------------------------------
+
+def _test_numbers() -> None:
+    testing.assertEqual(toks(r"0 42 007 18446744073709551615 99999999999999999999999"), r"n(0) n(42) n(007) n(18446744073709551615) n(99999999999999999999999)")
+    testing.assertEqual(toks(r"(-2147483648..-1) unknown(-1)"), r"( neg(-2147483648) .. neg(-1) ) l(unknown) ( neg(-1) )")
+    # '- 1' with a space: two tokens (the parser accepts it at level 5)
+    testing.assertEqual(toks(r"(- 1)"), r"( - n(1) )")
+    testing.assertEqual(toks(r"5-6"), r"n(5) neg(-6)")
+
+
+# --- comments -----------------------------------------------------------------------------------
+
+def _test_comment_to_end_of_line() -> None:
+    testing.assertEqual(toks("a -- c1 -- b\nc"), r"l(a) l(c)")
+    testing.assertEqual(toks("a\n----\nb"), r"l(a) l(b)")
+    testing.assertEqual(toks("a\n-----\nb"), r"l(a) l(b)")
+    testing.assertEqual(toks("a\n---------------------------\nb"), r"l(a) l(b)")
+    testing.assertEqual(toks("SYNTAX Integer32 -- see RFC -- for details\nSTATUS"), r"SYNTAX Integer32 STATUS")
+    testing.assertEqual(toks("SYNTAX -- the type -- Integer32\nx"), r"SYNTAX l(x)")
+    testing.assertEqual(toks("-- say \"hello\nx"), r"l(x)")
+    testing.assertEqual(toks("DESCRIPTION \"a -- b\""), "DESCRIPTION s(\"a -- b\")")
+    testing.assertEqual(diags("a -- c1 -- b\nc"), "")
+
+
+def _test_comment_inner_dashes_code() -> None:
+    # the text after an inner '--' looks like code: level 4 note (RFC 2578 would parse it)
+    testing.assertEqual(diags("x -- old -- SYNTAX Integer32\ny"), "1:10 L4 lex.comment-inner-dashes")
+    testing.assertEqual(diags(r"x -- a -- ::= { foo 1 }" + "\ny"), "1:8 L4 lex.comment-inner-dashes")
+    testing.assertEqual(diags("x -- Notifications   --cardCPUUtil\ny"), "")
+
+
+def _test_comment_rfc_mode() -> None:
+    testing.assertEqual(toks("a -- c1 -- b\nc", True), r"l(a) l(b) l(c)")
+    testing.assertEqual(toks("SYNTAX -- the type -- Integer32\nx", True), r"SYNTAX Integer32 l(x)")
+    # dash-only lines are comments in both modes (libsmi's 4n+1 special case)
+    testing.assertEqual(toks("a\n----\nb", True), r"l(a) l(b)")
+    testing.assertEqual(toks("a\n-----\nb", True), r"l(a) l(b)")
+    testing.assertEqual(toks("a\n---------------------------\nb", True), r"l(a) l(b)")
+    testing.assertEqual(toks("a\n-------------------------\nb", True), r"l(a) l(b)")
+
+
+def _test_c_comments() -> None:
+    testing.assertEqual(toks("a /* x\ny */ b // z\nc"), r"l(a) l(b) l(c)")
+    testing.assertEqual(diags("a /* x\ny */ b // z\nc"), "1:3 L2 lex.c-comment; 2:8 L2 lex.c-comment")
+    testing.assertEqual(positions("a /* x\ny */ b"), "1:1 2:6 2:7")
+
+
+# --- strings ------------------------------------------------------------------------------------
+
+def _test_strings() -> None:
+    testing.assertEqual(toks("DESCRIPTION \"multi\nline\" x"), "DESCRIPTION s(\"multi\nline\") l(x)")
+    testing.assertEqual(positions("\"a\nb\nc\" x\ny"), "1:1 3:4 4:1 4:2")
+    testing.assertEqual(toks("\"\" x"), "s(\"\") l(x)")
+    testing.assertEqual(toks("\"-- not a comment\" x"), "s(\"-- not a comment\") l(x)")
+
+
+def _test_string_escaped_quote() -> None:
+    data = b"\"say \"\"hi\"\" there\" x"
+    r = lexd(data)
+    testing.assertEqual(r.0[0].kind, mib.lexer.K_STR)
+    testing.assertEqual(r.0[0].end, 18)
+    testing.assertEqual(r.0[0].flags & mib.lexer.F_ESCAPED_QUOTE, mib.lexer.F_ESCAPED_QUOTE)
+    testing.assertEqual(bdiags(data), "1:1 L2 lex.escaped-quote")
+
+
+def _test_string_unterminated() -> None:
+    # cut at the end of the opening line, then lexing resumes on the next line
+    src = "a \"oops\nb c\n"
+    testing.assertEqual(toks(src), "l(a) s(\"oops) l(b) l(c)")
+    testing.assertEqual(diags(src), "1:3 L2 lex.unterminated-string")
+    testing.assertEqual(positions(src), "1:1 1:3 2:1 2:3 3:1")
+
+
+def _test_string_flags() -> None:
+    r = lexd(b"\"caf\xc3\xa9\" \"plain\"")
+    testing.assertEqual(r.0[0].flags & mib.lexer.F_NON_ASCII, mib.lexer.F_NON_ASCII)
+    testing.assertEqual(r.0[1].flags, 0)
+    testing.assertEqual(bdiags(b"\"caf\xe9\""), "")
+
+
+def _test_hex_and_binary_strings() -> None:
+    testing.assertEqual(toks(r"'0F0f'H ''h '1010'B '11110000'b"), r"hex('0F0f'H) hex(''h) bin('1010'B) bin('11110000'b)")
+    testing.assertEqual(diags(r"'fff'h"), "1:1 L2 lex.hex-odd-length")
+    testing.assertEqual(diags(r"'101'B"), "1:1 L2 lex.bin-length")
+    testing.assertEqual(diags(r"'xyz'H"), "1:1 L1 lex.bad-hex-string")
+    testing.assertEqual(diags(r"'0102'B"), "1:1 L1 lex.bad-hex-string")
+    # a quote that does not form a hex/binary string is an unexpected character
+    testing.assertEqual(toks(r"'abc' x"), r"?(') l(abc) ?(') l(x)")
+
+
+# --- line ends, columns, odd bytes -------------------------------------------------------------
+
+def _test_line_ends() -> None:
+    testing.assertEqual(positions("a\nb\r\nc\rd"), "1:1 2:1 3:1 4:1 4:2")
+    testing.assertEqual(positions("a\r\n\r\nb"), "1:1 3:1 3:2")
+    testing.assertEqual(positions("  a  bb\n\tc"), "1:3 1:6 2:2 2:3")
+    # bare CR ends comments too
+    testing.assertEqual(toks("a -- x\rb"), r"l(a) l(b)")
+
+
+def _test_whitespace_bytes() -> None:
+    testing.assertEqual(btoks(b"a\x0cb\x0bc\x00d"), r"l(a) l(b) l(c) l(d)")
+
+
+def _test_non_ascii_between_tokens() -> None:
+    data = b"SYNTAX\xa0Integer32 x\xe2\x80\x9cy"
+    testing.assertEqual(btoks(data), r"SYNTAX Integer32 l(x) l(y)")
+    testing.assertEqual(bdiags(data), "1:7 L2 lex.non-ascii; 1:19 L2 lex.non-ascii")
+
+
+def _test_control_chars() -> None:
+    testing.assertEqual(btoks(b"a\x01\x02b"), r"l(a) l(b)")
+    testing.assertEqual(bdiags(b"a\x01\x02b"), "1:2 L2 lex.control-char")
+
+
+def _test_bom_and_dos_eof() -> None:
+    data = b"\xef\xbb\xbfA-MIB DEFINITIONS ::= BEGIN END\r\n\x1a"
+    testing.assertEqual(btoks(data), r"u(A-MIB) DEFINITIONS ::= BEGIN END")
+    testing.assertEqual(bdiags(data), "2:1 L5 lex.dos-eof")
+    r = lexd(data)
+    testing.assertEqual(r.0[0].col, 1)
+    # a 0x1A with text after it is just a control character
+    testing.assertEqual(btoks(b"a\x1ab"), r"l(a) l(b)")
+    testing.assertEqual(bdiags(b"a\x1ab"), "1:2 L2 lex.control-char")
+
+
+def _test_unexpected_ascii() -> None:
+    testing.assertEqual(toks(r"a @ b # c"), r"l(a) ?(@) l(b) ?(#) l(c)")
+    testing.assertEqual(diags(r"a @ b"), "")
+
+
+# --- page headers and footers --------------------------------------------------------------------
+
+def _test_page_footers() -> None:
+    src = "a\nNadeau, et al.                                     [Page 4 ]\ndraft-ietf-ccamp-gmpls-tc-mib-00.txt               June 2002\nb\n"
+    testing.assertEqual(toks(src), r"l(a) l(b)")
+    testing.assertEqual(diags(src), "2:1 L2 lex.page-header; 3:1 L2 lex.page-header")
+    testing.assertEqual(toks("x\nPetrova                     INTERNET DRAFT                           5\ny"), r"l(x) l(y)")
+    testing.assertEqual(toks("x\nT. Nadeau and Z. Ali            Page 3                        2/9/2004\ny"), r"l(x) l(y)")
+    testing.assertEqual(toks("x\nRFC 2863                The Interfaces Group MIB               June 2000\ny"), r"l(x) l(y)")
+    testing.assertEqual(toks("x\n   Pseudo Wire (PW) Management     February 2004\n      Information Base\ny"), r"l(x) l(y)")
+    testing.assertEqual(toks("x\n   MPLS Fast-reroute MIB                March 5, 2007\ny"), r"l(x) l(y)")
+    testing.assertEqual(toks("x\n   Forbes      Expires December 31, 2001      Page 25    Internet Draft    Switch MIB\ny"), r"l(x) l(y)")
+
+
+def _test_page_footer_lookalikes_are_code() -> None:
+    # aligned code that ends in a number or a year is not a page footer
+    testing.assertEqual(toks("trap TRAP-TYPE\n    ENTERPRISE foo\n    ::=      5\n"), r"l(trap) TRAP-TYPE ENTERPRISE l(foo) ::= n(5)")
+    testing.assertEqual(toks(r"a OBJECT IDENTIFIER ::= { foo 2004 }" + "\n"), r"l(a) OBJECT IDENTIFIER ::= { l(foo) n(2004) }")
+    testing.assertEqual(toks("    up(1),    down(2)\n"), r"l(up) ( n(1) ) , l(down) ( n(2) )")
+    testing.assertEqual(toks("    ifIndex        InterfaceIndex\n"), r"l(ifIndex) u(InterfaceIndex)")
+    testing.assertEqual(toks("    Information Base\n"), r"u(Information) u(Base)")
+
+
+def _test_dump() -> None:
+    data = b"a ::= \"s\""
+    r = lexd(data)
+    testing.assertEqual(mib.lexer.dump(data, r.0), "1:1 LIDENT a\n1:3 ::= ::=\n1:7 STR \"s\"")

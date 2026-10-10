@@ -1,0 +1,310 @@
+"""Diagnostics for the MIB compiler: the `Diagnostic` record, the code catalogue and a collector.
+
+Levels follow libsmi/smilint, so `smilint -l N` output can be compared line by line:
+
+    0  internal error (a bug in the compiler, or an unknown diagnostic code)
+    1  data lost: a declaration or clause was dropped
+    2  RFC violation; the meaning was recovered or guessed
+    3  minor RFC violation
+    4  questionable but legal
+    5  style
+    6  info
+
+Levels 1-2 are errors, 3-4 warnings and 5-6 info.
+
+Every diagnostic has a stable string code such as `lex.unterminated-string` or
+`parse.missing-comma`. The prefix names the stage that reports it (`lex.`, `parse.`,
+`source.`; later stages add their own). Tests, `--ignore` style options and corpus summaries
+match on codes, never on message text. `CATALOG` maps each code to its default level, the
+closest libsmi error name (or "" when libsmi has none) and a one-line description.
+"""
+
+LEVEL_INTERNAL = 0
+LEVEL_ERROR = 1
+LEVEL_RFC = 2
+LEVEL_MINOR = 3
+LEVEL_WARNING = 4
+LEVEL_STYLE = 5
+LEVEL_INFO = 6
+
+# code -> (default level, libsmi error name or "", description)
+CATALOG: dict[str, (int, str, str)] = {
+    "internal": (0, "", "internal compiler error or unknown diagnostic code"),
+    # --- lexical (mib.lexer, and string decoding in mib.parser) ---------------------------
+    "lex.unterminated-string": (2, "", "a quoted string is not closed before the end of the file; it is cut at the end of its first line and lexing resumes there"),
+    "lex.escaped-quote": (2, "", "a doubled quote inside a string (the X.680 escape) is read as one quote character"),
+    "lex.string-stray-quote": (2, "", "a stray quote inside a string made the following code a string; the string ends at the next quote instead"),
+    "lex.string-missing-quote": (2, "", "a string is not closed before the code that follows it; it is cut at the end of its text"),
+    "parse.string-embedded-quote": (2, "", "unescaped quotes inside a string: the pieces are joined into one string"),
+    "lex.non-ascii": (2, "lexical", "bytes >= 0x80 (NBSP, smart quotes, ...) between tokens are skipped"),
+    "lex.control-char": (2, "lexical", "control characters between tokens are skipped"),
+    "lex.c-comment": (2, "lexical", "a C or C++ style comment is skipped"),
+    "lex.page-header": (2, "", "an RFC or Internet-Draft page header/footer line left in the module is skipped"),
+    "lex.dos-eof": (5, "", "a DOS end-of-file marker (0x1A) ends the input"),
+    "lex.comment-inner-dashes": (4, "comment-terminates", "text after an inner '--' is ignored; RFC 2578 would parse it as code"),
+    "lex.hex-odd-length": (2, "", "a hexadecimal string has an odd number of digits"),
+    "lex.bin-length": (2, "", "the length of a binary string is not a multiple of 8"),
+    "lex.bad-hex-string": (1, "", "a hexadecimal or binary string contains invalid digits"),
+    "lex.string-non-ascii": (5, "char-illegal-string", "a quoted string contains non-ASCII bytes (kept; decoded as UTF-8, else CP1252)"),
+    # --- module structure (mib.parser) -----------------------------------------------------
+    "parse.syntax": (1, "internal-other", "syntax error; the declaration is dropped"),
+    "parse.no-module": (4, "module-unknown-format", "the input contains no 'NAME DEFINITIONS ::= BEGIN' module header"),
+    "parse.junk": (2, "", "tokens outside a module (before, between or after modules) are ignored"),
+    "parse.missing-end": (2, "", "the module has no final END"),
+    "parse.module-oid": (5, "", "an ASN.1 module OID after the module name is ignored"),
+    "parse.module-name-case": (2, "bad-identifier-case", "a module name should start with an uppercase letter"),
+    "parse.sppi-module": (3, "", "an SPPI (PIB-DEFINITIONS) module is parsed as SMI; SPPI clauses are skipped"),
+    "parse.exports": (4, "export-not-allowed", "EXPORTS is only allowed in RFC1155-SMI; skipped"),
+    "parse.macro-definition": (3, "macro-not-allowed", "a MACRO definition outside the SMI base modules is skipped"),
+    "parse.choice": (3, "choice-not-allowed", "a CHOICE type outside the SMI base modules is skipped"),
+    "parse.tagged-type": (3, "tagged-type-not-allowed", "a tagged/IMPLICIT type outside the SMI base modules; the inner type is used"),
+    "parse.stray-semicolon": (5, "", "a stray ';' between declarations is ignored"),
+    "parse.non-smi-assignment": (2, "", "an ASN.1 assignment that is not SMI is skipped"),
+    "parse.unknown-macro": (3, "", "an invocation of a macro defined in this module is kept with its OID only"),
+    "parse.macro-missing": (2, "", "an OBJECT-TYPE whose macro keyword is missing or glued to the name"),
+    "parse.assign-missing": (2, "", "a type assignment without '::='"),
+    "parse.brace-missing": (2, "", "the opening brace of an enumeration is missing"),
+    "parse.clause-misspelled": (2, "", "a misspelled clause keyword (DESCRIPITION, DEFVALUE, Description) is read as the clause"),
+    "parse.clause-keyword-missing": (2, "", "a quoted string where a clause is expected is read as the DESCRIPTION"),
+    "parse.string-concat": (2, "", "adjacent quoted strings in one clause are joined"),
+    "parse.string-unquoted": (2, "", "unquoted text before or after a clause's string (a missing quote) is joined to it"),
+    # --- identifiers ----------------------------------------------------------------------------
+    "parse.bad-identifier-case": (2, "bad-identifier-case", "a descriptor should start with a lowercase letter, a type name with an uppercase letter"),
+    "parse.label-case": (3, "bad-identifier-case", "an enumeration or bit label should start with a lowercase letter"),
+    "parse.underscore-in-identifier": (5, "underscore-in-identifier", "an identifier contains '_'"),
+    "parse.identifier-trailing-hyphen": (2, "", "an identifier ends with '-'"),
+    "parse.identifier-leading-digit": (2, "", "an identifier starts with a digit"),
+    "parse.identifier-too-long": (3, "namelength-64", "an identifier is longer than 64 characters"),
+    # --- IMPORTS ----------------------------------------------------------------------------------
+    "parse.imports-missing-semicolon": (2, "", "IMPORTS is not terminated by ';'"),
+    "parse.imports-missing-comma": (2, "", "a comma is missing between imported symbols"),
+    "parse.imports-trailing-comma": (3, "", "a trailing comma before FROM in IMPORTS"),
+    "parse.imports-builtin": (5, "", "an ASN.1 built-in type (INTEGER, BITS, ...) must not be imported; ignored"),
+    "parse.imports-not-first": (3, "", "IMPORTS appears after other declarations"),
+    "parse.imports-module-oid": (5, "", "an OID after a FROM module name is ignored"),
+    # --- lists and punctuation -------------------------------------------------------------------
+    "parse.missing-comma": (2, "", "a comma is missing between list items"),
+    "parse.trailing-comma": (3, "", "a trailing comma at the end of a list"),
+    "parse.double-comma": (3, "", "an empty list element (two commas in a row)"),
+    "parse.empty-list": (2, "", "an empty list where at least one item is required"),
+    # --- clauses -----------------------------------------------------------------------------------
+    "parse.clause-order": (3, "", "clauses are not in the order the RFC grammar prescribes"),
+    "parse.clause-duplicate": (2, "", "a clause appears more than once; the first one is kept"),
+    "parse.clause-missing": (2, "", "a mandatory clause is missing"),
+    "parse.clause-unexpected": (2, "", "a clause that this macro does not have; it is ignored"),
+    "parse.trap-status": (3, "", "a STATUS clause in TRAP-TYPE is ignored"),
+    "parse.trap-enterprise-braced": (3, "", "ENTERPRISE value in braces"),
+    "parse.description-missing": (3, "", "an SMIv2 OBJECT-TYPE without DESCRIPTION"),
+    "parse.string-expected": (2, "", "a quoted string is missing after a clause keyword"),
+    "parse.revision-description-missing": (2, "", "a REVISION without DESCRIPTION"),
+    "parse.date-invalid": (2, "date-character", "a LAST-UPDATED/REVISION value is not a valid YYYYMMDDHHMMZ date (kept as written)"),
+    "parse.date-two-digit-year": (5, "date-year-2digits", "a date with a two-digit year (19YY)"),
+    "parse.date-before-1988": (4, "date-in-past", "a two-digit year before 1988 is read as 20YY"),
+    "parse.revision-order": (5, "revision-not-descending", "revisions are not in reverse chronological order"),
+    "parse.creation-requires-empty": (4, "", "an empty CREATION-REQUIRES list"),
+    "parse.augments-multiple": (2, "", "AUGMENTS names more than one row; the first is used"),
+    "parse.index-and-augments": (2, "index-and-augments", "a row has both INDEX and AUGMENTS; AUGMENTS wins"),
+    "parse.module-identity-missing": (3, "module-identity-missing", "an SMIv2 module without MODULE-IDENTITY"),
+    "parse.module-identity-multiple": (2, "", "more than one MODULE-IDENTITY; the first one is the module's identity"),
+    "parse.module-identity-not-first": (5, "module-identity-not-first", "MODULE-IDENTITY is not the first declaration after IMPORTS"),
+    "parse.access-in-smiv2": (5, "access-in-smiv2", "SMIv1 ACCESS clauses in an SMIv2 module"),
+    "parse.max-access-in-smiv1": (5, "", "SMIv2 MAX-ACCESS clauses in an SMIv1 module"),
+    "parse.smi-mix": (3, "", "the module mixes ACCESS and MAX-ACCESS clauses"),
+    "parse.trap-in-smiv2": (4, "trap", "TRAP-TYPE in an SMIv2 module"),
+    # --- types, values, numbers -----------------------------------------------------------------
+    "parse.enum-on-non-integer": (2, "", "an enumeration on a type other than INTEGER is read as INTEGER with named numbers"),
+    "parse.range-on-string": (2, "", "a value range on a string type is read as SIZE"),
+    "parse.size-on-integer": (2, "", "a SIZE constraint on an integer type is read as a range"),
+    "parse.range-separator": (2, "", "',' instead of '|' between ranges"),
+    "parse.range-min-max": (2, "", "MIN/MAX in a range means the base type's limit"),
+    "parse.range-symbolic": (2, "", "a symbolic name as a range bound"),
+    "parse.bit-string": (2, "", "the ASN.1 type BIT STRING is read as BITS"),
+    "parse.neg-number-space": (5, "", "a '-' separated from its number"),
+    "parse.number-leading-zero": (5, "number-leading-zero", "a number with leading zeros"),
+    "parse.number-too-large": (1, "", "a number does not fit in 64 bits"),
+    "parse.enum-hex-value": (3, "", "a hexadecimal or binary enumeration value"),
+    "parse.label-quoted": (2, "", "a quoted string used as an enumeration label"),
+    "parse.hyphen-in-label": (5, "hyphen-in-label", "an enumeration or bit label contains '-' in an SMIv2 module (reported once per type)"),
+    "parse.type-assignment-smiv2": (5, "", "a plain type assignment (no TEXTUAL-CONVENTION) in an SMIv2 module"),
+    "parse.enum-with-range": (3, "", "a range after an enumeration"),
+    "parse.defval-unquoted-ip": (2, "", "an unquoted dotted number (IP address, version) in DEFVAL is read as a string"),
+    "parse.string-type": (2, "", "the type STRING is read as OCTET STRING"),
+    "parse.bits-without-names": (3, "", "BITS without its list of named bits"),
+    "parse.sequence-of-base-type": (2, "", "SEQUENCE OF a base type (not a row type)"),
+    "parse.inline-sequence": (2, "", "an inline SEQUENCE (with its item list) as a SYNTAX: a structure node; its items are dropped"),
+    "parse.sequence-item-type-missing": (2, "", "a SEQUENCE item without a type"),
+    "parse.misplaced-comma": (2, "", "a comma between a SEQUENCE item name and its type"),
+    "parse.quoted-name": (2, "", "a quoted string where an object name is expected is read as the name"),
+    "parse.index-number": (2, "", "a number in INDEX is ignored"),
+    "parse.label-malformed": (2, "", "an enumeration or bit label with characters that are not allowed (n/a, two words) is kept as written"),
+    "parse.imports-extra-semicolon": (2, "", "a ';' inside IMPORTS (more symbols follow it) is ignored"),
+    "parse.sequence-subtype": (5, "", "a subtype inside a SEQUENCE item is ignored (the column's SYNTAX is authoritative)"),
+    # --- search path and module index (mib.source) ----------------------------------------------
+    "source.unreadable": (2, "", "a file in the MIB search path cannot be read"),
+    "source.no-module": (4, "module-unknown-format", "a file contains no module header"),
+    "source.duplicate-module": (4, "", "several files define the same module; which one is used"),
+    "source.alias": (5, "obsolete-import", "a module name is resolved through the alias table"),
+    "source.builtin-override": (4, "", "a file with the name of a built-in base module is ignored"),
+    "source.not-found": (1, "module-not-found", "an imported module is not found in the search path (reported by the resolver)"),
+}
+
+
+def level_of(code: str) -> int:
+    """Default level of `code`, or 0 (internal) when the code is not in the catalogue."""
+    e = CATALOG.get(code)
+    if e is not None:
+        return e.0
+    return 0
+
+
+def known_code(code: str) -> bool:
+    """True when `code` is in the catalogue."""
+    return code in CATALOG
+
+
+def severity_name(level: int) -> str:
+    """'internal', 'error' (1-2), 'warning' (3-4) or 'info' (5-6)."""
+    if level <= 0:
+        return "internal"
+    if level <= 2:
+        return "error"
+    if level <= 4:
+        return "warning"
+    return "info"
+
+
+class Diagnostic(object):
+    """One finding. Lines and byte columns are 1-based. `module` is the MIB module the
+    position belongs to, or "" when it is outside any module or not known yet."""
+    level: int
+    code: str
+    module: str
+    file: str
+    line: int
+    col: int
+    message: str
+
+    def __init__(self, level: int, code: str, module: str, file: str, line: int, col: int, message: str):
+        self.level = level
+        self.code = code
+        self.module = module
+        self.file = file
+        self.line = line
+        self.col = col
+        self.message = message
+
+    def severity(self) -> str:
+        return severity_name(self.level)
+
+    def where(self) -> str:
+        """`file:line:col`"""
+        return self.file + ":" + str(self.line) + ":" + str(self.col)
+
+    def __str__(self) -> str:
+        """`file:line:col: [level] {{code}} message`, close to smilint's line format."""
+        return self.where() + ": [" + str(self.level) + "] {{" + self.code + "}} " + self.message
+
+    def __repr__(self) -> str:
+        return "Diagnostic(" + self.__str__() + ")"
+
+
+class Diagnostics(object):
+    """A collector of diagnostics with a level policy.
+
+    `report()` stamps `file` and `module` on each diagnostic; the caller updates them as it
+    moves between files and modules. `overrides` replaces catalogue levels per code.
+    Diagnostics above `max_level` are only counted in `suppressed`, except level 0, which is
+    always kept.
+    """
+    file: str
+    module: str
+    items: list[Diagnostic]
+    overrides: dict[str, int]
+    max_level: int
+    suppressed: int
+
+    def __init__(self, file: str = "", max_level: int = 6):
+        self.file = file
+        self.module = ""
+        self.items = []
+        self.overrides = {}
+        self.max_level = max_level
+        self.suppressed = 0
+
+    def set_level(self, code: str, level: int) -> None:
+        """Override the level of `code` for everything reported from now on."""
+        self.overrides[code] = level
+
+    def effective_level(self, code: str) -> int:
+        o = self.overrides.get(code)
+        if o is not None:
+            return o
+        return level_of(code)
+
+    def report(self, code: str, line: int, col: int, message: str) -> None:
+        """Record a diagnostic at `line:col` of the current file, with the code's level.
+        An unknown code is recorded as an internal error (level 0) that names the code."""
+        lv = self.effective_level(code)
+        if not known_code(code):
+            self.items.append(Diagnostic(0, "internal", self.module, self.file, line, col,
+                                         "unknown diagnostic code " + code + ": " + message))
+            return
+        if lv > self.max_level and lv > 0:
+            self.suppressed += 1
+            return
+        self.items.append(Diagnostic(lv, code, self.module, self.file, line, col, message))
+
+    def add(self, d: Diagnostic) -> None:
+        """Add a ready-made diagnostic (subject to `max_level`)."""
+        if d.level > self.max_level and d.level > 0:
+            self.suppressed += 1
+            return
+        self.items.append(d)
+
+    def extend(self, ds: list[Diagnostic]) -> None:
+        for d in ds:
+            self.add(d)
+
+    def count(self, max_level: int = 6) -> int:
+        """Number of diagnostics with level <= max_level."""
+        n = 0
+        for d in self.items:
+            if d.level <= max_level:
+                n += 1
+        return n
+
+    def errors(self) -> list[Diagnostic]:
+        """Diagnostics of level 0-2."""
+        return [d for d in self.items if d.level <= 2]
+
+    def has_errors(self) -> bool:
+        for d in self.items:
+            if d.level <= 2:
+                return True
+        return False
+
+    def codes(self) -> list[str]:
+        """The codes of all diagnostics, in report order."""
+        return [d.code for d in self.items]
+
+    def ordered(self) -> list[Diagnostic]:
+        """All diagnostics ordered by file, line, column, then report order."""
+        keyed = [((d.file, d.line, d.col, i), i) for i, d in enumerate(self.items)]
+        return [self.items[k.1] for k in sorted(keyed)]
+
+    def format(self) -> str:
+        """All diagnostics, ordered, one per line."""
+        return "\n".join([str(d) for d in self.ordered()])
+
+
+def format_all(ds: list[Diagnostic]) -> str:
+    """One diagnostic per line, in the given order."""
+    return "\n".join([str(d) for d in ds])
+
+
+def summary(ds: list[Diagnostic]) -> str:
+    """`code xN` counts sorted by code, one per line: a stable digest for snapshot tests."""
+    cnt: dict[str, int] = {}
+    for d in ds:
+        cnt[d.code] = cnt.get_def(d.code, 0) + 1
+    return "\n".join([k + " x" + str(cnt[k]) for k in sorted(list(cnt.keys()))])

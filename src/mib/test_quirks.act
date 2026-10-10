@@ -1,0 +1,1467 @@
+"""Real-world MIB quirks, one test per quirk class, each with a minimal MIB snippet.
+
+Each test asserts the front end's policy for its quirk: the diagnostic codes and levels the
+lexer and parser report (`ok` when there are none), and the AST content that must survive.
+Where the policy belongs to the resolver (imports, types, OIDs, value ranges, STATUS and
+ACCESS values), the test asserts that the parser accepts the input silently and keeps what
+the resolver needs; a `resolver:` comment names the resolver's part, which test_resolver
+checks under the same test name.
+
+The `q41_` to `q48_` prefixes group the tests as the section banners below show; `qx_` are
+leniencies found by the corpus sweep (`mib.test_corpus`).
+"""
+
+import testing
+import mib.ast
+import mib.diag
+import mib.lexer
+import mib.parser
+import mib.source
+
+# SMIv2 skeleton: parses without diagnostics.
+V2_HEAD = r"""QUIRK-MIB DEFINITIONS ::= BEGIN
+IMPORTS
+    MODULE-IDENTITY, OBJECT-TYPE, OBJECT-IDENTITY, NOTIFICATION-TYPE,
+    Integer32, Counter32, Counter64, Unsigned32, Gauge32, TimeTicks, IpAddress, Opaque, enterprises
+        FROM SNMPv2-SMI
+    TEXTUAL-CONVENTION, DisplayString, RowStatus, TruthValue
+        FROM SNMPv2-TC
+    MODULE-COMPLIANCE, OBJECT-GROUP, NOTIFICATION-GROUP, AGENT-CAPABILITIES
+        FROM SNMPv2-CONF;
+quirkMIB MODULE-IDENTITY
+    LAST-UPDATED "202610100000Z"
+    ORGANIZATION "actsnmp"
+    CONTACT-INFO "none"
+    DESCRIPTION  "Quirk test module."
+    ::= { enterprises 99999 }
+quirkObjects OBJECT IDENTIFIER ::= { quirkMIB 1 }
+"""
+
+# SMIv1 skeleton.
+V1_HEAD = r"""QUIRK-V1-MIB DEFINITIONS ::= BEGIN
+IMPORTS
+    enterprises, Counter, Gauge, TimeTicks, IpAddress, NetworkAddress FROM RFC1155-SMI
+    OBJECT-TYPE FROM RFC-1212
+    TRAP-TYPE FROM RFC-1215
+    DisplayString FROM RFC1213-MIB;
+quirkV1 OBJECT IDENTIFIER ::= { enterprises 99998 }
+"""
+
+TAIL = r"""
+END
+"""
+
+
+def v2(body: str) -> str:
+    return V2_HEAD + body + TAIL
+
+
+def v1(body: str) -> str:
+    return V1_HEAD + body + TAIL
+
+
+def parse(src: str) -> mib.parser.ParseResult:
+    return mib.parser.parse_text(src, "q.mib")
+
+
+def codes(r: mib.parser.ParseResult) -> str:
+    """`L<level> <code>` per diagnostic in report order, or `ok`."""
+    c = ", ".join(["L" + str(d.level) + " " + d.code for d in r.diags])
+    return c if c != "" else "ok"
+
+
+def find(r: mib.parser.ParseResult, name: str) -> ?mib.ast.Def:
+    if len(r.modules) > 0:
+        return r.modules[0].find(name)
+    return None
+
+
+def out(r: mib.parser.ParseResult, name: str) -> str:
+    """`codes | dump_def(name)` (`<missing>` when the declaration was dropped)."""
+    d = find(r, name)
+    return codes(r) + " | " + (mib.ast.dump_def(d) if d is not None else "<missing>")
+
+
+def q2(body: str, name: str) -> str:
+    return out(parse(v2(body)), name)
+
+
+def q1(body: str, name: str) -> str:
+    return out(parse(v1(body)), name)
+
+
+def obj(syntax: str, extra: str = "") -> str:
+    """An SMIv2 scalar `q` with the given SYNTAX and extra clauses after DESCRIPTION."""
+    return r"""
+q OBJECT-TYPE
+    SYNTAX """ + syntax + r"""
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "d"
+    """ + extra + r"""
+    ::= { quirkObjects 5 }
+"""
+
+
+def obj1(syntax: str, extra: str = "") -> str:
+    """An SMIv1 scalar `q` with the given SYNTAX and extra clauses."""
+    return r"""
+q OBJECT-TYPE
+    SYNTAX """ + syntax + r"""
+    ACCESS read-only
+    STATUS mandatory
+    """ + extra + r"""
+    ::= { quirkV1 5 }
+"""
+
+
+def syntax_of(r: mib.parser.ParseResult, name: str) -> str:
+    d = find(r, name)
+    if isinstance(d, mib.ast.ObjectType):
+        s = d.syntax
+        if s is not None:
+            return s.dump()
+    if isinstance(d, mib.ast.TextualConvention):
+        s = d.syntax
+        if s is not None:
+            return s.dump()
+    if isinstance(d, mib.ast.TypeAssignment):
+        s = d.syntax
+        if s is not None:
+            return s.dump()
+    return "<none>"
+
+
+def syn2(syntax: str) -> str:
+    """`codes | syntax` of an SMIv2 scalar with that SYNTAX."""
+    r = parse(v2(obj(syntax)))
+    return codes(r) + " | " + syntax_of(r, "q")
+
+
+def defval_of(r: mib.parser.ParseResult) -> str:
+    d = find(r, "q")
+    if isinstance(d, mib.ast.ObjectType):
+        dv = d.defval
+        if dv is not None:
+            return dv.value.dump()
+    return "<none>"
+
+
+def dv2(syntax: str, defval: str) -> str:
+    """`codes | DEFVAL value` of an SMIv2 scalar."""
+    r = parse(v2(obj(syntax, "DEFVAL " + defval)))
+    return codes(r) + " | " + defval_of(r)
+
+
+def names(r: mib.parser.ParseResult) -> list[str]:
+    if len(r.modules) == 0:
+        return []
+    return [d.name for d in r.modules[0].defs]
+
+
+def lexcodes(data: bytes) -> str:
+    """`line:col L<level> code` of the lexer's diagnostics on `data`."""
+    d = mib.diag.Diagnostics("q.mib")
+    mib.lexer.lex(data, d)
+    return ", ".join([str(x.line) + ":" + str(x.col) + " L" + str(x.level) + " " + x.code for x in d.items])
+
+
+# ============================================================================================
+# Lexical (q41_)
+# ============================================================================================
+
+def _test_q41_prose_after_inner_dashes() -> None:
+    # comment to end of line; no diagnostic for prose
+    testing.assertEqual(q2(obj(r"Integer32 -- see RFC -- for details"), "q"),
+                        r"ok | OBJECT-TYPE q syntax=Integer32 max-access=read-only status=current ::= {quirkObjects 5}")
+
+
+def _test_q41_code_after_inner_dashes() -> None:
+    # comment to end of line; L4 when the tail would be a clause under RFC 2578 rules. The
+    # corpus form (commented-out code after dashes) stays a comment.
+    body = r"""
+q OBJECT-TYPE
+    SYNTAX Integer32
+    MAX-ACCESS read-only
+-- --   STATUS deprecated
+----    SYNTAX Integer32 (1..32)
+    STATUS current
+    DESCRIPTION "d"
+    ::= { quirkObjects 5 }
+"""
+    testing.assertEqual(q2(body, "q"), r"L4 lex.comment-inner-dashes | OBJECT-TYPE q syntax=Integer32 max-access=read-only status=current ::= {quirkObjects 5}")
+
+
+def _test_q41_dash_separator_lines() -> None:
+    # 4n+1 and other dash-only lines are comments in both comment modes
+    body = r"""
+-----
+a OBJECT IDENTIFIER ::= { quirkObjects 1 }
+---------------------------
+b OBJECT IDENTIFIER ::= { quirkObjects 2 }
+-------------------------
+c OBJECT IDENTIFIER ::= { quirkObjects 3 }
+"""
+    testing.assertEqual(names(parse(v2(body)))[2:], ["a", "b", "c"])
+    testing.assertEqual(codes(parse(v2(body))), "ok")
+    r = mib.parser.parse_text(v2(body), "q.mib", True)
+    testing.assertEqual(names(r)[2:], ["a", "b", "c"])
+    testing.assertEqual(codes(r), "ok")
+
+
+def _test_q41_comment_glued_to_identifier() -> None:
+    # `Integer32--comment`: the identifier ends before `--`
+    testing.assertEqual(syn2(r"Integer32--comment"), "ok | Integer32")
+    testing.assertEqual(syn2(r"Integer32---comment"), "ok | Integer32")
+
+
+def _test_q41_underscore_in_identifier() -> None:
+    testing.assertEqual(q2(r"quirk_obj OBJECT IDENTIFIER ::= { quirkObjects 9 }", "quirk_obj"),
+                        r"L5 parse.underscore-in-identifier | OBJECT IDENTIFIER quirk_obj ::= {quirkObjects 9}")
+    testing.assertEqual(syn2(r"INTEGER { link_up(1) }"), r"L5 parse.underscore-in-identifier | INTEGER {link_up(1)}")
+
+
+def _test_q41_identifier_trailing_hyphen() -> None:
+    testing.assertEqual(q2(r"quirkObj- OBJECT IDENTIFIER ::= { quirkObjects 9 }", "quirkObj-"),
+                        r"L2 parse.identifier-trailing-hyphen | OBJECT IDENTIFIER quirkObj- ::= {quirkObjects 9}")
+
+
+def _test_q41_identifier_leading_digit() -> None:
+    testing.assertEqual(q2(r"3comObj OBJECT IDENTIFIER ::= { quirkObjects 9 }", "3comObj"),
+                        r"L2 parse.identifier-leading-digit | OBJECT IDENTIFIER 3comObj ::= {quirkObjects 9}")
+
+
+def _test_q41_descriptor_too_long() -> None:
+    nm = "quirk" + "x" * 60
+    testing.assertEqual(q2(nm + r" OBJECT IDENTIFIER ::= { quirkObjects 9 }", nm),
+                        r"L3 parse.identifier-too-long | OBJECT IDENTIFIER " + nm + r" ::= {quirkObjects 9}")
+
+
+def _test_q41_non_ascii_in_strings() -> None:
+    # bytes kept; decoded as UTF-8, else CP1252; L5
+    data = (V2_HEAD + "q OBJECT-IDENTITY STATUS current DESCRIPTION \"caf").encode() + b"\xe9 \xe2\x80\x9cok\xe2\x80\x9d\"" + r""" ::= { quirkObjects 9 }""".encode() + TAIL.encode()
+    r = mib.parser.parse_bytes(data, "q.mib")
+    testing.assertEqual(codes(r), "L5 lex.string-non-ascii")
+    testing.assertEqual(find(r, "q")?.description?.value, "caf" + chr(0xe9) + " " + chr(0x201c) + "ok" + chr(0x201d))
+
+
+def _test_q41_non_ascii_in_comments() -> None:
+    data = (V2_HEAD + "-- caf").encode() + b"\xe9 \x93quoted\x94\n" + r"""q OBJECT IDENTIFIER ::= { quirkObjects 9 }""".encode() + TAIL.encode()
+    r = mib.parser.parse_bytes(data, "q.mib")
+    testing.assertEqual(out(r, "q"), r"ok | OBJECT IDENTIFIER q ::= {quirkObjects 9}")
+
+
+def _test_q41_non_ascii_between_tokens() -> None:
+    # NBSP or a smart quote between tokens: the byte run is skipped (L2), nothing else is lost
+    data = V2_HEAD.encode() + b"q OBJECT-TYPE SYNTAX Integer32\xa0 MAX-ACCESS read-only STATUS current\xc2\xa0 DESCRIPTION \"d\" ::= " + r"{ quirkObjects 9 }".encode() + TAIL.encode()
+    r = mib.parser.parse_bytes(data, "q.mib")
+    testing.assertEqual(out(r, "q"), r"L2 lex.non-ascii, L2 lex.non-ascii | OBJECT-TYPE q syntax=Integer32 max-access=read-only status=current ::= {quirkObjects 9}")
+
+
+def _test_q41_form_feed() -> None:
+    src = v2("\x0c\n" + r"q OBJECT IDENTIFIER ::= { quirkObjects 9 }" + "\x0c\n")
+    testing.assertEqual(out(parse(src), "q"), r"ok | OBJECT IDENTIFIER q ::= {quirkObjects 9}")
+
+
+def _test_q41_bare_cr_line_ends() -> None:
+    src = v2(r"a OBJECT IDENTIFIER ::= { quirkObjects 1 }" + "\r" + r"b OBJECT IDENTIFIER ::= { quirkObjects 2 }")
+    r = parse(src.replace("\n", "\r"))
+    testing.assertEqual(codes(r), "ok")
+    testing.assertEqual(find(r, "b")?.line, 18)
+
+
+def _test_q41_dos_eof_marker() -> None:
+    r = mib.parser.parse_bytes(v2("").encode() + b"\x1a", "q.mib")
+    testing.assertEqual(codes(r), "L5 lex.dos-eof")
+    testing.assertTrue(r.modules[0].has_end)
+
+
+def _test_q41_utf8_bom() -> None:
+    r = mib.parser.parse_bytes(b"\xef\xbb\xbf" + v2("").encode(), "q.mib")
+    testing.assertEqual(codes(r), "ok")
+    testing.assertEqual(r.modules[0].col, 1)
+
+
+def _test_q41_leading_zeros() -> None:
+    testing.assertEqual(q2(r"q OBJECT IDENTIFIER ::= { quirkObjects 01 }", "q"),
+                        r"L5 parse.number-leading-zero | OBJECT IDENTIFIER q ::= {quirkObjects 1}")
+
+
+def _test_q41_hex_odd_length() -> None:
+    # digits kept as written; the resolver pads on the left
+    testing.assertEqual(syn2(r"Unsigned32 (0..'fff'h)"), r"L2 lex.hex-odd-length | Unsigned32 (0..'fff'H)")
+
+
+def _test_q41_binary_length() -> None:
+    testing.assertEqual(dv2("OCTET STRING", r"{ '101'B }"), r"L2 lex.bin-length | '101'B")
+
+
+def _test_q41_hex_range_bound() -> None:
+    # legal (RFC 2578 section 3.1.1)
+    r = parse(v2(obj(r"Unsigned32 (0..'ffffffff'h)")))
+    testing.assertEqual(codes(r), "ok")
+    d = find(r, "q")
+    if isinstance(d, mib.ast.ObjectType):
+        testing.assertEqual(d.syntax?.constraint?.ranges[0].hi?.int_value(), 4294967295)
+        return
+    testing.error("q missing")
+
+
+def _test_q41_doubled_quote_in_string() -> None:
+    r = parse(v2(r"""q OBJECT-IDENTITY STATUS current DESCRIPTION "say ""hi"" now" ::= { quirkObjects 9 }"""))
+    testing.assertEqual(codes(r), "L2 lex.escaped-quote")
+    testing.assertEqual(find(r, "q")?.description?.value, "say \"hi\" now")
+
+
+def _test_q41_lowercase_keyword() -> None:
+    # rejected: the declaration is lost (L1), the next one survives
+    r = parse(v2(r"""
+q object-type SYNTAX Integer32 MAX-ACCESS read-only STATUS current DESCRIPTION "d" ::= { quirkObjects 5 }
+r OBJECT IDENTIFIER ::= { quirkObjects 6 }
+"""))
+    testing.assertEqual(codes(r), "L1 parse.syntax")
+    testing.assertEqual(names(r), ["quirkMIB", "quirkObjects", "r"])
+
+
+def _test_q41_min_max_in_ranges() -> None:
+    testing.assertEqual(syn2(r"Integer32 (0..MAX)"), r"L2 parse.range-min-max | Integer32 (0..MAX)")
+    testing.assertEqual(syn2(r"Integer32 (MIN..0)"), r"L2 parse.range-min-max | Integer32 (MIN..0)")
+
+
+def _test_q41_number_beyond_64_bits() -> None:
+    # L1, the constraint (or the enumeration label) is dropped; the declaration is kept.
+    # Bounds up to 2^64-1 are kept exactly; the resolver checks them against the base type.
+    testing.assertEqual(syn2(r"Integer32 (0..99999999999999999999)"), "L1 parse.number-too-large | Integer32")
+    testing.assertEqual(syn2(r"Unsigned32 (0..'010000000000000000'h)"), "L1 parse.number-too-large | Unsigned32")
+    testing.assertEqual(syn2(r"INTEGER { a(1), b(-99999999999999999999) }"), r"L1 parse.number-too-large | INTEGER {a(1)}")
+    r = parse(v2(obj(r"Counter64 (0..18446744073709551615)")))
+    testing.assertEqual(codes(r), "ok")
+    d = find(r, "q")
+    if isinstance(d, mib.ast.ObjectType):
+        hi = d.syntax?.constraint?.ranges[0].hi
+        testing.assertEqual(hi?.big_value(), bigint(18446744073709551615))
+        testing.assertNone(hi?.int_value())
+        return
+    testing.error("q missing")
+
+
+def _test_q41_negative_number_with_space() -> None:
+    testing.assertEqual(syn2(r"Integer32 (- 1..10)"), r"L5 parse.neg-number-space | Integer32 (-1..10)")
+    testing.assertEqual(syn2(r"INTEGER { unknown(- 1), up(1) }"), r"L5 parse.neg-number-space | INTEGER {unknown(-1), up(1)}")
+
+
+def _test_q41_keywords_in_text() -> None:
+    # CHOICE, EXPORTS, MACRO ... END in strings and comments never affect parsing
+    body = r"""
+-- EXPORTS nothing; a MACRO is not the END
+q OBJECT-IDENTITY STATUS current DESCRIPTION "pick a CHOICE { here; a MACRO is not the END" ::= { quirkObjects 9 }
+r OBJECT IDENTIFIER ::= { quirkObjects 10 }
+"""
+    r = parse(v2(body))
+    testing.assertEqual(codes(r), "ok")
+    testing.assertEqual(names(r), ["quirkMIB", "quirkObjects", "q", "r"])
+
+
+# ============================================================================================
+# Module structure (q42_)
+# ============================================================================================
+
+def _test_q42_module_name_differs_from_file_name() -> None:
+    # the content index finds a module by its name, whatever the file is called
+    mp = mib.source.MibPath(["/mibs"], False, False)
+    es = mp.add_file("/mibs/quirk.my", v2("").encode(), 0)
+    testing.assertEqual([e.name for e in es], ["QUIRK-MIB"])
+    testing.assertEqual(mp.find("QUIRK-MIB")?.path, "/mibs/quirk.my")
+
+
+def _test_q42_several_modules_per_file() -> None:
+    src = r"""A-MIB DEFINITIONS ::= BEGIN
+a OBJECT IDENTIFIER ::= { iso 1 }
+END
+B-MIB DEFINITIONS ::= BEGIN
+b OBJECT IDENTIFIER ::= { iso 2 }
+END
+"""
+    r = parse(src)
+    testing.assertEqual(codes(r), "ok")
+    testing.assertEqual([m.name for m in r.modules], ["A-MIB", "B-MIB"])
+    mp = mib.source.MibPath(["/mibs"], False, False)
+    mp.add_file("/mibs/bundle.txt", src.encode(), 0)
+    testing.assertEqual(mp.find("B-MIB")?.path, "/mibs/bundle.txt")
+
+
+def _test_q42_no_module_in_file() -> None:
+    r = parse("<html><body>Not found</body></html>\n")
+    testing.assertEqual(codes(r), "L4 parse.no-module")
+    testing.assertEqual(len(r.modules), 0)
+
+
+def _test_q42_tokens_after_end() -> None:
+    r = parse(v2(r"q OBJECT IDENTIFIER ::= { quirkObjects 9 }") + "END\n-- mail footer\nRegards, someone\n")
+    testing.assertEqual(codes(r), "L2 parse.junk")
+    testing.assertEqual(names(r), ["quirkMIB", "quirkObjects", "q"])
+
+
+def _test_q42_missing_end() -> None:
+    r = parse(V2_HEAD + r"q OBJECT IDENTIFIER ::= { quirkObjects 9 }" + "\n")
+    testing.assertEqual(codes(r), "L2 parse.missing-end")
+    testing.assertFalse(r.modules[0].has_end)
+    testing.assertEqual(names(r), ["quirkMIB", "quirkObjects", "q"])
+
+
+def _test_q42_smiv2_without_module_identity() -> None:
+    r = parse(r"""N-MIB DEFINITIONS ::= BEGIN
+IMPORTS OBJECT-TYPE, Integer32, enterprises FROM SNMPv2-SMI;
+n OBJECT IDENTIFIER ::= { enterprises 5 }
+END""")
+    testing.assertEqual(codes(r), "L3 parse.module-identity-missing")
+    testing.assertEqual(r.modules[0].lang, mib.ast.LANG_SMIV2)
+
+
+def _test_q42_several_module_identities() -> None:
+    r = parse(v2(r"""quirkMIB2 MODULE-IDENTITY LAST-UPDATED "202001010000Z" ORGANIZATION "o" CONTACT-INFO "c" DESCRIPTION "d" ::= { quirkMIB 9 }"""))
+    testing.assertEqual(codes(r), "L2 parse.module-identity-multiple")
+    testing.assertEqual(r.modules[0].module_identity()?.name, "quirkMIB")
+
+
+def _test_q42_module_identity_not_first() -> None:
+    r = parse(r"""N-MIB DEFINITIONS ::= BEGIN
+IMPORTS MODULE-IDENTITY, enterprises FROM SNMPv2-SMI;
+n OBJECT IDENTIFIER ::= { enterprises 5 }
+nMIB MODULE-IDENTITY LAST-UPDATED "202001010000Z" ORGANIZATION "o" CONTACT-INFO "c" DESCRIPTION "d" ::= { n 1 }
+END""")
+    testing.assertEqual(codes(r), "L5 parse.module-identity-not-first")
+    testing.assertEqual(r.modules[0].module_identity()?.name, "nMIB")
+
+
+def _test_q42_macro_definition_in_vendor_module() -> None:
+    r = parse(v2(r"""
+FOO-TYPE MACRO ::= BEGIN
+    TYPE NOTATION ::= "SYNTAX" type(TYPE ObjectSyntax)
+    VALUE NOTATION ::= value(VALUE ObjectName)
+END
+q OBJECT IDENTIFIER ::= { quirkObjects 9 }
+"""))
+    testing.assertEqual(codes(r), "L3 parse.macro-definition")
+    testing.assertEqual(names(r), ["quirkMIB", "quirkObjects", "FOO-TYPE", "q"])
+    testing.assertEqual(r.modules[0].macros, ["FOO-TYPE"])
+
+
+def _test_q42_exports_in_vendor_module() -> None:
+    r = parse(r"""E-MIB DEFINITIONS ::= BEGIN
+EXPORTS e;
+IMPORTS enterprises FROM RFC1155-SMI;
+e OBJECT IDENTIFIER ::= { enterprises 7 }
+END""")
+    testing.assertEqual(codes(r), "L4 parse.exports")
+    testing.assertTrue(r.modules[0].has_exports)
+    testing.assertEqual(names(r), ["e"])
+
+
+def _test_q42_tagged_type_in_vendor_module() -> None:
+    testing.assertEqual(q2(r"QuirkCounter ::= [APPLICATION 9] IMPLICIT INTEGER (0..4294967295)", "QuirkCounter"),
+                        r"L3 parse.tagged-type | TYPE QuirkCounter syntax=[APPLICATION 9] IMPLICIT INTEGER (0..4294967295)")
+
+
+def _test_q42_choice_in_vendor_module() -> None:
+    testing.assertEqual(q2(r"QuirkAddress ::= CHOICE { internet IpAddress, other OCTET STRING }", "QuirkAddress"),
+                        "L3 parse.choice | CHOICE QuirkAddress")
+
+
+def _test_q42_imports_from_v1_copies_of_base_modules() -> None:
+    # the parser keeps the import as written; the search path aliases the module (L5)
+    r = parse(r"""C-MIB DEFINITIONS ::= BEGIN
+IMPORTS Counter32, enterprises FROM SNMPv2-SMI-v1 DisplayString FROM SNMPv2-TC-v1;
+c OBJECT IDENTIFIER ::= { enterprises 9 }
+END""")
+    testing.assertEqual(codes(r), "ok")
+    testing.assertEqual(r.modules[0].import_modules(), ["SNMPv2-SMI-v1", "SNMPv2-TC-v1"])
+    mp = mib.source.MibPath([], True, False)
+    d = mib.diag.Diagnostics("")
+    e = mp.find("SNMPv2-SMI-v1", d)
+    testing.assertEqual(e?.name, "SNMPv2-SMI")
+    testing.assertEqual(e?.builtin, True)
+    testing.assertEqual([("L" + str(x.level) + " " + x.code) for x in d.items], ["L5 source.alias"])
+
+
+# ============================================================================================
+# IMPORTS (q43_)
+# ============================================================================================
+
+def imp(imports: str) -> mib.parser.ParseResult:
+    return parse(r"""I-MIB DEFINITIONS ::= BEGIN
+""" + imports + r"""
+iMIB MODULE-IDENTITY LAST-UPDATED "202001010000Z" ORGANIZATION "o" CONTACT-INFO "c" DESCRIPTION "d" ::= { enterprises 1 }
+END""")
+
+
+def imp_body(imports: str, body: str) -> mib.parser.ParseResult:
+    """A module with the given IMPORTS, a MODULE-IDENTITY iMIB and then `body`."""
+    return parse(r"""I-MIB DEFINITIONS ::= BEGIN
+""" + imports + r"""
+iMIB MODULE-IDENTITY LAST-UPDATED "202001010000Z" ORGANIZATION "o" CONTACT-INFO "c" DESCRIPTION "d" ::= { enterprises 1 }
+quirkObjects OBJECT IDENTIFIER ::= { iMIB 1 }
+""" + body + r"""
+END""")
+
+
+def imports_of(r: mib.parser.ParseResult) -> str:
+    return "; ".join([", ".join([s.name for s in g.symbols]) + " FROM " + g.module for g in r.modules[0].imports])
+
+
+def _test_q43_trailing_comma_before_from() -> None:
+    r = imp(r"IMPORTS MODULE-IDENTITY, enterprises, FROM SNMPv2-SMI;")
+    testing.assertEqual(codes(r), "L3 parse.imports-trailing-comma")
+    testing.assertEqual(imports_of(r), "MODULE-IDENTITY, enterprises FROM SNMPv2-SMI")
+
+
+def _test_q43_missing_comma() -> None:
+    r = imp(r"IMPORTS MODULE-IDENTITY enterprises FROM SNMPv2-SMI;")
+    testing.assertEqual(codes(r), "L2 parse.imports-missing-comma")
+    testing.assertEqual(imports_of(r), "MODULE-IDENTITY, enterprises FROM SNMPv2-SMI")
+
+
+def _test_q43_missing_semicolon() -> None:
+    r = imp(r"IMPORTS MODULE-IDENTITY, enterprises FROM SNMPv2-SMI DisplayString FROM SNMPv2-TC")
+    testing.assertEqual(codes(r), "L2 parse.imports-missing-semicolon")
+    testing.assertEqual(imports_of(r), "MODULE-IDENTITY, enterprises FROM SNMPv2-SMI; DisplayString FROM SNMPv2-TC")
+    testing.assertEqual(names(r), ["iMIB"])
+
+
+def _test_q43_base_symbol_used_without_import() -> None:
+    # resolver: bind to the base module (L3); the parser keeps the reference as written
+    r = imp_body(r"IMPORTS MODULE-IDENTITY, OBJECT-TYPE, enterprises FROM SNMPv2-SMI;", obj(r"Counter32"))
+    testing.assertEqual(codes(r), "ok")
+    testing.assertEqual(syntax_of(r, "q"), "Counter32")
+    testing.assertFalse("Counter32" in r.modules[0].imported_symbols())
+    # the official Juniper JUNIPER-SMI (26.2R1.7) uses TEXTUAL-CONVENTION and Opaque without
+    # importing them, and names its TC with the SPPI keyword Integer64; devices ship it as is
+    r2 = imp_body(r"IMPORTS MODULE-IDENTITY, OBJECT-IDENTITY, enterprises FROM SNMPv2-SMI;", r"""
+Integer64 ::= TEXTUAL-CONVENTION
+       STATUS      current
+       DESCRIPTION "A 64-bit signed integer, type Opaque is '44059f7a020081'h."
+       SYNTAX      Opaque (SIZE(4..11))
+""")
+    testing.assertEqual(out(r2, "Integer64"), r"ok | TEXTUAL-CONVENTION Integer64 status=current syntax=Opaque (SIZE (4..11))")
+
+
+def _test_q43_tc_used_without_import() -> None:
+    # resolver: bind to SNMPv2-TC (L3)
+    r = imp_body(r"IMPORTS MODULE-IDENTITY, OBJECT-TYPE, enterprises FROM SNMPv2-SMI;", obj(r"TruthValue"))
+    testing.assertEqual(codes(r), "ok")
+    testing.assertEqual(syntax_of(r, "q"), "TruthValue")
+
+
+def _test_q43_displaystring_from_rfc1213() -> None:
+    # resolver: rewrite to SNMPv2-TC (L5)
+    r = imp(r"IMPORTS MODULE-IDENTITY, enterprises FROM SNMPv2-SMI DisplayString FROM RFC1213-MIB;")
+    testing.assertEqual(codes(r), "ok")
+    testing.assertEqual(r.modules[0].imported_symbols()["DisplayString"], "RFC1213-MIB")
+
+
+def _test_q43_symbol_from_wrong_base_module() -> None:
+    # resolver: resolve through the fallback (L3)
+    r = imp(r"IMPORTS MODULE-IDENTITY, enterprises, DisplayString FROM SNMPv2-SMI;")
+    testing.assertEqual(codes(r), "ok")
+    testing.assertEqual(r.modules[0].imported_symbols()["DisplayString"], "SNMPv2-SMI")
+
+
+def _test_q43_smiv1_and_smiv2_base_modules_mixed() -> None:
+    # resolver: rewrite (L5); the language is SMIv2 (an uppercase symbol from SNMPv2-SMI)
+    r = imp(r"IMPORTS MODULE-IDENTITY, Integer32 FROM SNMPv2-SMI enterprises, Counter FROM RFC1155-SMI;")
+    testing.assertEqual(codes(r), "ok")
+    testing.assertEqual(r.modules[0].import_modules(), ["SNMPv2-SMI", "RFC1155-SMI"])
+    testing.assertEqual(r.modules[0].lang, mib.ast.LANG_SMIV2)
+
+
+def _test_q43_imported_module_missing() -> None:
+    # resolver: continue with unresolved symbols (source.not-found, L1, reported there)
+    r = imp(r"IMPORTS MODULE-IDENTITY, enterprises FROM SNMPv2-SMI fooThing FROM NO-SUCH-MIB;")
+    testing.assertEqual(codes(r), "ok")
+    testing.assertEqual(r.modules[0].imported_symbols()["fooThing"], "NO-SUCH-MIB")
+    mp = mib.source.MibPath([], True, False)
+    testing.assertNone(mp.find("NO-SUCH-MIB"))
+    testing.assertEqual(mib.diag.level_of("source.not-found"), 1)
+
+
+def _test_q43_symbol_not_in_imported_module() -> None:
+    # resolver: fallback, then unresolved (L2); the parser cannot know
+    r = imp(r"IMPORTS MODULE-IDENTITY, enterprises, noSuchSymbol FROM SNMPv2-SMI;")
+    testing.assertEqual(codes(r), "ok")
+    testing.assertEqual(r.modules[0].imported_symbols()["noSuchSymbol"], "SNMPv2-SMI")
+
+
+def _test_q43_asn1_builtins_imported() -> None:
+    r = imp(r"IMPORTS MODULE-IDENTITY, enterprises, INTEGER, OCTET STRING, BITS FROM SNMPv2-SMI;")
+    testing.assertEqual(codes(r), "L5 parse.imports-builtin, L5 parse.imports-builtin, L5 parse.imports-builtin")
+    testing.assertEqual(imports_of(r), "MODULE-IDENTITY, enterprises FROM SNMPv2-SMI")
+
+
+# ============================================================================================
+# Declarations, clauses and values (q44_)
+# ============================================================================================
+
+def _test_q44_uppercase_descriptor() -> None:
+    testing.assertEqual(q2(r"""QuirkObj OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current DESCRIPTION "d" ::= { quirkObjects 9 }""", "QuirkObj"),
+                        r"L2 parse.bad-identifier-case | OBJECT-TYPE QuirkObj syntax=Integer32 max-access=read-only status=current ::= {quirkObjects 9}")
+
+
+def _test_q44_lowercase_type_name() -> None:
+    testing.assertEqual(q2(r"quirkType ::= OCTET STRING (SIZE (4))", "quirkType"),
+                        r"L2 parse.bad-identifier-case, L5 parse.type-assignment-smiv2 | TYPE quirkType syntax=OCTET STRING (SIZE (4))")
+
+
+def _test_q44_duplicate_descriptor() -> None:
+    # resolver: first kept (L2); the parser keeps both, and defs_by_name() keeps the first
+    r = parse(v2(r"""
+dup OBJECT IDENTIFIER ::= { quirkObjects 1 }
+dup OBJECT IDENTIFIER ::= { quirkObjects 2 }
+"""))
+    testing.assertEqual(codes(r), "ok")
+    testing.assertEqual(names(r), ["quirkMIB", "quirkObjects", "dup", "dup"])
+    testing.assertEqual(mib.ast.dump_def(r.modules[0].defs_by_name()["dup"]), r"OBJECT IDENTIFIER dup ::= {quirkObjects 1}")
+
+
+def _test_q44_clauses_out_of_order() -> None:
+    testing.assertEqual(q2(r"""q OBJECT-TYPE SYNTAX Integer32 STATUS current DESCRIPTION "d" MAX-ACCESS read-only UNITS "s" ::= { quirkObjects 9 }""", "q"),
+                        r"""L3 parse.clause-order | OBJECT-TYPE q syntax=Integer32 units="s" max-access=read-only status=current ::= {quirkObjects 9}""")
+
+
+def _test_q44_object_type_without_description() -> None:
+    testing.assertEqual(q2(r"""q OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current ::= { quirkObjects 9 }""", "q"),
+                        r"L3 parse.description-missing | OBJECT-TYPE q syntax=Integer32 max-access=read-only status=current ::= {quirkObjects 9}")
+
+
+def _test_q44_access_in_smiv2() -> None:
+    testing.assertEqual(q2(r"""q OBJECT-TYPE SYNTAX Integer32 ACCESS read-only STATUS current DESCRIPTION "d" ::= { quirkObjects 9 }""", "q"),
+                        r"L5 parse.access-in-smiv2 | OBJECT-TYPE q syntax=Integer32 access=read-only status=current ::= {quirkObjects 9}")
+
+
+def _test_q44_max_access_in_smiv1() -> None:
+    testing.assertEqual(q1(r"""q OBJECT-TYPE SYNTAX Counter MAX-ACCESS read-only STATUS mandatory ::= { quirkV1 9 }""", "q"),
+                        r"L5 parse.max-access-in-smiv1 | OBJECT-TYPE q syntax=Counter max-access=read-only status=mandatory ::= {quirkV1 9}")
+
+
+def _test_q44_status_mandatory_in_smiv2() -> None:
+    # resolver: -> current (L3); the parser keeps the word
+    testing.assertEqual(q2(r"""q OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS mandatory DESCRIPTION "d" ::= { quirkObjects 9 }""", "q"),
+                        r"ok | OBJECT-TYPE q syntax=Integer32 max-access=read-only status=mandatory ::= {quirkObjects 9}")
+
+
+def _test_q44_status_current_in_smiv1() -> None:
+    # resolver: accept (L5)
+    testing.assertEqual(q1(obj1("Counter").replace("mandatory", "current"), "q"),
+                        r"ok | OBJECT-TYPE q syntax=Counter access=read-only status=current ::= {quirkV1 5}")
+
+
+def _test_q44_status_deprecated_in_smiv1() -> None:
+    # resolver: deprecated (not obsolete, unlike libsmi)
+    testing.assertEqual(q1(obj1("Counter").replace("mandatory", "deprecated"), "q"),
+                        r"ok | OBJECT-TYPE q syntax=Counter access=read-only status=deprecated ::= {quirkV1 5}")
+
+
+def _test_q44_unknown_access_or_status_value() -> None:
+    # resolver: normalise, else unknown (L2); the parser keeps the words
+    testing.assertEqual(q2(r"""q OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS readonly STATUS currnet DESCRIPTION "d" ::= { quirkObjects 9 }""", "q"),
+                        r"ok | OBJECT-TYPE q syntax=Integer32 max-access=readonly status=currnet ::= {quirkObjects 9}")
+    testing.assertEqual(q2(r"""q OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read_only STATUS current DESCRIPTION "d" ::= { quirkObjects 9 }""", "q"),
+                        r"ok | OBJECT-TYPE q syntax=Integer32 max-access=read_only status=current ::= {quirkObjects 9}")
+
+
+def _test_q44_write_only() -> None:
+    # resolver: -> read-write (L4)
+    testing.assertEqual(q2(r"""q OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS write-only STATUS current DESCRIPTION "d" ::= { quirkObjects 9 }""", "q"),
+                        r"ok | OBJECT-TYPE q syntax=Integer32 max-access=write-only status=current ::= {quirkObjects 9}")
+
+
+def _test_q44_read_create_in_smiv1() -> None:
+    # resolver: accept (L5)
+    testing.assertEqual(q1(obj1("Counter").replace("read-only", "read-create"), "q"),
+                        r"ok | OBJECT-TYPE q syntax=Counter access=read-create status=mandatory ::= {quirkV1 5}")
+
+
+def _test_q44_notification_without_status() -> None:
+    # status current (L2): the parser reports the missing clause and leaves status unset
+    testing.assertEqual(q2(r"""n NOTIFICATION-TYPE OBJECTS { quirkObjects } DESCRIPTION "d" ::= { quirkMIB 0 1 }""", "n"),
+                        r"L2 parse.clause-missing | NOTIFICATION-TYPE n objects={quirkObjects} ::= {quirkMIB 0 1}")
+
+
+def _test_q44_empty_objects_list() -> None:
+    testing.assertEqual(q2(r"""n NOTIFICATION-TYPE OBJECTS { } STATUS current DESCRIPTION "d" ::= { quirkMIB 0 1 }""", "n"),
+                        r"L2 parse.empty-list | NOTIFICATION-TYPE n objects={} status=current ::= {quirkMIB 0 1}")
+    testing.assertEqual(q2(r"""g NOTIFICATION-GROUP NOTIFICATIONS { } STATUS current DESCRIPTION "d" ::= { quirkMIB 2 1 }""", "g"),
+                        r"L2 parse.empty-list | NOTIFICATION-GROUP g notifications={} status=current ::= {quirkMIB 2 1}")
+
+
+def _test_q44_trap_type_in_smiv2() -> None:
+    testing.assertEqual(q2(r"""t TRAP-TYPE ENTERPRISE quirkMIB VARIABLES { quirkObjects } DESCRIPTION "d" ::= 3""", "t"),
+                        r"L4 parse.trap-in-smiv2 | TRAP-TYPE t enterprise={quirkMIB} variables={quirkObjects} number=3")
+
+
+def _test_q44_trap_enterprise_braced() -> None:
+    testing.assertEqual(q1(r"""t TRAP-TYPE ENTERPRISE { quirkV1 } DESCRIPTION "d" ::= 3""", "t"),
+                        r"L3 parse.trap-enterprise-braced | TRAP-TYPE t enterprise={quirkV1} variables={} number=3")
+
+
+def _test_q44_status_in_trap_type() -> None:
+    testing.assertEqual(q1(r"""t TRAP-TYPE ENTERPRISE quirkV1 STATUS current DESCRIPTION "d" ::= 3""", "t"),
+                        r"L3 parse.trap-status | TRAP-TYPE t enterprise={quirkV1} variables={} number=3")
+
+
+def _test_q44_same_trap_number_twice() -> None:
+    # resolver: first kept (L2); the parser keeps both
+    r = parse(v1(r"""
+t1 TRAP-TYPE ENTERPRISE quirkV1 DESCRIPTION "d" ::= 3
+t2 TRAP-TYPE ENTERPRISE quirkV1 DESCRIPTION "d" ::= 3
+"""))
+    testing.assertEqual(codes(r), "ok")
+    testing.assertEqual(names(r), ["quirkV1", "t1", "t2"])
+
+
+def _test_q44_compliance_module_with_oid() -> None:
+    testing.assertEqual(q2(r"""
+c MODULE-COMPLIANCE STATUS current DESCRIPTION "d"
+    MODULE IF-MIB { mib-2 31 } MANDATORY-GROUPS { ifGeneralGroup }
+    MODULE -- this module
+        GROUP g DESCRIPTION "d"
+    ::= { quirkMIB 3 1 }
+""", "c"), r"ok | MODULE-COMPLIANCE c status=current module(IF-MIB mandatory={ifGeneralGroup}) module(this group=g) ::= {quirkMIB 3 1}")
+
+
+def _test_q44_empty_creation_requires() -> None:
+    testing.assertEqual(q2(r"""
+a AGENT-CAPABILITIES PRODUCT-RELEASE "1" STATUS current DESCRIPTION "d"
+    SUPPORTS IF-MIB INCLUDES { ifGeneralGroup }
+        VARIATION ifStackStatus CREATION-REQUIRES { } DESCRIPTION "d"
+    ::= { quirkMIB 4 1 }
+""", "a"), r"""L4 parse.creation-requires-empty | AGENT-CAPABILITIES a release="1" status=current supports(IF-MIB includes={ifGeneralGroup} variation=ifStackStatus) ::= {quirkMIB 4 1}""")
+
+
+def mi(last_updated: str, revisions: str) -> mib.parser.ParseResult:
+    return parse(r"""D-MIB DEFINITIONS ::= BEGIN
+IMPORTS MODULE-IDENTITY, enterprises FROM SNMPv2-SMI;
+dMIB MODULE-IDENTITY LAST-UPDATED """ + last_updated + r""" ORGANIZATION "o" CONTACT-INFO "c" DESCRIPTION "d"
+""" + revisions + r"""
+    ::= { enterprises 1 }
+END""")
+
+
+def _test_q44_bad_dates() -> None:
+    # kept as written (L2); no YANG revision is derived from them. A lowercase 'z' is
+    # reported too, but its date is still usable (date_key).
+    r = mi("\"2016-09-29\"", "REVISION \"201701060000z\" DESCRIPTION \"r\" REVISION \"201613010000Z\" DESCRIPTION \"r\"")
+    testing.assertEqual(codes(r), "L2 parse.date-invalid, L2 parse.date-invalid, L2 parse.date-invalid")
+    testing.assertEqual(out(r, "dMIB"), "L2 parse.date-invalid, L2 parse.date-invalid, L2 parse.date-invalid | MODULE-IDENTITY dMIB last-updated=\"2016-09-29\" revisions=[201701060000z, 201613010000Z] ::= {{enterprises 1}}")
+    testing.assertEqual(mib.source.date_key("201701060000z"), "201701060000")
+    testing.assertEqual(mib.source.date_key("201613010000Z"), "")
+
+
+def _test_q44_two_digit_years() -> None:
+    r = mi("\"9801010000Z\"", "REVISION \"0801010000Z\" DESCRIPTION \"r\"")
+    testing.assertEqual(codes(r), "L5 parse.date-two-digit-year, L4 parse.date-before-1988")
+    testing.assertEqual(mib.source.date_key("9801010000Z"), "199801010000")
+    testing.assertEqual(mib.source.date_key("0801010000Z"), "200801010000")
+
+
+def _test_q44_revisions_not_in_order() -> None:
+    r = mi("\"202001010000Z\"", "REVISION \"201801010000Z\" DESCRIPTION \"r\" REVISION \"201901010000Z\" DESCRIPTION \"r\"")
+    testing.assertEqual(codes(r), "L5 parse.revision-order")
+    testing.assertEqual(out(r, "dMIB"), "L5 parse.revision-order | MODULE-IDENTITY dMIB last-updated=\"202001010000Z\" revisions=[201801010000Z, 201901010000Z] ::= {{enterprises 1}}")
+
+
+# ============================================================================================
+# Enumerations and BITS (q45_)
+# ============================================================================================
+
+def _test_q45_enum_missing_comma() -> None:
+    testing.assertEqual(syn2(r"INTEGER { up(1) down(2) }"), r"L2 parse.missing-comma | INTEGER {up(1), down(2)}")
+
+
+def _test_q45_enum_trailing_comma() -> None:
+    testing.assertEqual(syn2(r"INTEGER { up(1), down(2), }"), r"L3 parse.trailing-comma | INTEGER {up(1), down(2)}")
+
+
+def _test_q45_enum_double_comma() -> None:
+    testing.assertEqual(syn2(r"INTEGER { up(1),, down(2) }"), r"L3 parse.double-comma | INTEGER {up(1), down(2)}")
+
+
+def _test_q45_enum_uppercase_label() -> None:
+    testing.assertEqual(syn2(r"INTEGER { Up(1), down(2) }"), r"L3 parse.label-case | INTEGER {Up(1), down(2)}")
+
+
+def _test_q45_enum_underscore_label() -> None:
+    testing.assertEqual(syn2(r"INTEGER { link_up(1), link_down(2) }"), r"L5 parse.underscore-in-identifier, L5 parse.underscore-in-identifier | INTEGER {link_up(1), link_down(2)}")
+
+
+def _test_q45_enum_hyphen_label_in_smiv2() -> None:
+    # reported once per type
+    testing.assertEqual(syn2(r"INTEGER { link-up(1), link-down(2) }"), r"L5 parse.hyphen-in-label | INTEGER {link-up(1), link-down(2)}")
+    r = parse(v1(obj1(r"INTEGER { link-up(1) }")))
+    testing.assertEqual(codes(r), "ok")
+
+
+def _test_q45_enum_negative_values() -> None:
+    testing.assertEqual(syn2(r"INTEGER { unknown(-1), up(1) }"), r"ok | INTEGER {unknown(-1), up(1)}")
+
+
+def _test_q45_enum_hex_value() -> None:
+    testing.assertEqual(syn2(r"INTEGER { up('01'h), down('00000010'B) }"), r"L3 parse.enum-hex-value, L3 parse.enum-hex-value | INTEGER {up('01'H), down('00000010'B)}")
+
+
+def _test_q45_enum_duplicate_label() -> None:
+    # resolver: first kept (L2); the parser keeps both
+    testing.assertEqual(syn2(r"INTEGER { up(1), up(2) }"), r"ok | INTEGER {up(1), up(2)}")
+
+
+def _test_q45_enum_duplicate_value() -> None:
+    # resolver: both labels kept in the model (L2); YANG keeps the first
+    testing.assertEqual(syn2(r"INTEGER { up(1), on(1) }"), r"ok | INTEGER {up(1), on(1)}")
+
+
+def _test_q45_enum_zero_in_smiv1() -> None:
+    # resolver: accept (L5)
+    r = parse(v1(obj1(r"INTEGER { off(0), on(1) }")))
+    testing.assertEqual(codes(r), "ok")
+    testing.assertEqual(syntax_of(r, "q"), r"INTEGER {off(0), on(1)}")
+
+
+def _test_q45_enum_on_integer32() -> None:
+    testing.assertEqual(syn2(r"Integer32 { a(1), b(2) }"), r"L2 parse.enum-on-non-integer | INTEGER {a(1), b(2)}")
+    testing.assertEqual(syn2(r"Unsigned32 { a(1) }"), r"L2 parse.enum-on-non-integer | INTEGER {a(1)}")
+
+
+def _test_q45_enum_value_beyond_int32() -> None:
+    # resolver: keep (L2); YANG must drop or re-map it
+    testing.assertEqual(syn2(r"INTEGER { big(4294967295) }"), r"ok | INTEGER {big(4294967295)}")
+
+
+def _test_q45_bits_negative_position() -> None:
+    # resolver: drop the bit (L2)
+    testing.assertEqual(syn2(r"BITS { a(0), b(-1) }"), r"ok | BITS {a(0), b(-1)}")
+
+
+def _test_q45_bits_position_beyond_127() -> None:
+    testing.assertEqual(syn2(r"BITS { a(0), b(144) }"), r"ok | BITS {a(0), b(144)}")
+
+
+def _test_q45_bits_uppercase_label() -> None:
+    testing.assertEqual(syn2(r"BITS { A(0), b(1) }"), r"L3 parse.label-case | BITS {A(0), b(1)}")
+
+
+# ============================================================================================
+# Tables, SEQUENCE and INDEX (q46_)
+# ============================================================================================
+
+TABLE = r"""
+qTable OBJECT-TYPE SYNTAX SEQUENCE OF QEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "t" ::= { quirkObjects 7 }
+qEntry OBJECT-TYPE SYNTAX QEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "e" INDEX { qIndex } ::= { qTable 1 }
+qIndex OBJECT-TYPE SYNTAX Integer32 (1..10) MAX-ACCESS not-accessible STATUS current DESCRIPTION "i" ::= { qEntry 1 }
+qValue OBJECT-TYPE SYNTAX DisplayString MAX-ACCESS read-only STATUS current DESCRIPTION "v" ::= { qEntry 2 }
+"""
+
+
+def seq(items: str) -> str:
+    """`codes | SEQUENCE dump` for the row type QEntry with the given items."""
+    r = parse(v2(TABLE + r"QEntry ::= SEQUENCE { " + items + r" }"))
+    return out(r, "QEntry")
+
+
+def row(index: str) -> str:
+    """`codes | dump` of a row qEntry with the given INDEX/AUGMENTS clauses."""
+    r = parse(v2(r"""
+qEntry OBJECT-TYPE SYNTAX QEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "e"
+    """ + index + r"""
+    ::= { quirkObjects 7 1 }
+"""))
+    return out(r, "qEntry")
+
+
+def _test_q46_sequence_trailing_comma() -> None:
+    testing.assertEqual(seq(r"qIndex Integer32, qValue DisplayString,"), r"L3 parse.trailing-comma | SEQUENCE QEntry {qIndex Integer32, qValue DisplayString}")
+
+
+def _test_q46_sequence_missing_comma() -> None:
+    testing.assertEqual(seq(r"qIndex Integer32 qValue DisplayString"), r"L2 parse.missing-comma | SEQUENCE QEntry {qIndex Integer32, qValue DisplayString}")
+
+
+def _test_q46_sequence_subtypes() -> None:
+    testing.assertEqual(seq(r"qIndex Integer32 (1..10), qValue DisplayString (SIZE (0..32))"),
+                        r"L5 parse.sequence-subtype, L5 parse.sequence-subtype | SEQUENCE QEntry {qIndex Integer32 (1..10), qValue DisplayString (SIZE (0..32))}")
+
+
+def _test_q46_sequence_column_missing_or_mismatched() -> None:
+    # resolver: the OID tree is authoritative (L3)
+    testing.assertEqual(seq(r"qIndex OCTET STRING"), r"ok | SEQUENCE QEntry {qIndex OCTET STRING}")
+
+
+def _test_q46_smiv1_type_index() -> None:
+    # resolver: synthetic index leaf; the parser keeps the base type
+    r = parse(v1(r"""
+qEntry OBJECT-TYPE SYNTAX QEntry ACCESS not-accessible STATUS mandatory INDEX { INTEGER, OCTET STRING, NetworkAddress } ::= { quirkV1 7 1 }
+"""))
+    testing.assertEqual(out(r, "qEntry"), r"ok | OBJECT-TYPE qEntry syntax=QEntry access=not-accessible status=mandatory index={INTEGER, OCTET STRING, NetworkAddress} ::= {quirkV1 7 1}")
+    d = find(r, "qEntry")
+    if isinstance(d, mib.ast.ObjectType):
+        testing.assertEqual(d.index[0].name, "")
+        testing.assertEqual(d.index[0].syntax?.kind, mib.ast.SYN_INTEGER)
+        testing.assertEqual(d.index[2].syntax?.name, "NetworkAddress")
+
+
+def _test_q46_implied_in_smiv1_or_fixed_size() -> None:
+    # resolver: accept (L3); the parser keeps the flag
+    r = parse(v1(r"""
+qEntry OBJECT-TYPE SYNTAX QEntry ACCESS not-accessible STATUS mandatory INDEX { IMPLIED qName } ::= { quirkV1 7 1 }
+"""))
+    testing.assertEqual(out(r, "qEntry"), r"ok | OBJECT-TYPE qEntry syntax=QEntry access=not-accessible status=mandatory index={IMPLIED qName} ::= {quirkV1 7 1}")
+
+
+def _test_q46_index_trailing_comma() -> None:
+    testing.assertEqual(row(r"INDEX { a, b, }"), r"L3 parse.trailing-comma | OBJECT-TYPE qEntry syntax=QEntry max-access=not-accessible status=current index={a, b} ::= {quirkObjects 7 1}")
+
+
+def _test_q46_index_and_augments() -> None:
+    # AUGMENTS wins (L2); both are kept in the AST for the resolver
+    testing.assertEqual(row(r"INDEX { a } AUGMENTS { ifEntry }"), r"L2 parse.index-and-augments | OBJECT-TYPE qEntry syntax=QEntry max-access=not-accessible status=current index={a} augments={ifEntry} ::= {quirkObjects 7 1}")
+
+
+def _test_q46_augments_several_rows() -> None:
+    testing.assertEqual(row(r"AUGMENTS { ifEntry, ifXEntry }"), r"L2 parse.augments-multiple | OBJECT-TYPE qEntry syntax=QEntry max-access=not-accessible status=current augments={ifEntry, ifXEntry} ::= {quirkObjects 7 1}")
+
+
+def _test_q46_row_sub_id_not_one() -> None:
+    # resolver: accept (L3)
+    testing.assertEqual(q2(r"""qEntry OBJECT-TYPE SYNTAX QEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "e" INDEX { a } ::= { quirkObjects 7 2 }""", "qEntry"),
+                        r"ok | OBJECT-TYPE qEntry syntax=QEntry max-access=not-accessible status=current index={a} ::= {quirkObjects 7 2}")
+
+
+def _test_q46_smiv1_row_without_index() -> None:
+    # resolver: keyless list (L2)
+    r = parse(v1(r"""
+qEntry OBJECT-TYPE SYNTAX QEntry ACCESS not-accessible STATUS mandatory ::= { quirkV1 7 1 }
+"""))
+    testing.assertEqual(codes(r), "ok")
+    d = find(r, "qEntry")
+    if isinstance(d, mib.ast.ObjectType):
+        testing.assertFalse(d.has_index)
+        testing.assertEqual(len(d.augments), 0)
+        return
+    testing.error("qEntry missing")
+
+
+def _test_q46_scalar_as_index() -> None:
+    # resolver: accept (L3)
+    testing.assertEqual(row(r"INDEX { sysUpTime }"), r"ok | OBJECT-TYPE qEntry syntax=QEntry max-access=not-accessible status=current index={sysUpTime} ::= {quirkObjects 7 1}")
+
+
+# ============================================================================================
+# Syntax, subtyping, TCs and DEFVAL (q47_)
+# ============================================================================================
+
+def tc(body: str) -> str:
+    """`codes | dump` of the TC QuirkTC ::= TEXTUAL-CONVENTION body."""
+    return q2(r"QuirkTC ::= TEXTUAL-CONVENTION " + body, "QuirkTC")
+
+
+def _test_q47_tc_on_tc() -> None:
+    # resolver: chain (L5)
+    testing.assertEqual(tc(r"""STATUS current DESCRIPTION "d" SYNTAX DisplayString (SIZE (0..32))"""),
+                        r"ok | TEXTUAL-CONVENTION QuirkTC status=current syntax=DisplayString (SIZE (0..32))")
+
+
+def _test_q47_plain_type_assignment_in_smiv2() -> None:
+    testing.assertEqual(q2(r"QuirkType ::= OCTET STRING (SIZE (4))", "QuirkType"),
+                        r"L5 parse.type-assignment-smiv2 | TYPE QuirkType syntax=OCTET STRING (SIZE (4))")
+
+
+def _test_q47_tc_clauses_out_of_order() -> None:
+    testing.assertEqual(tc(r"""STATUS current DISPLAY-HINT "d" DESCRIPTION "d" SYNTAX Integer32"""),
+                        r"""L3 parse.clause-order | TEXTUAL-CONVENTION QuirkTC hint="d" status=current syntax=Integer32""")
+
+
+def _test_q47_tc_without_status() -> None:
+    # current (L2): reported as a missing clause, status left unset for the resolver
+    testing.assertEqual(tc(r"""DESCRIPTION "d" SYNTAX Integer32"""),
+                        r"L2 parse.clause-missing | TEXTUAL-CONVENTION QuirkTC syntax=Integer32")
+
+
+def _test_q47_tc_used_before_definition() -> None:
+    r = parse(v2(obj(r"QuirkTC") + r"""QuirkTC ::= TEXTUAL-CONVENTION STATUS current DESCRIPTION "d" SYNTAX Integer32"""))
+    testing.assertEqual(codes(r), "ok")
+    testing.assertEqual(names(r), ["quirkMIB", "quirkObjects", "q", "QuirkTC"])
+
+
+def _test_q47_bad_display_hint() -> None:
+    # resolver/hint: drop the hint (L2); the parser keeps the text
+    testing.assertEqual(tc(r"""DISPLAY-HINT "1q" STATUS current DESCRIPTION "d" SYNTAX OCTET STRING"""),
+                        r"""ok | TEXTUAL-CONVENTION QuirkTC hint="1q" status=current syntax=OCTET STRING""")
+
+
+def _test_q47_range_on_octet_string() -> None:
+    testing.assertEqual(syn2(r"OCTET STRING (0..255)"), r"L2 parse.range-on-string | OCTET STRING (SIZE (0..255))")
+
+
+def _test_q47_size_on_integer() -> None:
+    testing.assertEqual(syn2(r"Integer32 (SIZE (0..255))"), r"L2 parse.size-on-integer | Integer32 (0..255)")
+    testing.assertEqual(syn2(r"INTEGER (SIZE (1..4))"), r"L2 parse.size-on-integer | INTEGER (1..4)")
+
+
+def _test_q47_subtyped_timeticks_or_counter() -> None:
+    # resolver: keep (L2)
+    testing.assertEqual(syn2(r"TimeTicks (0..100)"), r"ok | TimeTicks (0..100)")
+    testing.assertEqual(syn2(r"Counter32 (0..100)"), r"ok | Counter32 (0..100)")
+
+
+def _test_q47_reversed_range() -> None:
+    # resolver: swap (L2)
+    testing.assertEqual(syn2(r"Integer32 (100..1)"), r"ok | Integer32 (100..1)")
+
+
+def _test_q47_comma_between_ranges() -> None:
+    testing.assertEqual(syn2(r"Integer32 (1..10, 20..30)"), r"L2 parse.range-separator | Integer32 (1..10 | 20..30)")
+
+
+def _test_q47_range_outside_base_type() -> None:
+    # resolver: clamp for YANG (L2)
+    testing.assertEqual(syn2(r"Integer32 (0..4294967295)"), r"ok | Integer32 (0..4294967295)")
+
+
+def _test_q47_smiv1_types_in_smiv2() -> None:
+    # resolver: map Counter/Gauge/NetworkAddress (L3)
+    testing.assertEqual(syn2(r"Counter"), "ok | Counter")
+    testing.assertEqual(syn2(r"Gauge"), "ok | Gauge")
+    testing.assertEqual(syn2(r"NetworkAddress"), "ok | NetworkAddress")
+
+
+def _test_q47_opaque_in_smiv2() -> None:
+    testing.assertEqual(syn2(r"Opaque (SIZE (0..8))"), r"ok | Opaque (SIZE (0..8))")
+
+
+def _test_q47_defval_hex_for_integer() -> None:
+    testing.assertEqual(dv2(r"Integer32", r"{ 'ff'h }"), r"ok | 'ff'H")
+
+
+def _test_q47_defval_quoted_number() -> None:
+    # resolver: parse the number (L2)
+    testing.assertEqual(dv2(r"Integer32", r"""{ "5" }"""), "ok | \"5\"")
+
+
+def _test_q47_defval_enum_number() -> None:
+    # resolver: map to the label (L5)
+    testing.assertEqual(dv2(r"INTEGER { up(1), down(2) }", r"{ 2 }"), "ok | 2")
+
+
+def _test_q47_defval_enum_in_braces() -> None:
+    # resolver: accept (L3); the parser keeps the neutral braced value
+    testing.assertEqual(dv2(r"INTEGER { up(1), down(2) }", r"{ { down } }"), r"ok | {down}")
+
+
+def _test_q47_defval_unknown_enum_label() -> None:
+    # resolver: drop (L2)
+    testing.assertEqual(dv2(r"INTEGER { up(1), down(2) }", r"{ sideways }"), "ok | sideways")
+
+
+def _test_q47_defval_out_of_range() -> None:
+    # resolver: drop (L2)
+    testing.assertEqual(dv2(r"Integer32 (1..10)", r"{ 99 }"), "ok | 99")
+
+
+def _test_q47_defval_oid_sub_ids() -> None:
+    # resolver: resolve the OID (L3)
+    testing.assertEqual(dv2(r"OBJECT IDENTIFIER", r"{ { 0 0 } }"), r"ok | {0 0}")
+    testing.assertEqual(dv2(r"OBJECT IDENTIFIER", r"{ { quirkObjects 1 } }"), r"ok | {quirkObjects 1}")
+    testing.assertEqual(dv2(r"OBJECT IDENTIFIER", r"{ zeroDotZero }"), r"ok | zeroDotZero")
+
+
+def _test_q47_defval_null() -> None:
+    # resolver: no default (L5)
+    testing.assertEqual(dv2(r"OBJECT IDENTIFIER", r"{ NULL }"), "ok | NULL")
+
+
+def _test_q47_defval_number_for_octet_string() -> None:
+    # resolver: drop (L2)
+    testing.assertEqual(dv2(r"OCTET STRING", r"{ 0 }"), "ok | 0")
+
+
+def _test_q47_defval_ip_as_string() -> None:
+    # resolver: parse a dotted quad (L3)
+    r = parse(v2(obj("IpAddress", r"""DEFVAL { "192.0.2.1" }""")))
+    testing.assertEqual(codes(r), "ok")
+    testing.assertEqual(defval_of(r), "\"192.0.2.1\"")
+
+
+def _test_q47_defval_bits_without_inner_braces() -> None:
+    # resolver: the set {a} (L3)
+    testing.assertEqual(dv2(r"BITS { a(0), b(1) }", r"{ a }"), "ok | a")
+    testing.assertEqual(dv2(r"BITS { a(0), b(1) }", r"{ { a, b } }"), r"ok | {a b}")
+    testing.assertEqual(dv2(r"BITS { a(0), b(1) }", r"{ {} }"), r"ok | {}")
+
+
+def _test_q47_defval_bits_as_hex() -> None:
+    # resolver: decode the bits (L3)
+    testing.assertEqual(dv2(r"BITS { a(0), b(1) }", r"{ '80'H }"), r"ok | '80'H")
+
+
+def _test_q47_defval_on_counter() -> None:
+    # resolver: keep (L3)
+    testing.assertEqual(dv2(r"Counter64", r"{ 0 }"), "ok | 0")
+
+
+def _test_q47_multi_line_defval_string() -> None:
+    r = parse(v2(obj("DisplayString", r"""DEFVAL { "first
+        second" }""")))
+    testing.assertEqual(codes(r), "ok")
+    testing.assertEqual(defval_of(r), "\"first\\n        second\"")
+
+
+# ============================================================================================
+# OIDs (q48_)
+# ============================================================================================
+
+def _test_q48_bare_name_not_first() -> None:
+    # resolver: a bare name after the first component (L2); the parser keeps every component
+    testing.assertEqual(q2(r"q OBJECT IDENTIFIER ::= { enterprises quirkObjects 1 }", "q"), r"ok | OBJECT IDENTIFIER q ::= {enterprises quirkObjects 1}")
+
+
+def _test_q48_numeric_oid() -> None:
+    testing.assertEqual(q2(r"q OBJECT IDENTIFIER ::= { 1 3 6 1 4 1 9 }", "q"), r"ok | OBJECT IDENTIFIER q ::= {1 3 6 1 4 1 9}")
+
+
+def _test_q48_iso_org_dod() -> None:
+    testing.assertEqual(q2(r"q OBJECT IDENTIFIER ::= { iso org(3) dod(6) internet(1) private(4) 1 9 }", "q"),
+                        r"ok | OBJECT IDENTIFIER q ::= {iso org(3) dod(6) internet(1) private(4) 1 9}")
+
+
+def _test_q48_name_and_number_in_the_middle() -> None:
+    testing.assertEqual(q2(r"q OBJECT IDENTIFIER ::= { mib-2 snmpDot3MauMgt(26) 4 }", "q"), r"ok | OBJECT IDENTIFIER q ::= {mib-2 snmpDot3MauMgt(26) 4}")
+
+
+def _test_q48_sub_id_too_big() -> None:
+    # beyond 2^32-1: the resolver drops the declaration (L1); beyond 64 bits the parser
+    # already reports it (L1) and marks the component
+    testing.assertEqual(q2(r"q OBJECT IDENTIFIER ::= { quirkObjects 4294967296 }", "q"), r"ok | OBJECT IDENTIFIER q ::= {quirkObjects 4294967296}")
+    testing.assertEqual(q2(r"q OBJECT IDENTIFIER ::= { quirkObjects 99999999999999999999 }", "q"),
+                        r"L1 parse.number-too-large | OBJECT IDENTIFIER q ::= {quirkObjects <too big>}")
+
+
+def _test_q48_last_sub_id_zero() -> None:
+    # resolver: accept (L3)
+    testing.assertEqual(q2(obj("Integer32").replace("quirkObjects 5", "quirkObjects 0"), "q"),
+                        r"ok | OBJECT-TYPE q syntax=Integer32 max-access=read-only status=current ::= {quirkObjects 0}")
+
+
+def _test_q48_oid_registered_twice() -> None:
+    # resolver: first kept (L2)
+    r = parse(v2(r"""
+a OBJECT IDENTIFIER ::= { quirkObjects 1 }
+b OBJECT IDENTIFIER ::= { quirkObjects 1 }
+"""))
+    testing.assertEqual(codes(r), "ok")
+    testing.assertEqual(names(r)[2:], ["a", "b"])
+
+
+def _test_q48_undefined_parent() -> None:
+    # resolver: unlinked (L1)
+    testing.assertEqual(q2(r"q OBJECT IDENTIFIER ::= { noSuchParent 1 }", "q"), r"ok | OBJECT IDENTIFIER q ::= {noSuchParent 1}")
+
+
+def _test_q48_forward_reference() -> None:
+    r = parse(v2(r"""
+child OBJECT IDENTIFIER ::= { parent 1 }
+parent OBJECT IDENTIFIER ::= { quirkObjects 1 }
+"""))
+    testing.assertEqual(codes(r), "ok")
+    testing.assertEqual(names(r)[2:], ["child", "parent"])
+
+
+def _test_q48_imported_descriptor_redefined() -> None:
+    # resolver: the local definition wins (L2)
+    testing.assertEqual(q2(r"enterprises OBJECT IDENTIFIER ::= { iso 3 6 1 4 1 }", "enterprises"), r"ok | OBJECT IDENTIFIER enterprises ::= {iso 3 6 1 4 1}")
+
+
+# ============================================================================================
+# Leniencies beyond the catalogue, found by the corpus sweep
+# ============================================================================================
+
+def _test_qx_inline_comment_closing_brace() -> None:
+    # `{ a, --b,-- c }`: the inline comment ends at the inner '--' (L4)
+    testing.assertEqual(q1(r"""
+t TRAP-TYPE ENTERPRISE quirkV1
+    VARIABLES { a, b, --c,-- d }
+    DESCRIPTION "d"
+    ::= 1
+""", "t"), r"L4 lex.comment-inner-dashes | TRAP-TYPE t enterprise={quirkV1} variables={a, b, d} number=1")
+
+
+def _test_qx_stray_quote_in_string() -> None:
+    # a stray quote made the following code a string; the string ends at the next quote (L2)
+    r = parse(v2(r"""
+a OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current
+    DESCRIPTION "a stray " quote."
+    ::= { quirkObjects 1 }
+b OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current
+    DESCRIPTION "b text."
+    ::= { quirkObjects 2 }
+"""))
+    testing.assertEqual(codes(r), "L2 lex.string-stray-quote")
+    testing.assertEqual(names(r)[2:], ["a", "b"])
+    testing.assertEqual(find(r, "a")?.description?.value, "a stray \" quote.")
+    testing.assertEqual(find(r, "b")?.oid?.dump(), r"{quirkObjects 2}")
+
+
+def _test_qx_missing_closing_quote() -> None:
+    # a string without its closing quote is cut before the code that follows (L2)
+    r = parse(v2(r"""
+a OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current
+    DESCRIPTION "
+    ::= { quirkObjects 1 }
+b OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current
+    DESCRIPTION "b text."
+    ::= { quirkObjects 2 }
+"""))
+    testing.assertEqual(codes(r), "L2 lex.string-missing-quote")
+    testing.assertEqual(find(r, "a")?.oid?.dump(), r"{quirkObjects 1}")
+    testing.assertEqual(find(r, "b")?.description?.value, "b text.")
+    testing.assertEqual(find(r, "b")?.line, 21)
+    # the same with CRLF and with CR line ends: the cut never splits a line end
+    for eol in ["\r\n", "\r"]:
+        r2 = parse(v2(r"""
+a OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current
+    DESCRIPTION "
+    ::= { quirkObjects 1 }
+b OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current
+    DESCRIPTION "b text."
+    ::= { quirkObjects 2 }
+""").replace("\n", eol))
+        testing.assertEqual(codes(r2), "L2 lex.string-missing-quote")
+        testing.assertEqual(find(r2, "b")?.line, 21)
+        testing.assertEqual(find(r2, "b")?.oid?.dump(), r"{quirkObjects 2}")
+        testing.assertEqual(r2.diags[0].line, 19)
+
+
+def _test_qx_missing_quote_after_other_clause() -> None:
+    # the previous string belongs to another clause: the broken string lacks its closing
+    # quote; it is not a stray quote in the DESCRIPTION
+    r = parse(v2(r"""
+a OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current
+    DESCRIPTION "desc"
+    REFERENCE "ref text without its closing quote
+    ::= { quirkObjects 1 }
+b OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current
+    DESCRIPTION "b text."
+    ::= { quirkObjects 2 }
+"""))
+    testing.assertEqual(codes(r), "L2 lex.string-missing-quote")
+    testing.assertEqual(find(r, "a")?.description?.value, "desc")
+    testing.assertEqual(find(r, "a")?.reference?.value, "ref text without its closing quote")
+    testing.assertEqual(find(r, "b")?.description?.value, "b text.")
+
+
+def _test_qx_unquoted_text_around_strings() -> None:
+    # text after the closing quote (CAMBIUM-PTP800-MIB), and a missing opening quote
+    # (SL-ESCON-MIB): the text is joined to the clause value (L2)
+    r = parse(v2(r"""
+o OBJECT-IDENTITY STATUS current
+    DESCRIPTION "first line."
+                Renamed 'a' to 'b'.
+    REFERENCE "r"
+    ::= { quirkObjects 9 }
+p OBJECT-IDENTITY STATUS current
+    DESCRIPTION
+        E-mail: someone@example.com"
+    ::= { quirkObjects 10 }
+q OBJECT-IDENTITY STATUS current DESCRIPTION "q text" ::= { quirkObjects 11 }
+"""))
+    testing.assertEqual(codes(r), "L2 lex.string-missing-quote, L2 parse.string-unquoted, L2 parse.string-unquoted")
+    testing.assertEqual(find(r, "q")?.description?.value, "q text")
+    testing.assertEqual(find(r, "o")?.description?.value, "first line.\nRenamed 'a' to 'b'.")
+    testing.assertEqual(find(r, "o")?.reference?.value, "r")
+    testing.assertEqual(find(r, "p")?.description?.value, "E-mail: someone@example.com")
+    testing.assertEqual(find(r, "p")?.oid?.dump(), r"{quirkObjects 10}")
+
+
+def _test_qx_stray_quote_before_declaration() -> None:
+    r = parse(v2(r"""
+a OBJECT IDENTIFIER ::= { quirkObjects 1 }
+"b OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current
+    DESCRIPTION "b text."
+    ::= { quirkObjects 2 }
+"""))
+    testing.assertEqual(codes(r), "L2 lex.string-stray-quote")
+    testing.assertEqual(names(r)[2:], ["a", "b"])
+    testing.assertEqual(find(r, "b")?.description?.value, "b text.")
+
+
+def _test_qx_misspelled_description_in_compliance() -> None:
+    testing.assertEqual(q2(r"""
+c MODULE-COMPLIANCE STATUS current DESCRIPTION "d"
+    MODULE
+        GROUP g DESCRIPTIO "d"
+        OBJECT o MIN-ACCESS read-only Description "d"
+    ::= { quirkMIB 3 1 }
+""", "c"), r"L2 parse.clause-misspelled, L2 parse.clause-misspelled | MODULE-COMPLIANCE c status=current module(this group=g object=o min-access=read-only) ::= {quirkMIB 3 1}")
+
+
+def _test_qx_embedded_quotes() -> None:
+    r = parse(v2(r"""
+a OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current
+    DESCRIPTION "the "seconds" interval"
+    ::= { quirkObjects 1 }
+"""))
+    testing.assertEqual(codes(r), "L2 parse.string-embedded-quote")
+    testing.assertEqual(find(r, "a")?.description?.value, "the \"seconds\" interval")
+
+
+def _test_qx_adjacent_strings() -> None:
+    testing.assertEqual(q2(r"""o OBJECT-IDENTITY STATUS current DESCRIPTION "d" REFERENCE "RFC 1" "RFC 2" ::= { quirkObjects 9 }""", "o"),
+                        r"L2 parse.string-concat | OBJECT-IDENTITY o status=current ::= {quirkObjects 9}")
+    r = parse(v2(r"""o OBJECT-IDENTITY STATUS current DESCRIPTION "d" REFERENCE "RFC 1" "RFC 2" ::= { quirkObjects 9 }"""))
+    testing.assertEqual(find(r, "o")?.reference?.value, "RFC 1\nRFC 2")
+
+
+def _test_qx_description_keyword_missing() -> None:
+    r = parse(v2(r"""q OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current "text" ::= { quirkObjects 9 }"""))
+    testing.assertEqual(codes(r), "L2 parse.clause-keyword-missing")
+    testing.assertEqual(find(r, "q")?.description?.value, "text")
+
+
+def _test_qx_misspelled_clause_keyword() -> None:
+    r = parse(v2(r"""
+q OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current DESCRIPITION "text" DEFVALUE { 1 } ::= { quirkObjects 9 }
+p OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current Description "text" ::= { quirkObjects 10 }
+"""))
+    testing.assertEqual(codes(r), "L2 parse.clause-misspelled, L2 parse.clause-misspelled, L2 parse.clause-misspelled")
+    testing.assertEqual(defval_of(r), "1")
+    testing.assertEqual(find(r, "p")?.description?.value, "text")
+
+
+def _test_qx_unquoted_clause_value() -> None:
+    testing.assertEqual(out(mi("TBD", ""), "dMIB"), r"L2 parse.string-expected, L2 parse.date-invalid | MODULE-IDENTITY dMIB last-updated=" + "\"TBD\"" + r" revisions=[] ::= {enterprises 1}")
+
+
+def _test_qx_bits_without_names() -> None:
+    # outside SEQUENCE items, BITS needs its named bits (RFC 2578 section 7.1.4)
+    testing.assertEqual(syn2(r"BITS"), "L3 parse.bits-without-names | BITS")
+    testing.assertEqual(seq(r"qIndex Integer32, qValue BITS"), r"ok | SEQUENCE QEntry {qIndex Integer32, qValue BITS}")
+
+
+def _test_qx_uppercase_sequence_item() -> None:
+    testing.assertEqual(seq(r"QIndex Integer32, qValue DisplayString"), r"L2 parse.bad-identifier-case | SEQUENCE QEntry {QIndex Integer32, qValue DisplayString}")
+
+
+def _test_qx_string_type() -> None:
+    testing.assertEqual(syn2(r"STRING"), "L2 parse.string-type | OCTET STRING")
+
+
+def _test_qx_sequence_of_base_type() -> None:
+    testing.assertEqual(syn2(r"SEQUENCE OF INTEGER"), "L2 parse.sequence-of-base-type | SEQUENCE OF INTEGER")
+    testing.assertEqual(syn2(r"SEQUENCE OF OCTET STRING"), "L2 parse.sequence-of-base-type | SEQUENCE OF OCTET STRING")
+
+
+def _test_qx_inline_sequence() -> None:
+    # SMIv1 "group" nodes written with an inline SEQUENCE (UNISYS-MIB): kept as structure
+    # nodes, so their children keep their parent
+    r = parse(v1(r"""
+qGrp OBJECT-TYPE
+    SYNTAX SEQUENCE { qA OCTET STRING, qB INTEGER }
+    ACCESS read-only
+    STATUS mandatory
+    ::= { quirkV1 1 }
+qA OBJECT-TYPE SYNTAX OCTET STRING ACCESS read-only STATUS mandatory ::= { qGrp 1 }
+"""))
+    testing.assertEqual(out(r, "qGrp"), r"L2 parse.inline-sequence | OBJECT-TYPE qGrp syntax=SEQUENCE access=read-only status=mandatory ::= {quirkV1 1}")
+    testing.assertEqual(names(r), ["quirkV1", "qGrp", "qA"])
+
+
+def _test_qx_sequence_item_without_type() -> None:
+    testing.assertEqual(seq(r"qIndex Integer32, qValue, qOther DisplayString"),
+                        r"L2 parse.sequence-item-type-missing | SEQUENCE QEntry {qIndex Integer32, qValue , qOther DisplayString}")
+    # a wrapped comment line: `delay` becomes an item without a type
+    testing.assertEqual(seq("qIndex Integer32, -- smooth\n    delay\n    qValue DisplayString"),
+                        r"L2 parse.sequence-item-type-missing, L2 parse.missing-comma | SEQUENCE QEntry {qIndex Integer32, delay , qValue DisplayString}")
+
+
+def _test_qx_sequence_misplaced_comma() -> None:
+    testing.assertEqual(seq(r"qIndex, Integer32, qValue DisplayString"),
+                        r"L2 parse.misplaced-comma | SEQUENCE QEntry {qIndex Integer32, qValue DisplayString}")
+
+
+def _test_qx_index_quoted_name_and_number() -> None:
+    testing.assertEqual(row(r"""INDEX { "qName" }"""), r"L2 parse.quoted-name | OBJECT-TYPE qEntry syntax=QEntry max-access=not-accessible status=current index={qName} ::= {quirkObjects 7 1}")
+    testing.assertEqual(row(r"INDEX { 1 }"), r"L2 parse.index-number, L2 parse.empty-list | OBJECT-TYPE qEntry syntax=QEntry max-access=not-accessible status=current index={} ::= {quirkObjects 7 1}")
+
+
+def _test_qx_includes_twice() -> None:
+    testing.assertEqual(q2(r"""
+a AGENT-CAPABILITIES PRODUCT-RELEASE "1" STATUS current DESCRIPTION "d"
+    SUPPORTS IF-MIB INCLUDES INCLUDES { ifGeneralGroup }
+    ::= { quirkMIB 4 1 }
+""", "a"), r"""L2 parse.clause-duplicate | AGENT-CAPABILITIES a release="1" status=current supports(IF-MIB includes={ifGeneralGroup}) ::= {quirkMIB 4 1}""")
+
+
+def _test_qx_defval_dotted_numbers() -> None:
+    testing.assertEqual(dv2(r"IpAddress", r"{ 0.0.0.0 }"), "L2 parse.defval-unquoted-ip | \"0.0.0.0\"")
+    testing.assertEqual(dv2(r"DisplayString", r"{ 1.0 }"), "L2 parse.defval-unquoted-ip | \"1.0\"")
+
+
+def _test_qx_malformed_labels() -> None:
+    testing.assertEqual(syn2(r"INTEGER { noAge(1), n/a(2), mixed environment(3), 1200-baud(4) }"),
+                        r"L2 parse.label-malformed, L2 parse.label-malformed, L2 parse.label-malformed, L5 parse.hyphen-in-label | INTEGER {noAge(1), n/a(2), mixed environment(3), 1200-baud(4)}")
+    testing.assertEqual(syn2(r"BITS { packet/attack(3) }"), r"L2 parse.label-malformed | BITS {packet/attack(3)}")
+
+
+def _test_qx_enumeration_punctuation() -> None:
+    # ';' instead of ',' and a missing opening brace
+    testing.assertEqual(syn2(r"INTEGER { a(1); b(2) }"), r"L2 parse.missing-comma | INTEGER {a(1), b(2)}")
+    testing.assertEqual(syn2(r"INTEGER a(1), b(2) }"), r"L2 parse.brace-missing | INTEGER {a(1), b(2)}")
+
+
+def _test_qx_octet_misspelled() -> None:
+    testing.assertEqual(syn2(r"OCTECT STRING (SIZE (16))"), r"L2 parse.string-type | OCTET STRING (SIZE (16))")
+
+
+def _test_qx_two_line_page_header() -> None:
+    # the second line of a draft page header needs no wide gap
+    body = r"""
+q OBJECT-TYPE
+    SYNTAX Integer32
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION
+
+   T. Otani et al.          Expires Sept. 30, 2006                   7
+   Internet Drafts draft-otani-ccamp-gmpls-ospf-mib-02.txt  March 2006
+
+        "d"
+    ::= { quirkObjects 5 }
+"""
+    testing.assertEqual(q2(body, "q"), r"L2 lex.page-header, L2 lex.page-header | OBJECT-TYPE q syntax=Integer32 max-access=read-only status=current ::= {quirkObjects 5}")
+
+
+def _test_qx_stray_word_in_enumeration() -> None:
+    testing.assertEqual(syn2(r"INTEGER {" + "\n    unicast(1), -- unicast route used in multicast\n        RIB\n    multicast(2) " + r"}"),
+                        r"L2 parse.junk | INTEGER {unicast(1), multicast(2)}")
+
+
+def _test_qx_stray_text_between_declarations() -> None:
+    # prose left outside comments is skipped (L2); nothing is lost
+    r = parse(v2(r"""
+a OBJECT IDENTIFIER ::= { quirkObjects 1 } _ final assignment by IANA
+b OBJECT IDENTIFIER ::= { quirkObjects 2 }
+NOTIFICATION-GROUP
+c OBJECT IDENTIFIER ::= { quirkObjects 3 }
+[RFC4750]
+d OBJECT IDENTIFIER ::= { quirkObjects 4 }
+"""))
+    testing.assertEqual(codes(r), "L2 parse.junk, L2 parse.junk, L2 parse.junk")
+    testing.assertEqual(names(r)[2:], ["a", "b", "c", "d"])
+    # a lone stray string between declarations
+    r3 = parse(v2("a OBJECT IDENTIFIER ::= " + r"{ quirkObjects 1 }" + "\n\"\"b OBJECT IDENTIFIER ::= " + r"{ quirkObjects 2 }"))
+    testing.assertEqual(codes(r3), "L2 parse.junk")
+    testing.assertEqual(names(r3)[2:], ["a", "b"])
+    # a skipped range with SMI content (here 'x OBJECT-TYPE') stays a level-1 syntax error
+    r2 = parse(v2(r"""
+a OBJECT IDENTIFIER ::= { quirkObjects 1 } x OBJECT-TYPE SYNTAX
+b OBJECT IDENTIFIER ::= { quirkObjects 2 }
+"""))
+    testing.assertEqual(codes(r2), "L1 parse.syntax")
+    testing.assertEqual(names(r2)[2:], ["a", "b"])

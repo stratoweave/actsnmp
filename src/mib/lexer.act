@@ -1,0 +1,973 @@
+"""Bytes lexer for SMIv1/SMIv2 MIB modules.
+
+`lex(data, diags)` turns the raw bytes of a MIB file into a `list[Token]`. A token holds
+only integers: its kind, its byte span `[start, end)`, and the 1-based line and byte column
+of its first byte. The text is sliced from the input only when the parser needs it. The
+list always ends with one `K_EOF` token.
+
+The lexer is total: it never raises. Problems become diagnostics (through the
+`mib.diag.Diagnostics` collector) or `K_OTHER` tokens that the parser reports.
+
+Lexical policy:
+
+- Line ends are LF, CRLF and bare CR. Whitespace is SP, HT, VT, FF and NUL.
+- Comments run from `--` to the end of the line by default (pysmi, net-snmp `-Pc`). With
+  `rfc_comments=True` a comment also ends at the next `--` (RFC 2578 section 3.4), with libsmi's
+  special case that a dash-only separator line never leaves a stray `-`. One exception in
+  the default mode: an inline comment (after a token on the same line, inside braces) whose
+  text after an inner `--` closes the brace, as in `{ a, b, --c,-- d }`, ends at the inner
+  `--` (level 4), because the end-of-line rule would leave the brace open.
+- Identifiers are `[A-Za-z_][A-Za-z0-9_]*` with internal single hyphens and possibly one
+  trailing hyphen; `--` is never part of an identifier. Digit-initial identifiers
+  (`3comFoo`) are accepted. The parser lints them.
+- Uppercase-initial identifiers that spell a keyword get the keyword's kind (`KW_*`, 256
+  and up). Keywords are case sensitive.
+- Quoted strings have no escapes and may span lines. A doubled quote inside a string is the
+  X.680 escaped quote (level 2). An unterminated string is cut at the end of its first line
+  (level 2), so one stray quote does not swallow the module; whatever is lost after that
+  shows up as a parser error.
+- Quotes out of step: a string whose text ends with a string-valued clause keyword
+  (`... ::= { x 1 } y OBJECT-TYPE ... DESCRIPTION "`) and has a line starting with `::=` or
+  a clause keyword has swallowed code. If only prose separates it from the previous string,
+  that string had a stray quote: it is extended to this string's opening quote
+  (`lex.string-stray-quote`). Otherwise this string lacks its closing quote: it is cut before
+  its first code line (`lex.string-missing-quote`). Both are level 2; lexing resumes on the
+  code.
+- `'...'H` and `'...'B` are hexadecimal and binary strings.
+- `-` immediately followed by a digit (outside an identifier) is one `K_NEGNUM` token.
+- Bytes >= 0x80 and control characters between tokens are skipped (level 2); a UTF-8 BOM
+  is stripped; a DOS EOF marker (0x1A) followed only by whitespace ends the input (level 5).
+- C-style comments (`/* */`, `//`) are skipped (level 2).
+- RFC and Internet-Draft page headers and footers left in extracted modules are dropped
+  (level 2): a line with `[Page n]`, or a line whose first token is an identifier, that has
+  no SMI punctuation, has a wide gap between words and ends with a page number, a date or a
+  month and year, or carries a marker word (`Expires`, `Page`, `Internet-Draft`, ...); plus
+  a second title line (`Management Information Base`) right after such a line. The check
+  runs only at the end of lines that end in a number or carry a marker word.
+
+Kinds below 256 that are not named constants are the ASCII code of a punctuation character:
+braces, parentheses, brackets, `, ; | - . :`. Use `kind_name()` for display.
+"""
+
+import mib.diag
+
+K_EOF = 0
+K_LIDENT = 1       # lowercase-initial (or digit- or '_'-initial) identifier
+K_UIDENT = 2       # uppercase-initial identifier that is not a keyword
+K_NUM = 3          # decimal digits
+K_NEGNUM = 4       # '-' immediately followed by digits
+K_STR = 5          # "..." including the quotes
+K_HEX = 6          # '...'H including quotes and suffix
+K_BIN = 7          # '...'B including quotes and suffix
+K_ASSIGN = 8       # ::=
+K_DOTDOT = 9       # ..
+K_OTHER = 10       # a character that cannot start any token
+
+F_ESCAPED_QUOTE = 1   # Token.flags: the string contains a doubled quote
+F_NON_ASCII = 2       # Token.flags: the string contains bytes >= 0x80
+
+P_LBRACE = 123
+P_RBRACE = 125
+P_LPAREN = 40
+P_RPAREN = 41
+P_COMMA = 44
+P_SEMI = 59
+P_BAR = 124
+P_LBRACK = 91
+P_RBRACK = 93
+P_MINUS = 45
+P_DOT = 46
+P_COLON = 58
+
+KW_BASE = 256
+
+# Keywords: RFC 2578 section 3.7 reserved words that SMI uses, plus PIB-DEFINITIONS and the SPPI
+# clause names (so SPPI clauses can be skipped as clauses). The ASN.1 words that are
+# reserved but illegal in SMI (MIN, MAX, NULL, TRUE, ...) are not keywords: the parser checks
+# their text where they are accepted leniently. SMIv1 type names (Counter, Gauge,
+# NetworkAddress) are ordinary uppercase identifiers.
+KEYWORDS: list[str] = [
+    # macros (KW_MACRO_FIRST .. KW_MACRO_LAST, contiguous)
+    "MODULE-IDENTITY", "OBJECT-IDENTITY", "OBJECT-TYPE", "NOTIFICATION-TYPE", "TRAP-TYPE",
+    "TEXTUAL-CONVENTION", "OBJECT-GROUP", "NOTIFICATION-GROUP", "MODULE-COMPLIANCE",
+    "AGENT-CAPABILITIES",
+    # clauses (KW_CLAUSE_FIRST .. KW_CLAUSE_LAST, contiguous)
+    "LAST-UPDATED", "ORGANIZATION", "CONTACT-INFO", "DESCRIPTION", "REVISION", "STATUS",
+    "REFERENCE", "SYNTAX", "UNITS", "MAX-ACCESS", "ACCESS", "INDEX", "AUGMENTS", "DEFVAL",
+    "OBJECTS", "NOTIFICATIONS", "ENTERPRISE", "VARIABLES", "DISPLAY-HINT", "MODULE",
+    "MANDATORY-GROUPS", "GROUP", "WRITE-SYNTAX", "MIN-ACCESS", "PRODUCT-RELEASE", "SUPPORTS",
+    "INCLUDES", "VARIATION", "CREATION-REQUIRES",
+    "SUBJECT-CATEGORIES", "PIB-ACCESS", "PIB-INDEX", "PIB-MIN-ACCESS", "PIB-REFERENCES",
+    "PIB-TAG", "POLICY-ACCESS", "INSTALL-ERRORS", "UNIQUENESS", "EXTENDS",
+    # structure
+    "DEFINITIONS", "PIB-DEFINITIONS", "BEGIN", "END", "IMPORTS", "EXPORTS", "FROM", "MACRO",
+    "OBJECT", "IDENTIFIER", "SEQUENCE", "OF", "CHOICE", "SIZE", "INTEGER", "OCTET", "STRING",
+    "BITS", "IMPLICIT", "IMPLIED", "APPLICATION", "UNIVERSAL",
+    # SMIv2 base types (KW_TYPE_FIRST .. KW_TYPE_LAST, contiguous)
+    "Integer32", "Unsigned32", "Gauge32", "Counter32", "Counter64", "TimeTicks", "IpAddress",
+    "Opaque", "Integer64", "Unsigned64",
+]
+
+def _kw(name: str) -> int:
+    return KW_BASE + KEYWORDS.index(name)
+
+KW_MODULE_IDENTITY = _kw("MODULE-IDENTITY")
+KW_OBJECT_IDENTITY = _kw("OBJECT-IDENTITY")
+KW_OBJECT_TYPE = _kw("OBJECT-TYPE")
+KW_NOTIFICATION_TYPE = _kw("NOTIFICATION-TYPE")
+KW_TRAP_TYPE = _kw("TRAP-TYPE")
+KW_TEXTUAL_CONVENTION = _kw("TEXTUAL-CONVENTION")
+KW_OBJECT_GROUP = _kw("OBJECT-GROUP")
+KW_NOTIFICATION_GROUP = _kw("NOTIFICATION-GROUP")
+KW_MODULE_COMPLIANCE = _kw("MODULE-COMPLIANCE")
+KW_AGENT_CAPABILITIES = _kw("AGENT-CAPABILITIES")
+KW_MACRO_FIRST = KW_MODULE_IDENTITY
+KW_MACRO_LAST = KW_AGENT_CAPABILITIES
+
+KW_LAST_UPDATED = _kw("LAST-UPDATED")
+KW_ORGANIZATION = _kw("ORGANIZATION")
+KW_CONTACT_INFO = _kw("CONTACT-INFO")
+KW_DESCRIPTION = _kw("DESCRIPTION")
+KW_REVISION = _kw("REVISION")
+KW_STATUS = _kw("STATUS")
+KW_REFERENCE = _kw("REFERENCE")
+KW_SYNTAX = _kw("SYNTAX")
+KW_UNITS = _kw("UNITS")
+KW_MAX_ACCESS = _kw("MAX-ACCESS")
+KW_ACCESS = _kw("ACCESS")
+KW_INDEX = _kw("INDEX")
+KW_AUGMENTS = _kw("AUGMENTS")
+KW_DEFVAL = _kw("DEFVAL")
+KW_OBJECTS = _kw("OBJECTS")
+KW_NOTIFICATIONS = _kw("NOTIFICATIONS")
+KW_ENTERPRISE = _kw("ENTERPRISE")
+KW_VARIABLES = _kw("VARIABLES")
+KW_DISPLAY_HINT = _kw("DISPLAY-HINT")
+KW_MODULE = _kw("MODULE")
+KW_MANDATORY_GROUPS = _kw("MANDATORY-GROUPS")
+KW_GROUP = _kw("GROUP")
+KW_WRITE_SYNTAX = _kw("WRITE-SYNTAX")
+KW_MIN_ACCESS = _kw("MIN-ACCESS")
+KW_PRODUCT_RELEASE = _kw("PRODUCT-RELEASE")
+KW_SUPPORTS = _kw("SUPPORTS")
+KW_INCLUDES = _kw("INCLUDES")
+KW_VARIATION = _kw("VARIATION")
+KW_CREATION_REQUIRES = _kw("CREATION-REQUIRES")
+KW_SUBJECT_CATEGORIES = _kw("SUBJECT-CATEGORIES")
+KW_PIB_ACCESS = _kw("PIB-ACCESS")
+KW_EXTENDS = _kw("EXTENDS")
+KW_CLAUSE_FIRST = KW_LAST_UPDATED
+KW_CLAUSE_LAST = KW_EXTENDS
+KW_SPPI_FIRST = KW_SUBJECT_CATEGORIES
+
+KW_DEFINITIONS = _kw("DEFINITIONS")
+KW_PIB_DEFINITIONS = _kw("PIB-DEFINITIONS")
+KW_BEGIN = _kw("BEGIN")
+KW_END = _kw("END")
+KW_IMPORTS = _kw("IMPORTS")
+KW_EXPORTS = _kw("EXPORTS")
+KW_FROM = _kw("FROM")
+KW_MACRO = _kw("MACRO")
+KW_OBJECT = _kw("OBJECT")
+KW_IDENTIFIER = _kw("IDENTIFIER")
+KW_SEQUENCE = _kw("SEQUENCE")
+KW_OF = _kw("OF")
+KW_CHOICE = _kw("CHOICE")
+KW_SIZE = _kw("SIZE")
+KW_INTEGER = _kw("INTEGER")
+KW_OCTET = _kw("OCTET")
+KW_STRING = _kw("STRING")
+KW_BITS = _kw("BITS")
+KW_IMPLICIT = _kw("IMPLICIT")
+KW_IMPLIED = _kw("IMPLIED")
+KW_APPLICATION = _kw("APPLICATION")
+KW_UNIVERSAL = _kw("UNIVERSAL")
+
+KW_INTEGER32 = _kw("Integer32")
+KW_UNSIGNED64 = _kw("Unsigned64")
+KW_TYPE_FIRST = KW_INTEGER32
+KW_TYPE_LAST = KW_UNSIGNED64
+KW_LAST = KW_BASE + len(KEYWORDS) - 1
+
+
+def _mk_kwmap() -> dict[bytes, int]:
+    d: dict[bytes, int] = {}
+    for i, k in enumerate(KEYWORDS):
+        d[k.encode()] = KW_BASE + i
+    return d
+
+KWMAP = _mk_kwmap()
+
+
+def keyword_kind(text: str) -> int:
+    """The keyword kind for `text`, or -1 when it is not a keyword."""
+    k = KWMAP.get(text.encode())
+    if k is not None:
+        return k
+    return -1
+
+
+def is_keyword(kind: int) -> bool:
+    return kind >= KW_BASE
+
+
+def is_macro_kw(kind: int) -> bool:
+    """MODULE-IDENTITY .. AGENT-CAPABILITIES (including TEXTUAL-CONVENTION)."""
+    return kind >= KW_MACRO_FIRST and kind <= KW_MACRO_LAST
+
+
+def is_clause_kw(kind: int) -> bool:
+    """A clause keyword of some macro (SYNTAX, STATUS, ...; SPPI clauses included)."""
+    return kind >= KW_CLAUSE_FIRST and kind <= KW_CLAUSE_LAST
+
+
+def is_type_kw(kind: int) -> bool:
+    """Integer32 .. Unsigned64: SMIv2 base types that are written like type references."""
+    return kind >= KW_TYPE_FIRST and kind <= KW_TYPE_LAST
+
+
+def is_ident(kind: int) -> bool:
+    """K_LIDENT or K_UIDENT (not keywords)."""
+    return kind == K_LIDENT or kind == K_UIDENT
+
+
+def is_name(kind: int) -> bool:
+    """An identifier or a keyword: anything that is spelled like a name."""
+    return kind == K_LIDENT or kind == K_UIDENT or kind >= KW_BASE
+
+
+def kind_name(kind: int) -> str:
+    """Readable name of a token kind (for messages and token dumps)."""
+    if kind >= KW_BASE and kind <= KW_LAST:
+        return KEYWORDS[kind - KW_BASE]
+    if kind == K_EOF:
+        return "EOF"
+    if kind == K_LIDENT:
+        return "LIDENT"
+    if kind == K_UIDENT:
+        return "UIDENT"
+    if kind == K_NUM:
+        return "NUM"
+    if kind == K_NEGNUM:
+        return "NEGNUM"
+    if kind == K_STR:
+        return "STR"
+    if kind == K_HEX:
+        return "HEX"
+    if kind == K_BIN:
+        return "BIN"
+    if kind == K_ASSIGN:
+        return "::="
+    if kind == K_DOTDOT:
+        return ".."
+    if kind == K_OTHER:
+        return "OTHER"
+    if kind > 32 and kind < 127:
+        return chr(kind)
+    return "?" + str(kind)
+
+
+class Token(object):
+    """One token: kind, byte span [start, end), 1-based line and byte column of `start`,
+    and `flags` (for K_STR: F_ESCAPED_QUOTE, F_NON_ASCII)."""
+    kind: int
+    start: int
+    end: int
+    line: int
+    col: int
+    flags: int
+
+    def __init__(self, kind: int, start: int, end: int, line: int, col: int, flags: int = 0):
+        self.kind = kind
+        self.start = start
+        self.end = end
+        self.line = line
+        self.col = col
+        self.flags = flags
+
+    def __repr__(self) -> str:
+        return "Token(" + kind_name(self.kind) + " " + str(self.line) + ":" + str(self.col) + " [" + str(self.start) + "," + str(self.end) + "))"
+
+
+# Character classes for the 256-entry table.
+CH_OTHER = 0       # unexpected ASCII character: K_OTHER token
+CH_WS = 1
+CH_LF = 2
+CH_CR = 3
+CH_ALPHA = 4       # A-Z a-z _
+CH_DIGIT = 5
+CH_MINUS = 6
+CH_DQ = 7
+CH_SQ = 8
+CH_COLON = 9
+CH_DOT = 10
+CH_PUNCT = 11      # { } ( ) , ; | ]
+CH_LBRACK = 12     # [ (may start a page footer "[Page n]")
+CH_HIGH = 13       # >= 0x80
+CH_CTRL = 14       # control characters other than whitespace
+CH_SUB = 15        # 0x1A (DOS EOF)
+CH_SLASH = 16
+
+
+def _mk_cc() -> list[int]:
+    t: list[int] = []
+    for c in range(256):
+        if c >= 128:
+            t.append(CH_HIGH)
+        elif c < 32 or c == 127:
+            t.append(CH_CTRL)
+        else:
+            t.append(CH_OTHER)
+    for c in [32, 9, 11, 12, 0]:
+        t[c] = CH_WS
+    t[10] = CH_LF
+    t[13] = CH_CR
+    t[26] = CH_SUB
+    for c in range(65, 91):
+        t[c] = CH_ALPHA
+    for c in range(97, 123):
+        t[c] = CH_ALPHA
+    t[95] = CH_ALPHA
+    for c in range(48, 58):
+        t[c] = CH_DIGIT
+    t[45] = CH_MINUS
+    t[34] = CH_DQ
+    t[39] = CH_SQ
+    t[58] = CH_COLON
+    t[46] = CH_DOT
+    for c in [123, 125, 40, 41, 44, 59, 124, 93]:
+        t[c] = CH_PUNCT
+    t[91] = CH_LBRACK
+    t[47] = CH_SLASH
+    return t
+
+CC = _mk_cc()
+
+
+def _is_hex_digit(c: int) -> bool:
+    return (c >= 48 and c <= 57) or (c >= 65 and c <= 70) or (c >= 97 and c <= 102)
+
+
+def _eol(b: bytes, i: int, n: int) -> int:
+    """Offset of the first CR or LF at or after i (n if none)."""
+    while i < n:
+        c = b[i]
+        if c == 10 or c == 13:
+            return i
+        i += 1
+    return n
+
+
+MONTHS: list[bytes] = [b"Jan", b"Feb", b"Mar", b"Apr", b"May", b"Jun", b"Jul", b"Aug", b"Sep", b"Oct", b"Nov", b"Dec"]
+
+# Words that mark a page header/footer line: Page, Expires, Draft, DRAFT, Internet-Draft, INTERNET-DRAFT.
+JUNK_HINTS: set[bytes] = {b"Page", b"Expires", b"Draft", b"DRAFT", b"Internet-Draft", b"INTERNET-DRAFT"}
+
+
+def _is_blank(c: int) -> bool:
+    return c == 32 or c == 9 or c == 12
+
+
+def _month_at(b: bytes, w: int, e: int) -> bool:
+    """Does a month name (3+ letters, optionally followed by '.') span [w, e)?"""
+    if e - w < 3:
+        return False
+    for mo in MONTHS:
+        if b[w] == mo[0] and b[w + 1] == mo[1] and b[w + 2] == mo[2]:
+            return True
+    return False
+
+
+def _page_junk_line(b: bytes, s: int, e: int, hint: bool, follows: bool = False) -> bool:
+    """Is the line [s, e), whose first token is an identifier, an RFC or Internet-Draft page
+    header or footer?
+
+    Such lines have no braces, quotes, ';', '|' or '::=', have a gap of 3+ blanks between
+    words, and end with a page number (`Petrova   INTERNET DRAFT   5`), a date, or a month
+    and year (`Pseudo Wire (PW) Management   February 2004`), unless `hint` says the line
+    carries a marker word such as `Expires` or `Internet Draft`. `follows` marks the line
+    after a header, which needs no wide gap (`Internet Drafts draft-x-02.txt  March 2006`).
+    """
+    gap = False
+    run = 0
+    seen_text = False
+    soft = False
+    k = s
+    while k < e:
+        c = b[k]
+        if _is_blank(c):
+            run += 1
+            k += 1
+            continue
+        if run >= 3 and seen_text:
+            gap = True
+        run = 0
+        seen_text = True
+        if c == 123 or c == 125 or c == 34 or c == 39 or c == 59 or c == 124 or c >= 128:
+            return False
+        if c == 58 and k + 2 < e and b[k + 1] == 58 and b[k + 2] == 61:
+            return False
+        if c == 40 or c == 41 or c == 44:
+            soft = True
+        k += 1
+    if not gap and not follows:
+        return False
+    q = e
+    while q > s and _is_blank(b[q - 1]):
+        q -= 1
+    r = q
+    while r > s and b[r - 1] >= 48 and b[r - 1] <= 57:
+        r -= 1
+    nd = q - r
+    if nd > 0:
+        before = r - 1
+        if before >= s and b[before] == 47 and nd == 4:
+            return True                     # .../2/9/2004
+        blanks = 0
+        while before >= s and _is_blank(b[before]):
+            blanks += 1
+            before -= 1
+        if nd <= 4 and blanks >= 3 and not soft:
+            return True                     # page number after a wide gap
+        if nd == 4 and blanks >= 1:
+            x = before                      # skip an optional "5," day
+            if x >= s and b[x] == 44:
+                x -= 1
+                while x >= s and b[x] >= 48 and b[x] <= 57:
+                    x -= 1
+                while x >= s and _is_blank(b[x]):
+                    x -= 1
+            if x >= s and b[x] == 46:
+                x -= 1                      # "Oct."
+            wend = x + 1
+            w = wend
+            while w > s and ((b[w - 1] >= 65 and b[w - 1] <= 90) or (b[w - 1] >= 97 and b[w - 1] <= 122)):
+                w -= 1
+            if _month_at(b, w, wend):
+                return True                 # ... June 2002
+    return hint
+
+
+def _title_continuation(b: bytes, out: list[Token], first: int) -> bool:
+    """Right after a page header: is this line the second line of a draft title
+    (`Management Information Base`), i.e. only plain identifiers, one of them
+    `Information` or `Base`?"""
+    found = False
+    for q in range(first, len(out)):
+        t = out[q]
+        if t.kind != K_UIDENT and t.kind != K_LIDENT:
+            return False
+        w = b[t.start:t.end]
+        if w == b"Information" or w == b"Base":
+            found = True
+    return found
+
+
+def _looks_like_code(b: bytes, s: int, e: int) -> bool:
+    """Heuristic for the text after an inner `--` in an end-of-line comment: would RFC 2578
+    comment rules turn it into a clause or value?"""
+    while s < e and (b[s] == 32 or b[s] == 9):
+        s += 1
+    if s >= e:
+        return False
+    if b[s] == 123:
+        return True
+    k = s
+    while k + 2 < e:
+        if b[k] == 58 and b[k + 1] == 58 and b[k + 2] == 61:
+            return True
+        k += 1
+    w = s
+    while w < e and (CC[b[w]] == CH_ALPHA or CC[b[w]] == CH_DIGIT or b[w] == 45):
+        w += 1
+    if w > s and b[s] >= 65 and b[s] <= 90:
+        kk = KWMAP.get(b[s:w])
+        if kk is not None:
+            return is_macro_kw(kk) or is_clause_kw(kk) or is_type_kw(kk)
+    return False
+
+
+# Clause keywords whose value is a quoted string: a string that ends with one of them (and
+# contains '::=') has swallowed code because its quotes are out of step.
+STRING_CLAUSE_WORDS: set[bytes] = {b"DESCRIPTION", b"REFERENCE", b"ORGANIZATION", b"CONTACT-INFO", b"UNITS",
+                                   b"DISPLAY-HINT", b"LAST-UPDATED", b"REVISION", b"PRODUCT-RELEASE"}
+
+
+def _is_space(c: int) -> bool:
+    return c == 32 or c == 9 or c == 10 or c == 13 or c == 12
+
+
+def _flipped_string(b: bytes, s: int, e: int) -> int:
+    """For the string token [s, e) (quotes included): has it swallowed code because a quote
+    is missing or stray? It has when its text ends with a string-valued clause keyword
+    (`... DESCRIPTION "`) and a later line of it starts with '::=' or a clause keyword.
+    Returns the offset of the line end before that first code line, or -1."""
+    q = e - 2
+    while q > s and _is_space(b[q]):
+        q -= 1
+    w = q + 1
+    while q > s and ((b[q] >= 65 and b[q] <= 90) or b[q] == 45):
+        q -= 1
+    if q <= s or not _is_space(b[q]) or w - q - 1 < 5 or b[q + 1:w] not in STRING_CLAUSE_WORDS:
+        return -1
+    # find the first line (not the first one) that starts with '::=' or a clause keyword
+    k = s + 1
+    while k < q:
+        c = b[k]
+        if c == 10 or c == 13:
+            le = k
+            k += 1
+            while k < e - 1 and (b[k] == 32 or b[k] == 9 or b[k] == 10 or b[k] == 13):
+                k += 1
+            if k + 2 < e and b[k] == 58 and b[k + 1] == 58 and b[k + 2] == 61:
+                return le
+            ws = k
+            while k < e and ((b[k] >= 65 and b[k] <= 90) or b[k] == 45):
+                k += 1
+            if k - ws >= 5 and k < e and _is_space(b[k]):
+                kk = KWMAP.get(b[ws:k])
+                if kk is not None and is_clause_kw(kk):
+                    return le
+            continue
+        k += 1
+    return -1
+
+
+def _decl_head_line(b: bytes, s: int, n: int) -> bool:
+    """Does the text at s (right after a quote) start with a declaration head on its line:
+    an identifier followed by a macro keyword (`fooEntry OBJECT-TYPE`)?"""
+    k = s
+    while k < n and (b[k] == 32 or b[k] == 9):
+        k += 1
+    w = k
+    while k < n and (CC[b[k]] == CH_ALPHA or CC[b[k]] == CH_DIGIT or b[k] == 45):
+        k += 1
+    if k == w or k >= n or not (b[k] == 32 or b[k] == 9):
+        return False
+    while k < n and (b[k] == 32 or b[k] == 9):
+        k += 1
+    w2 = k
+    while k < n and ((b[k] >= 65 and b[k] <= 90) or b[k] == 45):
+        k += 1
+    kk = KWMAP.get(b[w2:k])
+    return kk is not None and is_macro_kw(kk)
+
+
+def _prose_back(out: list[Token]) -> int:
+    """Index of the last string token in `out` when only prose follows it (no '::=', no
+    braces, no clause keyword, at most 400 tokens), else -1."""
+    q = len(out) - 1
+    cnt = 0
+    while q >= 0 and cnt < 400:
+        k = out[q].kind
+        if k == K_STR:
+            return q
+        if k == K_ASSIGN or k == 123 or k == 125 or (k >= KW_CLAUSE_FIRST and k <= KW_CLAUSE_LAST):
+            return -1
+        q -= 1
+        cnt += 1
+    return -1
+
+
+def _has_blank(b: bytes, s: int, e: int) -> bool:
+    """Does [s, e) contain a space or tab? (Then `' to 'b` in prose is not a binary string.)"""
+    k = s
+    while k < e:
+        if b[k] == 32 or b[k] == 9:
+            return True
+        k += 1
+    return False
+
+
+def _has_high(b: bytes, s: int, e: int) -> bool:
+    k = s
+    while k < e:
+        if b[k] >= 0x80:
+            return True
+        k += 1
+    return False
+
+
+def _line_ends(b: bytes, s: int, e: int) -> (int, int):
+    """Number of line ends (LF, CRLF, CR) in [s, e) and the offset just after the last one (-1 if none)."""
+    cnt = 0
+    last = -1
+    k = s
+    while k < e:
+        c = b[k]
+        if c == 10 or (c == 13 and not (k + 1 < e and b[k + 1] == 10)):
+            cnt += 1
+            last = k + 1
+        k += 1
+    return (cnt, last)
+
+
+def _closes_brace(b: bytes, s: int, e: int) -> bool:
+    """Does the text [s, e) after an inner `--` close a brace: a '}' that is not inside a
+    quoted string and not preceded by another '--' (a further comment)?"""
+    k = s
+    while k < e:
+        c = b[k]
+        if c == 34:
+            return False
+        if c == 45 and k + 1 < e and b[k + 1] == 45:
+            return False
+        if c == 125:
+            return True
+        k += 1
+    return False
+
+
+def lex(data: bytes, diags: mib.diag.Diagnostics, rfc_comments: bool = False) -> list[Token]:
+    """Tokenize `data` (the raw bytes of a MIB file).
+
+    Diagnostics go to `diags` (whose `file` names the input). The result ends with a K_EOF
+    token at offset len(data) (or at a DOS EOF marker).
+    """
+    b = data
+    cc = CC
+    kwm = KWMAP
+    n = len(b)
+    out: list[Token] = []
+    i: int = 0
+    line: int = 1
+    lstart: int = 0           # offset of the first byte of the current line
+    lfirst: int = 0           # index in `out` of the first token of the current line
+    hint = False              # the current line has a page header/footer marker word
+    junk_line = -1            # the last line dropped as a page header/footer
+    depth: int = 0            # brace nesting ('{' minus '}'), for inline comments
+    if n >= 3 and b[0] == 0xef and b[1] == 0xbb and b[2] == 0xbf:
+        i = 3
+        lstart = 3
+    while i < n:
+        c = b[i]
+        k = cc[c]
+        if k == CH_WS:
+            i += 1
+            continue
+        if k == CH_LF or k == CH_CR:
+            nt = len(out)
+            if nt > lfirst and (hint or out[nt - 1].kind == K_NUM) and cc[b[out[lfirst].start]] == CH_ALPHA and out[lfirst].line == line and _page_junk_line(b, out[lfirst].start, i, hint, junk_line == line - 1):
+                del out[lfirst:]
+                diags.report("lex.page-header", line, 1, "page header/footer line skipped")
+                junk_line = line
+            elif junk_line == line - 1 and nt - lfirst >= 2 and out[lfirst].line == line and _title_continuation(b, out, lfirst):
+                del out[lfirst:]
+                diags.report("lex.page-header", line, 1, "page header line skipped")
+                junk_line = line
+            hint = False
+            i += 1
+            if k == CH_CR and i < n and b[i] == 10:
+                i += 1
+            line += 1
+            lstart = i
+            lfirst = len(out)
+            continue
+        st = i
+        sl = line
+        scol = i - lstart + 1
+        kind = K_OTHER
+        flags: int = 0
+        if k == CH_ALPHA:
+            i += 1
+            while i < n:
+                k2 = cc[b[i]]
+                if k2 == CH_ALPHA or k2 == CH_DIGIT:
+                    i += 1
+                elif k2 == CH_MINUS and not (i + 1 < n and b[i + 1] == 45):
+                    i += 1
+                else:
+                    break
+            if c >= 65 and c <= 90:
+                kw = kwm.get(b[st:i])
+                if kw is not None:
+                    kind = kw
+                else:
+                    kind = K_UIDENT
+                    ln = i - st
+                    if (c == 80 or c == 69 or c == 68 or c == 73) and ln >= 4 and ln <= 14 and b[st:i] in JUNK_HINTS:
+                        hint = True
+            else:
+                kind = K_LIDENT
+        elif k == CH_DIGIT:
+            i += 1
+            while i < n and cc[b[i]] == CH_DIGIT:
+                i += 1
+            if i < n and cc[b[i]] == CH_ALPHA:
+                # digit-initial identifier such as 3comFoo (pysmi accepts it; linted by the parser)
+                while i < n:
+                    k2 = cc[b[i]]
+                    if k2 == CH_ALPHA or k2 == CH_DIGIT:
+                        i += 1
+                    elif k2 == CH_MINUS and not (i + 1 < n and b[i + 1] == 45):
+                        i += 1
+                    else:
+                        break
+                kind = K_LIDENT
+            else:
+                kind = K_NUM
+        elif k == CH_MINUS:
+            if i + 1 < n and b[i + 1] == 45:
+                # comment
+                i += 2
+                if rfc_comments:
+                    while i < n:
+                        c2 = b[i]
+                        if c2 == 10 or c2 == 13:
+                            break
+                        if c2 == 45 and i + 1 < n and b[i + 1] == 45:
+                            i += 2
+                            # libsmi: a lone '-' left before the end of the line is part of the comment
+                            if i < n and b[i] == 45 and (i + 1 >= n or b[i + 1] == 10 or b[i + 1] == 13):
+                                i += 1
+                            break
+                        i += 1
+                else:
+                    while i < n and b[i] == 45:
+                        i += 1
+                    inner = -1
+                    inner_at = -1
+                    while i < n:
+                        c2 = b[i]
+                        if c2 == 10 or c2 == 13:
+                            break
+                        if c2 == 45 and inner < 0 and i + 1 < n and b[i + 1] == 45:
+                            inner_at = i
+                            j = i + 2
+                            while j < n and b[j] == 45:
+                                j += 1
+                            inner = j
+                            i = j
+                            continue
+                        i += 1
+                    if inner >= 0 and depth > 0 and len(out) > lfirst and out[len(out) - 1].line == sl and _closes_brace(b, inner, i):
+                        # an inline comment inside braces whose tail closes the brace:
+                        # `{ a, b, --c,-- d }` means the RFC 2578 rule (the comment ends at
+                        # the inner '--'); comment-to-end-of-line would leave the brace open
+                        diags.report("lex.comment-inner-dashes", sl, inner_at - lstart + 1,
+                                     "comment ended at the inner '--' (RFC 2578 rule): the rest of the line closes a brace")
+                        i = inner
+                    elif inner >= 0 and _looks_like_code(b, inner, i):
+                        diags.report("lex.comment-inner-dashes", sl, inner_at - lstart + 1,
+                                     "text after an inner '--' is part of the comment (RFC 2578 would read it as code)")
+                continue
+            if i + 1 < n and cc[b[i + 1]] == CH_DIGIT:
+                i += 2
+                while i < n and cc[b[i]] == CH_DIGIT:
+                    i += 1
+                kind = K_NEGNUM
+            else:
+                i += 1
+                kind = 45
+        elif k == CH_DQ:
+            i += 1
+            escaped = False
+            high: int = 0
+            while True:
+                while i < n:
+                    c2 = b[i]
+                    if c2 == 34:
+                        break
+                    high |= c2
+                    if c2 == 10:
+                        line += 1
+                        lstart = i + 1
+                    elif c2 == 13 and not (i + 1 < n and b[i + 1] == 10):
+                        line += 1
+                        lstart = i + 1
+                    i += 1
+                if i + 1 < n and b[i] == 34 and b[i + 1] == 34:
+                    escaped = True
+                    i += 2
+                    continue
+                break
+            if high >= 0x80:
+                flags = F_NON_ASCII
+            if i < n:
+                i += 1
+                kind = K_STR
+                if escaped:
+                    flags |= F_ESCAPED_QUOTE
+                    diags.report("lex.escaped-quote", sl, scol, "doubled quote inside a string read as one '\"'")
+                cut = _flipped_string(b, st, i) if i - st > 16 else -1
+                if cut >= 0:
+                    # The string holds code and ends with a clause keyword (`... ::= { x 1 }
+                    # y OBJECT-TYPE ... DESCRIPTION "`): quotes are out of step.
+                    ps = _prose_back(out)
+                    if ps >= 0:
+                        # A stray quote inside the previous string: that string really
+                        # ends at this string's opening quote; the code is code again.
+                        pt = out[ps]
+                        del out[ps + 1:]
+                        fl = pt.flags
+                        if _has_high(b, pt.end, st):
+                            fl |= F_NON_ASCII
+                        out[ps] = Token(K_STR, pt.start, st + 1, pt.line, pt.col, fl)
+                        diags.report("lex.string-stray-quote", pt.line, pt.col,
+                                     "stray quote inside this string; it ends at the quote on line " + str(sl))
+                        i = st + 1
+                        line = sl
+                        lstart = st - scol + 1
+                        lfirst = len(out)
+                        continue
+                    if _decl_head_line(b, st + 1, n):
+                        # `"fooEntry OBJECT-TYPE`: the opening quote itself is stray
+                        diags.report("lex.string-stray-quote", sl, scol, "stray quote before a declaration skipped")
+                        i = st + 1
+                        line = sl
+                        lstart = st - scol + 1
+                        continue
+                    # The closing quote of this string is missing: cut it before the code.
+                    ne, ls = _line_ends(b, st, cut)
+                    i = cut
+                    line = sl + ne
+                    if ls >= 0:
+                        lstart = ls
+                    else:
+                        lstart = st - scol + 1
+                    flags = F_NON_ASCII if _has_high(b, st, cut) else 0
+                    diags.report("lex.string-missing-quote", sl, scol,
+                                 "string not closed before the code that follows; cut at the end of line " + str(line))
+            else:
+                # unterminated: cut the string at the end of its first line and re-lex from there
+                e = _eol(b, st + 1, n)
+                diags.report("lex.unterminated-string", sl, scol, "unterminated string; cut at the end of its line")
+                i = e
+                line = sl
+                lstart = st - scol + 1
+                kind = K_STR
+                flags = F_NON_ASCII
+        elif k == CH_SQ:
+            j = i + 1
+            while j < n and b[j] != 39 and b[j] != 10 and b[j] != 13:
+                j += 1
+            if j < n and b[j] == 39 and j + 1 < n and (b[j + 1] | 0x20 == 104 or b[j + 1] | 0x20 == 98) and not _has_blank(b, i + 1, j):
+                hexs = (b[j + 1] | 0x20) == 104
+                ndig = j - (i + 1)
+                bad = False
+                for q in range(i + 1, j):
+                    d = b[q]
+                    if hexs:
+                        if not _is_hex_digit(d):
+                            bad = True
+                    elif d != 48 and d != 49:
+                        bad = True
+                i = j + 2
+                if hexs:
+                    kind = K_HEX
+                    if bad:
+                        diags.report("lex.bad-hex-string", sl, scol, "invalid digit in hexadecimal string")
+                    elif ndig % 2 != 0:
+                        diags.report("lex.hex-odd-length", sl, scol, "hexadecimal string with an odd number of digits")
+                else:
+                    kind = K_BIN
+                    if bad:
+                        diags.report("lex.bad-hex-string", sl, scol, "invalid digit in binary string")
+                    elif ndig % 8 != 0:
+                        diags.report("lex.bin-length", sl, scol, "binary string length is not a multiple of 8")
+            else:
+                i += 1
+                kind = K_OTHER
+        elif k == CH_COLON:
+            if i + 2 < n and b[i + 1] == 58 and b[i + 2] == 61:
+                i += 3
+                kind = K_ASSIGN
+            else:
+                i += 1
+                kind = 58
+        elif k == CH_DOT:
+            if i + 1 < n and b[i + 1] == 46:
+                i += 2
+                kind = K_DOTDOT
+            else:
+                i += 1
+                kind = 46
+        elif k == CH_PUNCT:
+            i += 1
+            kind = c
+            if c == 123:
+                depth += 1
+            elif c == 125 and depth > 0:
+                depth -= 1
+        elif k == CH_LBRACK:
+            if i + 5 <= n and b[i + 1] == 80 and b[i + 2] == 97 and b[i + 3] == 103 and b[i + 4] == 101:
+                # "[Page 12]" page footer: drop the line
+                while len(out) > 0 and out[-1].line == line:
+                    out.pop()
+                diags.report("lex.page-header", sl, 1, "page footer line skipped")
+                i = _eol(b, i, n)
+                continue
+            i += 1
+            kind = 91
+        elif k == CH_HIGH:
+            while i < n and cc[b[i]] == CH_HIGH:
+                i += 1
+            diags.report("lex.non-ascii", sl, scol, "non-ASCII byte(s) outside a string skipped")
+            continue
+        elif k == CH_CTRL:
+            while i < n and cc[b[i]] == CH_CTRL:
+                i += 1
+            diags.report("lex.control-char", sl, scol, "control character(s) outside a string skipped")
+            continue
+        elif k == CH_SUB:
+            j = i + 1
+            only_ws = True
+            while j < n:
+                kj = cc[b[j]]
+                if kj != CH_WS and kj != CH_LF and kj != CH_CR and kj != CH_SUB:
+                    only_ws = False
+                    break
+                j += 1
+            if only_ws:
+                diags.report("lex.dos-eof", sl, scol, "DOS end-of-file marker (0x1A) ends the input")
+                n = i
+                break
+            i += 1
+            diags.report("lex.control-char", sl, scol, "control character(s) outside a string skipped")
+            continue
+        elif k == CH_SLASH:
+            if i + 1 < n and b[i + 1] == 42:
+                i += 2
+                while i < n and not (b[i] == 42 and i + 1 < n and b[i + 1] == 47):
+                    c2 = b[i]
+                    if c2 == 10:
+                        line += 1
+                        lstart = i + 1
+                    elif c2 == 13 and not (i + 1 < n and b[i + 1] == 10):
+                        line += 1
+                        lstart = i + 1
+                    i += 1
+                i = i + 2 if i < n else n
+                diags.report("lex.c-comment", sl, scol, "C-style comment skipped")
+                continue
+            if i + 1 < n and b[i + 1] == 47:
+                i = _eol(b, i, n)
+                diags.report("lex.c-comment", sl, scol, "C++-style comment skipped")
+                continue
+            i += 1
+            kind = K_OTHER
+        else:
+            i += 1
+            kind = K_OTHER
+        out.append(Token(kind, st, i, sl, scol, flags))
+    out.append(Token(K_EOF, n, n, line, n - lstart + 1))
+    return out
+
+
+def text(data: bytes, t: Token) -> str:
+    """The token's source text (ASCII for everything but strings; decoded as Latin-1 if not UTF-8)."""
+    raw = data[t.start:t.end]
+    try:
+        return raw.decode()
+    except ValueError:
+        return "".join([chr(c) for c in raw])
+
+
+def dump(data: bytes, toks: list[Token]) -> str:
+    """One `line:col KIND text` line per token (EOF excluded): for snapshot tests."""
+    out: list[str] = []
+    for t in toks:
+        if t.kind == K_EOF:
+            break
+        out.append(str(t.line) + ":" + str(t.col) + " " + kind_name(t.kind) + " " + text(data, t))
+    return "\n".join(out)

@@ -1,0 +1,1177 @@
+"""Tests for mib.parser and mib.ast: the SMIv1/SMIv2 grammar, common quirks, error recovery,
+the golden set and, with --tag mibcorpus, the whole corpus."""
+
+import file
+import testing
+import time
+import mib.ast
+import mib.diag
+import mib.parser
+import mib.source
+
+GOLDEN_DIR = "interop/mibs/golden/mibs"
+CORPUS_DIR = "interop/mibs/corpus/flat"
+
+# SMIv2 skeleton (QUIRK-MIB): it parses without diagnostics.
+V2_HEAD = r"""QUIRK-MIB DEFINITIONS ::= BEGIN
+IMPORTS
+    MODULE-IDENTITY, OBJECT-TYPE, OBJECT-IDENTITY, NOTIFICATION-TYPE,
+    Integer32, Counter32, Unsigned32, enterprises
+        FROM SNMPv2-SMI
+    TEXTUAL-CONVENTION, DisplayString, RowStatus
+        FROM SNMPv2-TC
+    MODULE-COMPLIANCE, OBJECT-GROUP, NOTIFICATION-GROUP, AGENT-CAPABILITIES
+        FROM SNMPv2-CONF;
+quirkMIB MODULE-IDENTITY
+    LAST-UPDATED "202610100000Z"
+    ORGANIZATION "actsnmp"
+    CONTACT-INFO "none"
+    DESCRIPTION  "Quirk test module."
+    ::= { enterprises 99999 }
+quirkObjects OBJECT IDENTIFIER ::= { quirkMIB 1 }
+"""
+
+# SMIv1 skeleton (QUIRK-V1-MIB).
+V1_HEAD = r"""QUIRK-V1-MIB DEFINITIONS ::= BEGIN
+IMPORTS
+    enterprises, Counter, IpAddress, NetworkAddress FROM RFC1155-SMI
+    OBJECT-TYPE FROM RFC-1212
+    TRAP-TYPE FROM RFC-1215
+    DisplayString FROM RFC1213-MIB;
+quirkV1 OBJECT IDENTIFIER ::= { enterprises 99998 }
+"""
+
+TAIL = r"""
+END
+"""
+
+
+def v2(body: str) -> str:
+    return V2_HEAD + body + TAIL
+
+
+def v1(body: str) -> str:
+    return V1_HEAD + body + TAIL
+
+
+def parse(src: str) -> mib.parser.ParseResult:
+    return mib.parser.parse_text(src, "q.mib")
+
+
+def codes(r: mib.parser.ParseResult) -> str:
+    """`L<level> <code>` per diagnostic, in report order."""
+    return ", ".join(["L" + str(d.level) + " " + d.code for d in r.diags])
+
+
+def v2codes(body: str) -> str:
+    return codes(parse(v2(body)))
+
+
+def v1codes(body: str) -> str:
+    return codes(parse(v1(body)))
+
+
+def dump(r: mib.parser.ParseResult, name: str) -> str:
+    """dump_def of declaration `name` in the first module ("<missing>" if absent)."""
+    if len(r.modules) > 0:
+        d = r.modules[0].find(name)
+        if d is not None:
+            return mib.ast.dump_def(d)
+    return "<missing>"
+
+
+def v2dump(body: str, name: str) -> str:
+    return dump(parse(v2(body)), name)
+
+
+def mdump(m: mib.ast.Module, name: str) -> str:
+    d = m.find(name)
+    if d is not None:
+        return mib.ast.dump_def(d)
+    return "<missing>"
+
+
+def names(r: mib.parser.ParseResult) -> list[str]:
+    if len(r.modules) == 0:
+        return []
+    return [d.name for d in r.modules[0].defs]
+
+
+# --- skeletons and module structure ------------------------------------------------------
+
+def _test_skeletons_are_clean() -> None:
+    r = parse(v2(""))
+    testing.assertEqual(codes(r), "")
+    m = r.modules[0]
+    testing.assertEqual(m.name, "QUIRK-MIB")
+    testing.assertEqual(m.lang, mib.ast.LANG_SMIV2)
+    testing.assertTrue(m.has_end)
+    testing.assertEqual([g.module for g in m.imports], ["SNMPv2-SMI", "SNMPv2-TC", "SNMPv2-CONF"])
+    testing.assertEqual(len(m.imports[0].symbols), 8)
+    testing.assertEqual(m.imported_symbols()["RowStatus"], "SNMPv2-TC")
+    testing.assertEqual(m.import_modules(), ["SNMPv2-SMI", "SNMPv2-TC", "SNMPv2-CONF"])
+    testing.assertEqual(names(r), ["quirkMIB", "quirkObjects"])
+    testing.assertEqual(m.module_identity()?.name, "quirkMIB")
+    testing.assertEqual(m.line, 1)
+    testing.assertEqual(m.defs[1].line, 16)
+    testing.assertEqual(m.defs[1].col, 1)
+    r1 = parse(v1(""))
+    testing.assertEqual(codes(r1), "")
+    testing.assertEqual(r1.modules[0].lang, mib.ast.LANG_SMIV1)
+
+
+def _test_module_dump() -> None:
+    r = parse(r"""T-MIB DEFINITIONS ::= BEGIN
+IMPORTS a, B FROM X-MIB c FROM Y-MIB;
+t OBJECT IDENTIFIER ::= { iso 3 }
+END""")
+    testing.assertEqual(mib.ast.dump_module(r.modules[0]), "MODULE T-MIB lang=SMIv1\n  IMPORTS a, B FROM X-MIB\n  IMPORTS c FROM Y-MIB\n" + r"  OBJECT IDENTIFIER t ::= {iso 3}")
+
+
+def _test_several_modules_and_junk() -> None:
+    r = parse(r"""From: someone@example.com
+A-MIB DEFINITIONS ::= BEGIN
+a OBJECT IDENTIFIER ::= { iso 1 }
+END
+-- footer between the modules
+mail footer text
+B-MIB DEFINITIONS ::= BEGIN
+b OBJECT IDENTIFIER ::= { iso 2 }
+END
+END""")
+    testing.assertEqual([m.name for m in r.modules], ["A-MIB", "B-MIB"])
+    testing.assertEqual(codes(r), "L2 parse.junk, L2 parse.junk, L2 parse.junk")
+    testing.assertEqual([d.module for d in r.diags], ["", "A-MIB", "B-MIB"])
+    testing.assertEqual([d.line for d in r.diags], [1, 6, 10])
+    testing.assertEqual(names(r), ["a"])
+    testing.assertEqual([d.name for d in r.modules[1].defs], ["b"])
+
+
+def _test_missing_end_and_no_module() -> None:
+    r = parse(r"""A-MIB DEFINITIONS ::= BEGIN
+a OBJECT IDENTIFIER ::= { iso 1 }
+""")
+    testing.assertEqual(codes(r), "L2 parse.missing-end")
+    testing.assertFalse(r.modules[0].has_end)
+    testing.assertEqual(names(r), ["a"])
+    r2 = parse("just some text")
+    testing.assertEqual(len(r2.modules), 0)
+    testing.assertEqual(codes(r2), "L4 parse.no-module")
+
+
+def _test_module_oid_pib_and_case() -> None:
+    r = parse(r"""A-MIB { iso 3 6 1 2 1 99 } DEFINITIONS ::= BEGIN
+END""")
+    testing.assertEqual(codes(r), "L5 parse.module-oid")
+    testing.assertEqual(r.modules[0].oid?.dump(), r"{iso 3 6 1 2 1 99}")
+    r2 = parse(r"""A-PIB PIB-DEFINITIONS ::= BEGIN
+END""")
+    testing.assertEqual(codes(r2), "L3 parse.sppi-module")
+    testing.assertTrue(r2.modules[0].pib)
+    testing.assertEqual(r2.modules[0].lang, mib.ast.LANG_SPPI)
+    r3 = parse(r"""quirk-mib DEFINITIONS ::= BEGIN
+END""")
+    testing.assertEqual(codes(r3), "L2 parse.module-name-case")
+
+
+def _test_exports_macro_choice_tagged_outside_base() -> None:
+    body = r"""
+EXPORTS quirkObjects;
+FOO-TYPE MACRO ::= BEGIN TYPE NOTATION ::= "SYNTAX" type VALUE NOTATION ::= value(VALUE INTEGER) END
+QuirkChoice ::= CHOICE { a INTEGER, b OCTET STRING }
+QuirkTagged ::= [APPLICATION 9] IMPLICIT OCTET STRING (SIZE (4))
+quirkFoo FOO-TYPE SYNTAX INTEGER ::= { quirkObjects 9 }
+"""
+    r = parse(v2(body))
+    testing.assertEqual(codes(r), "L4 parse.exports, L3 parse.macro-definition, L3 parse.choice, L3 parse.tagged-type, L3 parse.unknown-macro")
+    testing.assertEqual(dump(r, "QuirkTagged"), r"TYPE QuirkTagged syntax=[APPLICATION 9] IMPLICIT OCTET STRING (SIZE (4))")
+    testing.assertEqual(dump(r, "FOO-TYPE"), "MACRO FOO-TYPE")
+    testing.assertEqual(dump(r, "QuirkChoice"), "CHOICE QuirkChoice")
+    testing.assertEqual(dump(r, "quirkFoo"), r"FOO-TYPE quirkFoo ::= {quirkObjects 9}")
+    testing.assertEqual(r.modules[0].macros, ["FOO-TYPE"])
+    testing.assertTrue(r.modules[0].has_exports)
+
+
+def _test_base_modules_parse_cleanly() -> None:
+    expected = {"SNMPv2-SMI": 34, "SNMPv2-TC": 17, "SNMPv2-CONF": 4, "RFC1155-SMI": 17, "RFC-1212": 2, "RFC-1215": 1}
+    for nm, ndefs in expected.items():
+        r = mib.parser.parse_bytes(mib.source.base_module_bytes(nm), nm)
+        testing.assertEqual(codes(r), "", nm)
+        testing.assertEqual(len(r.modules), 1, nm)
+        testing.assertEqual(len(r.modules[0].defs), ndefs, nm)
+    m = mib.parser.parse_base_module("SNMPv2-SMI")
+    testing.assertEqual(m.lang, mib.ast.LANG_SMIV2)
+    testing.assertEqual(mdump(m, "Counter64"), r"TYPE Counter64 syntax=[APPLICATION 6] IMPLICIT INTEGER (0..18446744073709551615)")
+    testing.assertEqual(mdump(m, "zeroDotZero"), r"OBJECT-IDENTITY zeroDotZero status=current ::= {0 0}")
+    tc = mib.parser.parse_base_module("SNMPv2-TC")
+    testing.assertEqual(mdump(tc, "DisplayString"), r"TEXTUAL-CONVENTION DisplayString hint=" + "\"255a\"" + r" status=current syntax=OCTET STRING (SIZE (0..255))")
+    v1 = mib.parser.parse_base_module("RFC1155-SMI")
+    testing.assertEqual(mdump(v1, "internet"), r"OBJECT IDENTIFIER internet ::= {iso org(3) dod(6) 1}")
+    testing.assertTrue(v1.has_exports)
+
+
+# --- value assignments and OIDs ----------------------------------------------------------------
+
+def _test_oid_values() -> None:
+    body = r"""
+q1 OBJECT IDENTIFIER ::= { quirkObjects 1 }
+q2 OBJECT IDENTIFIER ::= { iso org(3) dod(6) internet(1) }
+q3 OBJECT IDENTIFIER ::= { 1 3 6 1 4 1 9 }
+q4 OBJECT IDENTIFIER ::= { zeroDotZero }
+q5 OBJECT IDENTIFIER ::= { IF-MIB.ifMIB 2 }
+q6 OBJECT IDENTIFIER ::= { enterprises quirkFoo 1 1 }
+q7 OBJECT IDENTIFIER ::= { mib-2 snmpDot3MauMgt(26) 4 }
+q8 OBJECT IDENTIFIER ::= { quirkObjects 4294967296 99999999999999999999 }
+"""
+    r = parse(v2(body))
+    testing.assertEqual(codes(r), "L1 parse.number-too-large")
+    testing.assertEqual(dump(r, "q1"), r"OBJECT IDENTIFIER q1 ::= {quirkObjects 1}")
+    testing.assertEqual(dump(r, "q2"), r"OBJECT IDENTIFIER q2 ::= {iso org(3) dod(6) internet(1)}")
+    testing.assertEqual(dump(r, "q3"), r"OBJECT IDENTIFIER q3 ::= {1 3 6 1 4 1 9}")
+    testing.assertEqual(dump(r, "q4"), r"OBJECT IDENTIFIER q4 ::= {zeroDotZero}")
+    testing.assertEqual(dump(r, "q5"), r"OBJECT IDENTIFIER q5 ::= {IF-MIB.ifMIB 2}")
+    testing.assertEqual(dump(r, "q6"), r"OBJECT IDENTIFIER q6 ::= {enterprises quirkFoo 1 1}")
+    testing.assertEqual(dump(r, "q7"), r"OBJECT IDENTIFIER q7 ::= {mib-2 snmpDot3MauMgt(26) 4}")
+    testing.assertEqual(dump(r, "q8"), r"OBJECT IDENTIFIER q8 ::= {quirkObjects 4294967296 <too big>}")
+    q5 = r.modules[0].find("q5")
+    if q5 is not None:
+        o = q5.oid
+        if o is not None:
+            testing.assertEqual(o.components[0].module, "IF-MIB")
+            testing.assertEqual(o.components[0].name, "ifMIB")
+            testing.assertEqual(o.components[1].number, 2)
+            testing.assertEqual(o.components[1].col, 41)
+    testing.assertEqual(v2codes(r"q OBJECT IDENTIFIER ::= { quirkObjects 01 }"), "L5 parse.number-leading-zero")
+
+
+# --- MODULE-IDENTITY, OBJECT-IDENTITY ------------------------------------------------------------
+
+def _test_module_identity_revisions() -> None:
+    src = r"""R-MIB DEFINITIONS ::= BEGIN
+IMPORTS MODULE-IDENTITY, enterprises FROM SNMPv2-SMI;
+rMIB MODULE-IDENTITY
+    LAST-UPDATED "200006140000Z"
+    ORGANIZATION "org"
+    CONTACT-INFO "contact"
+    DESCRIPTION  "desc"
+    REVISION     "200006140000Z"
+    DESCRIPTION  "second"
+    REVISION     "199602282155Z"
+    DESCRIPTION  "first"
+    ::= { enterprises 1 }
+END"""
+    r = parse(src)
+    testing.assertEqual(codes(r), "")
+    mi = r.modules[0].module_identity()
+    testing.assertEqual(mi?.last_updated?.value, "200006140000Z")
+    testing.assertEqual(mi?.organization?.value, "org")
+    testing.assertEqual(mi?.contact_info?.value, "contact")
+    testing.assertEqual(mi?.description?.value, "desc")
+    if mi is not None:
+        testing.assertEqual([x.date.value for x in mi.revisions], ["200006140000Z", "199602282155Z"])
+        testing.assertEqual([x.description?.value for x in mi.revisions], ["second", "first"])
+        testing.assertEqual(mi.clauses, ["LAST-UPDATED", "ORGANIZATION", "CONTACT-INFO", "DESCRIPTION", "REVISION", "REVISION"])
+    # REVISION text without DESCRIPTION keyword, and a REVISION with nothing at all
+    r2 = parse(src.replace("    DESCRIPTION  \"second\"\n", "    \"second\"\n").replace("    DESCRIPTION  \"first\"\n", ""))
+    testing.assertEqual(codes(r2), "L2 parse.revision-description-missing, L2 parse.revision-description-missing")
+    mi2 = r2.modules[0].module_identity()
+    if mi2 is not None:
+        testing.assertEqual([x.description?.value for x in mi2.revisions], ["second", None])
+
+
+def _test_module_identity_dates() -> None:
+    def mi(lu: str, revs: list[str]) -> str:
+        src = "D-MIB DEFINITIONS ::= BEGIN\nIMPORTS MODULE-IDENTITY, enterprises FROM SNMPv2-SMI;\n"
+        src += "dMIB MODULE-IDENTITY LAST-UPDATED \"" + lu + "\" ORGANIZATION \"o\" CONTACT-INFO \"c\" DESCRIPTION \"d\"\n"
+        for rv in revs:
+            src += "  REVISION \"" + rv + "\" DESCRIPTION \"r\"\n"
+        return codes(parse(src + "  ::= {{ enterprises 1 }}\nEND\n"))
+    testing.assertEqual(mi("200006140000Z", ["200006140000Z", "199602282155Z"]), "")
+    testing.assertEqual(mi("9905251200Z", []), "L5 parse.date-two-digit-year")
+    testing.assertEqual(mi("0801010000Z", []), "L4 parse.date-before-1988")
+    testing.assertEqual(mi("201701060000z", []), "L2 parse.date-invalid")
+    testing.assertEqual(mi("2016-09-29", []), "L2 parse.date-invalid")
+    testing.assertEqual(mi("202210203424Z", []), "L2 parse.date-invalid")
+    testing.assertEqual(mi("200006140000Z", ["199602282155Z", "200006140000Z"]), "L5 parse.revision-order")
+
+
+def _test_object_identity() -> None:
+    body = r"""
+quirkId OBJECT-IDENTITY
+    STATUS current
+    DESCRIPTION "an identity"
+    REFERENCE "RFC 2578"
+    ::= { quirkObjects 3 }
+"""
+    r = parse(v2(body))
+    testing.assertEqual(codes(r), "")
+    testing.assertEqual(dump(r, "quirkId"), r"OBJECT-IDENTITY quirkId status=current ::= {quirkObjects 3}")
+    d = r.modules[0].find("quirkId")
+    testing.assertEqual(d?.reference?.value, "RFC 2578")
+    testing.assertEqual(d?.description?.line, 20)
+    testing.assertTrue(d?.is_registration() == True)
+
+
+# --- OBJECT-TYPE -------------------------------------------------------------------------------
+
+TABLE = r"""
+quirkTable OBJECT-TYPE
+    SYNTAX      SEQUENCE OF QuirkEntry
+    MAX-ACCESS  not-accessible
+    STATUS      current
+    DESCRIPTION "table"
+    ::= { quirkObjects 2 }
+quirkEntry OBJECT-TYPE
+    SYNTAX      QuirkEntry
+    MAX-ACCESS  not-accessible
+    STATUS      current
+    DESCRIPTION "row"
+    INDEX       { quirkIndex, IMPLIED quirkName }
+    ::= { quirkTable 1 }
+QuirkEntry ::= SEQUENCE {
+    quirkIndex   Integer32,
+    quirkName    DisplayString,
+    quirkStatus  RowStatus
+}
+quirkIndex OBJECT-TYPE
+    SYNTAX      Integer32 (1..2147483647)
+    MAX-ACCESS  not-accessible
+    STATUS      current
+    DESCRIPTION "index"
+    ::= { quirkEntry 1 }
+quirkName OBJECT-TYPE
+    SYNTAX      DisplayString (SIZE (1..32))
+    MAX-ACCESS  read-create
+    STATUS      current
+    DESCRIPTION "name"
+    DEFVAL      { "none" }
+    ::= { quirkEntry 2 }
+quirkStatus OBJECT-TYPE
+    SYNTAX      RowStatus
+    UNITS       "rows"
+    MAX-ACCESS  read-create
+    STATUS      current
+    DESCRIPTION "status"
+    REFERENCE   "RFC 2579"
+    ::= { quirkEntry 3 }
+quirkAugEntry OBJECT-TYPE
+    SYNTAX      QuirkAugEntry
+    MAX-ACCESS  not-accessible
+    STATUS      current
+    DESCRIPTION "augmenting row"
+    AUGMENTS    { quirkEntry }
+    ::= { quirkAugTable 1 }
+"""
+
+
+def _test_object_type_table() -> None:
+    r = parse(v2(TABLE))
+    testing.assertEqual(codes(r), "")
+    testing.assertEqual(dump(r, "quirkTable"), "OBJECT-TYPE quirkTable syntax=SEQUENCE OF QuirkEntry max-access=not-accessible status=current " + r"::= {quirkObjects 2}")
+    testing.assertEqual(dump(r, "quirkEntry"), r"OBJECT-TYPE quirkEntry syntax=QuirkEntry max-access=not-accessible status=current index={quirkIndex, IMPLIED quirkName} ::= {quirkTable 1}")
+    testing.assertEqual(dump(r, "QuirkEntry"), r"SEQUENCE QuirkEntry {quirkIndex Integer32, quirkName DisplayString, quirkStatus RowStatus}")
+    testing.assertEqual(dump(r, "quirkIndex"), r"OBJECT-TYPE quirkIndex syntax=Integer32 (1..2147483647) max-access=not-accessible status=current ::= {quirkEntry 1}")
+    testing.assertEqual(dump(r, "quirkName"), r"OBJECT-TYPE quirkName syntax=DisplayString (SIZE (1..32)) max-access=read-create status=current defval=" + "\"none\"" + r" ::= {quirkEntry 2}")
+    testing.assertEqual(dump(r, "quirkStatus"), r"OBJECT-TYPE quirkStatus syntax=RowStatus units=" + "\"rows\"" + r" max-access=read-create status=current ::= {quirkEntry 3}")
+    testing.assertEqual(dump(r, "quirkAugEntry"), r"OBJECT-TYPE quirkAugEntry syntax=QuirkAugEntry max-access=not-accessible status=current augments={quirkEntry} ::= {quirkAugTable 1}")
+    e = r.modules[0].find("quirkEntry")
+    if isinstance(e, mib.ast.ObjectType):
+        testing.assertTrue(e.has_index)
+        testing.assertEqual(e.index[1].implied, True)
+        testing.assertEqual(e.access_kw, "MAX-ACCESS")
+        testing.assertEqual(e.clauses, ["SYNTAX", "MAX-ACCESS", "STATUS", "DESCRIPTION", "INDEX"])
+    else:
+        testing.error("quirkEntry is not an ObjectType")
+    n = r.modules[0].find("quirkName")
+    if isinstance(n, mib.ast.ObjectType):
+        testing.assertEqual(n.defval?.text, "\"none\"")
+        testing.assertEqual(n.defval?.value?.kind, mib.ast.VAL_STRING)
+
+
+def _test_object_type_smiv1() -> None:
+    body = r"""
+quirkV1Table OBJECT-TYPE
+    SYNTAX  SEQUENCE OF QuirkV1Entry
+    ACCESS  not-accessible
+    STATUS  mandatory
+    ::= { quirkV1 1 }
+quirkV1Entry OBJECT-TYPE
+    SYNTAX  QuirkV1Entry
+    ACCESS  not-accessible
+    STATUS  mandatory
+    INDEX   { INTEGER, OCTET STRING, NetworkAddress, IpAddress, quirkV1Addr }
+    ::= { quirkV1Table 1 }
+QuirkV1Entry ::= SEQUENCE { quirkV1Addr NetworkAddress, quirkV1Count Counter }
+quirkV1Count OBJECT-TYPE
+    SYNTAX  Counter
+    ACCESS  read-only
+    STATUS  mandatory
+    DESCRIPTION "count"
+    DEFVAL  { 0 }
+    ::= { quirkV1Entry 2 }
+"""
+    r = parse(v1(body))
+    testing.assertEqual(codes(r), "")
+    testing.assertEqual(dump(r, "quirkV1Entry"), r"OBJECT-TYPE quirkV1Entry syntax=QuirkV1Entry access=not-accessible status=mandatory index={INTEGER, OCTET STRING, NetworkAddress, IpAddress, quirkV1Addr} ::= {quirkV1Table 1}")
+    e = r.modules[0].find("quirkV1Entry")
+    if isinstance(e, mib.ast.ObjectType):
+        testing.assertEqual(e.index[0].name, "")
+        testing.assertEqual(e.index[0].syntax?.kind, mib.ast.SYN_INTEGER)
+        testing.assertEqual(e.index[2].syntax?.name, "NetworkAddress")
+        testing.assertEqual(e.index[4].name, "quirkV1Addr")
+        testing.assertEqual(e.access_kw, "ACCESS")
+        testing.assertNone(e.description)
+
+
+def _test_index_quirks() -> None:
+    def obj(index: str) -> str:
+        return r"""
+q OBJECT-TYPE SYNTAX QEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "d"
+    """ + index + r"""
+    ::= { quirkObjects 7 1 }
+"""
+    testing.assertEqual(v2codes(obj(r"INDEX { a, b, }")), "L3 parse.trailing-comma")
+    testing.assertEqual(v2codes(obj(r"INDEX { a b }")), "L2 parse.missing-comma")
+    testing.assertEqual(v2codes(obj(r"INDEX { }")), "L2 parse.empty-list")
+    testing.assertEqual(v2codes(obj(r"INDEX { a } AUGMENTS { b }")), "L2 parse.index-and-augments")
+    testing.assertEqual(v2codes(obj(r"AUGMENTS { a, b }")), "L2 parse.augments-multiple")
+    testing.assertEqual(v2dump(obj(r"INDEX { IF-MIB.ifIndex, IMPLIED q }"), "q"), r"OBJECT-TYPE q syntax=QEntry max-access=not-accessible status=current index={IF-MIB.ifIndex, IMPLIED q} ::= {quirkObjects 7 1}")
+
+
+# --- syntax and subtyping ----------------------------------------------------------------------
+
+def scalar(syntax: str) -> str:
+    return r"""
+q OBJECT-TYPE
+    SYNTAX """ + syntax + r"""
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "d"
+    ::= { quirkObjects 5 }
+"""
+
+
+def syn(syntax: str) -> str:
+    """The dumped SYNTAX of a scalar with that SYNTAX clause, plus its diagnostic codes."""
+    r = parse(v2(scalar(syntax)))
+    d = r.modules[0].find("q")
+    s = "<none>"
+    if isinstance(d, mib.ast.ObjectType):
+        sx = d.syntax
+        if sx is not None:
+            s = sx.dump()
+    c = codes(r)
+    return s if c == "" else s + " / " + c
+
+
+def _test_syntax_forms() -> None:
+    testing.assertEqual(syn(r"INTEGER"), "INTEGER")
+    testing.assertEqual(syn(r"Integer32 (0..10 | 20 | 30..40)"), r"Integer32 (0..10 | 20 | 30..40)")
+    testing.assertEqual(syn(r"INTEGER (-2147483648..2147483647)"), r"INTEGER (-2147483648..2147483647)")
+    testing.assertEqual(syn(r"Unsigned32 (0..'ffffffff'h)"), r"Unsigned32 (0..'ffffffff'H)")
+    testing.assertEqual(syn(r"OCTET STRING (SIZE (0..255))"), r"OCTET STRING (SIZE (0..255))")
+    testing.assertEqual(syn(r"OCTET STRING (SIZE (4 | 16))"), r"OCTET STRING (SIZE (4 | 16))")
+    testing.assertEqual(syn(r"OBJECT IDENTIFIER"), "OBJECT IDENTIFIER")
+    testing.assertEqual(syn(r"INTEGER { up(1), down(2), unknown(-1), zero(0) }"), r"INTEGER {up(1), down(2), unknown(-1), zero(0)}")
+    testing.assertEqual(syn(r"BITS { a(0), b(1), c(144) }"), r"BITS {a(0), b(1), c(144)}")
+    testing.assertEqual(syn(r"BITS"), "BITS / L3 parse.bits-without-names")
+    testing.assertEqual(syn(r"RowStatus { active(1) }"), r"RowStatus {active(1)}")
+    testing.assertEqual(syn(r"DisplayString (SIZE (0..32))"), r"DisplayString (SIZE (0..32))")
+    testing.assertEqual(syn(r"SNMPv2-TC.DisplayString"), "SNMPv2-TC.DisplayString")
+    testing.assertEqual(syn(r"Counter64"), "Counter64")
+    testing.assertEqual(syn(r"INTEGER { link-up(1), link-down(2) }"), r"INTEGER {link-up(1), link-down(2)} / L5 parse.hyphen-in-label")
+    testing.assertEqual(syn(r"Integer32 (0..99999999999999999999)"), r"Integer32 / L1 parse.number-too-large")
+
+
+def _test_syntax_quirks() -> None:
+    testing.assertEqual(syn(r"INTEGER { up(1) down(2) }"), r"INTEGER {up(1), down(2)} / L2 parse.missing-comma")
+    testing.assertEqual(syn(r"INTEGER { up(1), down(2), }"), r"INTEGER {up(1), down(2)} / L3 parse.trailing-comma")
+    testing.assertEqual(syn(r"INTEGER { up(1),, down(2) }"), r"INTEGER {up(1), down(2)} / L3 parse.double-comma")
+    testing.assertEqual(syn(r"INTEGER { Up(1), down(2) }"), r"INTEGER {Up(1), down(2)} / L3 parse.label-case")
+    testing.assertEqual(syn(r"INTEGER { link_up(1) }"), r"INTEGER {link_up(1)} / L5 parse.underscore-in-identifier")
+    testing.assertEqual(syn(r"INTEGER { up('01'h) }"), r"INTEGER {up('01'H)} / L3 parse.enum-hex-value")
+    testing.assertEqual(syn(r"INTEGER { 10baseT(1), 9600(2) }"), r"INTEGER {10baseT(1), 9600(2)} / L2 parse.identifier-leading-digit, L2 parse.identifier-leading-digit")
+    testing.assertEqual(syn("INTEGER {{ \"no access\"(0) }}"), r"INTEGER {no access(0)} / L2 parse.label-quoted")
+    testing.assertEqual(syn(r"Integer32 { a(1) }"), r"INTEGER {a(1)} / L2 parse.enum-on-non-integer")
+    testing.assertEqual(syn(r"Integer32 (SIZE (0..255))"), r"Integer32 (0..255) / L2 parse.size-on-integer")
+    testing.assertEqual(syn(r"OCTET STRING (0..255)"), r"OCTET STRING (SIZE (0..255)) / L2 parse.range-on-string")
+    testing.assertEqual(syn(r"Integer32 (MIN..MAX)"), r"Integer32 (MIN..MAX) / L2 parse.range-min-max, L2 parse.range-min-max")
+    testing.assertEqual(syn(r"Integer32 (1..10, 20..30)"), r"Integer32 (1..10 | 20..30) / L2 parse.range-separator")
+    testing.assertEqual(syn(r"Integer32 (- 1..10)"), r"Integer32 (-1..10) / L5 parse.neg-number-space")
+    testing.assertEqual(syn(r"INTEGER { a(0), b(1) } (0..1)"), r"INTEGER {a(0), b(1)} (0..1) / L3 parse.enum-with-range")
+    testing.assertEqual(syn(r"BIT STRING"), "BITS / L2 parse.bit-string")
+    testing.assertEqual(syn(r"BITS { a(0), b(1), }"), r"BITS {a(0), b(1)} / L3 parse.trailing-comma")
+    testing.assertEqual(syn(r"displayString"), "displayString / L2 parse.bad-identifier-case")
+
+
+def _test_value_numbers() -> None:
+    r = parse(v2(scalar(r"Unsigned32 (0..'ff'h | '0101'b | 18446744073709551615)")))
+    d = r.modules[0].find("q")
+    if isinstance(d, mib.ast.ObjectType):
+        c = d.syntax?.constraint
+        if c is not None:
+            testing.assertEqual(c.ranges[0].hi?.int_value(), 255)
+            testing.assertEqual(c.ranges[1].lo.int_value(), 5)
+            testing.assertNone(c.ranges[2].lo.int_value())
+            testing.assertEqual(c.ranges[2].lo.big_value(), bigint(18446744073709551615))
+            testing.assertTrue(c.ranges[0].lo.is_number())
+            return
+    testing.error("no constraint")
+
+
+def _test_type_assignments_and_tcs() -> None:
+    body = r"""
+QuirkString ::= OCTET STRING (SIZE (4))
+QuirkTC ::= TEXTUAL-CONVENTION
+    DISPLAY-HINT "1x:"
+    STATUS       current
+    DESCRIPTION  "a TC"
+    REFERENCE    "ref"
+    SYNTAX       OCTET STRING (SIZE (6))
+QuirkNested ::= TEXTUAL-CONVENTION
+    STATUS       current
+    DESCRIPTION  "a TC of a TC"
+    SYNTAX       QuirkTC
+"""
+    r = parse(v2(body))
+    testing.assertEqual(codes(r), "L5 parse.type-assignment-smiv2")
+    testing.assertEqual(dump(r, "QuirkString"), r"TYPE QuirkString syntax=OCTET STRING (SIZE (4))")
+    testing.assertEqual(dump(r, "QuirkTC"), r"TEXTUAL-CONVENTION QuirkTC hint=" + "\"1x:\"" + r" status=current syntax=OCTET STRING (SIZE (6))")
+    testing.assertEqual(dump(r, "QuirkNested"), "TEXTUAL-CONVENTION QuirkNested status=current syntax=QuirkTC")
+    # out-of-order clauses (L3), missing STATUS (L2), lowercase type name (L2)
+    testing.assertEqual(v2codes(r"""
+QuirkTC2 ::= TEXTUAL-CONVENTION
+    STATUS       current
+    DISPLAY-HINT "1x:"
+    DESCRIPTION  "a TC"
+    SYNTAX       OCTET STRING
+"""), "L3 parse.clause-order")
+    testing.assertEqual(v2codes(r"""
+QuirkTC3 ::= TEXTUAL-CONVENTION
+    DESCRIPTION  "a TC"
+    SYNTAX       OCTET STRING
+"""), "L2 parse.clause-missing")
+    testing.assertEqual(v2codes(r"""
+quirkType ::= OCTET STRING
+"""), "L2 parse.bad-identifier-case, L5 parse.type-assignment-smiv2")
+
+
+def _test_sequence_quirks() -> None:
+    testing.assertEqual(v2codes(r"QuirkEntry ::= SEQUENCE { a Integer32, b DisplayString, }"), "L3 parse.trailing-comma")
+    testing.assertEqual(v2codes(r"QuirkEntry ::= SEQUENCE { a Integer32 b DisplayString }"), "L2 parse.missing-comma")
+    testing.assertEqual(v2codes(r"QuirkEntry ::= SEQUENCE { a Integer32 (1..100), b OCTET STRING (SIZE (0..4)) }"), "L5 parse.sequence-subtype, L5 parse.sequence-subtype")
+    testing.assertEqual(v2dump(r"QuirkEntry ::= SEQUENCE { a Integer32 (1..100), b BITS }", "QuirkEntry"), r"SEQUENCE QuirkEntry {a Integer32 (1..100), b BITS}")
+
+
+# --- DEFVAL ------------------------------------------------------------------------------------
+
+def defval(v: str) -> str:
+    body = r"""
+q OBJECT-TYPE
+    SYNTAX Integer32
+    MAX-ACCESS read-write
+    STATUS current
+    DESCRIPTION "d"
+    DEFVAL """ + v + r"""
+    ::= { quirkObjects 6 }
+"""
+    r = parse(v2(body))
+    d = r.modules[0].find("q")
+    s = "<none>"
+    if isinstance(d, mib.ast.ObjectType):
+        dv = d.defval
+        if dv is not None:
+            s = dv.value.dump() + " [" + dv.text + "]"
+    c = codes(r)
+    return s if c == "" else s + " / " + c
+
+
+def _test_defval_forms() -> None:
+    testing.assertEqual(defval(r"{ 5 }"), "5 [5]")
+    testing.assertEqual(defval(r"{ -5 }"), "-5 [-5]")
+    testing.assertEqual(defval(r"{ 'ff'h }"), "'ff'H ['ff'h]")
+    testing.assertEqual(defval(r"{ '00000101'B }"), "'00000101'B ['00000101'B]")
+    testing.assertEqual(defval("{{ \"text\" }}"), "\"text\" [\"text\"]")
+    testing.assertEqual(defval(r"{ enabled }"), "enabled [enabled]")
+    testing.assertEqual(defval(r"{ zeroDotZero }"), "zeroDotZero [zeroDotZero]")
+    testing.assertEqual(defval(r"{ { a, b } }"), r"{a b} [{ a, b }]")
+    testing.assertEqual(defval(r"{ { } }"), r"{} [{ }]")
+    testing.assertEqual(defval(r"{ { 0 0 } }"), r"{0 0} [{ 0 0 }]")
+    testing.assertEqual(defval(r"{ { quirkObjects 1 } }"), r"{quirkObjects 1} [{ quirkObjects 1 }]")
+    testing.assertEqual(defval(r"{ internet 'c0210415'h }") , "<none> / L1 parse.syntax")
+    testing.assertEqual(defval(r"{ { internet 'c0210415'h } }"), r"{internet 'c0210415'H} [{ internet 'c0210415'h }]")
+    testing.assertEqual(defval(r"{ { down } }"), r"{down} [{ down }]")
+    testing.assertEqual(defval(r"{ NULL }"), "NULL [NULL]")
+    testing.assertEqual(defval(r"{ 192.0.2.1 }"), "\"192.0.2.1\" [192.0.2.1] / L2 parse.defval-unquoted-ip")
+
+
+# --- notifications, traps, groups, compliance, capabilities ------------------------------------
+
+def _test_notification_type() -> None:
+    body = r"""
+quirkNotif NOTIFICATION-TYPE
+    OBJECTS { quirkIndex, quirkName }
+    STATUS current
+    DESCRIPTION "notif"
+    ::= { quirkMIB 0 1 }
+"""
+    r = parse(v2(body))
+    testing.assertEqual(codes(r), "")
+    testing.assertEqual(dump(r, "quirkNotif"), r"NOTIFICATION-TYPE quirkNotif objects={quirkIndex, quirkName} status=current ::= {quirkMIB 0 1}")
+    testing.assertEqual(v2codes(r"""
+quirkNotif NOTIFICATION-TYPE
+    OBJECTS { }
+    DESCRIPTION "notif"
+    ::= { quirkMIB 0 2 }
+"""), "L2 parse.empty-list, L2 parse.clause-missing")
+
+
+def _test_trap_type() -> None:
+    body = r"""
+quirkTrap TRAP-TYPE
+    ENTERPRISE quirkV1
+    VARIABLES { ifIndex, quirkV1Count }
+    DESCRIPTION "trap"
+    REFERENCE "ref"
+    ::= 7
+"""
+    r = parse(v1(body))
+    testing.assertEqual(codes(r), "")
+    testing.assertEqual(dump(r, "quirkTrap"), r"TRAP-TYPE quirkTrap enterprise={quirkV1} variables={ifIndex, quirkV1Count} number=7")
+    t = r.modules[0].find("quirkTrap")
+    if isinstance(t, mib.ast.TrapType):
+        testing.assertEqual(t.number, 7)
+        testing.assertFalse(t.enterprise_braced)
+        testing.assertNone(t.oid)
+    # braced ENTERPRISE (L3), STATUS in TRAP-TYPE (L3), uppercase TRAP-TYPE descriptor (L2)
+    testing.assertEqual(v1codes(r"""
+QuirkTrap TRAP-TYPE
+    ENTERPRISE { quirkV1 }
+    STATUS current
+    DESCRIPTION "trap"
+    ::= 8
+"""), "L2 parse.bad-identifier-case, L3 parse.trap-enterprise-braced, L3 parse.trap-status")
+    # TRAP-TYPE in an SMIv2 module: L4, once per module
+    testing.assertEqual(v2codes(r"""
+t1 TRAP-TYPE ENTERPRISE quirkMIB ::= 1
+t2 TRAP-TYPE ENTERPRISE quirkMIB ::= 2
+"""), "L4 parse.trap-in-smiv2")
+
+
+def _test_groups() -> None:
+    body = r"""
+quirkGroup OBJECT-GROUP
+    OBJECTS { quirkIndex, quirkName }
+    STATUS current
+    DESCRIPTION "group"
+    ::= { quirkMIB 2 1 }
+quirkNotifGroup NOTIFICATION-GROUP
+    NOTIFICATIONS { quirkNotif }
+    STATUS current
+    DESCRIPTION "notification group"
+    ::= { quirkMIB 2 2 }
+"""
+    r = parse(v2(body))
+    testing.assertEqual(codes(r), "")
+    testing.assertEqual(dump(r, "quirkGroup"), r"OBJECT-GROUP quirkGroup objects={quirkIndex, quirkName} status=current ::= {quirkMIB 2 1}")
+    testing.assertEqual(dump(r, "quirkNotifGroup"), r"NOTIFICATION-GROUP quirkNotifGroup notifications={quirkNotif} status=current ::= {quirkMIB 2 2}")
+    testing.assertEqual(v2codes(r"""
+g OBJECT-GROUP OBJECTS { a, b, } STATUS current DESCRIPTION "x" ::= { quirkMIB 2 3 }
+"""), "L3 parse.trailing-comma")
+
+
+def _test_module_compliance() -> None:
+    body = r"""
+quirkCompliance MODULE-COMPLIANCE
+    STATUS current
+    DESCRIPTION "compliance"
+    MODULE -- this module
+        MANDATORY-GROUPS { quirkGroup }
+        GROUP quirkNotifGroup
+        DESCRIPTION "optional"
+        OBJECT quirkName
+        SYNTAX DisplayString (SIZE (1..16))
+        WRITE-SYNTAX DisplayString (SIZE (1..8))
+        MIN-ACCESS read-only
+        DESCRIPTION "refined"
+    MODULE IF-MIB { mib-2 31 }
+        MANDATORY-GROUPS { ifGeneralInformationGroup }
+    MODULE SNMPv2-MIB
+    ::= { quirkMIB 3 1 }
+"""
+    r = parse(v2(body))
+    testing.assertEqual(codes(r), "")
+    testing.assertEqual(dump(r, "quirkCompliance"), r"MODULE-COMPLIANCE quirkCompliance status=current module(this mandatory={quirkGroup} group=quirkNotifGroup object=quirkName syntax=DisplayString (SIZE (1..16)) write-syntax=DisplayString (SIZE (1..8)) min-access=read-only) module(IF-MIB mandatory={ifGeneralInformationGroup}) module(SNMPv2-MIB) ::= {quirkMIB 3 1}")
+    d = r.modules[0].find("quirkCompliance")
+    if isinstance(d, mib.ast.ModuleCompliance):
+        testing.assertEqual(d.modules[1].oid?.dump(), r"{mib-2 31}")
+        testing.assertEqual(d.modules[0].groups[0].description?.value, "optional")
+        testing.assertEqual(d.modules[0].objects[0].description?.value, "refined")
+    else:
+        testing.error("not a ModuleCompliance")
+
+
+def _test_agent_capabilities() -> None:
+    body = r"""
+quirkAgent AGENT-CAPABILITIES
+    PRODUCT-RELEASE "1.0"
+    STATUS current
+    DESCRIPTION "agent"
+    SUPPORTS IF-MIB
+        INCLUDES { ifGeneralInformationGroup }
+        VARIATION ifAdminStatus
+            SYNTAX INTEGER { up(1), down(2) }
+            ACCESS read-only
+            DESCRIPTION "no testing"
+        VARIATION ifStackStatus
+            CREATION-REQUIRES { ifStackStatus }
+            DEFVAL { active }
+            DESCRIPTION "creation"
+    SUPPORTS QUIRK-MIB { quirkMIB }
+        INCLUDES { quirkGroup }
+    ::= { quirkMIB 4 1 }
+"""
+    r = parse(v2(body))
+    testing.assertEqual(codes(r), "")
+    testing.assertEqual(dump(r, "quirkAgent"), r"AGENT-CAPABILITIES quirkAgent release=" + "\"1.0\"" + r" status=current supports(IF-MIB includes={ifGeneralInformationGroup} variation=ifAdminStatus syntax=INTEGER {up(1), down(2)} access=read-only variation=ifStackStatus creation={ifStackStatus} defval=active) supports(QUIRK-MIB includes={quirkGroup}) ::= {quirkMIB 4 1}")
+    testing.assertEqual(v2codes(r"""
+a AGENT-CAPABILITIES PRODUCT-RELEASE "1" STATUS current DESCRIPTION "d"
+    SUPPORTS IF-MIB INCLUDES { g }
+        VARIATION x CREATION-REQUIRES { } DESCRIPTION "d"
+    ::= { quirkMIB 4 2 }
+"""), "L4 parse.creation-requires-empty")
+
+
+# --- IMPORTS quirks ------------------------------------------------------------------------------
+
+def imp(imports: str) -> mib.parser.ParseResult:
+    return parse(r"""I-MIB DEFINITIONS ::= BEGIN
+""" + imports + r"""
+iMIB MODULE-IDENTITY LAST-UPDATED "202001010000Z" ORGANIZATION "o" CONTACT-INFO "c" DESCRIPTION "d" ::= { enterprises 1 }
+END""")
+
+
+def _test_imports_quirks() -> None:
+    testing.assertEqual(codes(imp(r"IMPORTS MODULE-IDENTITY, enterprises, FROM SNMPv2-SMI;")), "L3 parse.imports-trailing-comma")
+    testing.assertEqual(codes(imp(r"IMPORTS MODULE-IDENTITY enterprises FROM SNMPv2-SMI;")), "L2 parse.imports-missing-comma")
+    testing.assertEqual(codes(imp(r"IMPORTS MODULE-IDENTITY, enterprises FROM SNMPv2-SMI")), "L2 parse.imports-missing-semicolon")
+    testing.assertEqual(codes(imp(r"IMPORTS MODULE-IDENTITY, enterprises, INTEGER, OCTET STRING, BITS FROM SNMPv2-SMI;")), "L5 parse.imports-builtin, L5 parse.imports-builtin, L5 parse.imports-builtin")
+    testing.assertEqual(codes(imp(r"IMPORTS MODULE-IDENTITY, enterprises FROM SNMPv2-SMI { iso 3 6 1 6 3 1 };")), "L5 parse.imports-module-oid")
+    testing.assertEqual(codes(imp(r"IMPORTS MODULE-IDENTITY FROM SNMPv2-SMI; enterprises FROM RFC1155-SMI;")), "L2 parse.imports-extra-semicolon")
+    testing.assertEqual(codes(imp(r"IMPORTS MODULE-IDENTITY, enterprises FROM snmpv2-smi;")), "L2 parse.module-name-case")
+    testing.assertEqual(codes(imp(r"IMPORTS MODULE-IDENTITY,, enterprises FROM SNMPv2-SMI;")), "L3 parse.double-comma")
+    r = imp(r"IMPORTS MODULE-IDENTITY, enterprises FROM SNMPv2-SMI DisplayString FROM SNMPv2-TC DisplayString FROM RFC1213-MIB;")
+    testing.assertEqual(codes(r), "")
+    testing.assertEqual([g.module for g in r.modules[0].imports], ["SNMPv2-SMI", "SNMPv2-TC", "RFC1213-MIB"])
+    testing.assertEqual(r.modules[0].imported_symbols()["DisplayString"], "SNMPv2-TC")
+    # IMPORTS after a declaration
+    r2 = parse(r"""J-MIB DEFINITIONS ::= BEGIN
+j OBJECT IDENTIFIER ::= { iso 3 }
+IMPORTS enterprises FROM SNMPv2-SMI;
+END""")
+    testing.assertEqual(codes(r2), "L3 parse.imports-not-first")
+
+
+# --- identifiers -------------------------------------------------------------------------------
+
+def _test_identifier_quirks() -> None:
+    testing.assertEqual(v2codes(r"QuirkObj OBJECT IDENTIFIER ::= { quirkObjects 9 }"), "L2 parse.bad-identifier-case")
+    testing.assertEqual(v2codes(r"quirk_obj OBJECT IDENTIFIER ::= { quirkObjects 9 }"), "L5 parse.underscore-in-identifier")
+    testing.assertEqual(v2codes(r"quirkObj- OBJECT IDENTIFIER ::= { quirkObjects 9 }"), "L2 parse.identifier-trailing-hyphen")
+    testing.assertEqual(v2codes(r"3comObj OBJECT IDENTIFIER ::= { quirkObjects 9 }"), "L2 parse.identifier-leading-digit")
+    testing.assertEqual(v2codes(r"quirkObjWithAVeryLongNameThatGoesOnAndOnAndOnAndOnAndOnBeyondSixtyFour OBJECT IDENTIFIER ::= { quirkObjects 9 }"), "L3 parse.identifier-too-long")
+    testing.assertEqual(v2codes(r"quirk-obj OBJECT IDENTIFIER ::= { quirkObjects 9 }"), "")
+    r = parse(v2(r"""QuirkObj OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current DESCRIPTION "x" ::= { quirkObjects 9 }"""))
+    testing.assertEqual(names(r)[-1], "QuirkObj")
+
+
+# --- clauses and module-level checks ----------------------------------------------------------
+
+def _test_clause_quirks() -> None:
+    testing.assertEqual(v2codes(r"""
+q OBJECT-TYPE SYNTAX Integer32 STATUS current MAX-ACCESS read-only DESCRIPTION "d" ::= { quirkObjects 9 }
+"""), "L3 parse.clause-order")
+    testing.assertEqual(v2codes(r"""
+q OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current STATUS deprecated DESCRIPTION "d" ::= { quirkObjects 9 }
+"""), "L2 parse.clause-duplicate")
+    testing.assertEqual(v2dump(r"""
+q OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current STATUS deprecated DESCRIPTION "d" ::= { quirkObjects 9 }
+""", "q"), r"OBJECT-TYPE q syntax=Integer32 max-access=read-only status=current ::= {quirkObjects 9}")
+    testing.assertEqual(v2codes(r"""
+q OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current DESCRIPTION "d" PRODUCT-RELEASE "x" ::= { quirkObjects 9 }
+"""), "L2 parse.clause-unexpected")
+    testing.assertEqual(v2codes(r"""
+q OBJECT-TYPE MAX-ACCESS read-only STATUS current DESCRIPTION "d" ::= { quirkObjects 9 }
+"""), "L2 parse.clause-missing")
+    testing.assertEqual(v2codes(r"""
+q OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only ACCESS read-write STATUS current DESCRIPTION "d" ::= { quirkObjects 9 }
+"""), "L2 parse.clause-duplicate")
+    testing.assertEqual(v2codes(r"""
+q OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current ::= { quirkObjects 9 }
+"""), "L3 parse.description-missing")
+    testing.assertEqual(v2codes(r"""
+q OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current DESCRIPTION ::= { quirkObjects 9 }
+"""), "L2 parse.string-expected")
+
+
+def _test_module_level_checks() -> None:
+    # SMIv2 module without MODULE-IDENTITY
+    r = parse(r"""N-MIB DEFINITIONS ::= BEGIN
+IMPORTS OBJECT-TYPE, Integer32, enterprises FROM SNMPv2-SMI;
+n OBJECT IDENTIFIER ::= { enterprises 5 }
+END""")
+    testing.assertEqual(codes(r), "L3 parse.module-identity-missing")
+    # MODULE-IDENTITY not first, and a second one
+    r2 = parse(r"""N-MIB DEFINITIONS ::= BEGIN
+IMPORTS MODULE-IDENTITY, enterprises FROM SNMPv2-SMI;
+n OBJECT IDENTIFIER ::= { enterprises 5 }
+nMIB MODULE-IDENTITY LAST-UPDATED "202001010000Z" ORGANIZATION "o" CONTACT-INFO "c" DESCRIPTION "d" ::= { n 1 }
+nMIB2 MODULE-IDENTITY LAST-UPDATED "202001010000Z" ORGANIZATION "o" CONTACT-INFO "c" DESCRIPTION "d" ::= { n 2 }
+END""")
+    testing.assertEqual(codes(r2), "L5 parse.module-identity-not-first, L2 parse.module-identity-multiple")
+    # ACCESS in SMIv2, MAX-ACCESS in SMIv1, and a mix: one diagnostic per module
+    acc = r"q1 OBJECT-TYPE SYNTAX Integer32 ACCESS read-only STATUS current DESCRIPTION " + "\"d\"" + r" ::= { quirkObjects 1 }" + "\n" + r"q2 OBJECT-TYPE SYNTAX Integer32 ACCESS read-only STATUS current DESCRIPTION " + "\"d\"" + r" ::= { quirkObjects 2 }"
+    testing.assertEqual(v2codes(acc), "L5 parse.access-in-smiv2")
+    mx = r"q1 OBJECT-TYPE SYNTAX Counter MAX-ACCESS read-only STATUS mandatory ::= { quirkV1 1 }"
+    testing.assertEqual(v1codes(mx), "L5 parse.max-access-in-smiv1")
+    testing.assertEqual(v2codes(acc + "\n" + scalar("Integer32")), "L3 parse.smi-mix")
+
+
+def _test_strings_in_clauses() -> None:
+    data = (V2_HEAD + r"""
+q OBJECT-IDENTITY STATUS current DESCRIPTION "smart """).encode() + b"\x93quotes\x94 and caf\xc3\xa9\"" + r"""
+    ::= { quirkObjects 9 }""".encode() + TAIL.encode()
+    r = mib.parser.parse_bytes(data, "q.mib")
+    testing.assertEqual(codes(r), "L5 lex.string-non-ascii")
+    d = r.modules[0].find("q")
+    testing.assertEqual(d?.description?.value, "smart " + chr(0x201c) + "quotes" + chr(0x201d) + " and caf" + chr(0xe9))
+    testing.assertTrue("CP1252" in r.diags[0].message)
+    # escaped quote (X.680) and multi-line text with dedent
+    r2 = parse(v2(r"""
+q OBJECT-IDENTITY STATUS current DESCRIPTION "say ""hi""
+       second line" ::= { quirkObjects 9 }"""))
+    testing.assertEqual(codes(r2), "L2 lex.escaped-quote")
+    d2 = r2.modules[0].find("q")
+    testing.assertEqual(d2?.description?.value, "say \"hi\"\n       second line")
+    testing.assertEqual(d2?.description?.dedented(), "say \"hi\"\nsecond line")
+
+
+# --- recovery ----------------------------------------------------------------------------------
+
+def _test_recovery_per_declaration() -> None:
+    body = r"""
+a OBJECT IDENTIFIER ::= { quirkObjects 1 }
+b OBJECT-TYPE SYNTAX Integer32 (0..10 MAX-ACCESS read-only STATUS current DESCRIPTION "d" ::= { a 1 }
+c OBJECT IDENTIFIER ::= { quirkObjects 2 }
+d OBJECT IDENTIFIER ::= { quirkObjects @ 3 }
+quirkType ::= OCTET STRING
+e OBJECT IDENTIFIER ::= { quirkObjects 4 }
+"""
+    r = parse(v2(body))
+    testing.assertEqual(names(r), ["quirkMIB", "quirkObjects", "a", "c", "quirkType", "e"])
+    testing.assertEqual(codes(r), "L1 parse.syntax, L1 parse.syntax, L2 parse.bad-identifier-case, L5 parse.type-assignment-smiv2")
+    testing.assertEqual([str(d.line) + ":" + str(d.col) for d in r.diags], ["19:39", "21:40", "22:1", "22:1"])
+    testing.assertEqual(r.diags[0].message, "expected ')' to close the range, got 'MAX-ACCESS'; declaration skipped")
+    testing.assertEqual(r.diags[0].module, "QUIRK-MIB")
+
+
+def _test_recovery_unclosed_brace() -> None:
+    # the broken declaration runs into the next one; resync starts after the broken start
+    r = parse(v2(r"""
+a OBJECT IDENTIFIER ::= { quirkObjects 1
+b OBJECT IDENTIFIER ::= { quirkObjects 2 }
+"""))
+    testing.assertEqual(names(r), ["quirkMIB", "quirkObjects", "b"])
+    testing.assertEqual(codes(r), "L1 parse.syntax")
+
+
+def _test_missing_keywords() -> None:
+    r = parse(v2(r"""
+qMissing
+    SYNTAX Counter32 MAX-ACCESS read-only STATUS current DESCRIPTION "d" ::= { quirkObjects 1 }
+qGluedOBJECT-TYPE
+    SYNTAX Counter32 MAX-ACCESS read-only STATUS current DESCRIPTION "d" ::= { quirkObjects 2 }
+QEntry SEQUENCE { a Integer32 }
+"""))
+    testing.assertEqual(codes(r), "L2 parse.macro-missing, L2 parse.macro-missing, L2 parse.assign-missing")
+    testing.assertEqual(names(r), ["quirkMIB", "quirkObjects", "qMissing", "qGlued", "QEntry"])
+    testing.assertEqual(dump(r, "qGlued"), r"OBJECT-TYPE qGlued syntax=Counter32 max-access=read-only status=current ::= {quirkObjects 2}")
+
+
+def _test_recovery_resync_on_shape() -> None:
+    # 'index', 'status' or 'access' as descriptors never break the parse; a bad declaration
+    # does not swallow a following lowercase type assignment (judged by the token after ::=)
+    body = r"""
+index OBJECT IDENTIFIER ::= { quirkObjects 1 }
+status OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current DESCRIPTION "d" ::= { index 1 }
+broken OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current DESCRIPTION "d" ::= { index ! }
+access ::= INTEGER
+after OBJECT IDENTIFIER ::= { quirkObjects 3 }
+"""
+    r = parse(v2(body))
+    testing.assertEqual(names(r), ["quirkMIB", "quirkObjects", "index", "status", "access", "after"])
+    testing.assertEqual(codes(r), "L1 parse.syntax, L2 parse.bad-identifier-case, L5 parse.type-assignment-smiv2")
+
+
+def _test_recovery_unterminated_string() -> None:
+    # one stray quote does not swallow the rest of the module
+    r = parse(v2(r"""
+a OBJECT IDENTIFIER ::= { quirkObjects 1 }
+b OBJECT IDENTIFIER ::= { quirkObjects "2 }
+c OBJECT IDENTIFIER ::= { quirkObjects 3 }
+"""))
+    testing.assertEqual(names(r), ["quirkMIB", "quirkObjects", "a", "c"])
+    testing.assertEqual(codes(r), "L2 lex.unterminated-string, L1 parse.syntax")
+    testing.assertTrue(r.modules[0].has_end)
+    # a stray quote after END
+    r2 = parse(v2("") + "\"stray quote\n")
+    testing.assertEqual(codes(r2), "L2 lex.unterminated-string, L2 parse.junk")
+
+
+def _test_recovery_page_header_and_stray_tokens() -> None:
+    body = r"""
+q OBJECT-TYPE
+    SYNTAX INTEGER {
+        mplsLabel(1),
+
+Nadeau, et al.                                     [Page 5 ]
+draft-ietf-ccamp-gmpls-tc-mib-00.txt               June 2002
+
+        portWavelengthLabel(2)
+    }
+    MAX-ACCESS read-only STATUS current DESCRIPTION "d"
+    ::= { quirkObjects 1 } ;
+foo INTEGER ::= 5
+"""
+    r = parse(v2(body))
+    testing.assertEqual(codes(r), "L2 lex.page-header, L2 lex.page-header, L5 parse.stray-semicolon, L2 parse.non-smi-assignment")
+    testing.assertEqual(r.diags[0].module, "QUIRK-MIB")
+    testing.assertEqual(dump(r, "q"), r"OBJECT-TYPE q syntax=INTEGER {mplsLabel(1), portWavelengthLabel(2)} max-access=read-only status=current ::= {quirkObjects 1}")
+
+
+def _test_rfc_comments_option() -> None:
+    src = v2(r"""
+q OBJECT IDENTIFIER ::= { quirkObjects 1 } -- note -- r OBJECT IDENTIFIER ::= { quirkObjects 2 }
+""")
+    testing.assertEqual(names(parse(src)), ["quirkMIB", "quirkObjects", "q"])
+    r = mib.parser.parse_text(src, "q.mib", True)
+    testing.assertEqual(names(r), ["quirkMIB", "quirkObjects", "q", "r"])
+    testing.assertEqual(codes(r), "")
+
+
+def _test_max_level_and_hash() -> None:
+    src = v2(r"q OBJECT IDENTIFIER ::= { quirkObjects 01 }")
+    r = mib.parser.parse_bytes(src.encode(), "q.mib", False, 4)
+    testing.assertEqual(codes(r), "")
+    testing.assertEqual(r.modules[0].sha256, "")
+    r2 = mib.parser.parse_bytes(src.encode(), "q.mib", False, 6, True)
+    testing.assertEqual(r2.modules[0].sha256, mib.source.sha256_hex(src.encode()))
+    testing.assertEqual(r2.count(5), 1)
+    testing.assertEqual(len(r2.errors()), 0)
+    testing.assertEqual(r2.module("QUIRK-MIB")?.name, "QUIRK-MIB")
+
+
+def _test_resolver_quirks_pass_the_parser() -> None:
+    # quirks that only the resolver can judge must not upset the parser: base types and macros
+    # used without import, DisplayString from RFC1213-MIB, mixed SMIv1/SMIv2 imports,
+    # duplicate descriptors, STATUS mandatory in SMIv2, write-only, zero in an SMIv1-style
+    # enumeration, forward references and Counter in SMIv2
+    src = r"""MIX-MIB DEFINITIONS ::= BEGIN
+IMPORTS
+    MODULE-IDENTITY, OBJECT-TYPE, enterprises FROM SNMPv2-SMI
+    Counter FROM RFC1155-SMI
+    DisplayString FROM RFC1213-MIB;
+mixMIB MODULE-IDENTITY LAST-UPDATED "200801010000Z" ORGANIZATION "o" CONTACT-INFO "c" DESCRIPTION "d"
+    ::= { enterprises 4 }
+mixA OBJECT-TYPE SYNTAX Counter32 MAX-ACCESS read-only STATUS mandatory DESCRIPTION "d" ::= { mixObjects 1 }
+mixA OBJECT-TYPE SYNTAX Gauge32 MAX-ACCESS write-only STATUS current DESCRIPTION "d" ::= { mixObjects 2 }
+mixB OBJECT-TYPE SYNTAX INTEGER { zero(0), one(1) } MAX-ACCESS read-only STATUS current DESCRIPTION "d" ::= { mixObjects 3 }
+mixC OBJECT-TYPE SYNTAX Counter MAX-ACCESS read-only STATUS current DESCRIPTION "d" ::= { mixObjects 4 }
+mixN NOTIFICATION-TYPE OBJECTS { mixA } STATUS current DESCRIPTION "d" ::= { mixMIB 0 1 }
+MixT ::= TEXTUAL-CONVENTION STATUS current DESCRIPTION "d" SYNTAX TruthValue
+mixObjects OBJECT IDENTIFIER ::= { mixMIB 1 }
+END"""
+    r = parse(src)
+    testing.assertEqual(codes(r), "")
+    testing.assertEqual(names(r), ["mixMIB", "mixA", "mixA", "mixB", "mixC", "mixN", "MixT", "mixObjects"])
+    testing.assertEqual(r.modules[0].defs_by_name()["mixA"].line, 8)
+
+
+def _lcg(x: int) -> int:
+    return (x * 1103515245 + 12345) & 0x7fffffff
+
+
+def _test_fuzz_never_raises(t: testing.SyncT) -> None:
+    """Mutated and truncated inputs: the parser never raises and never reports an internal error."""
+    t.timeout(120.0)
+    base = v2(TABLE).encode()
+    alphabet = b"{}()[],;:.-'\"\n\r\x1a\x80\xa0aZ09 |"
+    x = 12345
+    for it in range(150):
+        data = base
+        for m in range(3):
+            x = _lcg(x)
+            pos = x % len(data)
+            x = _lcg(x)
+            op = x % 3
+            x = _lcg(x)
+            c = alphabet[x % len(alphabet)]
+            if op == 0:
+                data = data[:pos] + bytes([c]) + data[pos + 1:]
+            elif op == 1:
+                data = data[:pos] + data[pos + (x % 40):]
+            else:
+                data = data[:pos] + bytes([c, c]) + data[pos:]
+        r = mib.parser.parse_bytes(data, "fuzz.mib")
+        for d in r.diags:
+            testing.assertTrue(d.level > 0, str(d))
+    tc = mib.source.base_module_bytes("SNMPv2-TC")
+    step = len(tc) // 40
+    for k in range(1, 41):
+        r = mib.parser.parse_bytes(tc[:k * step], "cut.mib")
+        testing.assertEqual(len(r.modules), 1)
+    deep = "{{" * 5000
+    r2 = parse(v2(r"q OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current DESCRIPTION " + "\"d\" DEFVAL " + deep + r" ::= { quirkObjects 1 }"))
+    testing.assertEqual(names(r2), ["quirkMIB", "quirkObjects"])
+
+
+# --- files, golden set, corpus, performance --------------------------------------------------
+
+actor _test_parse_file(t: testing.EnvT):
+    t.timeout(30.0)
+    fc = file.FileCap(t.env.cap)
+    r = mib.parser.parse_file(fc, GOLDEN_DIR + "/IF-MIB")
+    testing.assertEqual(len(r.modules), 1)
+    testing.assertEqual(r.modules[0].name, "IF-MIB")
+    testing.assertEqual(r.modules[0].sha256, "a41d2d0414bd6e1b3249257d0d035ea11554624c525b830f6910195b72b0c297")
+    testing.assertEqual(r.modules[0].file, GOLDEN_DIR + "/IF-MIB")
+    testing.assertEqual(len(r.modules[0].defs), 99)
+    testing.assertEqual(codes(r), "")
+    r2 = mib.parser.parse_file(fc, "/nonexistent/NO-MIB")
+    testing.assertEqual(len(r2.modules), 0)
+    testing.assertEqual(codes(r2), "L2 source.unreadable")
+    # through the content index, including a built-in base module
+    mp = mib.source.MibPath([GOLDEN_DIR])
+    mib.source.index_path(mp, fc, mib.diag.Diagnostics(""))
+    e = mp.find("BRIDGE-MIB")
+    if e is not None:
+        r3 = mib.parser.parse_entry(fc, e)
+        testing.assertEqual(r3.module("BRIDGE-MIB")?.sha256, e.sha256)
+    else:
+        testing.error("BRIDGE-MIB not indexed")
+    b = mp.find("SNMPv2-TC")
+    if b is not None:
+        r4 = mib.parser.parse_entry(fc, b)
+        testing.assertEqual(r4.module("SNMPv2-TC")?.file, "<builtin>/SNMPv2-TC")
+        testing.assertEqual(codes(r4), "")
+    t.success()
+
+
+# Level-1/2 diagnostics expected on the golden set: only modules where smilint also reports
+# level-1/2 problems (interop/mibs/golden/expected/smilint). GMPLS-TC-MIB has draft page
+# footers inside an enumeration and the date 200224060900Z twice (smilint: date-month at the
+# same lines 15 and 73), SNMPv2-PDU is an ASN.1 protocol module (not SMI), and
+# TCPIPX-MIB has commas missing in two SEQUENCEs (and a trailing one, level 3).
+GOLDEN_ERRORS: dict[str, str] = {
+    "GMPLS-TC-MIB": "lex.page-header, lex.page-header, parse.date-invalid, parse.date-invalid",
+    "SNMPv2-PDU": "parse.non-smi-assignment, parse.range-symbolic, parse.range-symbolic, parse.range-symbolic, parse.syntax, parse.syntax",
+    "TCPIPX-MIB": "parse.missing-comma, parse.missing-comma",
+}
+
+
+actor _test_golden_set(t: testing.EnvT):
+    """Every golden module parses; level-1/2 diagnostics only where smilint reports errors too."""
+    t.timeout(120.0)
+    fc = file.FileCap(t.env.cap)
+    fs = file.FS(fc)
+    files = sorted(fs.listdir(GOLDEN_DIR))
+    testing.assertTrue(len(files) >= 44)
+    nmods = 0
+    ndefs = 0
+    for nm in files:
+        r = mib.parser.parse_file(fc, GOLDEN_DIR + "/" + nm)
+        testing.assertEqual([m.name for m in r.modules], [nm], nm)
+        m = r.modules[0]
+        testing.assertTrue(m.has_end, nm)
+        nmods += 1
+        ndefs += len(m.defs)
+        errs = ", ".join([d.code for d in r.diags if d.level <= 2])
+        testing.assertEqual(errs, GOLDEN_ERRORS.get_def(nm, ""), nm)
+        for d in r.diags:
+            testing.assertTrue(d.level > 0, "internal diagnostic in " + nm + ": " + str(d))
+            testing.assertEqual(d.module, nm, str(d))
+    testing.assertEqual(nmods, len(files))
+    if len(files) == 44:
+        testing.assertEqual(ndefs, 3343)
+    t.success()
+
+
+actor _test_corpus_sweep(t: testing.EnvT):
+    """Parse every module of the corpus (13,976 files; run with --tag mibcorpus, preferably
+    --fast). Gate: no internal diagnostics and syntax errors in at most 1% of the modules."""
+    t.require("mibcorpus")
+    t.timeout(1800.0)
+    fc = file.FileCap(t.env.cap)
+    fs = file.FS(fc)
+    files = sorted(fs.listdir(CORPUS_DIR))
+    nbytes = 0
+    nmods = 0
+    ndefs = 0
+    nsyntax = 0
+    bad_files = 0
+    by_level = [0, 0, 0, 0, 0, 0, 0]
+    t0 = time.monotonic_ns()
+    for nm in files:
+        r = mib.parser.parse_file(fc, CORPUS_DIR + "/" + nm, False, 6, False)
+        nmods += len(r.modules)
+        for m in r.modules:
+            ndefs += len(m.defs)
+        has_syntax = False
+        for d in r.diags:
+            by_level[d.level] += 1
+            if d.code == "parse.syntax":
+                nsyntax += 1
+                has_syntax = True
+        if has_syntax:
+            bad_files += 1
+    t1 = time.monotonic_ns()
+    print("corpus: files=" + str(len(files)) + " modules=" + str(nmods) + " defs=" + str(ndefs) +
+          " syntax-errors=" + str(nsyntax) + " in " + str(bad_files) + " files; levels " + str(by_level) +
+          "; " + str((t1 - t0) // 1000000) + " ms", err=True)
+    testing.assertEqual(by_level[0], 0)
+    testing.assertTrue(len(files) > 13000)
+    testing.assertTrue(bad_files * 100 <= len(files))
+    t.success()
+
+
+def synthetic_mib(nobj: int) -> bytes:
+    """A large, valid SMIv2 module: one table with `nobj` columns (each about 450 bytes)."""
+    parts: list[str] = [v2("").replace("\nEND\n", "\n")]
+    for i in range(nobj):
+        n = str(i + 1)
+        parts.append("quirkCol" + n + r""" OBJECT-TYPE
+    SYNTAX      INTEGER { enabled(1), disabled(2), testing(3), unknown(-1) }
+    MAX-ACCESS  read-create
+    STATUS      current
+    DESCRIPTION
+        "A generated column used for the parser performance test. It has a
+        reasonably long description, as real vendor MIBs do, spanning a few
+        lines of text so that string scanning is part of the measurement."
+    REFERENCE   "RFC 2578, section 7"
+    DEFVAL      { enabled }
+    ::= { quirkEntry """ + n + " }}\n")
+    parts.append("END\n")
+    return "".join(parts).encode()
+
+
+def _test_perf_parse_large_mib(t: testing.SyncT):
+    """`acton test perf --module mib.test_parser --name perf_parse_large_mib`: lex and parse a
+    generated 2 MB module (reports time per invocation; divide 2.0 MB by it for MB/s)."""
+    data = synthetic_mib(4000)
+    n = 0
+    for scale in t.loop():
+        for i in range(scale):
+            r = mib.parser.parse_bytes(data, "perf.mib")
+            n = len(r.modules[0].defs)
+    testing.assertEqual(n, 4002)
+    testing.assertTrue(len(data) > 1900000)

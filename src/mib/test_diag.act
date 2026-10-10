@@ -1,0 +1,80 @@
+"""Tests for mib.diag"""
+
+import testing
+import mib.diag
+
+
+def _test_diagnostic_format() -> None:
+    d = mib.diag.Diagnostic(2, "parse.missing-comma", "Q-MIB", "q.mib", 12, 5, "missing comma in enumeration list")
+    testing.assertEqual(str(d), r"q.mib:12:5: [2] {parse.missing-comma} missing comma in enumeration list")
+    testing.assertEqual(d.where(), "q.mib:12:5")
+    testing.assertEqual(d.severity(), "error")
+    testing.assertEqual(mib.diag.severity_name(0), "internal")
+    testing.assertEqual(mib.diag.severity_name(1), "error")
+    testing.assertEqual(mib.diag.severity_name(3), "warning")
+    testing.assertEqual(mib.diag.severity_name(4), "warning")
+    testing.assertEqual(mib.diag.severity_name(5), "info")
+    testing.assertEqual(mib.diag.severity_name(6), "info")
+
+
+def _test_catalog_is_consistent() -> None:
+    n = 0
+    for code, e in mib.diag.CATALOG.items():
+        n += 1
+        if code == "internal":
+            testing.assertEqual(e.0, 0)
+            continue
+        testing.assertTrue(e.0 >= 1 and e.0 <= 6, "level of " + code)
+        testing.assertTrue(code.startswith("lex.") or code.startswith("parse.") or code.startswith("source."), "prefix of " + code)
+        testing.assertTrue(len(e.2) > 0, "description of " + code)
+    testing.assertTrue(n > 50)
+    testing.assertEqual(mib.diag.level_of("parse.syntax"), 1)
+    testing.assertEqual(mib.diag.level_of("parse.trailing-comma"), 3)
+    testing.assertEqual(mib.diag.level_of("no.such-code"), 0)
+    testing.assertTrue(mib.diag.known_code("parse.syntax"))
+    testing.assertFalse(mib.diag.known_code("parse.nonsense"))
+
+
+def _test_collector_levels() -> None:
+    c = mib.diag.Diagnostics("f.mib")
+    c.module = "F-MIB"
+    c.report("parse.trailing-comma", 3, 4, "trailing comma")
+    c.report("parse.syntax", 1, 1, "unterminated")
+    c.report("parse.stray-semicolon", 9, 1, "stray")
+    testing.assertEqual(len(c.items), 3)
+    testing.assertEqual(c.items[0].level, 3)
+    testing.assertEqual(c.items[0].module, "F-MIB")
+    testing.assertEqual(c.items[0].file, "f.mib")
+    testing.assertEqual(c.count(2), 1)
+    testing.assertEqual(c.count(), 3)
+    testing.assertTrue(c.has_errors())
+    testing.assertEqual([d.code for d in c.errors()], ["parse.syntax"])
+    testing.assertEqual(c.codes(), ["parse.trailing-comma", "parse.syntax", "parse.stray-semicolon"])
+    testing.assertEqual([d.line for d in c.ordered()], [1, 3, 9])
+    testing.assertEqual(c.format(), r"f.mib:1:1: [1] {parse.syntax} unterminated" + "\n" + r"f.mib:3:4: [3] {parse.trailing-comma} trailing comma" + "\n" + r"f.mib:9:1: [5] {parse.stray-semicolon} stray")
+
+
+def _test_collector_policy() -> None:
+    c = mib.diag.Diagnostics("f.mib", 4)
+    c.report("parse.stray-semicolon", 1, 1, "level 5: suppressed")
+    testing.assertEqual(len(c.items), 0)
+    testing.assertEqual(c.suppressed, 1)
+    c.set_level("parse.stray-semicolon", 2)
+    c.report("parse.stray-semicolon", 1, 1, "now an error")
+    testing.assertEqual(c.items[0].level, 2)
+    testing.assertFalse(c.has_errors() and c.items[0].level != 2)
+    # unknown codes are kept as internal errors, whatever the policy
+    c.report("parse.bogus", 7, 3, "x")
+    testing.assertEqual(c.items[1].level, 0)
+    testing.assertEqual(c.items[1].code, "internal")
+    testing.assertTrue("parse.bogus" in c.items[1].message)
+    c.add(mib.diag.Diagnostic(6, "source.alias", "", "f.mib", 1, 1, "info dropped by max_level"))
+    testing.assertEqual(c.suppressed, 2)
+
+
+def _test_summary() -> None:
+    ds = [mib.diag.Diagnostic(3, "parse.trailing-comma", "", "f", 1, 1, ""),
+          mib.diag.Diagnostic(2, "parse.missing-comma", "", "f", 2, 1, ""),
+          mib.diag.Diagnostic(3, "parse.trailing-comma", "", "f", 3, 1, "")]
+    testing.assertEqual(mib.diag.summary(ds), "parse.missing-comma x1\nparse.trailing-comma x2")
+    testing.assertEqual(mib.diag.format_all(ds[:1]), r"f:1:1: [3] {parse.trailing-comma} ")

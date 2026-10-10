@@ -1,0 +1,240 @@
+"""Tests for mib.source"""
+
+import file
+import testing
+import mib.diag
+import mib.source
+
+GOLDEN_DIR = "interop/mibs/golden/mibs"
+
+
+# --- decoding -----------------------------------------------------------------------------------
+
+def _test_decode_lenient() -> None:
+    e_acute = chr(0xe9)
+    testing.assertEqual(mib.source.decode_lenient(b"plain"), "plain")
+    testing.assertEqual(mib.source.decode_lenient(b"caf\xc3\xa9"), "caf" + e_acute)
+    # invalid UTF-8: CP1252, here identical to Latin-1
+    testing.assertEqual(mib.source.decode_lenient(b"caf\xe9"), "caf" + e_acute)
+    # Word smart quotes and dashes (0x80..0x9F) map through CP1252, not to C1 controls
+    testing.assertEqual(mib.source.decode_lenient(b"\x93quoted\x94 \x96 \x80"), chr(0x201c) + "quoted" + chr(0x201d) + " " + chr(0x2013) + " " + chr(0x20ac))
+    # the five undefined CP1252 slots fall back to Latin-1
+    testing.assertEqual(mib.source.decode_lenient(b"\x81\x8d\x8f\x90\x9d"), chr(0x81) + chr(0x8d) + chr(0x8f) + chr(0x90) + chr(0x9d))
+    # valid sequences survive next to invalid bytes
+    testing.assertEqual(mib.source.decode_lenient(b"\xc3\xa9\xe9 \xe2\x80\x9cx\xe2\x80\x9d"), e_acute + e_acute + " " + chr(0x201c) + "x" + chr(0x201d))
+    # truncated sequence at the end
+    testing.assertEqual(mib.source.decode_lenient(b"a\xc3"), "a" + chr(0xc3))
+    testing.assertEqual(mib.source.cp1252_char(0x92), chr(0x2019))
+    testing.assertEqual(mib.source.cp1252_char(0x41), "A")
+
+
+def _test_encoding_predicates() -> None:
+    testing.assertTrue(mib.source.is_ascii(b"abc"))
+    testing.assertFalse(mib.source.is_ascii(b"caf\xc3\xa9"))
+    testing.assertTrue(mib.source.is_utf8(b"caf\xc3\xa9"))
+    testing.assertFalse(mib.source.is_utf8(b"caf\xe9"))
+
+
+# --- dates --------------------------------------------------------------------------------------
+
+def _test_date_key() -> None:
+    testing.assertEqual(mib.source.date_key("200006140000Z"), "200006140000")
+    testing.assertEqual(mib.source.date_key(" 200006140000Z "), "200006140000")
+    testing.assertEqual(mib.source.date_key("201701060000z"), "201701060000")
+    testing.assertEqual(mib.source.date_key("201701060000"), "201701060000")
+    testing.assertEqual(mib.source.date_key("9905251200Z"), "199905251200")
+    testing.assertEqual(mib.source.date_key("8801010000Z"), "198801010000")
+    # a 2-digit year before 1988 means 20YY
+    testing.assertEqual(mib.source.date_key("0801010000Z"), "200801010000")
+    testing.assertEqual(mib.source.date_key("2016-09-29"), "201609290000")
+    for bad in ["", "Z", "202210203424Z", "201400060000Z", "200224060900Z", "2016092", "yyyymmddhhmmZ", "20160929000Z"]:
+        testing.assertEqual(mib.source.date_key(bad), "", "date " + bad)
+
+
+# --- module headers -----------------------------------------------------------------------------
+
+MULTI = r"""-- leading comment with a fake header: FAKE-MIB DEFINITIONS ::= BEGIN
+junk text before
+A-MIB DEFINITIONS ::= BEGIN
+  aMod MODULE-IDENTITY LAST-UPDATED "200101010000Z" ORGANIZATION "o" CONTACT-INFO "c"
+       DESCRIPTION "NOT-A-MIB DEFINITIONS ::= BEGIN" ::= { enterprises 1 }
+END
+mail footer between modules
+B-MIB { iso 3 6 1 } DEFINITIONS ::= BEGIN
+  b OBJECT IDENTIFIER ::= { iso 9 }
+END
+C-PIB PIB-DEFINITIONS ::= BEGIN
+END
+D-MIB DEFINITIONS IMPLICIT TAGS ::= BEGIN
+"""
+
+
+def _test_scan_headers() -> None:
+    data = MULTI.encode()
+    hs = mib.source.scan_headers(data)
+    testing.assertEqual([h.name for h in hs], ["A-MIB", "B-MIB", "C-PIB", "D-MIB"])
+    testing.assertEqual([h.line for h in hs], [3, 8, 11, 13])
+    testing.assertEqual([h.pib for h in hs], [False, False, True, False])
+    testing.assertEqual(hs[0].last_updated, "200101010000Z")
+    testing.assertEqual(hs[1].last_updated, "")
+    # extents: the first module starts at 0, later ones at their header line; END closes them
+    testing.assertEqual(hs[0].start, 0)
+    testing.assertEqual(data[hs[0].end - 3:hs[0].end], b"END")
+    testing.assertEqual(data[hs[1].start:hs[1].start + 5], b"B-MIB")
+    testing.assertEqual(hs[3].end, len(data))
+    testing.assertTrue(hs[2].end_tok >= 0)
+    testing.assertEqual(hs[3].end_tok, -1)
+    testing.assertEqual(hs[1].sha256, mib.source.sha256_hex(data[hs[1].start:hs[1].end]))
+    testing.assertEqual(len(hs[0].sha256), 64)
+
+
+def _test_scan_headers_single_module_hash_is_file_hash() -> None:
+    data = b"-- c\nX-MIB DEFINITIONS ::= BEGIN\nEND\n\x1a"
+    hs = mib.source.scan_headers(data)
+    testing.assertEqual(len(hs), 1)
+    testing.assertEqual(hs[0].sha256, mib.source.sha256_hex(data))
+    testing.assertEqual(mib.source.sha256_hex(b"abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+
+
+def _test_scan_headers_none() -> None:
+    testing.assertEqual(len(mib.source.scan_headers(b"<html>no mib here</html>")), 0)
+    testing.assertEqual(len(mib.source.scan_headers(b"")), 0)
+    testing.assertEqual(len(mib.source.scan_headers(b"\"X-MIB DEFINITIONS ::= BEGIN\"")), 0)
+
+
+# --- search path ---------------------------------------------------------------------------------
+
+def mod(name: str, lu: str) -> bytes:
+    if lu == "":
+        return (name + " DEFINITIONS ::= BEGIN\nEND\n").encode()
+    return (name + " DEFINITIONS ::= BEGIN\nm MODULE-IDENTITY LAST-UPDATED \"" + lu + "\"\nEND\n").encode()
+
+
+def _test_mibpath_order() -> None:
+    mp = mib.source.MibPath(["/a", "/b"])
+    mp.add_file("/b/X-MIB", mod("X-MIB", "203001010000Z"), 1)
+    mp.add_file("/a/x-old.my", mod("X-MIB", "199001010000Z"), 0)
+    mp.add_file("/a/x-new.my", mod("X-MIB", "201001010000Z"), 0)
+    mp.add_file("/a/x-new2.my", mod("X-MIB", "201001010000Z") + b"-- a different copy\n", 0)
+    d = mib.diag.Diagnostics("")
+    e = mp.find("X-MIB", d)
+    # first directory wins over a newer copy later in the path; then newest; then lowest path
+    testing.assertEqual(e?.path, "/a/x-new.my")
+    testing.assertEqual(e?.date, "201001010000")
+    testing.assertEqual(d.codes(), ["source.duplicate-module"])
+    testing.assertEqual([c.path for c in mp.candidates("X-MIB")], ["/a/x-new.my", "/a/x-new2.my", "/a/x-old.my", "/b/X-MIB"])
+    testing.assertNone(mp.find("NOPE-MIB"))
+    testing.assertEqual(mp.module_names()[:3], ["RFC-1212", "RFC-1215", "RFC1155-SMI"])
+    testing.assertEqual(len(mp.index_rows()), 4)
+    # identical copies in one directory are not worth a diagnostic
+    mp2 = mib.source.MibPath(["/a"])
+    mp2.add_file("/a/1", mod("Y-MIB", ""), 0)
+    mp2.add_file("/a/2", mod("Y-MIB", ""), 0)
+    d2 = mib.diag.Diagnostics("")
+    testing.assertEqual(mp2.find("Y-MIB", d2)?.path, "/a/1")
+    testing.assertEqual(len(d2.items), 0)
+    mp3 = mib.source.MibPath(["/a"], True, False)
+    mp3.add_file("/a/1", mod("Y-MIB", ""), 0)
+    testing.assertEqual(mp3.find("Y-MIB")?.sha256, "")
+
+
+def _test_mibpath_two_modules_in_one_file() -> None:
+    mp = mib.source.MibPath(["/a"])
+    data = mod("P-MIB", "") + b"junk\n" + mod("Q-MIB", "")
+    new = mp.add_file("/a/bundle.txt", data, 0)
+    testing.assertEqual([e.name for e in new], ["P-MIB", "Q-MIB"])
+    q = mp.find("Q-MIB")
+    testing.assertEqual(q?.path, "/a/bundle.txt")
+    testing.assertEqual(q?.line, 4)
+
+
+def _test_mibpath_pins() -> None:
+    mp = mib.source.MibPath(["/a", "/b"])
+    mp.add_file("/a/X", mod("X-MIB", ""), 0)
+    mp.add_file("/b/X", mod("X-MIB", ""), 1)
+    mp.pin("X-MIB", "/b/X")
+    testing.assertEqual(mp.find("X-MIB")?.path, "/b/X")
+    mp.pin("X-MIB", "/c/missing")
+    testing.assertNone(mp.find("X-MIB"))
+
+
+def _test_mibpath_aliases() -> None:
+    mp = mib.source.MibPath(["/a"])
+    mp.add_file("/a/RFC1213-MIB", mod("RFC1213-MIB", ""), 0)
+    mp.add_file("/a/RMON-MIB", mod("RMON-MIB", ""), 0)
+    d = mib.diag.Diagnostics("")
+    testing.assertEqual(mp.find("RFC-1213", d)?.path, "/a/RFC1213-MIB")
+    testing.assertEqual(d.codes(), ["source.alias"])
+    testing.assertEqual(d.items[0].level, 5)
+    # aliases to base modules end at the built-in text
+    e = mp.find("RFC1212")
+    testing.assertEqual(e?.builtin, True)
+    testing.assertEqual(e?.path, "<builtin>/RFC-1212")
+    testing.assertEqual(mp.find("SNMPv2-SMI-v1")?.name, "SNMPv2-SMI")
+    testing.assertEqual(mp.find("SNMPv2-TC-v1")?.name, "SNMPv2-TC")
+    # net-snmp's module_map applies only when the old name is not found
+    testing.assertEqual(mp.find("RFC1271-MIB")?.path, "/a/RMON-MIB")
+    mp.add_file("/a/RFC1271-MIB", mod("RFC1271-MIB", ""), 0)
+    testing.assertEqual(mp.find("RFC1271-MIB")?.path, "/a/RFC1271-MIB")
+    # chained fallback aliases: RFC1066-MIB -> RFC1156-MIB -> RFC1158-MIB -> RFC1213-MIB
+    testing.assertEqual(mp.find("RFC1066-MIB")?.path, "/a/RFC1213-MIB")
+    # user aliases
+    mp.add_alias("MY-OLD-MIB", "RMON-MIB")
+    testing.assertEqual(mp.find("MY-OLD-MIB")?.path, "/a/RMON-MIB")
+    mp.add_alias("GONE-MIB", "RMON-MIB", True)
+    testing.assertEqual(mp.find("GONE-MIB")?.path, "/a/RMON-MIB")
+
+
+def _test_mibpath_builtins() -> None:
+    mp = mib.source.MibPath(["/a"])
+    mp.add_file("/a/SNMPv2-SMI", b"SNMPv2-SMI DEFINITIONS ::= BEGIN\n-- broken copy\nEND\n", 0)
+    d = mib.diag.Diagnostics("")
+    e = mp.find("SNMPv2-SMI", d)
+    testing.assertEqual(e?.builtin, True)
+    testing.assertEqual(d.codes(), ["source.builtin-override"])
+    for nm in ["SNMPv2-SMI", "SNMPv2-TC", "SNMPv2-CONF", "RFC1155-SMI", "RFC-1212", "RFC-1215"]:
+        testing.assertTrue(mib.source.is_base_module(nm))
+        b = mib.source.base_module_bytes(nm)
+        hs = mib.source.scan_headers(b)
+        testing.assertEqual(len(hs), 1)
+        testing.assertEqual(hs[0].name, nm)
+    testing.assertFalse(mib.source.is_base_module("IF-MIB"))
+    # without built-ins the file is used
+    mp2 = mib.source.MibPath(["/a"], False)
+    mp2.add_file("/a/SNMPv2-SMI", b"SNMPv2-SMI DEFINITIONS ::= BEGIN\nEND\n", 0)
+    testing.assertEqual(mp2.find("SNMPv2-SMI")?.path, "/a/SNMPv2-SMI")
+
+
+def _test_add_file_without_module() -> None:
+    mp = mib.source.MibPath(["/a"])
+    d = mib.diag.Diagnostics("")
+    testing.assertEqual(len(mp.add_file("/a/README", b"just text", 0, d)), 0)
+    testing.assertEqual(d.codes(), ["source.no-module"])
+    testing.assertEqual(d.items[0].file, "/a/README")
+
+
+actor _test_index_golden_dir(t: testing.EnvT):
+    """Index the golden directory from disk and check lookups, hashes and diagnostics."""
+    t.timeout(60.0)
+    fc = file.FileCap(t.env.cap)
+    mp = mib.source.MibPath([GOLDEN_DIR, "/nonexistent/mib/dir"])
+    d = mib.diag.Diagnostics("")
+    nfiles = mib.source.index_path(mp, fc, d)
+    testing.assertTrue(nfiles >= 44)
+    testing.assertEqual(len(mp.files), nfiles)
+    testing.assertEqual(d.codes(), ["source.unreadable"])
+    e = mp.find("IF-MIB")
+    testing.assertEqual(e?.path, GOLDEN_DIR + "/IF-MIB")
+    # the content index hashes follow interop/mibs/index.py (golden.tsv)
+    testing.assertEqual(e?.sha256, "a41d2d0414bd6e1b3249257d0d035ea11554624c525b830f6910195b72b0c297")
+    testing.assertEqual(e?.last_updated, "200006140000Z")
+    d2 = mib.diag.Diagnostics("")
+    s = mp.find("SNMPv2-SMI", d2)
+    testing.assertEqual(s?.builtin, True)
+    testing.assertEqual(d2.codes(), ["source.builtin-override"])
+    if e is not None:
+        data = mib.source.entry_bytes(fc, e)
+        testing.assertEqual(mib.source.sha256_hex(data), e.sha256)
+    if s is not None:
+        testing.assertEqual(mib.source.entry_bytes(fc, s), mib.source.base_module_bytes("SNMPv2-SMI"))
+    t.success()

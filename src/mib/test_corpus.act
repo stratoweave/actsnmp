@@ -1,0 +1,342 @@
+"""Parse sweep over the MIB corpus.
+
+`corpus_parse` lexes and parses every file of `interop/mibs/corpus/flat/` (about 14,000
+files, one module name each) and writes one TSV row per file to
+`interop/mibs/cache/actsnmp-parse.tsv`, plus a summary next to it.
+`interop/mibs/compare/parse_vs_oracles.py` compares the TSV with the oracle verdicts in
+`interop/mibs/modules.tsv`. Run it optimized and without the test cache:
+
+    acton test --fast --tag mibcorpus --no-cache --module mib.test_corpus --name corpus_parse
+
+`MIBCORPUS_CHUNK=k/n` parses only the k-th of n contiguous slices of the sorted file list and
+writes `actsnmp-parse.part<k>of<n>.tsv`, which the compare script merges. A whole run takes
+about 20 s with --fast, so chunks are only needed for debug builds. `MIBCORPUS_DIR` and
+`MIBCORPUS_OUT` override the corpus and output directories. `MIBCORPUS_ONLY=A-MIB,B-MIB`
+parses only those files and also writes every diagnostic.
+
+The TSV has a header line and these tab-separated columns:
+
+    module     file name in corpus/flat (the module name index.py chose)
+    modules    the modules found in the file, comma-separated
+    bytes      file size
+    ms         lex and parse time in milliseconds, without reading the file
+    max_level  the most severe diagnostic level present, `-` if none
+    defs       declarations in the AST, all modules of the file
+    codes      `code:level*count` per diagnostic code, most severe first, comma-separated
+    errors     up to 3 level 0-1 diagnostics as `line:col code message`, ` | `-separated
+
+The test fails on any internal (level-0) diagnostic, or when more than 1% of the files have
+level-1 diagnostics (pysmi's parse-only probe rejects 4.2%).
+"""
+
+import file
+import testing
+import time
+import mib.diag
+import mib.parser
+import mib.source
+
+CORPUS_DIR = "interop/mibs/corpus/flat"
+OUT_DIR = "interop/mibs/cache"
+OUT_NAME = "actsnmp-parse"
+
+TSV_HEADER = "module\tmodules\tbytes\tms\tmax_level\tdefs\tcodes\terrors"
+
+
+def tsv_field(s: str) -> str:
+    """`s` with tabs, CR and LF replaced by spaces, so it fits in one TSV cell."""
+    return s.replace("\t", " ").replace("\r", " ").replace("\n", " ")
+
+
+def chunk_bounds(spec: str, n: int) -> (int, int):
+    """The `[lo, hi)` slice of `n` items selected by a chunk spec `k/m` (the k-th of m
+    contiguous, nearly equal slices; 1-based). An empty or malformed spec selects all."""
+    parts = spec.split("/")
+    if len(parts) != 2:
+        return (0, n)
+    try:
+        k = int(parts[0].strip())
+        m = int(parts[1].strip())
+    except ValueError:
+        return (0, n)
+    if m < 1 or k < 1 or k > m:
+        return (0, n)
+    return ((k - 1) * n // m, k * n // m)
+
+
+def format_ms(ns: int) -> str:
+    """Nanoseconds as milliseconds with 3 decimals (`1234567` -> `1.235`)."""
+    us = (ns + 500) // 1000
+    frac = str(us % 1000)
+    return str(us // 1000) + "." + "0" * (3 - len(frac)) + frac
+
+
+def code_summary(ds: list[mib.diag.Diagnostic]) -> str:
+    """`code:level*count` per code, most severe level first, then by code."""
+    cnt: dict[(int, str), int] = {}
+    for d in ds:
+        key = (d.level, d.code)
+        cnt[key] = cnt.get_def(key, 0) + 1
+    return ",".join([k.1 + ":" + str(k.0) + "*" + str(cnt[k]) for k in sorted(list(cnt.keys()))])
+
+
+def max_level(ds: list[mib.diag.Diagnostic]) -> int:
+    """The most severe (lowest) level among `ds`, or -1 when there are none."""
+    best = -1
+    for d in ds:
+        if best < 0 or d.level < best:
+            best = d.level
+    return best
+
+
+def error_summary(ds: list[mib.diag.Diagnostic], limit: int = 3) -> str:
+    """Up to `limit` diagnostics of level 0-1, as `line:col code message`."""
+    out: list[str] = []
+    for d in ds:
+        if d.level <= 1:
+            msg = d.message
+            if len(msg) > 120:
+                msg = msg[:120] + "..."
+            out.append(str(d.line) + ":" + str(d.col) + " " + d.code + " " + msg)
+            if len(out) >= limit:
+                break
+    return tsv_field(" | ".join(out))
+
+
+def tsv_row(name: str, nbytes: int, ns: int, r: mib.parser.ParseResult) -> str:
+    """One TSV row (without the line end) for file `name` and its parse result."""
+    ml = max_level(r.diags)
+    ndefs = 0
+    for m in r.modules:
+        ndefs += len(m.defs)
+    cols = [tsv_field(name), tsv_field(",".join([m.name for m in r.modules])), str(nbytes), format_ms(ns),
+            "-" if ml < 0 else str(ml), str(ndefs), code_summary(r.diags), error_summary(r.diags)]
+    return "\t".join(cols)
+
+
+class SweepStats(object):
+    """Totals over a sweep."""
+    files: int
+    modules: int
+    defs: int
+    nbytes: int
+    ns: int
+    by_level: list[int]
+    files_by_max_level: list[int]
+    codes: dict[str, int]
+    slowest: list[(int, str)]
+
+    def __init__(self):
+        self.files = 0
+        self.modules = 0
+        self.defs = 0
+        self.nbytes = 0
+        self.ns = 0
+        self.by_level = [0, 0, 0, 0, 0, 0, 0]
+        self.files_by_max_level = [0, 0, 0, 0, 0, 0, 0, 0]
+        self.codes = {}
+        self.slowest = []
+
+    def add(self, name: str, nbytes: int, ns: int, r: mib.parser.ParseResult) -> None:
+        self.files += 1
+        self.modules += len(r.modules)
+        for m in r.modules:
+            self.defs += len(m.defs)
+        self.nbytes += nbytes
+        self.ns += ns
+        for d in r.diags:
+            if d.level >= 0 and d.level <= 6:
+                self.by_level[d.level] += 1
+            self.codes[d.code] = self.codes.get_def(d.code, 0) + 1
+        ml = max_level(r.diags)
+        self.files_by_max_level[ml if ml >= 0 else 7] += 1
+        self.slowest.append((ns, name))
+        if len(self.slowest) > 40:
+            self.slowest = sorted(self.slowest)[20:]
+
+    def report(self) -> str:
+        """A multi-line summary (deterministic apart from the timings)."""
+        mbps = 0.0
+        if self.ns > 0:
+            mbps = float(self.nbytes) / 1048576.0 / (float(self.ns) / 1000000000.0)
+        out: list[str] = []
+        out.append("files " + str(self.files) + ", modules " + str(self.modules) + ", declarations " + str(self.defs))
+        out.append("bytes " + str(self.nbytes) + ", lex+parse " + format_ms(self.ns) + " ms, " + str(round(mbps, 1)) + " MiB/s")
+        out.append("diagnostics by level 0-6: " + str(self.by_level))
+        out.append("files by most severe level 0-6, none: " + str(self.files_by_max_level))
+        top = sorted([(-c, k) for k, c in self.codes.items()])
+        out.append("codes: " + ", ".join([k.1 + " " + str(-k.0) for k in top]))
+        sl = sorted(self.slowest)
+        sl = sl[len(sl) - 10:] if len(sl) > 10 else sl
+        out.append("slowest: " + ", ".join([s.1 + " " + format_ms(s.0) + " ms" for s in sl]))
+        return "\n".join(out)
+
+
+proc def write_text(fc: file.FileCap, path: str, text: str) -> None:
+    w = file.WriteFile(file.WriteFileCap(fc), path)
+    w.write(text.encode())
+    w.close()
+
+
+# --- unit tests of the helpers (always run) ------------------------------------------------
+
+def _test_chunk_bounds() -> None:
+    testing.assertEqual(chunk_bounds("", 10), (0, 10))
+    testing.assertEqual(chunk_bounds("1/3", 10), (0, 3))
+    testing.assertEqual(chunk_bounds("2/3", 10), (3, 6))
+    testing.assertEqual(chunk_bounds("3/3", 10), (6, 10))
+    testing.assertEqual(chunk_bounds("4/3", 10), (0, 10))
+    testing.assertEqual(chunk_bounds("x/3", 10), (0, 10))
+
+
+def _test_row_format() -> None:
+    src = r"""R-MIB DEFINITIONS ::= BEGIN
+a OBJECT IDENTIFIER ::= { iso 01 }
+b OBJECT IDENTIFIER ::= { iso ! }
+c OBJECT IDENTIFIER ::= { iso 2 }
+"""
+    r = mib.parser.parse_text(src, "R-MIB")
+    testing.assertEqual(format_ms(1234567), "1.235")
+    testing.assertEqual(format_ms(5000), "0.005")
+    testing.assertEqual(tsv_row("R-MIB", len(src), 2000000, r),
+                        "R-MIB\tR-MIB\t" + str(len(src)) + "\t2.000\t1\t2\tparse.syntax:1*1,parse.missing-end:2*1,parse.number-leading-zero:5*1\t3:31 parse.syntax expected an OID component or '}}', got '!'; declaration skipped")
+    st = SweepStats()
+    st.add("R-MIB", len(src), 2000000, r)
+    testing.assertEqual(st.files_by_max_level, [0, 1, 0, 0, 0, 0, 0, 0])
+    testing.assertEqual(tsv_field("a\tb\nc"), "a b c")
+
+
+# --- the sweep (tagged) ---------------------------------------------------------------------
+
+actor _test_corpus_parse(t: testing.EnvT):
+    """Parse every corpus file and write the per-file TSV and a summary (see the module doc)."""
+    t.require("mibcorpus")
+    t.timeout(1800.0)
+    fc = file.FileCap(t.env.cap)
+    fs = file.FS(fc)
+    cdir = CORPUS_DIR
+    ed = t.env.getenv("MIBCORPUS_DIR")
+    if ed is not None and ed != "":
+        cdir = ed
+    odir = OUT_DIR
+    eo = t.env.getenv("MIBCORPUS_OUT")
+    if eo is not None and eo != "":
+        odir = eo
+    spec = ""
+    ec = t.env.getenv("MIBCORPUS_CHUNK")
+    if ec is not None:
+        spec = ec.strip()
+    files = sorted(fs.listdir(cdir))
+    only = ""
+    eon = t.env.getenv("MIBCORPUS_ONLY")
+    if eon is not None:
+        only = eon.strip()
+    if only != "":
+        files = [x.strip() for x in only.split(",") if x.strip() != ""]
+    lo, hi = chunk_bounds(spec, len(files))
+    suffix = ""
+    if only != "":
+        suffix = ".only"
+    elif lo != 0 or hi != len(files):
+        suffix = ".part" + spec.replace("/", "of")
+    alldiags: list[str] = []
+    st = SweepStats()
+    rows: list[str] = [TSV_HEADER]
+    unreadable = 0
+    for i in range(lo, hi):
+        nm = files[i]
+        path = cdir + "/" + nm
+        data = b""
+        try:
+            data = mib.source.read_bytes(fc, path)
+        except OSError:
+            unreadable += 1
+            continue
+        t0 = time.monotonic_ns()
+        r = mib.parser.parse_bytes(data, nm)
+        ns = time.monotonic_ns() - t0
+        st.add(nm, len(data), ns, r)
+        rows.append(tsv_row(nm, len(data), ns, r))
+        if only != "":
+            alldiags.append(mib.diag.format_all(r.diags))
+    write_text(fc, odir + "/" + OUT_NAME + suffix + ".tsv", "\n".join(rows) + "\n")
+    if only != "":
+        write_text(fc, odir + "/" + OUT_NAME + suffix + ".diags.txt", "\n".join(alldiags) + "\n")
+    write_text(fc, odir + "/" + OUT_NAME + suffix + ".summary.txt",
+               "corpus " + cdir + " files [" + str(lo) + ", " + str(hi) + ") of " + str(len(files)) +
+               ", unreadable " + str(unreadable) + "\n" + st.report() + "\n")
+    testing.assertEqual(st.by_level[0], 0)
+    testing.assertEqual(unreadable, 0)
+    if spec == "" and only == "":
+        testing.assertTrue(st.files > 13000)
+    testing.assertTrue(st.files_by_max_level[1] * 100 <= st.files)
+    t.success()
+
+
+def _lcg(x: int) -> int:
+    return (x * 1103515245 + 12345) & 0x7fffffff
+
+
+def mutate(data: bytes, seed: int, count: int) -> bytes:
+    """`data` with `count` deterministic mutations that stress string, comment and brace
+    recovery: a quote, `--`, a brace or a line end inserted, or a few bytes deleted."""
+    pieces: list[bytes] = [b"\"", b"--", b"{{", b"}}", b"\n", b"\r", b"'", b"\"\"", b"-- \"", b"::="]
+    x = seed
+    out = data
+    for m in range(count):
+        if len(out) == 0:
+            break
+        x = _lcg(x)
+        pos = x % len(out)
+        x = _lcg(x)
+        if x % 4 == 0:
+            out = out[:pos] + out[pos + 1 + (x % 7):]
+        else:
+            x = _lcg(x)
+            out = out[:pos] + pieces[x % len(pieces)] + out[pos:]
+    return out
+
+
+def _test_mutate_is_deterministic() -> None:
+    a = mutate(b"abc DEFINITIONS ::= BEGIN END", 7, 5)
+    testing.assertEqual(a, mutate(b"abc DEFINITIONS ::= BEGIN END", 7, 5))
+    testing.assertNotEqual(a, b"abc DEFINITIONS ::= BEGIN END")
+
+
+actor _test_corpus_mutations(t: testing.EnvT):
+    """Every 7th corpus file, mutated 3 times with 4 random edits each (quotes, `--`, braces,
+    line ends, deletions): the front end never raises, never reports an internal error, and a
+    mutated file never takes more than 20 times as long as the original plus 50 ms."""
+    t.require("mibcorpus")
+    t.timeout(1800.0)
+    fc = file.FileCap(t.env.cap)
+    fs = file.FS(fc)
+    files = sorted(fs.listdir(CORPUS_DIR))
+    n = 0
+    worst = 0.0
+    worst_name = ""
+    for i in range(0, len(files), 7):
+        nm = files[i]
+        data = b""
+        try:
+            data = mib.source.read_bytes(fc, CORPUS_DIR + "/" + nm)
+        except OSError:
+            continue
+        t0 = time.monotonic_ns()
+        mib.parser.parse_bytes(data, nm)
+        base = time.monotonic_ns() - t0
+        for k in range(3):
+            md = mutate(data, i * 31 + k, 4)
+            t1 = time.monotonic_ns()
+            r = mib.parser.parse_bytes(md, nm)
+            dt = time.monotonic_ns() - t1
+            n += 1
+            for d in r.diags:
+                testing.assertTrue(d.level > 0, nm + " mutation " + str(k) + ": " + str(d))
+            ratio = float(dt) / float(base + 50000000)
+            if ratio > worst:
+                worst = ratio
+                worst_name = nm + " mutation " + str(k)
+    write_text(fc, OUT_DIR + "/" + OUT_NAME + ".mutations.txt", "mutated parses " + str(n) + ", worst time ratio " + str(round(worst, 3)) + " (" + worst_name + ")\n")
+    testing.assertTrue(worst < 20.0, worst_name)
+    t.success()
