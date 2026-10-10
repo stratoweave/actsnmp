@@ -134,7 +134,24 @@ The commands are `get`, `getnext`, `bulkget`, `walk`, `bulkwalk`, `set`,
 `interop/` holds a Docker-based lab with net-snmp and snmpsim/pysnmp
 agents, managers and trap receivers. It serves a shared deterministic
 dataset and has SNMPv3 users for every supported protocol combination.
-See `interop/README.md` for how to build and run it.
+
+```bash
+interop/up.sh
+```
+
+`interop/up.sh` builds the lab image when needed and starts the agents and
+the trap receiver on loopback ports. With the lab up, these scripts test
+actsnmp against it:
+
+- `interop/agentcheck.sh` runs net-snmp's and pysnmp's managers against
+  `actsnmp agent`;
+- `interop/notifycheck.sh` sends traps and informs from net-snmp and pysnmp
+  to `actsnmp trapd`;
+- `interop/trapdcheck.sh` checks what net-snmp's snmptrapd received from
+  actsnmp as the sender.
+
+`interop/down.sh` stops the lab. See `interop/README.md` for ports, users
+and options.
 
 `interop/mibs/` holds a MIB corpus and oracle setup for testing the MIB
 compiler against pysmi, net-snmp and libsmi; see `interop/mibs/README.md`.
