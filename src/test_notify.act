@@ -1,0 +1,604 @@
+"""Tests for notify
+
+MSG_M and MSG_N are the reference linkDown Trap and SNMPv2-Trap packets.
+The RFC 3584 conversions (NETSNMP_*) were recorded from net-snmp 5.9.4's
+snmptrapd, which hands converted traps to a traphandle script. pysnmp's
+v1_to_v2() is not a reference: it orders and adds the extra varbinds
+differently. The other messages were encoded independently with pysnmp.
+"""
+
+import testing
+import ber
+import errors
+import message
+import notify
+import pdu
+import usm
+from message import CommunityMessage, V3Message, ScopedPdu, UsmSecurityParameters
+from notify import Notification
+from oid import Oid
+from pdu import Pdu, TrapV1Pdu
+from values import VarBind, Value, Integer, OctetString, Null, ObjectIdentifier, IpAddress, TimeTicks
+from values import Counter32, NoSuchObject
+from testutil import h, value_fails
+
+def o(s: str) -> Oid:
+    return Oid.parse(s)
+
+def vb(oid: str, v: Value) -> VarBind:
+    return VarBind(Oid.parse(oid), v)
+
+MSG_M = """30 3d 02 01 00 04 06 70 75 62 6c 69 63 a4 30 06 0a 2b 06 01 04 01 bf 08 03 02 0a 40 04 c0 00 02 01
+02 01 02 02 01 00 43 03 01 e2 40 30 11 30 0f 06 0a 2b 06 01 02 01 02 02 01 01 03 02 01 03"""
+MSG_N = """30 75 02 01 01 04 06 70 75 62 6c 69 63 a7 68 02 01 2a 02 01 00 02 01 00 30 5d
+30 0f 06 08 2b 06 01 02 01 01 03 00 43 03 01 e2 40
+30 17 06 0a 2b 06 01 06 03 01 01 04 01 00 06 09 2b 06 01 06 03 01 01 05 03
+30 0f 06 0a 2b 06 01 02 01 02 02 01 01 03 02 01 03
+30 0f 06 0a 2b 06 01 02 01 02 02 01 07 03 02 01 02
+30 0f 06 0a 2b 06 01 02 01 02 02 01 08 03 02 01 02"""
+MSG_M_AS_V2 = """30819602010104067075626c6963a7818802012a020100020100307d300f06082b06010201010300430301e240
+3017060a2b06010603010104010006092b0601060301010503300f060a2b060102010202010103020103
+301106092b06010603120103004004c0000201301306092b060106031201040004067075626c6963
+3018060a2b060106030101040300060a2b06010401bf0803020a"""
+MSG_V3_TRAP = """308194020103300e020107020300ffe30401000201030420301e0408800000000102030402010102010c0408755f6e6f
+6175746804000400305d040880000000010203040403637478a74c0201630201000201003041300f06082b06010201
+01030043032dcaaa301a060a2b060106030101040100060c2b06010401bf08ce0f0300163012060d2b06010401bf08
+ce0f01010100020100"""
+MSG_TRAP_3E9 = "302d02010004067075626c6963a42006092b06010401bf08ce0f4004c0000201020106020500b2d05e004301643000"
+MSG_INFORM = """305e02010104067075626c6963a651020312d6870201000201003044301106082b06010201010300430500ffffffff
+301a060a2b060106030101040100060c2b06010401bf08ce0f0300073013060d2b06010401bf08ce0f0101020004026869"""
+MSG_INFORM_RESPONSE = """305e02010104067075626c6963a251020312d6870201000201003044301106082b06010201010300430500ffffffff
+301a060a2b060106030101040100060c2b06010401bf08ce0f0300073013060d2b06010401bf08ce0f0101020004026869"""
+
+SYS_UPTIME = "1.3.6.1.2.1.1.3.0"
+TRAP_OID = "1.3.6.1.6.3.1.1.4.1.0"
+TRAP_ADDRESS = "1.3.6.1.6.3.18.1.3.0"
+TRAP_COMMUNITY = "1.3.6.1.6.3.18.1.4.0"
+TRAP_ENTERPRISE = "1.3.6.1.6.3.1.1.4.3.0"
+LINK_UP = "1.3.6.1.6.3.1.1.5.4"
+IF_INDEX_3 = "1.3.6.1.2.1.2.2.1.1.3"
+NETSNMP_ENTERPRISE = "1.3.6.1.4.1.8072.3.2.10"
+EXAMPLE_ENTERPRISE = "1.3.6.1.4.1.8072.9999"
+
+def decode_community(hx: str) -> CommunityMessage:
+    c, v3 = message.decode(h(hx))
+    if c is not None:
+        return c
+    raise AssertionError("not a community message: " + hx[:20])
+
+def decode_v3(hx: str) -> V3Message:
+    c, v3 = message.decode(h(hx))
+    if v3 is not None:
+        return v3
+    raise AssertionError("not an SNMPv3 message: " + hx[:20])
+
+def link_down_trap(generic: int) -> TrapV1Pdu:
+    """The trap net-snmp was sent for generic-trap 0..5 (packet M with another generic-trap)"""
+    return TrapV1Pdu(o(NETSNMP_ENTERPRISE), h("c0 00 02 01"), generic, 0, 123456, [vb(IF_INDEX_3, Integer(3))])
+
+
+# Constants #########################################################################################
+
+def _test_oid_constants() -> None:
+    testing.assertEqual(notify.SYS_UPTIME_0, o(SYS_UPTIME))
+    testing.assertEqual(notify.SNMP_TRAP_OID_0, o(TRAP_OID))
+    testing.assertEqual(notify.SNMP_TRAP_ENTERPRISE_0, o(TRAP_ENTERPRISE))
+    testing.assertEqual(notify.SNMP_TRAP_ADDRESS_0, o(TRAP_ADDRESS))
+    testing.assertEqual(notify.SNMP_TRAP_COMMUNITY_0, o(TRAP_COMMUNITY))
+    testing.assertEqual(notify.SNMP_TRAPS, o("1.3.6.1.6.3.1.1.5"))
+    standard = [notify.TRAP_COLD_START, notify.TRAP_WARM_START, notify.TRAP_LINK_DOWN, notify.TRAP_LINK_UP,
+                notify.TRAP_AUTHENTICATION_FAILURE, notify.TRAP_EGP_NEIGHBOR_LOSS]
+    for i, t in enumerate(standard):
+        testing.assertEqual(t, notify.SNMP_TRAPS.child([i + 1]), str(t))
+
+
+# v1_trap_oid #######################################################################################
+
+def _test_v1_trap_oid_generic() -> None:
+    # RFC 3584 section 3.1 (3), the table; net-snmp gave the same for each
+    expected = ["1.3.6.1.6.3.1.1.5.1", "1.3.6.1.6.3.1.1.5.2", "1.3.6.1.6.3.1.1.5.3", "1.3.6.1.6.3.1.1.5.4",
+                "1.3.6.1.6.3.1.1.5.5", "1.3.6.1.6.3.1.1.5.6"]
+    for g in range(6):
+        # enterprise and specific-trap do not matter for generic traps
+        testing.assertEqual(notify.v1_trap_oid(o(NETSNMP_ENTERPRISE), g, 0), o(expected[g]), "generic %d" % g)
+        testing.assertEqual(notify.v1_trap_oid(o("1.3"), g, 77), o(expected[g]), "generic %d" % g)
+    testing.assertEqual(notify.v1_trap_oid(o("1.3"), pdu.LINK_UP, 0), notify.TRAP_LINK_UP)
+
+def _test_v1_trap_oid_enterprise_specific() -> None:
+    # RFC 3584 section 3.1 (2): enterprise, 0, specific-trap
+    e = o(EXAMPLE_ENTERPRISE)
+    testing.assertEqual(notify.v1_trap_oid(e, 6, 42), o("1.3.6.1.4.1.8072.9999.0.42"))
+    testing.assertEqual(notify.v1_trap_oid(e, 6, 2147483647), o("1.3.6.1.4.1.8072.9999.0.2147483647"))
+    testing.assertEqual(notify.v1_trap_oid(e, 6, 0), o("1.3.6.1.4.1.8072.9999.0.0"))
+    testing.assertEqual(notify.v1_trap_oid(Oid([]), 6, 1), Oid([0, 1]))
+    testing.assertEqual(e, o(EXAMPLE_ENTERPRISE), "enterprise unchanged")
+    # the whole arc range: RFC 3584 3.2 puts the last arc of an SNMPv2 trap OID into specific-trap
+    testing.assertEqual(notify.v1_trap_oid(e, 6, 3000000000), o("1.3.6.1.4.1.8072.9999.0.3000000000"))
+    testing.assertEqual(notify.v1_trap_oid(e, 6, 4294967295), o("1.3.6.1.4.1.8072.9999.0.4294967295"))
+
+def _test_v1_trap_specific_unsigned32_wire() -> None:
+    # pysnmp's SNMPv1 sender puts specific-trap 3000000000 on the wire as 02 05 00 b2 d0 5e 00;
+    # the trap is delivered with the trap OID snmptrapd gives it, and re-encodes exactly
+    m = decode_community(MSG_TRAP_3E9)
+    t = m.trap!
+    n = notify.notification_from_v1(t, m.community, "192.0.2.1", 162)
+    testing.assertEqual(n.trap_oid, o("1.3.6.1.4.1.8072.9999.0.3000000000"))
+    testing.assertEqual(n.problem, "")
+    testing.assertEqual(message.encode_community(m), h(MSG_TRAP_3E9))
+
+def _test_v1_trap_oid_out_of_range() -> None:
+    # generic-trap 7: net-snmp gives snmpTraps.8. specific-trap -1: net-snmp (64-bit) prints
+    # .0.18446744073709551615, which is no valid arc; we take it modulo 2^32.
+    e = o(EXAMPLE_ENTERPRISE)
+    testing.assertEqual(notify.v1_trap_oid(e, 7, 0), o("1.3.6.1.6.3.1.1.5.8"))
+    testing.assertEqual(notify.v1_trap_oid(e, 2147483647, 0), o("1.3.6.1.6.3.1.1.5.2147483648"))
+    testing.assertEqual(notify.v1_trap_oid(e, -1, 0), o("1.3.6.1.6.3.1.1.5.0"))
+    testing.assertEqual(notify.v1_trap_oid(e, -2, 0), o("1.3.6.1.6.3.1.1.5.4294967295"))
+    testing.assertEqual(notify.v1_trap_oid(e, -2147483648, 0), o("1.3.6.1.6.3.1.1.5.2147483649"))
+    testing.assertEqual(notify.v1_trap_oid(e, 6, -1), o("1.3.6.1.4.1.8072.9999.0.4294967295"))
+    testing.assertEqual(notify.v1_trap_oid(e, 6, -2147483648), o("1.3.6.1.4.1.8072.9999.0.2147483648"))
+    testing.assertEqual(notify.v1_trap_oid(e, 6, 4294967296), o("1.3.6.1.4.1.8072.9999.0.0"))
+    testing.assertEqual(notify.v1_trap_oid(e, 6, -9223372036854775807 - 1), o("1.3.6.1.4.1.8072.9999.0.0"))
+    testing.assertEqual(notify.v1_trap_oid(e, 9223372036854775807, 0), o("1.3.6.1.6.3.1.1.5.0"))
+
+
+# v1_to_v2 ##########################################################################################
+
+def netsnmp_extras(addr: bytes, community: bytes, enterprise: str) -> list[VarBind]:
+    return [VarBind(notify.SNMP_TRAP_ADDRESS_0, IpAddress(addr)),
+            VarBind(notify.SNMP_TRAP_COMMUNITY_0, OctetString(community)),
+            VarBind(notify.SNMP_TRAP_ENTERPRISE_0, ObjectIdentifier(o(enterprise)))]
+
+def _test_v1_to_v2_generic_netsnmp() -> None:
+    # net-snmp: sysUpTime.0 0:0:20:34.56, snmpTrapOID.0 .1.3.6.1.6.3.1.1.5.<g+1>, ifIndex.3 3,
+    # snmpTrapAddress.0 192.0.2.1, snmpTrapCommunity.0 "public", snmpTrapEnterprise.0 .1.3.6.1.4.1.8072.3.2.10
+    for g in range(6):
+        r = notify.v1_to_v2(link_down_trap(g), b"public")
+        testing.assertEqual(r.uptime, 123456, "uptime %d" % g)
+        testing.assertEqual(r.trap_oid, notify.SNMP_TRAPS.child([g + 1]), "trap OID %d" % g)
+        testing.assertEqual(r.varbinds, [vb(IF_INDEX_3, Integer(3))]
+                            + netsnmp_extras(h("c0 00 02 01"), b"public", NETSNMP_ENTERPRISE), "varbinds %d" % g)
+
+def _test_v1_to_v2_enterprise_specific_netsnmp() -> None:
+    t = TrapV1Pdu(o(EXAMPLE_ENTERPRISE), h("0a 00 00 01"), 6, 42, 12345,
+                  [vb("1.3.6.1.4.1.8072.9999.1.1.1.0", Integer(0))])
+    r = notify.v1_to_v2(t, b"public")
+    testing.assertEqual(r.uptime, 12345)
+    testing.assertEqual(r.trap_oid, o("1.3.6.1.4.1.8072.9999.0.42"))
+    testing.assertEqual(r.varbinds, [vb("1.3.6.1.4.1.8072.9999.1.1.1.0", Integer(0))]
+                        + netsnmp_extras(h("0a 00 00 01"), b"public", EXAMPLE_ENTERPRISE))
+    # no varbinds, maximum specific-trap and time-stamp, another community
+    t = TrapV1Pdu(o(EXAMPLE_ENTERPRISE), h("0a 00 00 01"), 6, 2147483647, 4294967295)
+    r = notify.v1_to_v2(t, b"secret")
+    testing.assertEqual(r.uptime, 4294967295)
+    testing.assertEqual(r.trap_oid, o("1.3.6.1.4.1.8072.9999.0.2147483647"))
+    testing.assertEqual(r.varbinds, netsnmp_extras(h("0a 00 00 01"), b"secret", EXAMPLE_ENTERPRISE))
+
+def _test_v1_to_v2_extras_already_present() -> None:
+    # net-snmp: v1 varbinds snmpTrapAddress.0 = 198.51.100.1, snmpTrapEnterprise.0 = .1.3.6.1.4.1.1
+    # become the same two followed by snmpTrapCommunity.0 "public" only
+    present = [vb(TRAP_ADDRESS, IpAddress(h("c6 33 64 01"))), vb(TRAP_ENTERPRISE, ObjectIdentifier(o("1.3.6.1.4.1.1")))]
+    t = TrapV1Pdu(o(EXAMPLE_ENTERPRISE), h("c0 00 02 07"), 6, 1, 5, present)
+    r = notify.v1_to_v2(t, b"public")
+    testing.assertEqual(r.trap_oid, o("1.3.6.1.4.1.8072.9999.0.1"))
+    testing.assertEqual(r.varbinds, present + [vb(TRAP_COMMUNITY, OctetString(b"public"))])
+    testing.assertEqual(len(t.varbinds), 2, "input varbinds unchanged")
+
+    # all three present: nothing is added, whatever their values and types
+    all3 = [vb(TRAP_COMMUNITY, Integer(1)), vb(TRAP_ENTERPRISE, Null()), vb(TRAP_ADDRESS, OctetString(b"x"))]
+    r = notify.v1_to_v2(TrapV1Pdu(o("1.3"), h("01 02 03 04"), 0, 0, 0, all3), b"c")
+    testing.assertEqual(r.varbinds, all3)
+    # only the community present: address and enterprise are appended, in RFC order
+    t = TrapV1Pdu(o("1.3.6"), h("01 02 03 04"), 1, 0, 0, [vb(TRAP_COMMUNITY, OctetString(b"orig"))])
+    r = notify.v1_to_v2(t, b"new")
+    testing.assertEqual(r.varbinds, [vb(TRAP_COMMUNITY, OctetString(b"orig")),
+                                     vb(TRAP_ADDRESS, IpAddress(h("01 02 03 04"))),
+                                     vb(TRAP_ENTERPRISE, ObjectIdentifier(o("1.3.6")))])
+    # only exact names count: other instances or the object itself do not
+    near = [vb("1.3.6.1.6.3.18.1.3", IpAddress(h("01 01 01 01"))), vb("1.3.6.1.6.3.18.1.4.1", OctetString(b"y")),
+            vb("1.3.6.1.6.3.1.1.4.3.0.0", Null())]
+    t = TrapV1Pdu(o("1.3.6"), h("01 02 03 04"), 1, 0, 0, near)
+    r = notify.v1_to_v2(t, b"c")
+    testing.assertEqual(r.varbinds, near + netsnmp_extras(h("01 02 03 04"), b"c", "1.3.6"))
+
+def _test_v1_to_v2_netsnmp_zero_addr_empty_community() -> None:
+    # net-snmp: `snmptrap -v1 -c public H .1.3.6.1.4.1.8072.9999 0.0.0.0 0 0 100` gives no
+    # snmpTrapAddress.0, and `snmptrap -v1 -c '' H ... 192.0.2.1 1 0 100` no snmpTrapCommunity.0
+    r = notify.v1_to_v2(TrapV1Pdu(o(EXAMPLE_ENTERPRISE), h("00 00 00 00"), 0, 0, 100), b"public")
+    testing.assertEqual(r.trap_oid, notify.TRAP_COLD_START)
+    testing.assertEqual(r.varbinds, [vb(TRAP_COMMUNITY, OctetString(b"public")),
+                                     vb(TRAP_ENTERPRISE, ObjectIdentifier(o(EXAMPLE_ENTERPRISE)))])
+    r = notify.v1_to_v2(TrapV1Pdu(o(EXAMPLE_ENTERPRISE), h("c0 00 02 01"), 1, 0, 100), b"")
+    testing.assertEqual(r.trap_oid, notify.TRAP_WARM_START)
+    testing.assertEqual(r.varbinds, [vb(TRAP_ADDRESS, IpAddress(h("c0 00 02 01"))),
+                                     vb(TRAP_ENTERPRISE, ObjectIdentifier(o(EXAMPLE_ENTERPRISE)))])
+    # one octet other than 0 is an address
+    r = notify.v1_to_v2(TrapV1Pdu(o("1.3.6"), h("00 00 00 01"), 0, 0, 0), b"c")
+    testing.assertEqual(r.varbinds, netsnmp_extras(h("00 00 00 01"), b"c", "1.3.6"))
+    # the converted SNMPv1 Notification has the same varbinds
+    n = notify.notification_from_v1(TrapV1Pdu(o(EXAMPLE_ENTERPRISE), h("00 00 00 00"), 0, 0, 100), b"", "10.0.0.1", 162)
+    testing.assertEqual(n.varbinds, [vb(TRAP_ENTERPRISE, ObjectIdentifier(o(EXAMPLE_ENTERPRISE)))])
+    testing.assertEqual(n.problem, "")
+
+def _test_v1_to_v2_does_not_alias_input() -> None:
+    vbs = [vb(IF_INDEX_3, Integer(3))]
+    t = TrapV1Pdu(o("1.3.6"), h("01 02 03 04"), 6, 1, 0, vbs)
+    r = notify.v1_to_v2(t, b"")
+    r.varbinds.append(vb("1.3.6.1", Null()))
+    testing.assertEqual(len(vbs), 1)
+    testing.assertEqual(len(t.varbinds), 1)
+    # all three present: still a copy
+    all3 = netsnmp_extras(h("01 02 03 04"), b"", "1.3")
+    r = notify.v1_to_v2(TrapV1Pdu(o("1.3"), h("01 02 03 04"), 0, 0, 0, all3), b"")
+    r.varbinds.append(vb("1.3.6.1", Null()))
+    testing.assertEqual(len(all3), 3)
+
+def _test_v1_to_v2_lenient_fields() -> None:
+    # A decoded Trap-PDU may hold an agent-addr of any length and an impossible generic-trap;
+    # the conversion still works (the value is kept as received).
+    t = TrapV1Pdu(Oid([]), h("0a 00 00"), 7, -5, 0)
+    r = notify.v1_to_v2(t, b"c")
+    testing.assertEqual(r.trap_oid, o("1.3.6.1.6.3.1.1.5.8"))
+    testing.assertEqual(r.varbinds, [VarBind(notify.SNMP_TRAP_ADDRESS_0, IpAddress(h("0a 00 00"))),
+                                     VarBind(notify.SNMP_TRAP_COMMUNITY_0, OctetString(b"c")),
+                                     VarBind(notify.SNMP_TRAP_ENTERPRISE_0, ObjectIdentifier(Oid([])))])
+    # an empty agent-addr is no address, like 0.0.0.0
+    r = notify.v1_to_v2(TrapV1Pdu(Oid([]), b"", 7, -5, 0), b"")
+    testing.assertEqual(r.varbinds, [VarBind(notify.SNMP_TRAP_ENTERPRISE_0, ObjectIdentifier(Oid([])))])
+
+def _test_v1_message_to_v2_message() -> None:
+    # Packet M decoded, converted and sent on as an SNMPv2-Trap: byte-identical to pysnmp's encoding
+    m = decode_community(MSG_M)
+    t = m.trap!
+    r = notify.v1_to_v2(t, m.community)
+    out = CommunityMessage(message.SNMP_V2C, m.community,
+                           Pdu(pdu.TRAP_V2, 42, varbinds=notify.build_trap_v2(r.uptime, r.trap_oid, r.varbinds)))
+    testing.assertEqual(message.encode_community(out), h(MSG_M_AS_V2))
+
+
+# build_trap_v2, split_v2 ###########################################################################
+
+def _test_build_trap_v2_packet_n() -> None:
+    payload = [vb(IF_INDEX_3, Integer(3)), vb("1.3.6.1.2.1.2.2.1.7.3", Integer(2)),
+               vb("1.3.6.1.2.1.2.2.1.8.3", Integer(2))]
+    vbs = notify.build_trap_v2(123456, notify.TRAP_LINK_DOWN, payload)
+    testing.assertEqual(vbs[0], vb(SYS_UPTIME, TimeTicks(123456)))
+    testing.assertEqual(vbs[1], vb(TRAP_OID, ObjectIdentifier(o("1.3.6.1.6.3.1.1.5.3"))))
+    testing.assertEqual(vbs[2:], payload)
+    testing.assertEqual(len(payload), 3, "payload list unchanged")
+    m = CommunityMessage(message.SNMP_V2C, b"public", Pdu(pdu.TRAP_V2, 42, varbinds=vbs))
+    testing.assertEqual(message.encode_community(m), h(MSG_N))
+
+def _test_build_trap_v2_no_payload() -> None:
+    testing.assertEqual(notify.build_trap_v2(0, o("1.3"), []),
+                        [vb(SYS_UPTIME, TimeTicks(0)), vb(TRAP_OID, ObjectIdentifier(o("1.3")))])
+
+def _test_build_trap_v2_checked_on_encode() -> None:
+    # build_trap_v2 itself accepts anything; encoding the PDU rejects what cannot go on the wire
+    for vbs in [notify.build_trap_v2(-1, o("1.3"), []), notify.build_trap_v2(4294967296, o("1.3"), []),
+                notify.build_trap_v2(0, Oid([1]), [])]:
+        try:
+            pdu.encode_pdu(Pdu(pdu.TRAP_V2, 1, varbinds=vbs))
+            testing.error("no EncodeError: " + repr(vbs))
+        except errors.EncodeError:
+            pass
+
+def _test_split_v2_packet_n() -> None:
+    c = decode_community(MSG_N)
+    p = c.pdu!
+    s = notify.split_v2(p.varbinds)
+    testing.assertEqual(s.uptime, 123456)
+    testing.assertEqual(s.trap_oid, notify.TRAP_LINK_DOWN)
+    testing.assertEqual(s.varbinds, p.varbinds[2:])
+    testing.assertEqual(len(s.varbinds), 3)
+    testing.assertEqual(s.problem, "")
+
+def round_trip_cases() -> list[(int, Oid, list[VarBind])]:
+    long_oid = Oid([1, 3] + [4294967295] * 126)
+    return [
+        (0, o("1.3.6.1.6.3.1.1.5.1"), []),
+        (4294967295, o("1.3.6.1.4.1.8072.9999.3.0.22"), [vb(IF_INDEX_3, Integer(3))]),
+        (123456, long_oid, [vb("1.3.6.1.2.1.1.5.0", OctetString(b"host")), vb("1.3.6.1.2.1.2.2.1.10.1", Counter32(7)),
+                            vb(SYS_UPTIME, TimeTicks(1)), vb(TRAP_OID, ObjectIdentifier(o("1.3")))]),
+    ]
+
+def _test_build_split_round_trip() -> None:
+    for uptime, trap_oid, payload in round_trip_cases():
+        s = notify.split_v2(notify.build_trap_v2(uptime, trap_oid, payload))
+        testing.assertEqual(s.uptime, uptime)
+        testing.assertEqual(s.trap_oid, trap_oid)
+        testing.assertEqual(s.varbinds, payload)
+        testing.assertEqual(s.problem, "")
+
+def _test_build_split_round_trip_wire() -> None:
+    # build, encode as SNMPv2-Trap and InformRequest, decode, split
+    for uptime, trap_oid, payload in round_trip_cases():
+        for t in [pdu.TRAP_V2, pdu.INFORM]:
+            wire = message.encode_community(CommunityMessage(message.SNMP_V2C, b"public",
+                Pdu(t, 7, varbinds=notify.build_trap_v2(uptime, trap_oid, payload))))
+            p = decode_community(wire.hex()).pdu!
+            n = notify.notification_from_v2c(p, b"public", "192.0.2.1", 1162)
+            testing.assertEqual(n.pdu_type, t)
+            testing.assertEqual(n.uptime, uptime)
+            testing.assertEqual(n.trap_oid, trap_oid)
+            testing.assertEqual(n.varbinds, payload)
+            testing.assertEqual(n.problem, "")
+
+def malformed_cases() -> list[(list[VarBind], int, Oid, str)]:
+    """(varbinds, uptime, trap OID, problem) of SNMPv2 notifications with bad leading varbinds"""
+    up = vb(SYS_UPTIME, TimeTicks(5))
+    lu = vb(TRAP_OID, ObjectIdentifier(o(LINK_UP)))
+    x = vb(IF_INDEX_3, Integer(3))
+    none = Oid([])
+    return [
+        ([], -1, none, "no variable bindings: sysUpTime.0 and snmpTrapOID.0 missing"),
+        ([up], 5, none, "snmpTrapOID.0 missing"),
+        ([x], -1, none, "first variable binding is .1.3.6.1.2.1.2.2.1.1.3, not sysUpTime.0"),
+        ([lu, x], -1, o(LINK_UP), "first variable binding is .1.3.6.1.6.3.1.1.4.1.0, not sysUpTime.0"),
+        ([lu, up, x], 5, o(LINK_UP), "first variable binding is .1.3.6.1.6.3.1.1.4.1.0, not sysUpTime.0"),
+        ([vb("1.3.6.1.2.1.1.3", TimeTicks(5)), lu], -1, o(LINK_UP),
+         "first variable binding is .1.3.6.1.2.1.1.3, not sysUpTime.0"),
+        ([vb(SYS_UPTIME, Integer(5)), lu, x], -1, o(LINK_UP), "sysUpTime.0 is INTEGER, not Timeticks"),
+        ([vb(SYS_UPTIME, NoSuchObject()), lu], -1, o(LINK_UP), "sysUpTime.0 is noSuchObject, not Timeticks"),
+        ([up, x, lu], 5, o(LINK_UP), "second variable binding is .1.3.6.1.2.1.2.2.1.1.3, not snmpTrapOID.0"),
+        ([up, up, lu], 5, o(LINK_UP), "second variable binding is .1.3.6.1.2.1.1.3.0, not snmpTrapOID.0"),
+        ([up, vb(TRAP_OID, OctetString(b"1.3.6.1.6.3.1.1.5.4")), x], 5, none,
+         "snmpTrapOID.0 is STRING, not OID"),
+        ([up, vb(TRAP_OID, Null())], 5, none, "snmpTrapOID.0 is NULL, not OID"),
+        # the first usable sysUpTime.0 and snmpTrapOID.0 anywhere are taken
+        ([vb(SYS_UPTIME, Integer(1)), vb(TRAP_OID, Null()), x, vb(SYS_UPTIME, TimeTicks(2)), lu,
+          vb(SYS_UPTIME, TimeTicks(3)), vb(TRAP_OID, ObjectIdentifier(o("1.3")))], 2, o(LINK_UP),
+         "sysUpTime.0 is INTEGER, not Timeticks"),
+    ]
+
+def _test_split_v2_malformed() -> None:
+    for vbs, uptime, trap_oid, problem in malformed_cases():
+        s = notify.split_v2(vbs)
+        testing.assertEqual(s.problem, problem)
+        testing.assertEqual(s.uptime, uptime, problem)
+        testing.assertEqual(s.trap_oid, trap_oid, problem)
+        testing.assertEqual(s.varbinds, vbs, problem)
+        n = len(vbs)
+        s.varbinds.append(vb("1.3.6.1", Null()))
+        testing.assertEqual(len(vbs), n, "a copy: " + problem)
+
+def _test_split_v2_malformed_wire() -> None:
+    # Malformed notifications that decode fine on the wire become Notifications with a problem
+    for vbs, uptime, trap_oid, problem in malformed_cases():
+        for t in [pdu.TRAP_V2, pdu.INFORM]:
+            wire = message.encode_community(CommunityMessage(message.SNMP_V2C, b"public", Pdu(t, 9, varbinds=vbs)))
+            p = decode_community(wire.hex()).pdu!
+            n = notify.notification_from_v2c(p, b"public", "10.0.0.1", 162)
+            testing.assertEqual(n.problem, problem)
+            testing.assertEqual(n.uptime, uptime, problem)
+            testing.assertEqual(n.trap_oid, trap_oid, problem)
+            testing.assertEqual(n.varbinds, vbs, problem)
+            testing.assertEqual(n.all_varbinds, vbs, problem)
+
+def _test_split_v2_empty_trap_pdu_wire() -> None:
+    # SNMPv2-Trap without any varbinds, as raw octets
+    c = decode_community("30 18 02 01 01 04 06 70 75 62 6c 69 63 a7 0b 02 01 01 02 01 00 02 01 00 30 00")
+    p = c.pdu!
+    n = notify.notification_from_v2c(p, c.community, "10.0.0.1", 162)
+    testing.assertEqual(n.uptime, -1)
+    testing.assertEqual(n.trap_oid, Oid([]))
+    testing.assertEqual(n.varbinds, [])
+    testing.assertEqual(n.problem, "no variable bindings: sysUpTime.0 and snmpTrapOID.0 missing")
+
+
+# Notification constructors #########################################################################
+
+def _test_notification_from_v1_packet_m() -> None:
+    m = decode_community(MSG_M)
+    t = m.trap!
+    n = notify.notification_from_v1(t, m.community, "192.0.2.99", 50162)
+    payload = [vb(IF_INDEX_3, Integer(3))] + netsnmp_extras(h("c0 00 02 01"), b"public", NETSNMP_ENTERPRISE)
+    all_vbs = [vb(SYS_UPTIME, TimeTicks(123456)), vb(TRAP_OID, ObjectIdentifier(notify.TRAP_LINK_DOWN))] + payload
+    testing.assertEqual(n.version, message.SNMP_V1)
+    testing.assertEqual(n.pdu_type, pdu.TRAP_V1)
+    testing.assertEqual(n.source_address, "192.0.2.99")
+    testing.assertEqual(n.source_port, 50162)
+    testing.assertEqual(n.community, b"public")
+    testing.assertEqual(n.request_id, 0)
+    testing.assertEqual(n.uptime, 123456)
+    testing.assertEqual(n.trap_oid, notify.TRAP_LINK_DOWN)
+    testing.assertEqual(n.varbinds, payload)
+    testing.assertEqual(n.all_varbinds, all_vbs)
+    testing.assertEqual(n.v1, t)
+    testing.assertEqual(n.problem, "")
+    testing.assertEqual((n.user, n.security_level, n.engine_id, n.context_engine_id, n.context_name),
+                        (b"", 0, b"", b"", b""))
+    testing.assertEqual(n, Notification(message.SNMP_V1, pdu.TRAP_V1, "192.0.2.99", 50162, 0, 123456,
+                                        notify.TRAP_LINK_DOWN, payload, all_vbs, community=b"public", v1=t))
+
+def _test_notification_from_v1_problems() -> None:
+    addr = h("c0 00 02 07")
+    cases: list[(TrapV1Pdu, Oid, str)] = [
+        (TrapV1Pdu(o(EXAMPLE_ENTERPRISE), addr, 7, 0, 5), o("1.3.6.1.6.3.1.1.5.8"), "generic-trap 7 is not 0..6"),
+        (TrapV1Pdu(o(EXAMPLE_ENTERPRISE), addr, -1, 0, 5), o("1.3.6.1.6.3.1.1.5.0"), "generic-trap -1 is not 0..6"),
+        (TrapV1Pdu(o(EXAMPLE_ENTERPRISE), addr, 6, -1, 5), o("1.3.6.1.4.1.8072.9999.0.4294967295"),
+         "specific-trap -1 is not 0..4294967295"),
+        (TrapV1Pdu(o(EXAMPLE_ENTERPRISE), addr, 6, 4294967296, 5), o("1.3.6.1.4.1.8072.9999.0.0"),
+         "specific-trap 4294967296 is not 0..4294967295"),
+        (TrapV1Pdu(o(EXAMPLE_ENTERPRISE), addr, 2147483648, 0, 5), o("1.3.6.1.6.3.1.1.5.2147483649"),
+         "generic-trap 2147483648 is not 0..6"),
+        (TrapV1Pdu(o(EXAMPLE_ENTERPRISE), addr, 6, 4294967295, 5), o("1.3.6.1.4.1.8072.9999.0.4294967295"), ""),
+        (TrapV1Pdu(o(EXAMPLE_ENTERPRISE), h("c0 00 02"), 6, 1, 5), o("1.3.6.1.4.1.8072.9999.0.1"),
+         "agent-addr has 3 octets, not 4"),
+        # a negative specific-trap of a generic trap is not used, so it is no problem
+        (TrapV1Pdu(o(EXAMPLE_ENTERPRISE), addr, 0, -1, 5), notify.TRAP_COLD_START, ""),
+    ]
+    for t, trap_oid, problem in cases:
+        n = notify.notification_from_v1(t, b"public", "10.0.0.1", 162)
+        testing.assertEqual(n.trap_oid, trap_oid, problem)
+        testing.assertEqual(n.problem, problem)
+        testing.assertEqual(n.all_varbinds[1], VarBind(notify.SNMP_TRAP_OID_0, ObjectIdentifier(trap_oid)), problem)
+
+def _test_notification_from_v1_lenient_wire() -> None:
+    # The lenient Trap-PDU of test_pdu: enterprise without arcs, empty agent-addr, generic 6,
+    # specific 1, time-stamp ff ff ff ff
+    b = ber.enc_tlv(pdu.TRAP_V1, h("06 00 40 00 02 01 06 02 01 01 43 04 ff ff ff ff 30 00"))
+    t = pdu.decode_pdu(b, 0, len(b)).1!
+    n = notify.notification_from_v1(t, b"", "10.0.0.1", 162)
+    testing.assertEqual(n.uptime, 4294967295)
+    testing.assertEqual(n.trap_oid, Oid([0, 1]))
+    testing.assertEqual(n.problem, "agent-addr has 0 octets, not 4")
+    testing.assertEqual(n.varbinds, [VarBind(notify.SNMP_TRAP_ENTERPRISE_0, ObjectIdentifier(Oid([])))])
+
+def _test_notification_from_v2c_packet_n() -> None:
+    c = decode_community(MSG_N)
+    p = c.pdu!
+    n = notify.notification_from_v2c(p, c.community, "2001:db8::1", 162)
+    testing.assertEqual(n.version, message.SNMP_V2C)
+    testing.assertEqual(n.pdu_type, pdu.TRAP_V2)
+    testing.assertEqual(n.source_address, "2001:db8::1")
+    testing.assertEqual(n.source_port, 162)
+    testing.assertEqual(n.community, b"public")
+    testing.assertEqual(n.request_id, 42)
+    testing.assertEqual(n.uptime, 123456)
+    testing.assertEqual(n.trap_oid, notify.TRAP_LINK_DOWN)
+    testing.assertEqual(n.varbinds, p.varbinds[2:])
+    testing.assertEqual(n.all_varbinds, p.varbinds)
+    testing.assertEqual(len(n.all_varbinds), 5)
+    testing.assertNone(n.v1)
+    testing.assertEqual(n.problem, "")
+    testing.assertEqual((n.user, n.security_level, n.engine_id, n.context_engine_id, n.context_name),
+                        (b"", 0, b"", b"", b""))
+
+def _test_notification_from_v2c_inform() -> None:
+    c = decode_community(MSG_INFORM)
+    p = c.pdu!
+    n = notify.notification_from_v2c(p, c.community, "127.0.0.1", 40000)
+    testing.assertEqual(n.pdu_type, pdu.INFORM)
+    testing.assertEqual(n.request_id, 1234567)
+    testing.assertEqual(n.uptime, 4294967295)
+    testing.assertEqual(n.trap_oid, o("1.3.6.1.4.1.8072.9999.3.0.7"))
+    testing.assertEqual(n.varbinds, [vb("1.3.6.1.4.1.8072.9999.1.1.2.0", OctetString(b"hi"))])
+    testing.assertEqual(n.problem, "")
+
+def _test_notification_from_v2_rejects_other_pdus() -> None:
+    vbs = notify.build_trap_v2(1, o("1.3"), [])
+    params = UsmSecurityParameters(b"\x80\x00\x00\x00\x01", 1, 1, b"u")
+    for t in [pdu.GET, pdu.GETNEXT, pdu.RESPONSE, pdu.SET, pdu.GETBULK, pdu.REPORT]:
+        p = Pdu(t, 1, varbinds=vbs)
+        value_fails(lambda: notify.notification_from_v2c(p, b"public", "10.0.0.1", 162), pdu.pdu_type_name(t))
+        msg = V3Message(1, 65507, 0, params)
+        value_fails(lambda: notify.notification_from_v3(msg, ScopedPdu(b"", b"", p), "10.0.0.1", 162),
+                    "v3 " + pdu.pdu_type_name(t))
+
+def _test_notification_from_v3_trap() -> None:
+    msg = decode_v3(MSG_V3_TRAP)
+    scoped = msg.scoped!
+    n = notify.notification_from_v3(msg, scoped, "192.0.2.5", 162)
+    testing.assertEqual(n.version, message.SNMP_V3)
+    testing.assertEqual(n.pdu_type, pdu.TRAP_V2)
+    testing.assertEqual(n.community, b"")
+    testing.assertEqual(n.user, b"u_noauth")
+    testing.assertEqual(n.security_level, 0)
+    testing.assertEqual(n.engine_id, h("80 00 00 00 01 02 03 04"))
+    testing.assertEqual(n.context_engine_id, h("80 00 00 00 01 02 03 04"))
+    testing.assertEqual(n.context_name, b"ctx")
+    testing.assertEqual(n.request_id, 99)
+    testing.assertEqual(n.uptime, 3001002)
+    testing.assertEqual(n.trap_oid, o("1.3.6.1.4.1.8072.9999.3.0.22"))
+    testing.assertEqual(n.varbinds, [vb("1.3.6.1.4.1.8072.9999.1.1.1.0", Integer(0))])
+    testing.assertEqual(n.all_varbinds, scoped.pdu.varbinds)
+    testing.assertNone(n.v1)
+    testing.assertEqual(n.problem, "")
+
+def _test_notification_from_v3_security_level() -> None:
+    params = UsmSecurityParameters(h("80 00 1f 88 80 61 63 74 73 6e 6d 70 72"), 3, 100, b"u_sha_aes")
+    scoped = ScopedPdu(b"\x80\x01", b"", Pdu(pdu.INFORM, 5, varbinds=notify.build_trap_v2(7, o("1.3.6"), [])))
+    # security_level holds msgFlags bits (usm.LEVEL_*); RFC 3411 numbers the levels 1, 2, 3
+    levels = [(0, usm.LEVEL_NO_AUTH_NO_PRIV, 1), (message.FLAG_AUTH, usm.LEVEL_AUTH_NO_PRIV, 2),
+              (message.FLAG_AUTH | message.FLAG_PRIV, usm.LEVEL_AUTH_PRIV, 3),
+              (message.FLAG_AUTH | message.FLAG_PRIV | message.FLAG_REPORTABLE, usm.LEVEL_AUTH_PRIV, 3),
+              (message.FLAG_AUTH | message.FLAG_REPORTABLE, usm.LEVEL_AUTH_NO_PRIV, 2),
+              (message.FLAG_REPORTABLE, usm.LEVEL_NO_AUTH_NO_PRIV, 1)]
+    for flags, level, rfc3411 in levels:
+        n = notify.notification_from_v3(V3Message(1, 65507, flags, params), scoped, "10.0.0.1", 162)
+        testing.assertEqual(n.security_level, level, "flags %d" % flags)
+        testing.assertEqual(usm.rfc3411_level(n.security_level), rfc3411, "flags %d" % flags)
+        testing.assertEqual(n.pdu_type, pdu.INFORM)
+        testing.assertEqual(n.user, b"u_sha_aes")
+        testing.assertEqual(n.engine_id, h("80 00 1f 88 80 61 63 74 73 6e 6d 70 72"))
+        testing.assertEqual(n.context_engine_id, b"\x80\x01")
+        testing.assertEqual(n.request_id, 5)
+        testing.assertEqual(n.uptime, 7)
+
+
+# inform_response ###################################################################################
+
+def _test_inform_response_kat() -> None:
+    c = decode_community(MSG_INFORM)
+    p = c.pdu!
+    r = notify.inform_response(p)
+    testing.assertEqual(r, Pdu(pdu.RESPONSE, 1234567, 0, 0, p.varbinds))
+    testing.assertEqual(message.encode_community(CommunityMessage(message.SNMP_V2C, c.community, r)),
+                        h(MSG_INFORM_RESPONSE))
+
+def _test_inform_response_clears_error_fields() -> None:
+    vbs = notify.build_trap_v2(1, o("1.3"), [vb(IF_INDEX_3, Integer(3))])
+    r = notify.inform_response(Pdu(pdu.INFORM, -7, 5, 2, vbs))
+    testing.assertEqual(r, Pdu(pdu.RESPONSE, -7, 0, 0, vbs))
+
+def _test_inform_response_rejects_other_pdus() -> None:
+    for t in [pdu.TRAP_V2, pdu.GET, pdu.RESPONSE, pdu.REPORT]:
+        value_fails(lambda: notify.inform_response(Pdu(t, 1)), pdu.pdu_type_name(t))
+
+
+# Notification ######################################################################################
+
+def sample() -> Notification:
+    return notify.notification_from_v1(link_down_trap(pdu.LINK_DOWN), b"secret", "10.0.0.1", 162)
+
+def _test_notification_eq() -> None:
+    a = sample()
+    testing.assertEqual(a, sample())
+    b = sample()
+    b.community = b"other"
+    testing.assertNotEqual(a, b)
+    b = sample()
+    b.v1 = None
+    testing.assertNotEqual(a, b)
+    testing.assertNotEqual(b, a)
+    c = sample()
+    c.v1 = None
+    testing.assertEqual(b, c)
+    b = sample()
+    b.problem = "x"
+    testing.assertNotEqual(a, b)
+    b = sample()
+    b.varbinds = b.varbinds[1:]
+    testing.assertNotEqual(a, b)
+    b = sample()
+    b.source_port = 163
+    testing.assertNotEqual(a, b)
+    b = sample()
+    b.context_name = b"x"
+    testing.assertNotEqual(a, b)
+
+def _test_notification_repr() -> None:
+    r = repr(sample())
+    testing.assertFalse("secret" in r, r)
+    testing.assertTrue(r.startswith("Notification(version=0, TRAP, source=10.0.0.1:162, community=<6 octets>"), r)
+    testing.assertTrue("trap_oid=1.3.6.1.6.3.1.1.5.3" in r, r)
+    # the community is also hidden as the snmpTrapCommunity.0 value
+    testing.assertTrue("VarBind(1.3.6.1.6.3.18.1.4.0, OctetString(<6 octets>)), VarBind(1.3.6.1.6.3.1.1.4.3.0" in r, r)
+    testing.assertFalse("problem" in r, r)
+    # v2c: also a forwarded snmpTrapCommunity.0; other varbinds are shown in full
+    vbs = [vb(TRAP_COMMUNITY, OctetString(b"secret")), vb(IF_INDEX_3, OctetString(b"public"))]
+    n = notify.notification_from_v2c(Pdu(pdu.TRAP_V2, 3, varbinds=vbs), b"secret", "10.0.0.1", 162)
+    testing.assertFalse("secret" in repr(n), repr(n))
+    testing.assertTrue("VarBind(1.3.6.1.2.1.2.2.1.1.3, OctetString(b'public'))" in repr(n), repr(n))
+    testing.assertTrue(repr(n).endswith(", problem='first variable binding is .1.3.6.1.6.3.18.1.4.0, not sysUpTime.0')"),
+                       repr(n))
+    v3 = notify.notification_from_v3(decode_v3(MSG_V3_TRAP), ScopedPdu(b"\x80", b"ctx", Pdu(pdu.TRAP_V2, 1)),
+                                     "10.0.0.1", 162)
+    testing.assertTrue("user=b'u_noauth', security_level=noAuthNoPriv, engine_id=8000000001020304" in repr(v3), repr(v3))
+    testing.assertEqual(str(v3), repr(v3))
+    sec = UsmSecurityParameters(b"\x80\x00\x00\x00\x01", 1, 1, b"u")
+    for flags, name in [(0x07, "authPriv"), (0x01, "authNoPriv"), (0x02, "privWithoutAuth")]:
+        n3 = notify.notification_from_v3(V3Message(1, 65507, flags, sec), ScopedPdu(b"", b"", Pdu(pdu.TRAP_V2, 1)),
+                                         "10.0.0.1", 162)
+        testing.assertTrue(", security_level=" + name + ", " in repr(n3), repr(n3))

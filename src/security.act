@@ -1,0 +1,198 @@
+"""Security settings for talking to an SNMP engine: communities and USM users
+
+A Security tells a Client, Agent or NotificationReceiver how to secure
+messages: Community for SNMPv1/v2c and Usm for SNMPv3 with the User-based
+Security Model. Build them once and share them; treat them as immutable.
+
+Usm keeps master keys (Ku), never passwords. Turning a password into Ku
+hashes 1 MiB, so build a Usm once per set of credentials and reuse it;
+localized() derives the per-engine keys from it cheaply (except for the
+Reeder key extension, which runs one more password-to-key round), and
+localized_auth() only the authentication key, which is always cheap.
+
+Communities, passwords and keys never appear in repr() or str().
+"""
+
+import message
+import usm
+from usm import LocalizedUser
+
+MIN_PASSWORD_LEN = 8
+
+
+class Security(object):
+    """Base class of the security settings; version is the message version they are for"""
+    version: int
+
+    def __init__(self, version: int):
+        self.version = version
+
+
+class Community(Security):
+    """An SNMPv1 or SNMPv2c community
+
+    community is sent as its UTF-8 octets. version is message.SNMP_V1 or
+    message.SNMP_V2C (the default); anything else raises ValueError.
+    """
+    community: bytes
+
+    def __init__(self, community: str, version: int=message.SNMP_V2C):
+        if version != message.SNMP_V1 and version != message.SNMP_V2C:
+            raise ValueError("a community is for SNMP version 0 (v1) or 1 (v2c), got %d" % version)
+        Security.__init__(self, version)
+        self.community = community.encode()
+
+    def __repr__(self) -> str:
+        v = "1" if self.version == message.SNMP_V1 else "2c"
+        return "Community(v" + v + ", community=<%d octets>)" % len(self.community)
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
+
+def _check_protocols(auth: int, priv: int) -> int:
+    # Return the Ku length of auth; raise ValueError for unknown protocols and privacy without authentication
+    key_len = usm.auth_key_len(auth)
+    if usm.priv_key_len(priv) > 0 and auth == usm.AUTH_NONE:
+        raise ValueError("privacy needs an authentication protocol")
+    return key_len
+
+def _check_password(password: str, what: str) -> bytes:
+    p = password.encode()
+    if len(p) < MIN_PASSWORD_LEN:
+        raise ValueError("%s password must be at least %d octets, got %d" % (what, MIN_PASSWORD_LEN, len(p)))
+    return p
+
+
+class Usm(Security):
+    """SNMPv3 credentials of one USM user
+
+    user is the user name (1 to 32 octets of UTF-8). auth_protocol and
+    priv_protocol are usm.AUTH_* and usm.PRIV_* values, auth_ku and priv_ku
+    the master keys (Ku) of the authentication and privacy passwords, both
+    derived with the hash of the authentication protocol and empty when the
+    protocol is none. context_name and context_engine_id select the context
+    of requests; context_engine_id None means the engine ID of the
+    authoritative engine (the usual case, RFC 3413 section 3.1).
+
+    Build one with from_passwords() or from_keys(). The constructor checks
+    the same as from_keys() and raises ValueError for an unknown protocol,
+    privacy without authentication, keys of the wrong length, or a user name
+    that is empty or longer than 32 octets.
+    """
+    user: str
+    auth_protocol: int
+    auth_ku: bytes
+    priv_protocol: int
+    priv_ku: bytes
+    context_name: bytes
+    context_engine_id: ?bytes
+
+    def __init__(self, user: str, auth_protocol: int, auth_ku: bytes, priv_protocol: int, priv_ku: bytes,
+                 context_name: bytes, context_engine_id: ?bytes):
+        n = len(user.encode())
+        if n == 0 or n > message.MAX_USER_NAME:
+            raise ValueError("user name must be 1 to %d octets, got %d" % (message.MAX_USER_NAME, n))
+        key_len = _check_protocols(auth_protocol, priv_protocol)
+        if len(auth_ku) != key_len:
+            raise ValueError("%s needs an authentication key of %d octets, got %d"
+                             % (usm.auth_name(auth_protocol), key_len, len(auth_ku)))
+        priv_len = key_len if priv_protocol != usm.PRIV_NONE else 0
+        if len(priv_ku) != priv_len:
+            raise ValueError("%s with %s needs a privacy key of %d octets, got %d"
+                             % (usm.priv_name(priv_protocol), usm.auth_name(auth_protocol), priv_len, len(priv_ku)))
+        Security.__init__(self, message.SNMP_V3)
+        self.user = user
+        self.auth_protocol = auth_protocol
+        self.auth_ku = auth_ku
+        self.priv_protocol = priv_protocol
+        self.priv_ku = priv_ku
+        self.context_name = context_name
+        self.context_engine_id = context_engine_id
+
+    @staticmethod
+    def from_passwords(user: str, auth_protocol: int=usm.AUTH_NONE, auth_password: str="",
+                       priv_protocol: int=usm.PRIV_NONE, priv_password: str="", context_name: str="",
+                       context_engine_id: ?bytes=None) -> Usm:
+        """Return the credentials of user with the given passwords
+
+        A password must be at least 8 octets (RFC 3414 section 11.2) when its
+        protocol is set and empty when it is none. The privacy key is derived
+        with the hash of the authentication protocol. Everything is checked
+        before the (expensive) password-to-key runs. Raises ValueError for
+        bad passwords and everything the constructor rejects.
+        """
+        _check_protocols(auth_protocol, priv_protocol)
+        if auth_protocol == usm.AUTH_NONE and auth_password != "":
+            raise ValueError("authentication password without an authentication protocol")
+        if priv_protocol == usm.PRIV_NONE and priv_password != "":
+            raise ValueError("privacy password without a privacy protocol")
+        auth_ku = b""
+        priv_ku = b""
+        if auth_protocol != usm.AUTH_NONE:
+            auth_pw = _check_password(auth_password, "authentication")
+            priv_pw = _check_password(priv_password, "privacy") if priv_protocol != usm.PRIV_NONE else b""
+            auth_ku = usm.password_to_key(auth_protocol, auth_pw)
+            if priv_protocol != usm.PRIV_NONE:
+                priv_ku = usm.password_to_key(auth_protocol, priv_pw)
+        return Usm(user, auth_protocol, auth_ku, priv_protocol, priv_ku, context_name.encode(), context_engine_id)
+
+    @staticmethod
+    def from_keys(user: str, auth_protocol: int, auth_ku: bytes, priv_protocol: int, priv_ku: bytes,
+                  context_name: str="", context_engine_id: ?bytes=None) -> Usm:
+        """Return the credentials of user with master keys (Ku) instead of passwords
+
+        Like net-snmp's -3m/-3M. Each key must be as long as the digest of
+        the authentication protocol, or empty when its protocol is none.
+        Raises ValueError like the constructor.
+        """
+        return Usm(user, auth_protocol, auth_ku, priv_protocol, priv_ku, context_name.encode(), context_engine_id)
+
+    def level(self) -> int:
+        """Return the security level of the credentials as msgFlags bits (message.FLAG_AUTH, FLAG_PRIV)"""
+        return usm.level_of(self.auth_protocol, self.priv_protocol)
+
+    def localized(self, engine_id: bytes) -> LocalizedUser:
+        """Return the keys of this user localized to the authoritative engine engine_id
+
+        Pure, and cheap except with a Reeder key extension (AES-192-C,
+        AES-256-C or 3DES with MD5, SHA or SHA-224), which runs
+        password-to-key once more: about 1 MiB of hashing. Callers cache
+        the result per engine ID. Never run it for an engine ID taken from
+        a message whose MAC has not been verified: use localized_auth()
+        for that check first.
+        """
+        auth_key = b""
+        priv_key = b""
+        if self.auth_protocol != usm.AUTH_NONE:
+            auth_key = usm.localize(self.auth_protocol, self.auth_ku, engine_id)
+            if self.priv_protocol != usm.PRIV_NONE:
+                kul = usm.localize(self.auth_protocol, self.priv_ku, engine_id)
+                priv_key = usm.priv_key_from_kul(self.auth_protocol, self.priv_protocol, kul, engine_id)
+        return LocalizedUser(self.user.encode(), self.auth_protocol, self.priv_protocol, auth_key, priv_key, engine_id)
+
+    def localized_auth(self, engine_id: bytes) -> LocalizedUser:
+        """Return this user localized to engine_id with the authentication key only
+
+        One hash, whatever the privacy protocol. The result has the user's
+        protocols and level, so usm.authenticate() verifies the MAC of a
+        message at any level with it, but it has no privacy key and cannot
+        encrypt or decrypt. A receiver that localizes keys to the engine ID
+        a message names (the sender of an SNMPv3 trap) verifies the MAC
+        with this, and only then calls localized() for the privacy key, so
+        that forged messages cost no key derivation.
+        """
+        auth_key = b""
+        if self.auth_protocol != usm.AUTH_NONE:
+            auth_key = usm.localize(self.auth_protocol, self.auth_ku, engine_id)
+        return LocalizedUser(self.user.encode(), self.auth_protocol, self.priv_protocol, auth_key, b"", engine_id)
+
+    def __repr__(self) -> str:
+        ceid = self.context_engine_id
+        return ("Usm(user=" + repr(self.user) + ", level=" + usm.level_name(self.level()) + ", auth="
+                + usm.auth_name(self.auth_protocol) + ", priv=" + usm.priv_name(self.priv_protocol)
+                + ", context_name=" + repr(self.context_name) + ", context_engine_id="
+                + (ceid.hex() if ceid is not None else "None") + ")")
+
+    def __str__(self) -> str:
+        return self.__repr__()

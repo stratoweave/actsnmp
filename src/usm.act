@@ -1,0 +1,947 @@
+"""SNMPv3 User-based Security Model (RFC 3414, RFC 7860, RFC 3826)
+
+Protocol identifiers and their names, key localization and privacy key
+extension, the processing of outgoing and incoming messages for both the
+authoritative and the non-authoritative role, the Report counter OIDs, and
+the timeliness checks of RFC 3414 section 3.2 step 7.
+
+Everything here is pure except SaltCounter: no clock, no randomness, no
+state. Callers supply the salt of an outgoing message (the next value of a
+SaltCounter) and the monotonic time for the timeliness checks, and keep the
+engine time records (EngineTime).
+
+Incoming messages go through RFC 3414 section 3.2: authenticate() (steps 1
+to 6), a timeliness check (step 7, mandatory for every authenticated
+message) and decrypt_scoped() (step 8). process_incoming() runs all of them
+for a non-authoritative engine (a manager receiving responses and reports,
+a notification receiver receiving traps); an authoritative engine runs them
+itself with check_time_authoritative() (engine.AuthoritativeEngine).
+
+Keys come in three stages:
+  * Ku, the master key: password_to_key(auth, password); about 1 MiB of
+    hashing, so callers cache it (security.Usm does).
+  * Kul, the key localized to one authoritative engine: localize(auth, ku,
+    engine_id). For authentication Kul is the key.
+  * The privacy key: priv_key_from_kul(auth, priv, kul, engine_id) truncates
+    the Kul of the privacy password, or extends it when the hash of the
+    authentication protocol is shorter than the cipher needs (MD5 and SHA-1
+    for AES-192/256, SHA-224 for AES-256 and 3DES).
+A LocalizedUser holds the final keys of one user for one engine; protect()
+and the incoming functions take it.
+"""
+
+import ber
+import errors
+import message
+import usmcrypto
+from message import ScopedPdu, UsmSecurityParameters, V3Message
+from oid import Oid
+
+# Authentication protocols
+AUTH_NONE = 0
+AUTH_MD5 = 1
+AUTH_SHA1 = 2
+AUTH_SHA224 = 3
+AUTH_SHA256 = 4
+AUTH_SHA384 = 5
+AUTH_SHA512 = 6
+
+# Privacy protocols. AES192/AES256 extend short keys with the Blumenthal
+# algorithm (net-snmp "AES-192"), AES192C/AES256C with the Reeder algorithm
+# (net-snmp "AES-192-C", pysnmp's usmAesCfb192Protocol).
+PRIV_NONE = 0
+PRIV_DES = 1
+PRIV_AES128 = 2
+PRIV_AES192 = 3
+PRIV_AES256 = 4
+PRIV_AES192C = 5
+PRIV_AES256C = 6
+PRIV_3DES = 7
+
+# Names of the Report counters (and of the counters an engine keeps). The
+# usmStats ones are RFC 3414, the snmp* ones RFC 3412 and RFC 3413.
+USM_STATS_UNSUPPORTED_SEC_LEVELS = "usmStatsUnsupportedSecLevels"
+USM_STATS_NOT_IN_TIME_WINDOWS = "usmStatsNotInTimeWindows"
+USM_STATS_UNKNOWN_USER_NAMES = "usmStatsUnknownUserNames"
+USM_STATS_UNKNOWN_ENGINE_IDS = "usmStatsUnknownEngineIDs"
+USM_STATS_WRONG_DIGESTS = "usmStatsWrongDigests"
+USM_STATS_DECRYPTION_ERRORS = "usmStatsDecryptionErrors"
+SNMP_UNKNOWN_SECURITY_MODELS = "snmpUnknownSecurityModels"
+SNMP_INVALID_MSGS = "snmpInvalidMsgs"
+SNMP_UNKNOWN_PDU_HANDLERS = "snmpUnknownPDUHandlers"
+SNMP_UNAVAILABLE_CONTEXTS = "snmpUnavailableContexts"
+SNMP_UNKNOWN_CONTEXTS = "snmpUnknownContexts"
+
+# Security levels as msgFlags bits, the encoding every level in actsnmp uses (level_of,
+# level_from_name, LocalizedUser.level, notify.Notification.security_level). RFC 3411's
+# SnmpSecurityLevel numbers them 1, 2 and 3 instead: see rfc3411_level().
+LEVEL_NO_AUTH_NO_PRIV = 0
+LEVEL_AUTH_NO_PRIV = message.FLAG_AUTH
+LEVEL_AUTH_PRIV = message.FLAG_AUTH | message.FLAG_PRIV
+
+# Length of an snmpEngineID in octets (RFC 3411 SnmpEngineID). Discovery and
+# trap receivers check engine IDs learned from the network against it before
+# localizing keys to them; localize() itself takes any length.
+MIN_ENGINE_ID_LEN = 5
+MAX_ENGINE_ID_LEN = 32
+
+# Timeliness (RFC 3414 section 2.2.3 and 3.2 step 7)
+TIME_WINDOW = 150
+MAX_BOOTS = 2147483647
+
+_INT31_WRAP = 2147483648
+
+# Per-protocol tables, indexed by the AUTH_* / PRIV_* value
+_AUTH_HASH: list[int] = [0, usmcrypto.HASH_MD5, usmcrypto.HASH_SHA1, usmcrypto.HASH_SHA224,
+                         usmcrypto.HASH_SHA256, usmcrypto.HASH_SHA384, usmcrypto.HASH_SHA512]
+_AUTH_NAMES: list[str] = ["none", "MD5", "SHA", "SHA-224", "SHA-256", "SHA-384", "SHA-512"]
+_AUTH_MAC_LEN: list[int] = [0, 12, 12, 16, 24, 32, 48]
+_AUTH_KEY_LEN: list[int] = [0, 16, 20, 28, 32, 48, 64]
+_PRIV_NAMES: list[str] = ["none", "DES", "AES", "AES-192", "AES-256", "AES-192-C", "AES-256-C", "3DES"]
+_PRIV_KEY_LEN: list[int] = [0, 16, 16, 24, 32, 24, 32, 32]
+
+# Accepted spellings, upper case: net-snmp's -a/-x arguments, the usual
+# variants without dashes, and pysnmp's protocol names. pysnmp's own "AES192"
+# means the Reeder variant; here the net-snmp meaning (Blumenthal) wins, and
+# pysnmp's Blumenthal variant is spelled AES192BLMT.
+_AUTH_ALIASES: dict[str, int] = {
+    "NONE": AUTH_NONE, "USMNOAUTHPROTOCOL": AUTH_NONE,
+    "MD5": AUTH_MD5, "HMAC-MD5": AUTH_MD5, "HMACMD5": AUTH_MD5, "USMHMACMD5AUTHPROTOCOL": AUTH_MD5,
+    "SHA": AUTH_SHA1, "SHA1": AUTH_SHA1, "SHA-1": AUTH_SHA1, "HMAC-SHA": AUTH_SHA1, "HMACSHA": AUTH_SHA1,
+    "USMHMACSHAAUTHPROTOCOL": AUTH_SHA1,
+    "SHA-224": AUTH_SHA224, "SHA224": AUTH_SHA224, "USMHMAC128SHA224AUTHPROTOCOL": AUTH_SHA224,
+    "SHA-256": AUTH_SHA256, "SHA256": AUTH_SHA256, "USMHMAC192SHA256AUTHPROTOCOL": AUTH_SHA256,
+    "SHA-384": AUTH_SHA384, "SHA384": AUTH_SHA384, "USMHMAC256SHA384AUTHPROTOCOL": AUTH_SHA384,
+    "SHA-512": AUTH_SHA512, "SHA512": AUTH_SHA512, "USMHMAC384SHA512AUTHPROTOCOL": AUTH_SHA512}
+_PRIV_ALIASES: dict[str, int] = {
+    "NONE": PRIV_NONE, "USMNOPRIVPROTOCOL": PRIV_NONE,
+    "DES": PRIV_DES, "USMDESPRIVPROTOCOL": PRIV_DES,
+    "AES": PRIV_AES128, "AES128": PRIV_AES128, "AES-128": PRIV_AES128, "USMAESCFB128PROTOCOL": PRIV_AES128,
+    "AES192": PRIV_AES192, "AES-192": PRIV_AES192, "AES192BLMT": PRIV_AES192,
+    "USMAESBLUMENTHALCFB192PROTOCOL": PRIV_AES192,
+    "AES256": PRIV_AES256, "AES-256": PRIV_AES256, "AES256BLMT": PRIV_AES256,
+    "USMAESBLUMENTHALCFB256PROTOCOL": PRIV_AES256,
+    "AES192C": PRIV_AES192C, "AES-192-C": PRIV_AES192C, "USMAESCFB192PROTOCOL": PRIV_AES192C,
+    "AES256C": PRIV_AES256C, "AES-256-C": PRIV_AES256C, "USMAESCFB256PROTOCOL": PRIV_AES256C,
+    "3DES": PRIV_3DES, "3DESEDE": PRIV_3DES, "DES3": PRIV_3DES, "USM3DESEDEPRIVPROTOCOL": PRIV_3DES}
+_LEVEL_ALIASES: dict[str, int] = {
+    "NOAUTHNOPRIV": 0, "1": 0, "NANP": 0,
+    "AUTHNOPRIV": message.FLAG_AUTH, "2": message.FLAG_AUTH, "ANP": message.FLAG_AUTH,
+    "AUTHPRIV": message.FLAG_AUTH | message.FLAG_PRIV, "3": message.FLAG_AUTH | message.FLAG_PRIV,
+    "AP": message.FLAG_AUTH | message.FLAG_PRIV}
+
+# Report counter instances
+_REPORT_COUNTERS: list[(str, list[int])] = [
+    (USM_STATS_UNSUPPORTED_SEC_LEVELS, [1, 3, 6, 1, 6, 3, 15, 1, 1, 1, 0]),
+    (USM_STATS_NOT_IN_TIME_WINDOWS, [1, 3, 6, 1, 6, 3, 15, 1, 1, 2, 0]),
+    (USM_STATS_UNKNOWN_USER_NAMES, [1, 3, 6, 1, 6, 3, 15, 1, 1, 3, 0]),
+    (USM_STATS_UNKNOWN_ENGINE_IDS, [1, 3, 6, 1, 6, 3, 15, 1, 1, 4, 0]),
+    (USM_STATS_WRONG_DIGESTS, [1, 3, 6, 1, 6, 3, 15, 1, 1, 5, 0]),
+    (USM_STATS_DECRYPTION_ERRORS, [1, 3, 6, 1, 6, 3, 15, 1, 1, 6, 0]),
+    (SNMP_UNKNOWN_SECURITY_MODELS, [1, 3, 6, 1, 6, 3, 11, 2, 1, 1, 0]),
+    (SNMP_INVALID_MSGS, [1, 3, 6, 1, 6, 3, 11, 2, 1, 2, 0]),
+    (SNMP_UNKNOWN_PDU_HANDLERS, [1, 3, 6, 1, 6, 3, 11, 2, 1, 3, 0]),
+    (SNMP_UNAVAILABLE_CONTEXTS, [1, 3, 6, 1, 6, 3, 12, 1, 4, 0]),
+    (SNMP_UNKNOWN_CONTEXTS, [1, 3, 6, 1, 6, 3, 12, 1, 5, 0])]
+
+
+# Protocol identifiers ##############################################################################
+
+def _check_auth(a: int) -> None:
+    if a < AUTH_NONE or a > AUTH_SHA512:
+        raise ValueError("unknown authentication protocol %d" % a)
+
+def _check_priv(p: int) -> None:
+    if p < PRIV_NONE or p > PRIV_3DES:
+        raise ValueError("unknown privacy protocol %d" % p)
+
+def _hash_of(auth: int) -> int:
+    # The usmcrypto hash of an authentication protocol other than AUTH_NONE
+    _check_auth(auth)
+    if auth == AUTH_NONE:
+        raise ValueError("no hash without an authentication protocol")
+    return _AUTH_HASH[auth]
+
+def auth_from_name(s: str) -> int:
+    """Return the AUTH_* value of an authentication protocol name, ignoring case
+
+    Accepts net-snmp's -a spellings (MD5, SHA, SHA-224, SHA-256, SHA-384,
+    SHA-512), the variants SHA1, SHA-1, SHA224 ... SHA512, pysnmp's protocol
+    names (usmHMACSHAAuthProtocol, usmHMAC192SHA256AuthProtocol, ...) and
+    "none". Raises ValueError for anything else.
+    """
+    a = _AUTH_ALIASES.get(s.upper())
+    if a is not None:
+        return a
+    raise ValueError("unknown authentication protocol %r" % s)
+
+def priv_from_name(s: str) -> int:
+    """Return the PRIV_* value of a privacy protocol name, ignoring case
+
+    Accepts net-snmp's -x spellings (DES, AES, AES-128, AES-192, AES-256,
+    AES-192-C, AES-256-C, AES128, AES192, AES192C, ...), 3DES, pysnmp's
+    protocol names (usmAesCfb128Protocol, usmAesBlumenthalCfb192Protocol,
+    usmAesCfb192Protocol, ...) and "none". AES192/AES256 follow net-snmp and
+    mean the Blumenthal key extension; pysnmp's short name for that is
+    AES192BLMT/AES256BLMT, also accepted. Raises ValueError for anything else.
+    """
+    p = _PRIV_ALIASES.get(s.upper())
+    if p is not None:
+        return p
+    raise ValueError("unknown privacy protocol %r" % s)
+
+def level_from_name(s: str) -> int:
+    """Return the msgFlags security bits of a security level name, ignoring case
+
+    Accepts what net-snmp's -l accepts: noAuthNoPriv, authNoPriv, authPriv,
+    1, 2, 3, nanp, anp and ap. The result is 0, FLAG_AUTH or
+    FLAG_AUTH | FLAG_PRIV. Raises ValueError for anything else.
+    """
+    level = _LEVEL_ALIASES.get(s.upper())
+    if level is not None:
+        return level
+    raise ValueError("unknown security level %r" % s)
+
+def auth_name(a: int) -> str:
+    """Return the net-snmp spelling of an authentication protocol ("none" for AUTH_NONE)
+
+    Raises ValueError for an unknown value.
+    """
+    _check_auth(a)
+    return _AUTH_NAMES[a]
+
+def priv_name(p: int) -> str:
+    """Return the net-snmp spelling of a privacy protocol ("none" for PRIV_NONE)
+
+    Raises ValueError for an unknown value.
+    """
+    _check_priv(p)
+    return _PRIV_NAMES[p]
+
+def level_of(auth: int, priv: int) -> int:
+    """Return the highest security level of a user with these protocols, as msgFlags bits
+
+    0 (noAuthNoPriv) for AUTH_NONE, FLAG_AUTH for authentication without
+    privacy and FLAG_AUTH | FLAG_PRIV with both. The protocols are not
+    validated here.
+    """
+    if auth == AUTH_NONE:
+        return 0
+    if priv == PRIV_NONE:
+        return message.FLAG_AUTH
+    return message.FLAG_AUTH | message.FLAG_PRIV
+
+def level_name(flags: int) -> str:
+    """Return the name of the security level in msgFlags: noAuthNoPriv, authNoPriv or authPriv
+
+    Only the FLAG_AUTH and FLAG_PRIV bits count. Raises ValueError for
+    FLAG_PRIV without FLAG_AUTH, which is not a security level.
+    """
+    bits = flags & (message.FLAG_AUTH | message.FLAG_PRIV)
+    if bits == 0:
+        return "noAuthNoPriv"
+    if bits == message.FLAG_AUTH:
+        return "authNoPriv"
+    if bits == message.FLAG_AUTH | message.FLAG_PRIV:
+        return "authPriv"
+    raise ValueError("privacy without authentication is not a security level")
+
+def level_text(flags: int) -> str:
+    """Return level_name(flags), or "privWithoutAuth" for FLAG_PRIV without FLAG_AUTH; never raises
+
+    For repr(), logs and output that show the level of any decoded message,
+    including an invalid one (snmpInvalidMsgs).
+    """
+    if (flags & LEVEL_AUTH_PRIV) == message.FLAG_PRIV:
+        return "privWithoutAuth"
+    return level_name(flags)
+
+def rfc3411_level(flags: int) -> int:
+    """Return the RFC 3411 SnmpSecurityLevel of the security level in msgFlags
+
+    1 noAuthNoPriv, 2 authNoPriv, 3 authPriv: the numbering of
+    SNMP-TARGET-MIB, SNMP-NOTIFICATION-MIB and the ietf-snmp YANG modules.
+    Only the FLAG_AUTH and FLAG_PRIV bits count. Raises ValueError for
+    FLAG_PRIV without FLAG_AUTH, which is not a security level.
+    """
+    bits = flags & LEVEL_AUTH_PRIV
+    if bits == LEVEL_NO_AUTH_NO_PRIV:
+        return 1
+    if bits == LEVEL_AUTH_NO_PRIV:
+        return 2
+    if bits == LEVEL_AUTH_PRIV:
+        return 3
+    raise ValueError("privacy without authentication is not a security level")
+
+def level_from_rfc3411(n: int) -> int:
+    """Return the msgFlags bits of an RFC 3411 SnmpSecurityLevel (1, 2 or 3); ValueError otherwise"""
+    if n == 1:
+        return LEVEL_NO_AUTH_NO_PRIV
+    if n == 2:
+        return LEVEL_AUTH_NO_PRIV
+    if n == 3:
+        return LEVEL_AUTH_PRIV
+    raise ValueError("SnmpSecurityLevel must be 1, 2 or 3, got %d" % n)
+
+def auth_mac_len(a: int) -> int:
+    """Return the length of the MAC in msgAuthenticationParameters
+
+    12 for MD5 and SHA, 16, 24, 32 and 48 for SHA-224 to SHA-512 (RFC 7860),
+    0 for AUTH_NONE. Raises ValueError for an unknown value.
+    """
+    _check_auth(a)
+    return _AUTH_MAC_LEN[a]
+
+def auth_key_len(a: int) -> int:
+    """Return the length of Ku and Kul: the digest length of the protocol's hash
+
+    16 for MD5, 20 for SHA, 28/32/48/64 for SHA-224/256/384/512, 0 for
+    AUTH_NONE. Privacy keys derive from the same hash, so their Ku and Kul
+    have this length too. Raises ValueError for an unknown value.
+    """
+    _check_auth(a)
+    return _AUTH_KEY_LEN[a]
+
+def priv_key_len(p: int) -> int:
+    """Return the length of the privacy key that priv_key_from_kul() derives
+
+    16 for DES (8 key octets and the 8-octet pre-IV) and AES-128, 24 for the
+    AES-192 variants, 32 for the AES-256 variants and 3DES (24 key octets
+    and the pre-IV), 0 for PRIV_NONE. Raises ValueError for an unknown value.
+    """
+    _check_priv(p)
+    return _PRIV_KEY_LEN[p]
+
+def report_oid(name: str) -> Oid:
+    """Return the OID of the counter instance a Report carries, for example 1.3.6.1.6.3.15.1.1.5.0
+
+    name is one of the USM_STATS_* or SNMP_* counter names. Raises ValueError
+    for any other name.
+    """
+    for entry in _REPORT_COUNTERS:
+        if entry.0 == name:
+            return Oid(entry.1.copy())
+    raise ValueError("unknown report counter %r" % name)
+
+def report_name(o: Oid) -> ?str:
+    """Return the counter name that a Report varbind OID refers to, or None
+
+    Like net-snmp, the counter object is matched with or without its
+    instance arc, so both 1.3.6.1.6.3.15.1.1.3.0 and 1.3.6.1.6.3.15.1.1.3
+    give "usmStatsUnknownUserNames".
+    """
+    arcs = o.arcs
+    for entry in _REPORT_COUNTERS:
+        obj = entry.1[:len(entry.1) - 1]
+        n = len(obj)
+        if (len(arcs) == n or len(arcs) == n + 1) and arcs[:n] == obj:
+            return entry.0
+    return None
+
+
+# Keys ##############################################################################################
+
+def password_to_key(auth: int, password: bytes) -> bytes:
+    """Return the master key Ku of password for authentication protocol auth (RFC 3414 A.2)
+
+    The privacy password is turned into its Ku with the same function and
+    the same auth protocol. This hashes 1 MiB, so cache the result. Raises
+    ValueError for AUTH_NONE, an unknown protocol or an empty password; the
+    minimum length of 8 octets is enforced by security.Usm.
+    """
+    return usmcrypto.password_to_key(_hash_of(auth), password)
+
+def localize(auth: int, ku: bytes, engine_id: bytes) -> bytes:
+    """Return Kul = H(Ku || engine_id || Ku), the key localized to an engine (RFC 3414 2.6)
+
+    H is the hash of auth; the result is as long as its digest. Raises
+    ValueError for AUTH_NONE or an unknown protocol.
+    """
+    return usmcrypto.hash(_hash_of(auth), b"".join([ku, engine_id, ku]))
+
+def extend_blumenthal(auth: int, kul: bytes, need: int) -> bytes:
+    """Extend kul to need octets by appending H(everything so far) (draft-blumenthal-aes-usm-04 3.1.2.1)
+
+    Returns kul truncated to need octets when it is long enough already.
+    Raises ValueError for AUTH_NONE or an unknown protocol.
+    """
+    alg = _hash_of(auth)
+    k = kul
+    while len(k) < need:
+        k += usmcrypto.hash(alg, k)
+    return k[:need]
+
+def extend_reeder(auth: int, kul: bytes, engine_id: bytes, need: int) -> bytes:
+    """Extend kul to need octets by password-to-key chaining (draft-reeder-snmpv3-usm-3desede-00 2.1)
+
+    Each round runs password_to_key with the key so far as the password and
+    localizes the result to engine_id. Like net-snmp and pysnmp, every round
+    starts from the whole accumulated key; the draft uses only the last
+    block, which makes no difference while one round suffices, as it always
+    does for keys of up to 32 octets. Returns kul truncated to need octets
+    when it is long enough already. Raises ValueError for AUTH_NONE or an
+    unknown protocol.
+    """
+    k = kul
+    while len(k) < need:
+        k += localize(auth, password_to_key(auth, k), engine_id)
+    return k[:need]
+
+def priv_key_from_kul(auth: int, priv: int, kul: bytes, engine_id: bytes) -> bytes:
+    """Return the privacy key of a user from the localized key of its privacy password
+
+    kul is localize(auth, Ku of the privacy password, engine_id). DES and
+    AES-128 use its first 16 octets. The other ciphers use its first
+    priv_key_len(priv) octets when it is that long, and otherwise extend it:
+    with Blumenthal for PRIV_AES192/PRIV_AES256 and with Reeder for
+    PRIV_AES192C/PRIV_AES256C/PRIV_3DES, which needs the engine_id. Extension
+    happens for MD5 and SHA with the AES-192/256 variants and 3DES, and for
+    SHA-224 with the AES-256 variants and 3DES.
+
+    Raises ValueError for PRIV_NONE, AUTH_NONE, an unknown protocol or a kul
+    that is not auth_key_len(auth) octets long.
+    """
+    _check_auth(auth)
+    _check_priv(priv)
+    if priv == PRIV_NONE or auth == AUTH_NONE:
+        raise ValueError("a privacy key needs a privacy and an authentication protocol")
+    if len(kul) != _AUTH_KEY_LEN[auth]:
+        raise ValueError("a localized %s key has %d octets, got %d" % (_AUTH_NAMES[auth], _AUTH_KEY_LEN[auth], len(kul)))
+    need = _PRIV_KEY_LEN[priv]
+    if priv == PRIV_AES192 or priv == PRIV_AES256:
+        return extend_blumenthal(auth, kul, need)
+    if priv == PRIV_AES192C or priv == PRIV_AES256C or priv == PRIV_3DES:
+        return extend_reeder(auth, kul, engine_id, need)
+    return kul[:need]
+
+
+class LocalizedUser(object):
+    """The keys of one USM user, localized to one authoritative engine
+
+    user is the msgUserName, engine_id the msgAuthoritativeEngineID the keys
+    were localized to, auth and priv the AUTH_* and PRIV_* protocols,
+    auth_key the Kul of the authentication password (empty for AUTH_NONE)
+    and priv_key the privacy key from priv_key_from_kul() (empty for
+    PRIV_NONE). security.Usm.localized() builds one from credentials.
+
+    priv_key may also be empty with a privacy protocol: such a user, from
+    security.Usm.localized_auth(), has the user's level but only the
+    authentication key. It verifies MACs (authenticate()), which is cheap,
+    but cannot encrypt or decrypt; deriving the privacy key can cost a
+    whole password-to-key round (the Reeder extension), so a receiver
+    derives it only for messages whose MAC verified.
+
+    The constructor raises ValueError for an unknown protocol, privacy
+    without authentication, keys of the wrong length for their protocols,
+    or a user name over 32 octets. repr() and str() never show the keys.
+    """
+    user: bytes
+    auth: int
+    priv: int
+    auth_key: bytes
+    priv_key: bytes
+    engine_id: bytes
+
+    def __init__(self, user: bytes, auth: int, priv: int, auth_key: bytes, priv_key: bytes, engine_id: bytes):
+        _check_auth(auth)
+        _check_priv(priv)
+        if priv != PRIV_NONE and auth == AUTH_NONE:
+            raise ValueError("privacy needs authentication")
+        if len(auth_key) != _AUTH_KEY_LEN[auth]:
+            raise ValueError("%s needs a %d-octet key, got %d" % (_AUTH_NAMES[auth], _AUTH_KEY_LEN[auth], len(auth_key)))
+        if len(priv_key) != _PRIV_KEY_LEN[priv] and len(priv_key) != 0:
+            raise ValueError("%s needs a %d-octet key, got %d" % (_PRIV_NAMES[priv], _PRIV_KEY_LEN[priv], len(priv_key)))
+        if len(user) > message.MAX_USER_NAME:
+            raise ValueError("user name of %d octets exceeds %d" % (len(user), message.MAX_USER_NAME))
+        self.user = user
+        self.auth = auth
+        self.priv = priv
+        self.auth_key = auth_key
+        self.priv_key = priv_key
+        self.engine_id = engine_id
+
+    def level(self) -> int:
+        """Return the highest security level of the user as msgFlags bits (FLAG_AUTH, FLAG_PRIV)"""
+        return level_of(self.auth, self.priv)
+
+    def has_priv_key(self) -> bool:
+        """Return True if the user can encrypt and decrypt: it has a privacy protocol and its key"""
+        return self.priv != PRIV_NONE and len(self.priv_key) > 0
+
+    def __repr__(self) -> str:
+        return ("LocalizedUser(user=" + repr(self.user) + ", engine_id=" + self.engine_id.hex() + ", auth="
+                + _AUTH_NAMES[self.auth] + ", priv=" + _PRIV_NAMES[self.priv] + ")")
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
+
+class UsmIncomingError(errors.AuthError):
+    """An incoming SNMPv3 message failed USM (or MPv3) security processing
+
+    kind is the name of the counter the failure increments, one of the
+    USM_STATS_* or SNMP_* names (for example "usmStatsWrongDigests"); an
+    authoritative engine answers with a Report of report_oid(kind) where
+    RFC 3414 asks for one, a non-authoritative one drops the message.
+
+    undecodable is True for a usmStatsDecryptionErrors where the ciphertext
+    was well-formed but decrypted to something that is not a ScopedPDU,
+    which is what a wrong privacy key gives. pysnmp answers that with a
+    Report like any decryption error; net-snmp drops it without one, so
+    the requester times out.
+    """
+    kind: str
+    undecodable: bool
+
+    def __init__(self, kind: str, reason: str, undecodable: bool=False):
+        errors.AuthError.__init__(self, kind + ": " + reason)
+        self.kind = kind
+        self.undecodable = undecodable
+
+
+# Outgoing messages #################################################################################
+
+def _initial_salt(start: ?u64) -> u64:
+    if start is not None:
+        return start
+    r: u64 = 0
+    for b in usmcrypto.random_bytes(8):
+        r = (r << 8) | u64(b)
+    return r
+
+class SaltCounter(object):
+    """The source of the privacy salts of one engine: a 64-bit counter with a random start
+
+    protect() needs a salt that is never used twice with the same privacy
+    key (RFC 3414 section 8.1.1.1, RFC 3826 section 3.1.2.1). A counter
+    gives that within one engine; the random start (RFC 3826 recommends a
+    pseudo-random initial value) keeps two engines that share a key, such
+    as an actsnmp manager and an actsnmp agent, or one engine before and
+    after a restart, from walking through the same values. DES and 3DES
+    use only the low 32 bits. Pass start only to make tests reproducible.
+    Keep one SaltCounter per engine (per Client, per agent) for all users.
+    """
+    value: u64
+
+    def __init__(self, start: ?u64=None):
+        self.value = _initial_salt(start)
+
+    def next(self) -> u64:
+        """Return the next salt: the counter after incrementing it (wrapping at 2^64)"""
+        self.value += 1
+        return self.value
+
+    def __repr__(self) -> str:
+        return "SaltCounter()"
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
+
+def _be32(v: int) -> bytes:
+    t = ber.BYTE_TABLE
+    return b"".join([t[(v >> 24) & 0xff], t[(v >> 16) & 0xff], t[(v >> 8) & 0xff], t[v & 0xff]])
+
+def _be64(v: u64) -> bytes:
+    return _be32(int(v >> 32)) + _be32(int(v & u64(0xffffffff)))
+
+def _xor(a: bytes, b: bytes) -> bytes:
+    t = ber.BYTE_TABLE
+    return b"".join([t[a[i] ^ b[i]] for i in range(len(a))])
+
+def _is_cbc(priv: int) -> bool:
+    return priv == PRIV_DES or priv == PRIV_3DES
+
+def _cbc_split(user: LocalizedUser) -> (bytes, bytes):
+    # (cipher key, pre-IV) of DES and 3DES: the pre-IV is the last 8 octets of the privacy key
+    k = user.priv_key
+    n = len(k) - 8
+    return (k[:n], k[n:])
+
+def _encrypt(user: LocalizedUser, boots: int, time: int, salt: u64, plain: bytes) -> (bytes, bytes):
+    # Return (msgPrivacyParameters, encryptedPDU) of plain
+    if _is_cbc(user.priv):
+        # RFC 3414 8.1.1.1: the salt is the engine boots and a 32-bit counter
+        salt8 = _be32(boots) + _be32(int(salt & u64(0xffffffff)))
+        key, pre_iv = _cbc_split(user)
+        iv = _xor(pre_iv, salt8)
+        data = plain + b"\x00" * ((8 - len(plain) % 8) % 8)
+        if user.priv == PRIV_DES:
+            return (salt8, usmcrypto.des_cbc_encrypt(key, iv, data))
+        return (salt8, usmcrypto.des3_cbc_encrypt(key, iv, data))
+    # RFC 3826 3.1.2.1: the IV is boots, time and the 64-bit salt
+    salt8 = _be64(salt)
+    iv = b"".join([_be32(boots), _be32(time), salt8])
+    return (salt8, usmcrypto.aes_cfb128_encrypt(user.priv_key, iv, plain))
+
+def protect(msg: V3Message, scoped_plain: bytes, user: ?LocalizedUser, salt: u64) -> bytes:
+    """Return the datagram of msg with scoped_plain as its ScopedPDU, encrypted and authenticated as msg.flags say
+
+    msg supplies msgID, msgMaxSize, msgFlags and, in msg.usm, the
+    msgAuthoritativeEngineID, boots, time and user name; msg.usm.auth_params
+    and priv_params are ignored and filled in here, as are msg.scoped and
+    msg.encrypted. scoped_plain is message.encode_scoped() of the ScopedPDU.
+    This works for both roles: a manager puts the agent's (estimated) boots
+    and time in msg.usm, an authoritative engine its own.
+
+    With FLAG_PRIV the ScopedPDU is encrypted first (RFC 3414 section 3.1
+    step 4): DES and 3DES use the salt msgAuthoritativeEngineBoots || the
+    low 32 bits of salt, IV = pre-IV XOR salt and zero padding to a multiple
+    of 8; the AES variants use the 64-bit salt and IV = boots || time ||
+    salt. With FLAG_AUTH the message is then encoded with a zero MAC and the
+    truncated HMAC over the whole message is written in its place (step 8).
+    salt is ignored without FLAG_PRIV. With it, salt must never repeat
+    under the same privacy key: pass SaltCounter.next() of the engine's
+    counter, never a constant or a counter that always starts at the same
+    value (two engines sharing a key would then encrypt with the same IV).
+
+    user may be None for noAuthNoPriv. Raises errors.EncodeError when
+    FLAG_PRIV is set without FLAG_AUTH, when the user is missing, cannot do
+    the requested level, lacks its privacy key (Usm.localized_auth()), or
+    has another name or engine ID than msg.usm, for a security model other
+    than USM, for scoped_plain that is not a SEQUENCE, or when
+    message.encode_v3 rejects a field.
+    """
+    flags = msg.flags
+    with_auth = (flags & message.FLAG_AUTH) != 0
+    with_priv = (flags & message.FLAG_PRIV) != 0
+    if msg.security_model != message.SEC_MODEL_USM:
+        raise errors.EncodeError("security model %d is not USM" % msg.security_model)
+    if with_priv and not with_auth:
+        raise errors.EncodeError("privFlag without authFlag")
+    if len(scoped_plain) == 0 or scoped_plain[0] != ber.TAG_SEQUENCE:
+        raise errors.EncodeError("scoped_plain must be an encoded ScopedPDU")
+    u = msg.usm
+    if not with_auth:
+        plain = V3Message(msg.msg_id, msg.max_size, flags, UsmSecurityParameters(u.engine_id, u.boots, u.time, u.user))
+        return message.encode_v3(plain, scoped_plain).msg
+    if user is not None:
+        return _protect_auth(msg, scoped_plain, user, salt)
+    raise errors.EncodeError("an authenticated message needs a localized user")
+
+def _protect_auth(msg: V3Message, scoped_plain: bytes, user: LocalizedUser, salt: u64) -> bytes:
+    flags = msg.flags
+    with_priv = (flags & message.FLAG_PRIV) != 0
+    u = msg.usm
+    if user.user != u.user or user.engine_id != u.engine_id:
+        raise errors.EncodeError("the localized user does not match the user name and engine ID of the message")
+    if user.auth == AUTH_NONE or (with_priv and user.priv == PRIV_NONE):
+        raise errors.EncodeError("user cannot send " + level_name(flags))
+    if with_priv and not user.has_priv_key():
+        raise errors.EncodeError("the privacy key of the user was not derived (localized for authentication only)")
+    n = _AUTH_MAC_LEN[user.auth]
+    if with_priv:
+        priv_params, data = _encrypt(user, u.boots, u.time, salt, scoped_plain)
+    else:
+        priv_params = b""
+        data = scoped_plain
+    params = UsmSecurityParameters(u.engine_id, u.boots, u.time, u.user, b"\x00" * n, priv_params)
+    r = message.encode_v3(V3Message(msg.msg_id, msg.max_size, flags, params), data)
+    whole = r.msg
+    off = r.auth_offset
+    mac = usmcrypto.hmac(_AUTH_HASH[user.auth], user.auth_key, whole)
+    return b"".join([whole[:off], mac[:n], whole[off + n:]])
+
+
+# Incoming messages #################################################################################
+
+def authenticate(data: bytes, msg: V3Message, user: ?LocalizedUser) -> None:
+    """Check an incoming message up to and including its MAC (RFC 3414 section 3.2 steps 1 to 6)
+
+    data is the datagram exactly as received and msg its message.decode().
+    user holds the keys of msg.usm.user localized to msg.usm.engine_id, or
+    is None when there are none. Raises UsmIncomingError whose kind is:
+      * snmpUnknownSecurityModels: the security model is not USM;
+      * snmpInvalidMsgs: privFlag without authFlag;
+      * usmStatsUnknownEngineIDs: user is for another engine ID;
+      * usmStatsUnknownUserNames: an authenticated message and no user, or
+        a user with another name;
+      * usmStatsUnsupportedSecLevels: the user has no authentication (or
+        privacy) protocol for the level of the message;
+      * usmStatsWrongDigests: msgAuthenticationParameters of the wrong length
+        or a MAC that does not verify (compared in constant time).
+    A noAuthNoPriv message needs no user; when one is given, its name and
+    engine ID must still match.
+
+    What the caller must add, because it depends on the role:
+      * Step 3 for unknown engine IDs: an authoritative engine reports
+        usmStatsUnknownEngineIDs for any msgAuthoritativeEngineID other
+        than its own (an empty one is a discovery request) before it looks
+        up the user (step 4); engine.AuthoritativeEngine does.
+      * Unknown users: map msg.usm.user to the LocalizedUser, or None. An
+        authenticated message without a user raises
+        usmStatsUnknownUserNames; for a noAuthNoPriv one the caller decides
+        (an authoritative engine reports an unknown name).
+      * The level: a lower level than the user's passes (a noAuthNoPriv
+        message passes whatever user is given). The caller requires the
+        level it expects: a manager the request's for a Response (RFC 3412
+        section 7.2 step 12b; a Report may come at a lower level), a
+        receiver the level of the user's credentials.
+      * Step 7, timeliness, after this and before decrypt_scoped(): it is
+        mandatory for every message with FLAG_AUTH, or captured messages
+        can be replayed. See check_time_authoritative() and
+        check_time_non_authoritative(); process_incoming() does all of
+        this for a non-authoritative engine.
+    user may come from security.Usm.localized_auth(): verifying the MAC
+    needs only the authentication key.
+    """
+    if msg.security_model != message.SEC_MODEL_USM:
+        raise UsmIncomingError(SNMP_UNKNOWN_SECURITY_MODELS, "security model %d" % msg.security_model)
+    flags = msg.flags
+    with_auth = (flags & message.FLAG_AUTH) != 0
+    if (flags & message.FLAG_PRIV) != 0 and not with_auth:
+        raise UsmIncomingError(SNMP_INVALID_MSGS, "privFlag without authFlag")
+    u = msg.usm
+    if user is not None:
+        if user.engine_id != u.engine_id:
+            raise UsmIncomingError(USM_STATS_UNKNOWN_ENGINE_IDS, "keys are localized to another engine ID")
+        if user.user != u.user:
+            raise UsmIncomingError(USM_STATS_UNKNOWN_USER_NAMES, "keys belong to another user")
+    if not with_auth:
+        return
+    if user is not None:
+        _verify_mac(data, msg, user)
+    else:
+        raise UsmIncomingError(USM_STATS_UNKNOWN_USER_NAMES, "no keys for user " + repr(u.user))
+
+def _verify_mac(data: bytes, msg: V3Message, user: LocalizedUser) -> None:
+    flags = msg.flags
+    u = msg.usm
+    if (user.level() & flags) != (flags & (message.FLAG_AUTH | message.FLAG_PRIV)):
+        raise UsmIncomingError(USM_STATS_UNSUPPORTED_SEC_LEVELS, "user cannot do " + level_name(flags))
+    n = _AUTH_MAC_LEN[user.auth]
+    off = msg.auth_offset
+    if len(u.auth_params) != n:
+        raise UsmIncomingError(USM_STATS_WRONG_DIGESTS, "MAC of %d octets, %s needs %d"
+                               % (len(u.auth_params), _AUTH_NAMES[user.auth], n))
+    if off < 0 or off + n > len(data):
+        raise UsmIncomingError(USM_STATS_WRONG_DIGESTS, "MAC offset %d outside the datagram" % off)
+    zeroed = b"".join([data[:off], b"\x00" * n, data[off + n:]])
+    mac = usmcrypto.hmac(_AUTH_HASH[user.auth], user.auth_key, zeroed)[:n]
+    if not usmcrypto.ct_equal(mac, u.auth_params):
+        raise UsmIncomingError(USM_STATS_WRONG_DIGESTS, "MAC does not verify")
+
+def _decrypt(user: LocalizedUser, u: UsmSecurityParameters, ct: bytes) -> bytes:
+    if user.priv == PRIV_NONE:
+        raise UsmIncomingError(USM_STATS_UNSUPPORTED_SEC_LEVELS, "user has no privacy protocol")
+    if not user.has_priv_key():
+        raise ValueError("the privacy key of the user was not derived (localized for authentication only)")
+    salt8 = u.priv_params
+    if len(salt8) != 8:
+        raise UsmIncomingError(USM_STATS_DECRYPTION_ERRORS, "msgPrivacyParameters of %d octets" % len(salt8))
+    if _is_cbc(user.priv):
+        if len(ct) == 0 or len(ct) % 8 != 0:
+            raise UsmIncomingError(USM_STATS_DECRYPTION_ERRORS, "ciphertext of %d octets" % len(ct))
+        key, pre_iv = _cbc_split(user)
+        iv = _xor(pre_iv, salt8)
+        if user.priv == PRIV_DES:
+            return usmcrypto.des_cbc_decrypt(key, iv, ct)
+        return usmcrypto.des3_cbc_decrypt(key, iv, ct)
+    iv = b"".join([_be32(u.boots), _be32(u.time), salt8])
+    return usmcrypto.aes_cfb128_decrypt(user.priv_key, iv, ct)
+
+def decrypt_scoped(msg: V3Message, user: ?LocalizedUser) -> ScopedPdu:
+    """Return the ScopedPDU of an incoming message, decrypting it when FLAG_PRIV is set (RFC 3414 3.2 step 8)
+
+    Call it only for a message that passed authenticate() and the
+    timeliness check: nothing here verifies the MAC, and decrypting
+    unauthenticated ciphertext would let an attacker probe the plaintext
+    format through the responses (the ciphers are malleable). For the same
+    reason a Report to an encrypted request that failed before this step
+    carries request-id 0, as net-snmp's do (engine.AuthoritativeEngine).
+    Octets after the ScopedPDU in the plaintext (DES padding) are ignored.
+
+    Raises UsmIncomingError with kind usmStatsDecryptionErrors when
+    msgPrivacyParameters is not 8 octets, a DES/3DES ciphertext is not a
+    non-empty multiple of 8 octets, or the plaintext is not a well-formed
+    ScopedPDU (wrong key or garbage; the error is undecodable then);
+    usmStatsUnknownUserNames or usmStatsUnsupportedSecLevels when an
+    encrypted message comes without a user with privacy; snmpInvalidMsgs
+    for FLAG_PRIV without FLAG_AUTH, or when a plaintext message has no
+    ScopedPDU. Raises ValueError for a user without its privacy key
+    (security.Usm.localized_auth()).
+    """
+    if (msg.flags & message.FLAG_PRIV) == 0:
+        s = msg.scoped
+        if s is not None:
+            return s
+        raise UsmIncomingError(SNMP_INVALID_MSGS, "no plaintext ScopedPDU")
+    if (msg.flags & message.FLAG_AUTH) == 0:
+        raise UsmIncomingError(SNMP_INVALID_MSGS, "privFlag without authFlag")
+    ct = msg.encrypted
+    if user is not None and ct is not None:
+        plain = _decrypt(user, msg.usm, ct)
+        if len(plain) == 0 or plain[0] != ber.TAG_SEQUENCE:
+            raise UsmIncomingError(USM_STATS_DECRYPTION_ERRORS, "plaintext is not a ScopedPDU", True)
+        try:
+            return message.decode_scoped(plain, 0, len(plain))
+        except errors.DecodeError as e:
+            raise UsmIncomingError(USM_STATS_DECRYPTION_ERRORS, "plaintext is not a ScopedPDU: " + e.error_message, True)
+    if user is None:
+        raise UsmIncomingError(USM_STATS_UNKNOWN_USER_NAMES, "no keys for user " + repr(msg.usm.user))
+    raise UsmIncomingError(USM_STATS_DECRYPTION_ERRORS, "no encryptedPDU")
+
+def unprotect(data: bytes, msg: V3Message, user: ?LocalizedUser) -> ScopedPdu:
+    """Verify an incoming message and return its ScopedPDU, without the timeliness check
+
+    authenticate() then decrypt_scoped(); data, msg and user are as for
+    authenticate(), and UsmIncomingError is raised as those two raise it.
+    This skips RFC 3414 section 3.2 step 7, which every receiver of
+    authenticated messages must run, or captured messages can be replayed
+    at any later time; and it accepts a message at any level up to the
+    user's. Use it where neither matters, for example to look into a
+    message in a test or a trace. A manager or notification receiver uses
+    process_incoming(), an agent engine.AuthoritativeEngine.
+    """
+    authenticate(data, msg, user)
+    return decrypt_scoped(msg, user)
+
+def process_incoming(data: bytes, msg: V3Message, user: ?LocalizedUser, min_level: int, et: EngineTime,
+                     now: float) -> (scoped: ScopedPdu, record: EngineTime):
+    """Run RFC 3414 section 3.2 on an incoming message as a non-authoritative engine; return its ScopedPDU
+
+    This is the receive path of a manager (Responses and Reports) and of a
+    notification receiver (SNMPv3 traps, whose sender is authoritative).
+    data, msg and user are as for authenticate(); user must hold the
+    privacy key for an encrypted message. min_level is the lowest security
+    level the caller accepts, as LEVEL_* bits: the request's level for a
+    Response (RFC 3412 section 7.2 step 12b; a Report may come at a lower
+    level, which the caller checks before calling this), or the level of
+    the user's credentials for a trap. et is the time record of
+    msg.usm.engine_id and now the monotonic time in seconds.
+
+    Runs the level check, authenticate() (steps 1 to 6), the timeliness
+    check of step 7b for an authenticated message, and decrypt_scoped()
+    (step 8). Also returns the time record to keep for the engine, which is
+    et itself for an unauthenticated message. Raises UsmIncomingError for
+    every failure, and ValueError for an invalid min_level or a time record
+    of another engine.
+    """
+    if min_level != LEVEL_NO_AUTH_NO_PRIV and min_level != LEVEL_AUTH_NO_PRIV and min_level != LEVEL_AUTH_PRIV:
+        raise ValueError("min_level must be a security level as msgFlags bits, got %d" % min_level)
+    level = msg.flags & LEVEL_AUTH_PRIV
+    # privFlag alone is left to authenticate(): snmpInvalidMsgs, not a level
+    if msg.security_model == message.SEC_MODEL_USM and level != message.FLAG_PRIV and level < min_level:
+        raise UsmIncomingError(USM_STATS_UNSUPPORTED_SEC_LEVELS,
+                               level_name(level) + " message where " + level_name(min_level) + " is required")
+    authenticate(data, msg, user)
+    rec = et
+    if (msg.flags & message.FLAG_AUTH) != 0:
+        if et.engine_id != msg.usm.engine_id:
+            raise ValueError("the time record is for engine " + et.engine_id.hex() + ", the message from "
+                             + msg.usm.engine_id.hex())
+        r = check_time_non_authoritative(et, msg.usm.boots, msg.usm.time, now)
+        if not r.0:
+            raise UsmIncomingError(USM_STATS_NOT_IN_TIME_WINDOWS, "boots %d time %d outside the time window"
+                                   % (msg.usm.boots, msg.usm.time))
+        rec = r.1
+    return (scoped=decrypt_scoped(msg, user), record=rec)
+
+
+# Timeliness ########################################################################################
+
+class EngineTime(object):
+    """What a non-authoritative engine knows about the clock of an authoritative one (RFC 3414 2.3)
+
+    boots and time are the snmpEngineBoots/Time of engine_id as known at
+    monotonic time learned_at (seconds), and latest_received_time is
+    latestReceivedEngineTime. authenticated tells where they come from:
+
+      * True: from an authenticated message, through
+        check_time_non_authoritative(), which returns such records. They
+        drive the timeliness check of incoming messages.
+      * False (the default): from nothing (boots, time and
+        latest_received_time 0) or from an unauthenticated hint such as
+        the boots and time of a discovery Report. Such a record only feeds
+        estimate() for outgoing messages; check_time_non_authoritative()
+        treats it as empty and learns the first authenticated message
+        unconditionally. So a forged Report cannot lock the engine out
+        with huge boots.
+
+    Create a record with learned_at set to the current monotonic time:
+    EngineTime(engine_id, 0, 0, 0, now) when nothing is known yet,
+    EngineTime(engine_id, boots, time, 0, now) for a hint. Treat it as a
+    value: check_time_non_authoritative() returns an updated copy.
+    """
+    engine_id: bytes
+    boots: int
+    time: int
+    latest_received_time: int
+    learned_at: float
+    authenticated: bool
+
+    def __init__(self, engine_id: bytes, boots: int, time: int, latest_received_time: int, learned_at: float,
+                 authenticated: bool=False):
+        self.engine_id = engine_id
+        self.boots = boots
+        self.time = time
+        self.latest_received_time = latest_received_time
+        self.learned_at = learned_at
+        self.authenticated = authenticated
+
+    def estimate(self, now: float) -> (int, int):
+        """Return the estimated (boots, time) of the engine at monotonic time now, for outgoing messages
+
+        time advances with the seconds since learned_at. Past 2^31-1 it
+        wraps and boots goes up (at most to MAX_BOOTS), as the engine itself
+        would do.
+        """
+        t = self.time + int(now - self.learned_at)
+        if t < 0:
+            t = 0
+        boots = self.boots + t // _INT31_WRAP
+        return (boots if boots < MAX_BOOTS else MAX_BOOTS, t % _INT31_WRAP)
+
+    def __repr__(self) -> str:
+        return ("EngineTime(engine_id=" + self.engine_id.hex() + ", boots=%d, time=%d, latest_received_time=%d, "
+                % (self.boots, self.time, self.latest_received_time) + "learned_at=%f, authenticated=" % self.learned_at
+                + str(self.authenticated) + ")")
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
+
+def check_time_authoritative(own_boots: int, own_time: int, msg_boots: int, msg_time: int) -> bool:
+    """Return True if an authenticated message is inside the time window of its authoritative engine
+
+    RFC 3414 section 3.2 step 7a, for the engine that msgAuthoritativeEngineID
+    names: own_boots/own_time are its snmpEngineBoots/Time, msg_boots and
+    msg_time the values in the message. Outside means: own boots latched at
+    MAX_BOOTS, different boots, or times more than TIME_WINDOW (150) seconds
+    apart. False means usmStatsNotInTimeWindows.
+    """
+    if own_boots >= MAX_BOOTS or msg_boots != own_boots:
+        return False
+    return msg_time >= own_time - TIME_WINDOW and msg_time <= own_time + TIME_WINDOW
+
+def check_time_non_authoritative(et: EngineTime, msg_boots: int, msg_time: int, now: float) -> (bool, EngineTime):
+    """Check an authenticated message from another engine against its time record (RFC 3414 3.2 step 7b)
+
+    Only for a message with FLAG_AUTH whose MAC authenticate() verified:
+    the values of an unauthenticated message (a noAuthNoPriv Report
+    passes authenticate() too) must never reach this, or anyone could move
+    the clock. process_incoming() calls it at the right point.
+
+    et is the record of msgAuthoritativeEngineID, msg_boots/msg_time are
+    from the message and now is the monotonic time in seconds. Returns
+    (inside, record), where record is an authenticated record to keep in
+    either case (et itself is not modified; the same object comes back
+    when nothing changed):
+      * an unauthenticated et (nothing known, or only a hint) is replaced
+        by the message's values, and the message is inside unless its
+        boots are latched at MAX_BOOTS;
+      * otherwise step 7b(1) updates the record when the message carries
+        newer boots or a later time than latestReceivedEngineTime, and
+        step 7b(2) puts the message outside the window when the known boots
+        are latched at MAX_BOOTS, the message has older boots, or its time
+        is more than TIME_WINDOW seconds behind the estimate.
+    """
+    if not et.authenticated:
+        return (msg_boots < MAX_BOOTS, EngineTime(et.engine_id, msg_boots, msg_time, msg_time, now, True))
+    rec = et
+    if msg_boots > et.boots or (msg_boots == et.boots and msg_time > et.latest_received_time):
+        rec = EngineTime(et.engine_id, msg_boots, msg_time, msg_time, now, True)
+    if rec.boots >= MAX_BOOTS or msg_boots < rec.boots:
+        return (False, rec)
+    estimated = rec.time + int(now - rec.learned_at)
+    return (msg_time >= estimated - TIME_WINDOW, rec)

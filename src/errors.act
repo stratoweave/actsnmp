@@ -1,0 +1,183 @@
+"""Error hierarchy of actsnmp
+
+Every error that actsnmp raises or reports to a callback is an SnmpError.
+error_message holds a human-readable description; str(e) prefixes it with the
+module path of the class, so command-line tools print e.error_message.
+transient tells whether repeating the same operation later may succeed.
+
+This module is at the bottom of the dependency order and imports no other
+actsnmp module. Fields that conceptually hold an OID therefore hold its arcs
+as list[int]; build an oid.Oid from them with Oid(e.oid). The Response that
+an ErrorStatusError came with is typed ?value for the same reason (it is a
+client.Response, which lives much higher up).
+"""
+
+def _dotted(arcs: list[int]) -> str:
+    # net-snmp -On style, for example .1.3.6.1.2.1.1.1.0
+    return "." + ".".join([str(a) for a in arcs])
+
+def _timeout_msg(attempts: int, elapsed: float, hint: ?str) -> str:
+    msg = "no response after %d attempts in %.2f s" % (attempts, elapsed)
+    if hint is not None:
+        return msg + " (" + hint + ")"
+    return msg
+
+def _status_msg(status: int, index: int, oid: ?list[int], text: str) -> str:
+    msg = text if text != "" else "error-status %d" % status
+    msg += ", error-index %d" % index
+    if oid is not None:
+        return msg + " (" + _dotted(oid) + ")"
+    return msg
+
+def _report_msg(oid: list[int], name: str, value: ?int) -> str:
+    msg = "report " + name + " (" + _dotted(oid) + ")"
+    if value is not None:
+        return msg + " = %d" % value
+    return msg
+
+
+class SnmpError(Exception):
+    """Base class of all actsnmp errors
+
+    transient is True when the same operation may succeed if tried again
+    later (no response, a socket error, genErr), False when it will not.
+    """
+    transient: bool
+
+    def __init__(self, msg: str, transient: bool=False):
+        self.error_message = msg
+        self.transient = transient
+
+
+class DecodeError(SnmpError):
+    """Malformed input; the only exception a decoder may raise
+
+    offset is the position in the decoded buffer where the problem was found
+    and reason describes it. error_message is "<reason> at offset <offset>".
+    """
+    offset: int
+    reason: str
+
+    def __init__(self, reason: str, offset: int):
+        SnmpError.__init__(self, "%s at offset %d" % (reason, offset))
+        self.offset = offset
+        self.reason = reason
+
+
+class EncodeError(SnmpError):
+    """Request content that cannot be encoded
+
+    For example an Integer32 out of range, an OID with fewer than 2 or more
+    than 128 arcs, or an IpAddress that is not 4 octets long.
+    """
+    def __init__(self, msg: str):
+        SnmpError.__init__(self, msg)
+
+
+class TimeoutError(SnmpError):
+    """No valid response arrived after all attempts (transient)
+
+    attempts is the number of datagrams sent, elapsed the time in seconds from
+    the first send to giving up. hint summarises why nothing usable arrived,
+    when something is known (for example "ICMP port unreachable" or
+    "3 datagrams failed authentication").
+    """
+    attempts: int
+    elapsed: float
+    hint: ?str
+
+    def __init__(self, attempts: int, elapsed: float, hint: ?str=None):
+        SnmpError.__init__(self, _timeout_msg(attempts, elapsed, hint), True)
+        self.attempts = attempts
+        self.elapsed = elapsed
+        self.hint = hint
+
+
+class TransportError(SnmpError):
+    """Socket, address resolution or send failure (transient)"""
+    def __init__(self, msg: str):
+        SnmpError.__init__(self, msg, True)
+
+
+class ErrorStatusError(SnmpError):
+    """The agent answered with a non-zero error-status
+
+    status is the error-status (1 tooBig .. 18 inconsistentName) and index the
+    1-based error-index (0 when the agent names no varbind). oid holds the arcs
+    of the varbind that error-index points at, or None. text is the
+    description of the status to use in error_message, for example
+    pdu.error_status_text(status); when empty a generic text is used.
+    response is the client.Response the error came with (None when there is
+    none); narrow it with isinstance(r, client.Response).
+
+    Transient for genErr (5) and resourceUnavailable (13).
+    """
+    status: int
+    index: int
+    oid: ?list[int]
+    response: ?value
+
+    def __init__(self, status: int, index: int, oid: ?list[int]=None, text: str="", response: ?value=None):
+        SnmpError.__init__(self, _status_msg(status, index, oid, text), status == 5 or status == 13)
+        self.status = status
+        self.index = index
+        self.oid = oid
+        self.response = response
+
+
+class ReportError(SnmpError):
+    """An SNMPv3 Report-PDU ended the request
+
+    oid holds the arcs of the reported counter (for example
+    1.3.6.1.6.3.15.1.1.3.0), name its name ("usmStatsUnknownUserNames") and
+    value the counter value when the report carried an integer.
+    """
+    oid: list[int]
+    name: str
+    value: ?int
+
+    def __init__(self, oid: list[int], name: str, value: ?int=None):
+        SnmpError.__init__(self, _report_msg(oid, name, value))
+        self.oid = oid
+        self.name = name
+        self.value = value
+
+
+class AuthError(SnmpError):
+    """An incoming message failed authentication or decryption
+
+    Usually such messages are dropped and counted; this error is for the rare
+    cases where the failure is reported to the caller.
+    """
+    def __init__(self, msg: str):
+        SnmpError.__init__(self, msg)
+
+
+class InvalidResponseError(SnmpError):
+    """A response that decodes but does not answer the request
+
+    For example an OID or varbind count that differs from the request, an
+    unexpected PDU type, or a GETBULK response that makes no progress.
+    """
+    def __init__(self, msg: str):
+        SnmpError.__init__(self, msg)
+
+
+class OidNotIncreasingError(SnmpError):
+    """A walk received an OID that is not greater than the previous one
+
+    previous and received hold the arcs of the two OIDs.
+    """
+    previous: list[int]
+    received: list[int]
+
+    def __init__(self, previous: list[int], received: list[int]):
+        SnmpError.__init__(self, "OID not increasing: " + _dotted(previous) + " >= " + _dotted(received))
+        self.previous = previous
+        self.received = received
+
+
+class CancelledError(SnmpError):
+    """The request was cancelled by cancel() or close()"""
+    def __init__(self, msg: str="cancelled"):
+        SnmpError.__init__(self, msg)

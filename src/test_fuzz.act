@@ -1,0 +1,1534 @@
+"""Mutation fuzzing of the decoders
+
+The seeds are the reference messages, net-snmp captures, decrypted
+ScopedPDUs and value TLVs embedded below. Mutations range from bit flips
+and truncation to structure-aware edits that keep the enclosing lengths
+consistent, so that they reach the checks deep inside a message.
+
+Properties checked for every mutated input:
+1. Only DecodeError escapes a decoder, with an offset inside the decoded
+   range.
+2. A decoded result re-encodes (or raises EncodeError, as encoding is
+   stricter than decoding) to octets that decode to an equal result.
+3. message.peek agrees with message.decode, and the auth_offset of a
+   decoded SNMPv3 message locates its MAC.
+4. An offset decoder gives the same result when its input is embedded
+   between random octets: it never reads outside [pos, end).
+5. Decoded results can be printed, and opaque_special classifies every
+   decoded Opaque without raising.
+6. Non-minimal lengths and integers decode to the seed's structure.
+7. A value decodes to a MalformedValue exactly when its TLV is intact and
+   the strict decoder of its type rejects the content.
+
+The generator is seeded, so every run checks the same inputs.
+"""
+
+import testing
+import ber
+import errors
+import message
+import pdu
+import values
+from message import CommunityMessage, V3Message, ScopedPdu
+from pdu import Pdu, TrapV1Pdu
+from values import Value, VarBind, Opaque, UnknownValue, MalformedValue
+
+
+# Mutation material #################################################################################
+
+# Interesting octet values: the extremes of a signed and an unsigned octet
+INTERESTING: list[int] = [0x00, 0x7f, 0x80, 0xff]
+
+# INTERESTING plus tag octets, the length forms around the short/long boundary (81..85) and
+# the net-snmp Opaque escape 9f
+OCTETS: list[int] = [0x00, 0x7f, 0x80, 0xff, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x1f, 0x30, 0x40, 0x41, 0x43,
+                     0x44, 0x46, 0x81, 0x82, 0x83, 0x84, 0x85, 0x9f, 0xa0, 0xa2, 0xa4, 0xa5, 0xa8, 0xfe]
+
+# Universal, application, context-specific (exceptions and PDUs) and high-tag-number form tags
+TAGS: list[int] = [0x00, 0x02, 0x04, 0x05, 0x06, 0x1f, 0x30, 0x31, 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47,
+                   0x80, 0x81, 0x82, 0x9f, 0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xbf, 0xff]
+
+# Replacement first length octets: zero, the short form maximum, indefinite, long forms of
+# 1, 2 and 4 octets, the unsupported 5-octet form and 0xff
+LENGTH_OCTETS: list[int] = [0x00, 0x7f, 0x80, 0x81, 0x82, 0x84, 0x85, 0xff]
+
+LENGTH_DELTAS: list[int] = [-2, -1, 1, 2]
+
+# Pseudo-random numbers #############################################################################
+
+class Rng(object):
+    """xorshift64 (Marsaglia 2003, shifts 13, 7, 17) from a fixed seed
+
+    A fixed seed makes every run check the same inputs.
+    """
+    state: u64
+
+    def __init__(self, seed: u64):
+        self.state = seed if seed != 0 else 0x9e3779b97f4a7c15
+
+    def next(self) -> u64:
+        """Return the next 64-bit number"""
+        x = self.state
+        x ^= x << 13
+        x ^= x >> 7
+        x ^= x << 17
+        self.state = x
+        return x
+
+    def below(self, n: int) -> int:
+        """Return a number in 0..n-1; n must be at least 1"""
+        return int(self.next() >> 33) % n
+
+    def octets(self, n: int) -> bytes:
+        """Return n random octets"""
+        return b"".join([ber.BYTE_TABLE[self.below(256)] for i in range(n)])
+
+    def steering(self, n: int) -> bytes:
+        """Return n octets, about half of them from OCTETS"""
+        return b"".join([ber.BYTE_TABLE[OCTETS[self.below(len(OCTETS))] if self.below(2) == 0 else self.below(256)]
+                         for i in range(n)])
+
+
+def edge_contents() -> list[bytes]:
+    """Contents at the limits of the value decoders (INTEGER, unsigned, Counter64, OID, Opaque)"""
+    return [
+        b"", b"\x00", b"\x7f", b"\x80", b"\xff",
+        # INTEGER: 9-octet forms around the int range, 10 octets, Integer32 limits and beyond
+        b"\x00\x7f\xff\xff\xff\xff\xff\xff\xff", b"\x00\x80\x00\x00\x00\x00\x00\x00\x00",
+        b"\xff\x80\x00\x00\x00\x00\x00\x00\x00", b"\xff\x7f\xff\xff\xff\xff\xff\xff\xff",
+        b"\x00" * 10, b"\x80\x00\x00\x00", b"\x7f\xff\xff\xff", b"\x00\x80\x00\x00\x00", b"\xff\x7f\xff\xff\xff",
+        # unsigned32 and Counter64: negative forms, 2^32, 2^64-1, 2^64
+        b"\xff\xff\xff\xff\xff", b"\x80\x00\x00\x00\x00", b"\x01\x00\x00\x00\x00",
+        b"\x00\x00\x00\x00\x01\x00\x00\x00\x00", b"\x00\xff\xff\xff\xff\xff\xff\xff\xff",
+        b"\x01\x00\x00\x00\x00\x00\x00\x00\x00", b"\xff" * 9, b"\x80" + b"\x00" * 8,
+        # OID: 128 and 129 arcs, arcs 2^32-1 and 2^32, a truncated and a padded sub-identifier,
+        # first sub-identifiers 2^32-1 and 2^35-1
+        b"\x2b" + b"\x01" * 126, b"\x2b" + b"\x01" * 127, b"\x2b\x8f\xff\xff\xff\x7f", b"\x2b\x90\x80\x80\x80\x00",
+        b"\x2b\x86", b"\x2b" + b"\x80" * 20 + b"\x01", b"\x8f\xff\xff\xff\x7f", b"\xff\xff\xff\xff\x7f",
+        # net-snmp Opaque wrappers: float, double extremes (max, subnormal, NaN, -inf), I64 min,
+        # U64 max, Counter64, and malformed ones
+        b"\x9f\x78\x04\x3f\xc0\x00\x00", b"\x9f\x79\x08\x7f\xef\xff\xff\xff\xff\xff\xff",
+        b"\x9f\x79\x08\x00\x00\x00\x00\x00\x00\x00\x01", b"\x9f\x79\x08\x7f\xf8\x00\x00\x00\x00\x00\x00",
+        b"\x9f\x79\x08\xff\xf0\x00\x00\x00\x00\x00\x00", b"\x9f\x7a\x08\x80\x00\x00\x00\x00\x00\x00\x00",
+        b"\x9f\x7b\x09\x00\xff\xff\xff\xff\xff\xff\xff\xff", b"\x9f\x76\x05\x01\x00\x00\x00\x00",
+        b"\x9f\x7a\x00", b"\x9f\x7b\x85\x00\x00\x00\x00\x01\x00", b"\x9f\x7a\x09\x00\x80\x00\x00\x00\x00\x00\x00\x00",
+        b"\x9f\x78\x05\x00\x00\x00\x00\x00", b"\x9f\x79", b"\x9f\x7b\x80",
+        # a long string (two length octets)
+        b"A" * 300,
+    ]
+
+
+# Seeds #############################################################################################
+
+# The complete messages: the SNMPv1/v2c example packets (A to O and D(b)), the deterministic
+# SNMPv3 vectors, the net-snmp exchanges and the net-snmp captures. The ScopedPDU plaintexts:
+# the worked encryption examples, the time synchronisation exchange and the captures.
+MESSAGES: list[(str, str)] = [
+    ("v1v2c 2.4 A",
+     """302902010104067075626c6963a01c020412345678020100020100300e300c06
+         082b060102010101000500"""),
+    ("v1v2c 2.4 B",
+     """303b02010104067075626c6963a22e0204123456780201000201003020301e06
+         082b0601020101010004124c696e757820726f7574657220362e312e30"""),
+    ("v1v2c 2.4 C",
+     """302402010104067075626c6963a117020107020100020100300c300a06062b06
+         010201010500"""),
+    ("v1v2c 2.4 D",
+     """304302010104067075626c6963a53602010102010102010a302b300b06072b06
+         01020101030500300d06092b06010201020201020500300d06092b0601020102
+         0201030500"""),
+    ("v1v2c 2.4 D(b)",
+     """304302010104067075626c6963a536020101020101020102302b300b06072b06
+         01020101030500300d06092b06010201020201020500300d06092b0601020102
+         0201030500"""),
+    ("v1v2c 2.4 E",
+     """307002010104067075626c6963a2630201010201000201003058300e06082b06
+         01020101030043020ef63010060a2b06010201020201020104026c6f300f060a
+         2b0601020102020103010201183012060a2b0601020102020102020404657468
+         30300f060a2b060102010202010302020106"""),
+    ("v1v2c 2.4 F",
+     """304002010104067075626c6963a2330201020201000201003028300c06082b06
+         0102010163008000300c06082b060102010101018100300a06062b0601060301
+         8200"""),
+    ("v1v2c 2.4 G",
+     """303402010004067075626c6963a027020103020100020100301c300c06082b06
+         0102010103000500300c06082b060102010105000500"""),
+    ("v1v2c 2.4 H",
+     """303402010004067075626c6963a227020103020102020102301c300c06082b06
+         0102010103000500300c06082b060102010105000500"""),
+    ("v1v2c 2.4 I",
+     """3081c802010104067075626c6963a281ba0201ff0201000201003081ae301006
+         082b06010201010300430400bc614e301806082b06010201010200060c2b0601
+         0401944c01010102153013060a2b060102010202010a01410500ffffffff3012
+         060a2b06010201020201050142043b9aca003015060d2b06010201041401010a
+         00000140040a0000013018060b2b060102011f0101010601460900ffffffffff
+         ffffff3014060a2b06010201020201060104060050569abcde3010060a2b0601
+         0401868d1f01000202ff7f"""),
+    ("v1v2c 2.4 J",
+     """3037020101040770726976617465a329020203e8020100020100301d301b0608
+         2b06010201010400040f6e6f63406578616d706c652e6e6574"""),
+    ("v1v2c 2.4 K",
+     """3037020101040770726976617465a229020203e8020111020101301d301b0608
+         2b06010201010400040f6e6f63406578616d706c652e6e6574"""),
+    ("v1v2c 2.4 L",
+     "301802010104067075626c6963a20b0201050201010201003000"),
+    ("v1v2c 2.4 M",
+     """303d02010004067075626c6963a430060a2b06010401bf0803020a4004c00002
+         01020102020100430301e2403011300f060a2b060102010202010103020103"""),
+    ("v1v2c 2.4 N",
+     """307502010104067075626c6963a76802012a020100020100305d300f06082b06
+         010201010300430301e2403017060a2b06010603010104010006092b06010603
+         01010503300f060a2b060102010202010103020103300f060a2b060102010202
+         010703020102300f060a2b060102010202010803020102"""),
+    ("v1v2c 2.4 O",
+     """303002010104067075626c6963a22302010902010002010030183016060b2b06
+         0104018f650a01060144079f78043e800000"""),
+    ("v3 9 V-NOAUTH",
+     """306c0201033011020401020304020300ffe304010402010304233021040d8000
+         1f8880010203040506070802010002010004066e6f6175746804000400302f04
+         0d80001f888001020304050607080400a01c02040a0b0c0d020100020100300e
+         300c06082b060102010101000500"""),
+    ("v3 9 V-SHA-AUTHNOPRIV",
+     """307a0201033011020401020304020300ffe30401050201030431302f040d8000
+         1f888001020304050607080201010202009604077368616f6e6c79040cf559bb
+         6bc446b77acb582af50400302f040d80001f888001020304050607080400a01c
+         02040a0b0c0d020100020100300e300c06082b060102010101000500"""),
+    ("v3 9 V-SHA512-AUTHNOPRIV",
+     """3081a10201033011020401020304020300ffe304010502010304583056040d80
+         001f8880010203040506070802010102020096040a7368613531326f6e6c7904
+         302c307a9806583640a8a4e8f5a480b1a1d7f87863f0e1a0e6076cc97491fe26
+         896a41702840afebd9660caaf7ca8432230400302f040d80001f888001020304
+         050607080400a01c02040a0b0c0d020100020100300e300c06082b0601020101
+         01000500"""),
+    ("v3 9 V-MD5-DES",
+     """30818a0201033011020401020304020300ffe304010702010304383036040d80
+         001f888001020304050607080201010202009604066d6435646573040c972432
+         bea3b7105727ff5f1b0408000000010000002a043828468e6066b2c3d978d523
+         2f7f7e56785d793d927d63c15db32b6afd75589c1ec76ce216b5d4b8a40c9178
+         ddee5f9915c79a24204d99f04b"""),
+    ("v3 9 V-SHA-AES",
+     """3081830201033011020401020304020300ffe304010702010304383036040d80
+         001f88800102030405060708020101020200960406736861616573040cf348b9
+         14214305ef905cb2960408deadbeef000000010431de46c1433b208b758146de
+         11e079276ee206bab469d6ce21038348f198816b713439d9e58ac5b4b2b45044
+         c7e38c6a50ad"""),
+    ("v3 9 V-SHA256-AES",
+     """3081920201033011020401020304020300ffe304010702010304473045040d80
+         001f888001020304050607080201010202009604097368613235366165730418
+         d6751c0da3fe7040e062c22ec7860a29c7672659f71c9eb20408deadbeef0000
+         00020431fe3e1e5c4c5796fe07c9bd16ce71174ee7de35ab7219fcafe3a8e612
+         1bff78d6001a75ed00825f0460460a1bee412124bc"""),
+    ("v3 9 V-SHA512-AES",
+     """3081aa0201033011020401020304020300ffe3040107020103045f305d040d80
+         001f888001020304050607080201010202009604097368613531326165730430
+         6b11470be02819178940abc55f55ee61623e2c5e46ba6ede055765df22742fc2
+         9819f7d3b571c40956850296bd5662e60408deadbeef00000003043100f6bd88
+         5a2280d692f48d7235bf0253d53a61f9bea0f761968260557e1dc4d68cda4555
+         9cff1ad1a3c4c64df1c9b39028"""),
+    ("v3 9 V-SHA-AES256-BLUMENTHAL",
+     """3081860201033011020401020304020300ffe3040107020103043b3039040d80
+         001f88800102030405060708020101020200960409736861616573323536040c
+         d2f58f68255ebe2c103852eb0408deadbeef000000040431b0b1388a10dd06ed
+         7e9001f7be3fe765f8cfcc39780e43260f8cf10dc82dacba69fea90096724237
+         b279da96eb01771f5b"""),
+    ("v3 9 V-SHA-AES256C-REEDER",
+     """3081870201033011020401020304020300ffe3040107020103043c303a040d80
+         001f8880010203040506070802010102020096040a7368616165733235366304
+         0cf89490fb29493054b2aca0fe0408deadbeef000000050431d36f8dda309897
+         7e766a64088f2ca41c63858c002d198dbd50d1324a0d21888fcf013625023657
+         588401df41961e1c8329"""),
+    ("v3 9 V-SHA256-DES",
+     """3081990201033011020401020304020300ffe304010702010304473045040d80
+         001f888001020304050607080201010202009604097368613235366465730418
+         5983f965061f1dc3dcc133a891482e5885bc94d6064b22320408000000010000
+         002b04386f846754d1c7fe34ef066d97fef3cf748d540de2f60cb18404ebea28
+         95d8f20dedf885de2f36d6f72039e5358278bf6690776cc96db61a43"""),
+    ("v3 6.1 discovery request",
+     """303a020103300f020203e9020300ffe30401040201030410300e040002010002
+         0100040004000400301204000400a00c020213890201000201003000"""),
+    ("v3 6.1 discovery report",
+     """3065020103300f020203e9020300ffe3040100020103041d301b040d80001f88
+         8001020304050607080201010201310400040004003030040d80001f88800102
+         0304050607080400a81d020213890201000201003011300f060a2b060106030f
+         0101040041010b"""),
+    ("v3 6.2 authPriv request, boots/time 0/0",
+     """307e020103300f020203ea020300ffe304010702010304373035040d80001f88
+         8001020304050607080201000201000406736861616573040c2af60c653f8b27
+         f6a69b4838040870303bcd6260e5b8042fe6e83a37328aae89eabfc43d2c809a
+         341ce11f7e26bd7de97ad5bafcc1822581e187f4a3f6e3bcd20f3133a009f3e0"""),
+    ("v3 6.2 notInTimeWindow report",
+     """3076020103300f020203ea020300ffe3040101020103042f302d040d80001f88
+         8001020304050607080201010201310406736861616573040cf9ea5ba42655e1
+         4b7bcc50e60400302f040d80001f888001020304050607080400a81c02010002
+         01000201003011300f060a2b060106030f01010200410101"""),
+    ("v3 9.1 shaaes discovery request",
+     """303e020103301102047e2724ee020300ffe30401040201030410300e04000201
+         00020100040004000400301404000400a00e02047fd703ac0201000201003000"""),
+    ("v3 9.1 shaaes discovery Report",
+     """306a020103301102047e2724ee020300ffe3040100020103041e301c040d8000
+         1f88800102030405060708020101020201330400040004003032040d80001f88
+         8001020304050607080400a81f02047fd703ac0201000201003011300f060a2b
+         060106030f01010400410101"""),
+    ("v3 9.1 shaaes authPriv GET",
+     """308183020103301102047e2724ed020300ffe304010702010304383036040d80
+         001f88800102030405060708020101020201330406736861616573040cc410a1
+         3c02ddf2e4c746624404081ab1c1139c3a22650431cfab219671423932850d0f
+         d0d1556ddf50ac3353011367715b9e188b13a8c1e33ecfd1697865793176483b
+         469c86ba8aaa"""),
+    ("v3 9.1 shaaes Response",
+     """308197020103301102047e2724ed020300ffe304010302010304383036040d80
+         001f88800102030405060708020101020201330406736861616573040c1152ab
+         d1076047dee28f835c04080ad9df2c507d65ce0445cdb34047a4d84a26e46c47
+         107f0436c465dcce4e217a1240c97f750d12d57fb50744f706c9d25fbe189d23
+         96aa75cb416ad220df8bf501944d085de1ff79adaaef8a8423ff"""),
+    ("v3 9.1 md5des authPriv GET",
+     """308189020103301102042b4f41c3020300ffe304010702010304373035040d80
+         001f8880010203040506070802010102015a04066d6435646573040c069ccb74
+         c6f521d8895a0151040800000001601ee48a0438d5ba42f90d1c4902e4d0e9e4
+         a6e97bac8b7627395912b02f14e3610276e6738ae6a5da07119c01d044df61df
+         7b7323a4f25efa460e8e55fd"""),
+    ("v3 9.1 md5des Response",
+     """308199020103301102042b4f41c3020300ffe304010302010304373035040d80
+         001f8880010203040506070802010102015a04066d6435646573040c68362b69
+         0688667f12eb106e04080000000141ce4c210448a06a7fc72123cafd18a35873
+         73d0631d757624369ff4217695171fc12bacd9f6392a4b6d74d00ab91805658f
+         d5c20ee49d619efaddf86d36362fb190db25a8f53cdccd19e11cf6e2"""),
+    ("v3 9.1 sha256aes authPriv GET",
+     """30819102010330110204241e54ae020300ffe304010702010304463044040d80
+         001f8880010203040506070802010102015a04097368613235366165730418fe
+         39a24f22776a75ef37e781fa0c422b146a073e0b26d1090408cd64b2db1a6101
+         c204314329a93fe1559fc83271d74e5e339291bedb31d694c8a67cb430758395
+         73b7924f13375f6b01357b164d180568f65275e1"""),
+    ("v3 9.1 sha256aes Response",
+     """3081a502010330110204241e54ae020300ffe304010302010304463044040d80
+         001f8880010203040506070802010102015a04097368613235366165730418db
+         b852d86a9d8f69e4c6f3f2a7feda7027728cd14da4be01040853c8002187c1d9
+         c104452370ff96a2486f50dc98be84ace339b2103992931905a392a29428a592
+         13e7a2a9955b44f71e498e9de87736e72a25c346c34fb210d441d892f4d55cc7
+         e2ba32d2323d7b28"""),
+]
+
+PLAINTEXTS: list[(str, str)] = [
+    ("v3 6.2 request plaintext",
+     """302d040d80001f888001020304050607080400a01a0202138a02010002010030
+         0e300c06082b060102010101000500"""),
+    ("v3 9.1 shaaes authPriv GET plaintext",
+     """302f040d80001f888001020304050607080400a01c02047fd703ab0201000201
+         00300e300c06082b060102010101000500"""),
+    ("v3 9.1 shaaes Response plaintext",
+     """3043040d80001f888001020304050607080400a23002047fd703ab0201000201
+         003022302006082b060102010101000414616374736e6d702d76332d73706563
+         2d74657374"""),
+    ("v3 9.1 md5des authPriv GET plaintext",
+     """302f040d80001f888001020304050607080400a01c020401a95adc0201000201
+         00300e300c06082b06010201010100050007070707070707"""),
+    ("v3 9.1 md5des Response plaintext",
+     """3043040d80001f888001020304050607080400a230020401a95adc0201000201
+         003022302006082b060102010101000414616374736e6d702d76332d73706563
+         2d74657374030303"""),
+    ("v3 9.1 sha256aes authPriv GET plaintext",
+     """302f040d80001f888001020304050607080400a01c02045ca535b80201000201
+         00300e300c06082b060102010101000500"""),
+    ("v3 9.1 sha256aes Response plaintext",
+     """3043040d80001f888001020304050607080400a23002045ca535b80201000201
+         003022302006082b060102010101000414616374736e6d702d76332d73706563
+         2d74657374"""),
+    ("v3 5.4 plaintext",
+     """302f040d80001f888001020304050607080400a01c02040a0b0c0d0201000201
+         00300e300c06082b060102010101000500"""),
+]
+
+# Value TLVs that decode: net-snmp Opaque special types and the lenient vectors
+VALUES_OK: list[(str, str)] = [
+    ("v1v2c 1.10 Opaque Counter64 2^40", "44 09 9f 76 06 01 00 00 00 00 00"),
+    ("v1v2c 1.10 Opaque Float 1.5", "44 07 9f 78 04 3f c0 00 00"),
+    ("v1v2c 1.10 Opaque Float laLoadFloat.1", "44 07 9f 78 04 40 0b c8 00"),
+    ("v1v2c 1.10 Opaque Double 2.5", "44 0b 9f 79 08 40 04 00 00 00 00 00 00"),
+    ("v1v2c 1.10 Opaque Int64 -5", "44 04 9f 7a 01 fb"),
+    ("v1v2c 1.10 Opaque UInt64 5", "44 04 9f 7b 01 05"),
+    ("v1v2c 1.10 Opaque UInt64 2^64-1", "44 0c 9f 7b 09 00 ff ff ff ff ff ff ff ff"),
+    ("v1v2c 1.11 INTEGER 5 in 4 octets", "02 04 00 00 00 05"),
+    ("v1v2c 1.11 Counter32 ff ff ff ff", "41 04 ff ff ff ff"),
+    ("v1v2c 1.11 Counter64 2^32", "46 05 01 00 00 00 00"),
+    ("v1v2c 1.11 OID 06 00", "06 00"),
+    ("v1v2c 1.11 OID with 80 padding", "06 0a 2b 06 01 04 01 80 80 80 80 7f"),
+    ("v1v2c 1.11 UInteger32", "47 01 2a"),
+    ("v1v2c 1.11 NsapAddress", "45 03 47 00 05"),
+    ("v1v2c 8 IpAddress of 3 octets", "40 03 0a 00 00"),
+]
+
+# The malformed-value vectors: the TLV is intact, so they
+# decode, to a MalformedValue (INTEGER 2^48 fits 64 bits and is an Integer)
+VALUES_MALFORMED: list[(str, str)] = [
+    ("v1v2c 8 empty Counter32", "41 00"),
+    ("v1v2c 8 empty INTEGER", "02 00"),
+    ("v1v2c 8 TimeTicks of 8 octets", "43 08 ff ff ff ff ff ff ff ff"),
+    ("v1v2c 8 INTEGER 2^48", "02 07 01 00 00 00 00 00 00"),
+    ("v1v2c 8 OID arc 2^32", "06 0a 2b 06 01 04 01 90 80 80 80 00"),
+    ("v1v2c 8 OID ending in a continuation octet", "06 02 2b 86"),
+]
+
+
+# Seed trees ########################################################################################
+
+class Node(object):
+    """A TLV of a seed; content that is itself a series of TLVs is parsed into children
+
+    Constructed TLVs are parsed, and so is an OCTET STRING holding a
+    SEQUENCE (msgSecurityParameters). The root of a seed is a virtual node
+    with tag -1 whose children are the seed's top-level TLVs.
+    """
+    tag: int
+    pos: int            # offset of the identifier octet in the seed
+    start: int          # content range [start, stop) in the seed
+    stop: int
+    children: list[Node]
+    nested: bool
+    body: bytes         # the content, re-encoded from the children when nested
+    encoded: bytes      # the whole TLV (only the body for the root)
+
+    def __init__(self, tag: int, pos: int, start: int, stop: int, children: list[Node], nested: bool, body: bytes):
+        self.tag = tag
+        self.pos = pos
+        self.start = start
+        self.stop = stop
+        self.children = children
+        self.nested = nested
+        self.body = body
+        self.encoded = render(tag, body)
+
+
+class Seed(object):
+    """A named input and its TLV tree, flattened for picking nodes at random
+
+    nodes and paths list every TLV in pre-order with the child indices that
+    lead to it from the root; parents and parent_paths do the same for the
+    nodes with children, the root (path []) included. tail holds the octets
+    after the last top-level TLV that parses (DES padding).
+    """
+    name: str
+    data: bytes
+    root: Node
+    tail: bytes
+    nodes: list[Node]
+    paths: list[list[int]]
+    parents: list[Node]
+    parent_paths: list[list[int]]
+
+    def __init__(self, name: str, data: bytes, root: Node, tail: bytes):
+        self.name = name
+        self.data = data
+        self.root = root
+        self.tail = tail
+        self.nodes = []
+        self.paths = []
+        self.parents = [root]
+        self.parent_paths = [[]]
+
+
+def render(tag: int, body: bytes) -> bytes:
+    """Return the TLV with tag (any octet, also the high-tag-number form) and a minimal length"""
+    if tag < 0:
+        return body
+    return ber.BYTE_TABLE[tag] + ber.enc_length(len(body)) + body
+
+def render_long(tag: int, body: bytes, k: int) -> bytes:
+    """Return the TLV with its length in the long form of k (1 to 4) octets, minimal or not"""
+    n = len(body)
+    octs = b"".join([ber.BYTE_TABLE[(n >> (8 * (k - 1 - i))) & 0xff] for i in range(k)])
+    return ber.BYTE_TABLE[tag] + ber.BYTE_TABLE[0x80 | k] + octs + body
+
+def parse_node(buf: bytes, pos: int, end: int) -> Node:
+    tag, start, stop = ber.read_tlv(buf, pos, end)
+    if (tag & 0x20) != 0 or (tag == ber.TAG_OCTET_STRING and stop > start and buf[start] == ber.TAG_SEQUENCE):
+        kids, q = parse_tlvs(buf, start, stop)
+        if q == stop:
+            return Node(tag, pos, start, stop, kids, True, b"".join([c.encoded for c in kids]))
+    return Node(tag, pos, start, stop, [], False, buf[start:stop])
+
+def try_parse(buf: bytes, pos: int, end: int) -> ?Node:
+    try:
+        return parse_node(buf, pos, end)
+    except errors.DecodeError:
+        return None
+
+def parse_tlvs(buf: bytes, pos: int, end: int) -> (list[Node], int):
+    """Parse TLVs from pos until end or the first one that does not parse; return them and where they stop"""
+    nodes: list[Node] = []
+    p = pos
+    while p < end:
+        nd = try_parse(buf, p, end)
+        if nd is not None:
+            nodes.append(nd)
+            p = nd.stop
+        else:
+            break
+    return (nodes, p)
+
+def flatten(s: Seed, n: Node, path: list[int]) -> None:
+    for i in range(len(n.children)):
+        c = n.children[i]
+        p = path + [i]
+        s.nodes.append(c)
+        s.paths.append(p)
+        if c.nested:
+            s.parents.append(c)
+            s.parent_paths.append(p)
+            flatten(s, c, p)
+
+def make_seed(name: str, data: bytes) -> Seed:
+    kids, q = parse_tlvs(data, 0, len(data))
+    root = Node(-1, 0, 0, q, kids, True, b"".join([c.encoded for c in kids]))
+    s = Seed(name, data, root, data[q:])
+    flatten(s, root, [])
+    return s
+
+def rebuild(n: Node, path: list[int], depth: int, repl: bytes) -> bytes:
+    """Return the encoding of n with the TLV at path (from depth on) replaced by repl
+
+    The lengths of all enclosing TLVs are recomputed.
+    """
+    if depth == len(path):
+        return repl
+    i = path[depth]
+    parts = [c.encoded for c in n.children]
+    parts[i] = rebuild(n.children[i], path, depth + 1, repl)
+    return render(n.tag, b"".join(parts))
+
+def replace_at(s: Seed, path: list[int], repl: bytes) -> bytes:
+    """Return the seed with the TLV at path replaced by repl and consistent enclosing lengths"""
+    return rebuild(s.root, path, 0, repl) + s.tail
+
+def node_at(s: Seed, path: list[int]) -> Node:
+    n = s.root
+    for i in path:
+        n = n.children[i]
+    return n
+
+def message_seeds() -> list[Seed]:
+    return [make_seed(name, ber.from_hex(hx)) for name, hx in MESSAGES]
+
+# Decoders to check: T_MESSAGE for datagrams (message.decode, message.peek, ber.dump), the
+# others for the offset decoders
+T_MESSAGE = -1
+T_SCOPED = 0
+T_PDU = 1
+T_VARBINDS = 2
+T_VALUE = 3
+TARGETS: list[int] = [T_SCOPED, T_PDU, T_VARBINDS, T_VALUE]
+TARGET_NAMES: list[str] = ["message.decode_scoped", "pdu.decode_pdu", "values.decode_varbinds", "values.decode_value"]
+
+def is_pdu_tag(tag: int) -> bool:
+    return tag >= pdu.GET and tag <= pdu.REPORT
+
+def corpus(target: int) -> list[Seed]:
+    """Return the inputs of an offset decoder, cut out of the seeds without duplicates
+
+    T_SCOPED: the plaintexts and the ScopedPDUs of unencrypted SNMPv3
+    messages; T_PDU: every PDU; T_VARBINDS: the content of every
+    VarBindList; T_VALUE: every varbind name and value, the SNMPv1 Trap-PDU
+    fields and VALUES_OK/VALUES_MALFORMED.
+    """
+    seen: set[bytes] = set()
+    out: list[Seed] = []
+
+    def add(name: str, data: bytes) -> None:
+        if data not in seen:
+            seen.add(data)
+            out.append(make_seed(name, data))
+
+    plain = [make_seed(name, ber.from_hex(hx)) for name, hx in PLAINTEXTS]
+    if target == T_SCOPED:
+        for s in plain:
+            add(s.name, s.data)
+    for s in message_seeds() + plain:
+        for nd in s.nodes:
+            kids = nd.children
+            if target == T_SCOPED and nd.pos == 0 and len(kids) == 4 and kids[0].body == b"\x03" and kids[3].nested:
+                add(s.name + " ScopedPDU", kids[3].encoded)
+            if not is_pdu_tag(nd.tag) or not nd.nested or len(kids) == 0:
+                continue
+            vbl = kids[len(kids) - 1]
+            if target == T_PDU:
+                add(s.name + " PDU", nd.encoded)
+            elif target == T_VARBINDS:
+                add(s.name + " varbinds", vbl.body)
+            elif target == T_VALUE:
+                if nd.tag == pdu.TRAP_V1:
+                    for i in range(len(kids) - 1):
+                        add(s.name + " Trap-PDU field %d" % i, kids[i].encoded)
+                for i in range(len(vbl.children)):
+                    vb = vbl.children[i]
+                    if len(vb.children) == 2:
+                        add(s.name + " name %d" % i, vb.children[0].encoded)
+                        add(s.name + " value %d" % i, vb.children[1].encoded)
+    if target == T_VALUE:
+        for name, hx in VALUES_OK + VALUES_MALFORMED:
+            add(name, ber.from_hex(hx))
+    return out
+
+
+# Properties ########################################################################################
+
+MAX_REPORTED = 12
+
+# Prefix of a property 1 violation in the texts that attempt() returns
+BUG = "BUG: "
+
+class Findings(object):
+    """The inputs a test checked, the property violations it found and how many MalformedValues it saw"""
+    test: str
+    inputs: int
+    decoded: int
+    malformed: int
+    count: int
+    failures: list[str]
+
+    def __init__(self, test: str):
+        self.test = test
+        self.inputs = 0
+        self.decoded = 0
+        self.malformed = 0
+        self.count = 0
+        self.failures = []
+
+    def input(self) -> None:
+        self.inputs += 1
+
+    def ok(self) -> None:
+        self.decoded += 1
+
+    def fail(self, seed: str, op: str, data: bytes, what: str) -> None:
+        """Record a violation by data, the input that mutation op made from seed"""
+        self.count += 1
+        if len(self.failures) < MAX_REPORTED:
+            self.failures.append("seed " + seed + ", mutation " + op + ", input " + data.hex() + ": " + what)
+
+    def finish(self, min_inputs: int, mixed: bool=True) -> None:
+        """Fail the test if a property was violated or the inputs were not what the test intends
+
+        mixed: some inputs must decode and others must not, otherwise the
+        mutations do not exercise the decoders.
+        """
+        if self.count > 0:
+            testing.error("%s: %d property violations in %d inputs, the first %d:\n"
+                          % (self.test, self.count, self.inputs, len(self.failures)) + "\n".join(self.failures))
+        testing.assertTrue(self.inputs >= min_inputs,
+                           "%s: %d inputs, expected %d" % (self.test, self.inputs, min_inputs))
+        if mixed:
+            testing.assertTrue(self.decoded > 0 and self.decoded < self.inputs,
+                               "%s: %d of %d inputs decoded" % (self.test, self.decoded, self.inputs))
+        else:
+            testing.assertEqual(self.decoded, self.inputs, self.test + ": inputs that did not decode")
+
+def attempt[T](f: mut() -> T, pos: int, end: int) -> (?T, str):
+    """Run the decoder f on the input range [pos, end) of its buffer
+
+    Returns (result, "") on success and (None, text) otherwise. text starts
+    with BUG for a property 1 violation: an exception other than
+    DecodeError, or a DecodeError offset outside [pos, end]. Otherwise it
+    describes the DecodeError with its offset relative to pos, so that runs
+    at different positions compare equal.
+    """
+    try:
+        return (f(), "")
+    except errors.DecodeError as e:
+        if e.offset < pos or e.offset > end:
+            return (None, BUG + "DecodeError offset %d outside [%d, %d]: " % (e.offset, pos, end) + e.error_message)
+        return (None, "DecodeError at +%d: " % (e.offset - pos) + e.reason)
+    except Exception as e:
+        return (None, BUG + str(e))
+
+def attempt_encode[T](f: mut() -> T) -> (?T, str):
+    """Run the encoder f; like attempt, but EncodeError is the expected failure"""
+    try:
+        return (f(), "")
+    except errors.EncodeError as e:
+        return (None, "EncodeError: " + e.error_message)
+    except Exception as e:
+        return (None, BUG + str(e))
+
+def outcome(err: str) -> str:
+    return err if err != "" else "success"
+
+def bug(fx: Findings, seed: str, op: str, data: bytes, what: str, err: str) -> bool:
+    """Record err if it is a property 1 violation by what; return True if it is"""
+    if err.startswith(BUG):
+        fx.fail(seed, op, data, what + ": " + err)
+        return True
+    return False
+
+def same_opt[A(Eq)](a: ?A, b: ?A) -> bool:
+    if a is not None and b is not None:
+        return a == b
+    return a is None and b is None
+
+def same_community(a: CommunityMessage, b: CommunityMessage) -> bool:
+    return (a.version == b.version and a.community == b.community and same_opt(a.pdu, b.pdu)
+            and same_opt(a.trap, b.trap))
+
+def same_v3(a: V3Message, b: V3Message) -> bool:
+    """Equal SNMPv3 messages, except for auth_offset, which depends on the length encodings"""
+    return (a.msg_id == b.msg_id and a.max_size == b.max_size and a.flags == b.flags
+            and a.security_model == b.security_model and a.usm == b.usm
+            and same_opt(a.scoped, b.scoped) and same_opt(a.encrypted, b.encrypted))
+
+def check_printable(fx: Findings, seed: str, op: str, data: bytes, f: mut() -> str) -> None:
+    try:
+        f()
+    except Exception as e:
+        fx.fail(seed, op, data, "repr of the decoded result raised " + str(e))
+
+def check_values(fx: Findings, seed: str, op: str, data: bytes, vbs: list[VarBind]) -> None:
+    for vb in vbs:
+        check_value(fx, seed, op, data, vb.value)
+
+def strict_error(tag: int, c: bytes) -> ?str:
+    """The DecodeError reason of the strict ber decoder of tag for the content c, or None
+
+    None also for the tags that decode without a strict decoder.
+    """
+    n = len(c)
+    try:
+        if tag == ber.TAG_INTEGER:
+            ber.dec_int(c, 0, n)
+        elif tag == ber.TAG_OID:
+            ber.dec_oid(c, 0, n)
+        elif tag == ber.TAG_COUNTER64:
+            ber.dec_u64(c, 0, n)
+        elif tag == ber.TAG_COUNTER32 or tag == ber.TAG_GAUGE32 or tag == ber.TAG_TIMETICKS:
+            ber.dec_uint32(c, 0, n)
+        return None
+    except errors.DecodeError as e:
+        return e.reason
+
+def check_value(fx: Findings, seed: str, op: str, data: bytes, v: Value) -> None:
+    """Properties 5 and 7 for one decoded value"""
+    if isinstance(v, Opaque):
+        try:
+            values.opaque_special(v)
+        except Exception as e:
+            fx.fail(seed, op, data, "values.opaque_special raised " + str(e))
+    if isinstance(v, MalformedValue):
+        fx.malformed += 1
+        reason = strict_error(v.raw_tag, v.value)
+        if reason is None or reason != v.reason:
+            fx.fail(seed, op, data, repr(v) + ": the strict decoder gives " + repr(reason))
+    elif isinstance(v, UnknownValue):
+        if strict_error(v.raw_tag, v.value) is not None:
+            fx.fail(seed, op, data, repr(v) + ": malformed content as an UnknownValue")
+
+def varbinds_of(p: ?Pdu, t: ?TrapV1Pdu) -> list[VarBind]:
+    if p is not None:
+        return p.varbinds
+    if t is not None:
+        return t.varbinds
+    return []
+
+def encode_v3_again(m: V3Message) -> (bytes, int):
+    """Re-encode a decoded SNMPv3 message with its MAC written back; return it and the auth_offset"""
+    s = m.scoped
+    e = m.encrypted
+    payload = message.encode_scoped(s) if s is not None else e if e is not None else b""
+    r = message.encode_v3(m, payload)
+    mac = m.usm.auth_params
+    if m.security_model != message.SEC_MODEL_USM:
+        return (r.msg, r.auth_offset)
+    return (r.msg[:r.auth_offset] + mac + r.msg[r.auth_offset + len(mac):], r.auth_offset)
+
+def check_peek(fx: Findings, seed: str, op: str, data: bytes, r: ?(version: int, id: int), err: str,
+               version: int, ident: int) -> None:
+    """Property 3: r and err, what message.peek gave for data, match what decode gave"""
+    if r is not None:
+        if r.version != version or r.id != ident:
+            fx.fail(seed, op, data, "message.peek gives version %d, id %d; decode gives %d, %d"
+                    % (r.version, r.id, version, ident))
+    else:
+        fx.fail(seed, op, data, "message.peek failed on a datagram that decodes: " + err)
+
+def check_community(fx: Findings, seed: str, op: str, data: bytes, m: CommunityMessage) -> None:
+    p = m.pdu
+    t = m.trap
+    if (p is None) == (t is None):
+        fx.fail(seed, op, data, "a CommunityMessage must hold exactly one of pdu and trap")
+        return
+    check_printable(fx, seed, op, data, lambda: repr(m))
+    check_values(fx, seed, op, data, varbinds_of(p, t))
+    enc, eerr = attempt_encode(lambda: message.encode_community(m))
+    bug(fx, seed, op, data, "message.encode_community", eerr)
+    if enc is not None:
+        check_community_reencoding(fx, seed, op, data, m, enc)
+
+def check_community_reencoding(fx: Findings, seed: str, op: str, data: bytes, m: CommunityMessage, enc: bytes) -> None:
+    r, err = attempt(lambda: message.decode(enc), 0, len(enc))
+    if r is not None:
+        c2, v2 = r
+        if c2 is not None:
+            if not same_community(m, c2):
+                fx.fail(seed, op, data, "re-encoding " + enc.hex() + " decodes to " + repr(c2))
+        else:
+            fx.fail(seed, op, data, "re-encoding " + enc.hex() + " decodes to an SNMPv3 message")
+    else:
+        fx.fail(seed, op, data, "re-encoding " + enc.hex() + " does not decode: " + err)
+
+def check_v3(fx: Findings, seed: str, op: str, data: bytes, m: V3Message) -> None:
+    s = m.scoped
+    e = m.encrypted
+    if (s is None) == (e is None):
+        fx.fail(seed, op, data, "a V3Message must hold exactly one of scoped and encrypted")
+        return
+    if ((m.flags & message.FLAG_PRIV) != 0) != (e is not None):
+        fx.fail(seed, op, data, "privFlag and encrypted disagree")
+    mac = m.usm.auth_params
+    a = m.auth_offset
+    if m.security_model == message.SEC_MODEL_USM:
+        if a < 0 or a + len(mac) > len(data) or data[a:a + len(mac)] != mac:
+            fx.fail(seed, op, data, "auth_offset %d does not locate msgAuthenticationParameters " % a + mac.hex())
+    elif a != -1:
+        fx.fail(seed, op, data, "auth_offset %d without USM" % a)
+    check_printable(fx, seed, op, data, lambda: repr(m))
+    if s is not None:
+        check_values(fx, seed, op, data, s.pdu.varbinds)
+    r, eerr = attempt_encode(lambda: encode_v3_again(m))
+    bug(fx, seed, op, data, "message.encode_v3", eerr)
+    if r is not None:
+        check_v3_reencoding(fx, seed, op, data, m, r.0, r.1)
+
+def check_v3_reencoding(fx: Findings, seed: str, op: str, data: bytes, m: V3Message, enc: bytes, aoff: int) -> None:
+    r2, err = attempt(lambda: message.decode(enc), 0, len(enc))
+    if r2 is not None:
+        c2, v2 = r2
+        if v2 is not None:
+            if not same_v3(m, v2):
+                fx.fail(seed, op, data, "re-encoding " + enc.hex() + " decodes to " + repr(v2))
+            elif m.security_model == message.SEC_MODEL_USM and v2.auth_offset != aoff:
+                fx.fail(seed, op, data, "re-encoding " + enc.hex()
+                        + ": encode_v3 auth_offset %d, decode auth_offset %d" % (aoff, v2.auth_offset))
+        else:
+            fx.fail(seed, op, data, "re-encoding " + enc.hex() + " decodes to a community message")
+    else:
+        fx.fail(seed, op, data, "re-encoding " + enc.hex() + " does not decode: " + err)
+
+def check_message(fx: Findings, seed: str, op: str, data: bytes) -> None:
+    """Check properties 1, 2, 3 and 5 for a datagram"""
+    fx.input()
+    n = len(data)
+    r, err = attempt(lambda: message.decode(data), 0, n)
+    pk, perr = attempt(lambda: message.peek(data), 0, n)
+    derr = attempt(lambda: ber.dump(data, 0, n), 0, n).1
+    bug(fx, seed, op, data, "message.decode", err)
+    bug(fx, seed, op, data, "message.peek", perr)
+    bug(fx, seed, op, data, "ber.dump", derr)
+    if r is not None:
+        fx.ok()
+        c, v = r
+        if c is not None:
+            p = c.pdu
+            check_peek(fx, seed, op, data, pk, perr, c.version, p.request_id if p is not None else 0)
+            check_community(fx, seed, op, data, c)
+        elif v is not None:
+            check_peek(fx, seed, op, data, pk, perr, message.SNMP_V3, v.msg_id)
+            check_v3(fx, seed, op, data, v)
+        else:
+            fx.fail(seed, op, data, "message.decode returned no message")
+
+
+class Decoded(object):
+    """The result of an offset decoder in one comparable shape
+
+    used is the number of octets consumed from pos, for decode_pdu and
+    decode_value (which return the next position); 0 for the others.
+    """
+    scoped: ?ScopedPdu
+    pdu: ?Pdu
+    trap: ?TrapV1Pdu
+    varbinds: list[VarBind]
+    value: ?Value
+    used: int
+
+    def __init__(self, scoped: ?ScopedPdu=None, pdu: ?Pdu=None, trap: ?TrapV1Pdu=None,
+                 varbinds: list[VarBind]=[], value: ?Value=None, used: int=0):
+        self.scoped = scoped
+        self.pdu = pdu
+        self.trap = trap
+        self.varbinds = varbinds
+        self.value = value
+        self.used = used
+
+    def __repr__(self) -> str:
+        return ("Decoded(" + repr(self.scoped) + ", " + repr(self.pdu) + ", " + repr(self.trap) + ", "
+                + repr(self.varbinds) + ", " + repr(self.value) + ", used=%d)" % self.used)
+
+def decode_at(target: int, buf: bytes, pos: int, end: int) -> Decoded:
+    if target == T_SCOPED:
+        return Decoded(scoped=message.decode_scoped(buf, pos, end))
+    if target == T_PDU:
+        p, t, nxt = pdu.decode_pdu(buf, pos, end)
+        return Decoded(pdu=p, trap=t, used=nxt - pos)
+    if target == T_VARBINDS:
+        return Decoded(varbinds=values.decode_varbinds(buf, pos, end))
+    v, nxt = values.decode_value(buf, pos, end)
+    return Decoded(value=v, used=nxt - pos)
+
+def encode_decoded(d: Decoded) -> bytes:
+    """Re-encode d with the encoder of the decoder that produced it"""
+    s = d.scoped
+    p = d.pdu
+    t = d.trap
+    v = d.value
+    if s is not None:
+        return message.encode_scoped(s)
+    if p is not None:
+        return pdu.encode_pdu(p)
+    if t is not None:
+        return pdu.encode_trap_v1(t)
+    if v is not None:
+        return v.encode()
+    return b"".join([values.encode_varbind(vb) for vb in d.varbinds])
+
+def same_decoded(a: Decoded, b: Decoded, with_used: bool) -> bool:
+    return (same_opt(a.scoped, b.scoped) and same_opt(a.pdu, b.pdu) and same_opt(a.trap, b.trap)
+            and a.varbinds == b.varbinds and same_opt(a.value, b.value) and (not with_used or a.used == b.used))
+
+def decoded_varbinds(d: Decoded) -> list[VarBind]:
+    s = d.scoped
+    if s is not None:
+        return s.pdu.varbinds
+    return varbinds_of(d.pdu, d.trap) + d.varbinds
+
+def check_decoded(fx: Findings, target: int, seed: str, op: str, x: bytes, d: Decoded) -> None:
+    if d.used < 0 or d.used > len(x):
+        fx.fail(seed, op, x, TARGET_NAMES[target] + " returned a next position outside the input")
+    check_printable(fx, seed, op, x, lambda: repr(d))
+    check_values(fx, seed, op, x, decoded_varbinds(d))
+    v = d.value
+    if v is not None:
+        check_value(fx, seed, op, x, v)
+    enc, eerr = attempt_encode(lambda: encode_decoded(d))
+    bug(fx, seed, op, x, "re-encoding", eerr)
+    if enc is not None:
+        d2, err = attempt(lambda: decode_at(target, enc, 0, len(enc)), 0, len(enc))
+        if d2 is not None:
+            if not same_decoded(d, d2, False):
+                fx.fail(seed, op, x, "re-encoding " + enc.hex() + " decodes to " + repr(d2))
+        else:
+            fx.fail(seed, op, x, "re-encoding " + enc.hex() + " does not decode: " + err)
+
+def check_at(fx: Findings, rng: Rng, target: int, seed: str, op: str, x: bytes) -> None:
+    """Check properties 1, 2, 4 and 5 for the input x of an offset decoder"""
+    fx.input()
+    name = TARGET_NAMES[target]
+    n = len(x)
+    d, err = attempt(lambda: decode_at(target, x, 0, n), 0, n)
+    pre = rng.octets(1 + rng.below(4))
+    buf = pre + x + rng.octets(1 + rng.below(4))
+    k = len(pre)
+    d2, err2 = attempt(lambda: decode_at(target, buf, k, k + n), k, k + n)
+    derr = attempt(lambda: ber.dump(x, 0, n), 0, n).1
+    bug(fx, seed, op, x, "ber.dump", derr)
+    if bug(fx, seed, op, x, name, err) or bug(fx, seed, op, x, name + " embedded in " + buf.hex(), err2):
+        return
+    if d is not None and d2 is not None:
+        if not same_decoded(d, d2, True):
+            fx.fail(seed, op, x, name + " embedded at offset %d in " % k + buf.hex() + " gives " + repr(d2)
+                    + " instead of " + repr(d))
+    elif err != err2:
+        fx.fail(seed, op, x, name + " embedded at offset %d in " % k + buf.hex() + " gives " + outcome(err2)
+                + " instead of " + outcome(err))
+    if d is not None:
+        fx.ok()
+        check_decoded(fx, target, seed, op, x, d)
+
+def check_input(fx: Findings, rng: Rng, target: int, seed: str, op: str, data: bytes) -> None:
+    """Check data with the decoders of target (T_MESSAGE or one of TARGETS)"""
+    if target == T_MESSAGE:
+        check_message(fx, seed, op, data)
+    else:
+        check_at(fx, rng, target, seed, op, data)
+
+
+# Mutations #########################################################################################
+
+def set_octet(d: bytes, i: int, x: int) -> bytes:
+    return d[:i] + ber.BYTE_TABLE[x] + d[i + 1:]
+
+def raw_mutation(rng: Rng, d: bytes, s: Seed, other: Seed) -> (bytes, str):
+    """Apply one octet-level mutation to d, which was derived from s; lengths are not fixed up
+
+    The TLV positions come from s, so after earlier mutations they may be
+    off, which is fine for fuzzing.
+    """
+    n = len(d)
+    op = rng.below(9)
+    if n == 0 or op == 0:
+        i = rng.below(n + 1)
+        ins = rng.steering(1 + rng.below(4))
+        return (d[:i] + ins + d[i:], "insert@%d:" % i + ins.hex())
+    i = rng.below(n)
+    if op == 1:
+        bit = rng.below(8)
+        return (set_octet(d, i, d[i] ^ (1 << bit)), "flip@%d.%d" % (i, bit))
+    if op == 2:
+        x = OCTETS[rng.below(len(OCTETS))]
+        return (set_octet(d, i, x), "set@%d=%02x" % (i, x))
+    if op == 3:
+        x = rng.below(256)
+        return (set_octet(d, i, x), "set@%d=%02x" % (i, x))
+    if op == 4:
+        return (d[:i], "cut@%d" % i)
+    if op == 5:
+        k = 1 + rng.below(4)
+        return (d[:i] + d[i + k:], "remove@%d:%d" % (i, k))
+    if op == 8 or len(s.nodes) == 0:
+        j = rng.below(len(other.data) + 1)
+        return (d[:i] + other.data[j:], "splice@%d:%s@%d" % (i, other.name, j))
+    nd = s.nodes[rng.below(len(s.nodes))]
+    if op == 6:
+        # one of the length octets of a TLV of the seed
+        lp = nd.pos + 1 + rng.below(nd.start - nd.pos - 1)
+        if lp < n:
+            delta = LENGTH_DELTAS[rng.below(len(LENGTH_DELTAS))]
+            return (set_octet(d, lp, (d[lp] + delta) & 0xff), "length@%d:%d" % (lp, delta))
+        return (d[:i], "cut@%d" % i)
+    # op == 7: duplicate a TLV of the seed right after itself
+    if nd.stop <= n:
+        return (d[:nd.stop] + d[nd.pos:nd.stop] + d[nd.stop:], "duplicate@%d-%d" % (nd.pos, nd.stop))
+    return (d[:i], "cut@%d" % i)
+
+def tree_mutation(rng: Rng, s: Seed, other: Seed, contents: list[bytes]) -> (bytes, str):
+    """Apply one structure-aware mutation to s; the enclosing lengths stay consistent"""
+    op = rng.below(13)
+    if op >= 9 or len(s.nodes) == 0:
+        j = rng.below(len(s.parents))
+        par = s.parents[j]
+        path = s.parent_paths[j]
+        parts = [c.encoded for c in par.children]
+        m = len(parts)
+        if m == 0 or op == 9:
+            k = rng.below(m + 1)
+            new = other.nodes[rng.below(len(other.nodes))].encoded if len(other.nodes) > 0 else b"\x05\x00"
+            parts.insert(k, new)
+            what = "insert-child@%d:%d" % (par.pos, k)
+        elif op == 10:
+            k = rng.below(m)
+            parts.insert(k, parts[k])
+            what = "duplicate-child@%d:%d" % (par.pos, k)
+        elif op == 11:
+            k = rng.below(m)
+            del parts[k]
+            what = "remove-child@%d:%d" % (par.pos, k)
+        else:
+            k = rng.below(m)
+            k2 = rng.below(m)
+            tmp = parts[k]
+            parts[k] = parts[k2]
+            parts[k2] = tmp
+            what = "swap-children@%d:%d,%d" % (par.pos, k, k2)
+        return (replace_at(s, path, render(par.tag, b"".join(parts))), what)
+    i = rng.below(len(s.nodes))
+    nd = s.nodes[i]
+    path = s.paths[i]
+    tag = nd.tag
+    if op == 0:
+        c = contents[rng.below(len(contents))]
+        return (replace_at(s, path, render(tag, c)), "content@%d:" % nd.pos + c.hex())
+    if op == 1:
+        c = rng.steering(rng.below(13))
+        return (replace_at(s, path, render(tag, c)), "content@%d:" % nd.pos + c.hex())
+    if op == 2:
+        t = TAGS[rng.below(len(TAGS))]
+        return (replace_at(s, path, render(t, nd.body)), "tag@%d=%02x" % (nd.pos, t))
+    if op == 3:
+        o = other.nodes[rng.below(len(other.nodes))] if len(other.nodes) > 0 else nd
+        return (replace_at(s, path, o.encoded), "transplant@%d:%s@%d" % (nd.pos, other.name, o.pos))
+    if op == 4:
+        t = [ber.TAG_SEQUENCE, ber.TAG_OCTET_STRING, pdu.RESPONSE][rng.below(3)]
+        return (replace_at(s, path, render(t, nd.encoded)), "wrap@%d:%02x" % (nd.pos, t))
+    if op == 5:
+        # a wrong length at this TLV only
+        delta = LENGTH_DELTAS[rng.below(len(LENGTH_DELTAS))]
+        n = len(nd.body) + delta
+        if n < 0:
+            n = 0
+        bad = ber.BYTE_TABLE[tag] + ber.enc_length(n) + nd.body
+        return (replace_at(s, path, bad), "length@%d:%d" % (nd.pos, delta))
+    if op == 6:
+        k = 1 + rng.below(4)
+        if len(nd.body) >= 1 << (8 * k):
+            k = 4
+        return (replace_at(s, path, render_long(tag, nd.body, k)), "long-length@%d:%d" % (nd.pos, k))
+    if op == 7:
+        pad = b"\x00" * (1 + rng.below(9)) if rng.below(2) == 0 else b"\xff" * (1 + rng.below(9))
+        return (replace_at(s, path, render(tag, pad + nd.body)), "pad@%d:" % nd.pos + pad.hex())
+    # op == 8: random octets appended to the content
+    extra = rng.steering(1 + rng.below(4))
+    return (replace_at(s, path, render(tag, nd.body + extra)), "append@%d:" % nd.pos + extra.hex())
+
+MODE_RAW = 0
+MODE_TREE = 1
+MODE_MIXED = 2
+
+def mutate(rng: Rng, s: Seed, other: Seed, contents: list[bytes], mode: int) -> (bytes, str):
+    """Return a mutant of s and a description of the mutations
+
+    The first mutation is octet-level (MODE_RAW), structure-aware
+    (MODE_TREE) or either (MODE_MIXED); each further octet-level mutation
+    follows with probability 1/4.
+    """
+    structural = (mode == MODE_TREE) or (mode == MODE_MIXED and rng.below(2) == 0)
+    d, what = tree_mutation(rng, s, other, contents) if structural else raw_mutation(rng, s.data, s, other)
+    while rng.below(4) == 0:
+        d, w = raw_mutation(rng, d, s, other)
+        what += "+" + w
+    return (d, what)
+
+def fuzz(fx: Findings, rng: Rng, target: int, seeds: list[Seed], mutants: int, mode: int) -> None:
+    """Check the given number of random mutants of seeds with the decoders of target"""
+    contents = edge_contents()
+    for i in range(mutants):
+        s = seeds[rng.below(len(seeds))]
+        other = seeds[rng.below(len(seeds))]
+        d, what = mutate(rng, s, other, contents, mode)
+        check_input(fx, rng, target, s.name, what, d)
+
+
+# Tests: the harness itself #########################################################################
+
+def _test_rng_xorshift64() -> None:
+    # Reference values computed with Python integers:
+    # x ^= x << 13 & (2**64-1); x ^= x >> 7; x ^= x << 17 & (2**64-1), from x = 1.
+    r = Rng(1)
+    want: list[u64] = [1082269761, 1152992998833853505, 11177516664432764457, 17678023832001937445,
+                       9659130143999365733]
+    testing.assertEqual([r.next() for i in range(5)], want)
+    z = Rng(0)
+    testing.assertEqual(z.next(), 15860402102123842989, "seed 0 falls back to the golden ratio seed")
+    counts = [0] * 7
+    for i in range(7000):
+        counts[r.below(7)] += 1
+    for c in counts:
+        testing.assertTrue(c > 850 and c < 1150, "below(7) is roughly uniform: %d" % c)
+
+def _test_seeds_and_corpora() -> None:
+    # Guards the embedded hex and the tree code: every seed decodes, re-encodes to itself and
+    # is rebuilt from its tree octet for octet; the corpora decode, VALUES_MALFORMED to
+    # MalformedValue (except INTEGER 2^48, an Integer).
+    for s in message_seeds():
+        testing.assertEqual(replace_at(s, [], s.root.encoded), s.data, "tree of " + s.name)
+        testing.assertEqual(s.tail, b"", s.name)
+        c, v = message.decode(s.data)
+        if c is not None:
+            testing.assertEqual(message.encode_community(c), s.data, s.name)
+        elif v is not None:
+            testing.assertEqual(encode_v3_again(v).0, s.data, s.name)
+        else:
+            testing.error("no message: " + s.name)
+    testing.assertEqual(len(MESSAGES), 38)
+    testing.assertEqual(len(PLAINTEXTS), 8)
+    malformed_names = set([name for name, hx in VALUES_MALFORMED])
+    sizes = []
+    for target in TARGETS:
+        seeds = corpus(target)
+        sizes.append(len(seeds))
+        for s in seeds:
+            d = decode_at(target, s.data, 0, len(s.data))
+            # VALUES_OK holds lenient forms, which re-encode differently
+            if s.tail == b"" and target != T_VALUE:
+                testing.assertEqual(encode_decoded(d), s.data, "re-encoding " + s.name)
+            v = d.value
+            if s.name in malformed_names and v is not None:
+                integer = isinstance(v, values.Integer)
+                testing.assertTrue(isinstance(v, MalformedValue) or (integer and s.name == "v1v2c 8 INTEGER 2^48"),
+                                   s.name + " decodes to " + repr(v))
+    testing.assertEqual(sizes, [13, 29, 17, 80])
+
+def _test_mutations_are_deterministic() -> None:
+    seeds = message_seeds()
+    contents = edge_contents()
+    runs: list[list[str]] = []
+    for run in range(2):
+        rng = Rng(42)
+        runs.append([mutate(rng, seeds[i % len(seeds)], seeds[(i * 7) % len(seeds)], contents, MODE_MIXED).0.hex()
+                     for i in range(200)])
+    testing.assertEqual(runs[0], runs[1])
+    testing.assertTrue(len(set(runs[0])) > 150, "mutants are diverse")
+
+
+# Tests: exhaustive mutations of the seeds ##########################################################
+
+def _test_truncation_at_every_offset(t: testing.SyncT) -> None:
+    t.timeout(60.0)
+    fx = Findings("truncation")
+    rng = Rng(0x7472756e63617465)
+    for s in message_seeds():
+        for k in range(len(s.data)):
+            check_message(fx, s.name, "cut@%d" % k, s.data[:k])
+            check_message(fx, s.name, "drop-first:%d" % (k + 1), s.data[k + 1:])
+    for target in TARGETS:
+        for s in corpus(target):
+            for k in range(len(s.data)):
+                check_at(fx, rng, target, s.name, "cut@%d" % k, s.data[:k])
+    fx.finish(10000)
+
+def _test_every_octet_interesting_values(t: testing.SyncT) -> None:
+    t.timeout(60.0)
+    fx = Findings("octets 00/7f/80/ff")
+    for s in message_seeds():
+        for i in range(len(s.data)):
+            for x in INTERESTING:
+                if x != s.data[i]:
+                    check_message(fx, s.name, "set@%d=%02x" % (i, x), set_octet(s.data, i, x))
+    fx.finish(15000)
+
+def _test_every_bit_flipped(t: testing.SyncT) -> None:
+    t.timeout(60.0)
+    fx = Findings("bit flips")
+    for s in message_seeds():
+        for i in range(len(s.data)):
+            for bit in range(8):
+                check_message(fx, s.name, "flip@%d.%d" % (i, bit), set_octet(s.data, i, s.data[i] ^ (1 << bit)))
+    fx.finish(30000)
+
+def _test_every_length_field(t: testing.SyncT) -> None:
+    # Each length field of each TLV, also inside msgSecurityParameters: changed in place
+    # (the enclosing lengths no longer match) and changed with consistent enclosing lengths.
+    t.timeout(60.0)
+    fx = Findings("length fields")
+    for s in message_seeds():
+        for i in range(len(s.nodes)):
+            nd = s.nodes[i]
+            lp = nd.pos + 1
+            for delta in LENGTH_DELTAS:
+                for p in range(lp, nd.start):
+                    d = set_octet(s.data, p, (s.data[p] + delta) & 0xff)
+                    check_message(fx, s.name, "length@%d:%d" % (p, delta), d)
+                n = len(nd.body) + delta
+                if n >= 0:
+                    bad = ber.BYTE_TABLE[nd.tag] + ber.enc_length(n) + nd.body
+                    check_message(fx, s.name, "length-at@%d:%d" % (nd.pos, delta), replace_at(s, s.paths[i], bad))
+            for x in LENGTH_OCTETS:
+                if x != s.data[lp]:
+                    check_message(fx, s.name, "length@%d=%02x" % (lp, x), set_octet(s.data, lp, x))
+    fx.finish(10000)
+
+def _test_structural_edits_at_every_tlv(t: testing.SyncT) -> None:
+    # Each TLV duplicated, removed, wrapped, emptied and retagged, with consistent lengths
+    t.timeout(60.0)
+    fx = Findings("structural edits")
+    for s in message_seeds():
+        for i in range(len(s.nodes)):
+            nd = s.nodes[i]
+            path = s.paths[i]
+            ppath = path[:len(path) - 1]
+            par = node_at(s, ppath)
+            k = path[len(path) - 1]
+            parts = [c.encoded for c in par.children]
+            dup = parts[:k + 1] + parts[k:]
+            check_message(fx, s.name, "duplicate@%d" % nd.pos, replace_at(s, ppath, render(par.tag, b"".join(dup))))
+            rest = parts[:k] + parts[k + 1:]
+            check_message(fx, s.name, "remove@%d" % nd.pos, replace_at(s, ppath, render(par.tag, b"".join(rest))))
+            check_message(fx, s.name, "wrap@%d" % nd.pos, replace_at(s, path, render(ber.TAG_SEQUENCE, nd.encoded)))
+            check_message(fx, s.name, "empty@%d" % nd.pos, replace_at(s, path, render(nd.tag, b"")))
+            for tag in TAGS:
+                if tag != nd.tag:
+                    check_message(fx, s.name, "tag@%d=%02x" % (nd.pos, tag), replace_at(s, path, render(tag, nd.body)))
+    fx.finish(20000)
+
+def lenient_variants(nd: Node) -> list[(str, bytes)]:
+    """Encodings of nd that a lenient decoder must read as nd itself
+
+    Every long length form that fits; for INTEGER, unsigned32 and Counter64
+    a redundant leading 00 (or ff for negative INTEGERs) up to the octet
+    limit of the type; for OIDs an 80 padding octet before the last
+    sub-identifier.
+    """
+    out: list[(str, bytes)] = []
+    body = nd.body
+    n = len(body)
+    for k in range(1, 5):
+        if n < 1 << (8 * k):
+            out.append(("long-length:%d" % k, render_long(nd.tag, body, k)))
+    if nd.nested or n == 0:
+        return out
+    if nd.tag == ber.TAG_INTEGER and n < 9:
+        out.append(("pad-integer", render(nd.tag, (b"\xff" if body[0] >= 0x80 else b"\x00") + body)))
+    if nd.tag == ber.TAG_COUNTER64 and n < 9:
+        out.append(("pad-counter64", render(nd.tag, b"\x00" * (9 - n) + body)))
+    if (nd.tag == ber.TAG_COUNTER32 or nd.tag == ber.TAG_GAUGE32 or nd.tag == ber.TAG_TIMETICKS) and body[0] < 0x80:
+        out.append(("pad-unsigned", render(nd.tag, b"\x00\x00\x00\x00\x00" + body)))
+    if nd.tag == ber.TAG_OID:
+        j = n - 1
+        while j > 0 and body[j - 1] >= 0x80:
+            j -= 1
+        out.append(("pad-subid@%d" % j, render(nd.tag, body[:j] + b"\x80" + body[j:])))
+    return out
+
+def check_same_message(fx: Findings, seed: Seed, op: str, d: bytes) -> None:
+    """Property 6: d, a lenient encoding of the seed, decodes to the seed's message"""
+    r, err = attempt(lambda: message.decode(d), 0, len(d))
+    c0, v0 = message.decode(seed.data)
+    if r is not None:
+        c, v = r
+        if c0 is not None and c is not None:
+            if not same_community(c0, c):
+                fx.fail(seed.name, op, d, "decodes to " + repr(c))
+        elif v0 is not None and v is not None:
+            if not same_v3(v0, v):
+                fx.fail(seed.name, op, d, "decodes to " + repr(v))
+        else:
+            fx.fail(seed.name, op, d, "decodes to another kind of message")
+    else:
+        fx.fail(seed.name, op, d, "a lenient form does not decode: " + err)
+
+def _test_lenient_forms_decode_equal(t: testing.SyncT) -> None:
+    t.timeout(60.0)
+    fx = Findings("lenient forms")
+    for s in message_seeds():
+        for i in range(len(s.nodes)):
+            nd = s.nodes[i]
+            for what, variant in lenient_variants(nd):
+                op = what + "@%d" % nd.pos
+                d = replace_at(s, s.paths[i], variant)
+                check_message(fx, s.name, op, d)
+                check_same_message(fx, s, op, d)
+    fx.finish(2900, False)
+
+
+# Tests: random mutations ###########################################################################
+
+def _test_random_octet_mutations(t: testing.SyncT) -> None:
+    t.timeout(60.0)
+    fx = Findings("random octet-level mutations")
+    fuzz(fx, Rng(0x6f63746574), T_MESSAGE, message_seeds(), 30000, MODE_RAW)
+    fx.finish(30000)
+
+def _test_random_structural_mutations(t: testing.SyncT) -> None:
+    t.timeout(60.0)
+    fx = Findings("random structure-aware mutations")
+    fuzz(fx, Rng(0x7472656573), T_MESSAGE, message_seeds(), 30000, MODE_TREE)
+    fx.finish(30000)
+
+def _test_random_scoped_pdu_mutations(t: testing.SyncT) -> None:
+    t.timeout(60.0)
+    fx = Findings("decode_scoped")
+    fuzz(fx, Rng(0x73636f706564), T_SCOPED, corpus(T_SCOPED), 25000, MODE_MIXED)
+    fx.finish(25000)
+
+def _test_random_pdu_mutations(t: testing.SyncT) -> None:
+    t.timeout(60.0)
+    fx = Findings("decode_pdu")
+    fuzz(fx, Rng(0x706475), T_PDU, corpus(T_PDU), 25000, MODE_MIXED)
+    fx.finish(25000)
+
+def _test_random_varbind_mutations(t: testing.SyncT) -> None:
+    t.timeout(60.0)
+    fx = Findings("decode_varbinds")
+    fuzz(fx, Rng(0x766172), T_VARBINDS, corpus(T_VARBINDS), 25000, MODE_MIXED)
+    fx.finish(25000)
+    testing.assertTrue(fx.malformed > 100, "%d MalformedValues: property 7 is exercised" % fx.malformed)
+
+def _test_random_value_mutations(t: testing.SyncT) -> None:
+    t.timeout(60.0)
+    fx = Findings("decode_value")
+    fuzz(fx, Rng(0x76616c7565), T_VALUE, corpus(T_VALUE), 40000, MODE_MIXED)
+    fx.finish(40000)
+    testing.assertTrue(fx.malformed > 1000, "%d MalformedValues: property 7 is exercised" % fx.malformed)
+
+
+# Tests: ber primitives and opaque_special ##########################################################
+
+def check_dec_int(fx: Findings, b: bytes) -> None:
+    n = len(b)
+    v, err = attempt(lambda: ber.dec_int(b, 0, n), 0, n)
+    bug(fx, "random", "", b, "ber.dec_int", err)
+    if v is not None:
+        fx.ok()
+        enc = ber.enc_int_content(v)
+        if ber.dec_int(enc, 0, len(enc)) != v or len(enc) > n:
+            fx.fail("random", "", b, "dec_int gives %d, which re-encodes to " % v + enc.hex())
+    elif n >= 1 and n <= 8:
+        fx.fail("random", "", b, "dec_int rejects an INTEGER of 1 to 8 octets: " + err)
+
+def check_dec_uint32(fx: Findings, b: bytes) -> None:
+    n = len(b)
+    u, err = attempt(lambda: ber.dec_uint32(b, 0, n), 0, n)
+    bug(fx, "random", "", b, "ber.dec_uint32", err)
+    if u is not None:
+        if u < 0 or u > 0xffffffff:
+            fx.fail("random", "", b, "dec_uint32 gives %d" % u)
+        else:
+            enc = ber.enc_uint_content(u)
+            if ber.dec_uint32(enc, 0, len(enc)) != u:
+                fx.fail("random", "", b, "dec_uint32 gives %d, which re-encodes to " % u + enc.hex())
+    elif n >= 1 and n <= 4 and b[0] < 0x80:
+        fx.fail("random", "", b, "dec_uint32 rejects a value below 2^31: " + err)
+
+def check_dec_u64(fx: Findings, b: bytes) -> None:
+    n = len(b)
+    w, err = attempt(lambda: ber.dec_u64(b, 0, n), 0, n)
+    bug(fx, "random", "", b, "ber.dec_u64", err)
+    if w is not None:
+        enc = ber.enc_u64_content(w)
+        if ber.dec_u64(enc, 0, len(enc)) != w:
+            fx.fail("random", "", b, "dec_u64 gives " + str(w) + ", which re-encodes to " + enc.hex())
+    elif n >= 1 and n <= 8:
+        fx.fail("random", "", b, "dec_u64 rejects a Counter64 of 1 to 8 octets: " + err)
+
+def check_dec_oid(fx: Findings, b: bytes) -> None:
+    # A decoded OID has 0 (06 00) or 2 to 128 arcs in range, and re-encodes to the same arcs.
+    n = len(b)
+    r, err = attempt(lambda: ber.dec_oid(b, 0, n), 0, n)
+    bug(fx, "random", "", b, "ber.dec_oid", err)
+    if r is not None:
+        check_arcs(fx, b, r)
+
+def check_arcs(fx: Findings, b: bytes, arcs: list[int]) -> None:
+    n = len(b)
+    bad = len(arcs) > ber.MAX_OID_ARCS or len(arcs) == 1 or (len(arcs) == 0) != (n == 0)
+    for a in arcs:
+        if a < 0 or a > ber.MAX_ARC:
+            bad = True
+    if bad:
+        fx.fail("random", "", b, "dec_oid gives " + str(arcs))
+    elif len(arcs) >= 2:
+        enc, eerr = attempt_encode(lambda: ber.enc_oid_content(arcs))
+        if enc is not None:
+            if ber.dec_oid(enc, 0, len(enc)) != arcs:
+                fx.fail("random", "", b, "the decoded OID " + str(arcs) + " re-encodes to " + enc.hex())
+        else:
+            fx.fail("random", "", b, "the decoded OID " + str(arcs) + " does not re-encode: " + eerr)
+
+def check_read_tlv(fx: Findings, b: bytes) -> None:
+    # A TLV header lies within the input, and expect_tlv with its tag agrees.
+    n = len(b)
+    r, err = attempt(lambda: ber.read_tlv(b, 0, n), 0, n)
+    bug(fx, "random", "", b, "ber.read_tlv", err)
+    if r is not None:
+        check_header(fx, b, r.0, r.1, r.2)
+
+def check_header(fx: Findings, b: bytes, tag: int, start: int, stop: int) -> None:
+    n = len(b)
+    if tag != b[0] or start < 2 or start > stop or stop > n:
+        fx.fail("random", "", b, "read_tlv gives %d, %d, %d" % (tag, start, stop))
+    r, err2 = attempt(lambda: ber.expect_tlv(b, 0, n, tag), 0, n)
+    if r is not None:
+        if r.0 != start or r.1 != stop:
+            fx.fail("random", "", b, "expect_tlv gives %d, %d, read_tlv %d, %d" % (r.0, r.1, start, stop))
+    else:
+        fx.fail("random", "", b, "expect_tlv with the tag read_tlv found fails: " + err2)
+    ln, err3 = attempt(lambda: ber.read_length(b, 1, n), 1, n)
+    if ln is not None:
+        if ln.0 != start or ln.1 != stop:
+            fx.fail("random", "", b, "read_length gives %d, %d, read_tlv %d, %d" % (ln.0, ln.1, start, stop))
+    else:
+        fx.fail("random", "", b, "read_length fails where read_tlv succeeds: " + err3)
+
+def check_primitives(fx: Findings, b: bytes) -> None:
+    """Check the ber primitives on b; besides property 1, results must stay in range and re-encode"""
+    fx.input()
+    check_dec_int(fx, b)
+    check_dec_uint32(fx, b)
+    check_dec_u64(fx, b)
+    check_dec_oid(fx, b)
+    check_read_tlv(fx, b)
+    n = len(b)
+    bug(fx, "random", "", b, "ber.read_length", attempt(lambda: ber.read_length(b, 0, n), 0, n).1)
+
+def check_ranges(fx: Findings, b: bytes, pos: int, end: int) -> None:
+    """Property 1 for (pos, end) arguments that may lie outside the buffer or be reversed"""
+    fx.input()
+    what = "range [%d, %d)" % (pos, end)
+    # check_bounds reports a bad range at pos, which may lie outside the buffer: do not
+    # check DecodeError offsets here
+    lo = -1000
+    hi = 1000
+    bug(fx, "random", what, b, "ber.dec_int", attempt(lambda: ber.dec_int(b, pos, end), lo, hi).1)
+    bug(fx, "random", what, b, "ber.dec_uint32", attempt(lambda: ber.dec_uint32(b, pos, end), lo, hi).1)
+    bug(fx, "random", what, b, "ber.dec_u64", attempt(lambda: ber.dec_u64(b, pos, end), lo, hi).1)
+    bug(fx, "random", what, b, "ber.dec_oid", attempt(lambda: ber.dec_oid(b, pos, end), lo, hi).1)
+    bug(fx, "random", what, b, "ber.read_tlv", attempt(lambda: ber.read_tlv(b, pos, end), lo, hi).1)
+    bug(fx, "random", what, b, "ber.read_length", attempt(lambda: ber.read_length(b, pos, end), lo, hi).1)
+    bug(fx, "random", what, b, "ber.dump", attempt(lambda: ber.dump(b, pos, end), lo, hi).1)
+    for target in TARGETS:
+        d, err = attempt(lambda: decode_at(target, b, pos, end), lo, hi)
+        bug(fx, "random", what, b, TARGET_NAMES[target], err)
+        if target == T_VALUE and d is not None:
+            fx.ok()
+
+def _test_ber_primitives_random(t: testing.SyncT) -> None:
+    t.timeout(60.0)
+    fx = Findings("ber primitives")
+    rng = Rng(0x7072696d)
+    for i in range(40000):
+        check_primitives(fx, rng.steering(rng.below(12)))
+    fx.finish(40000)
+    fx = Findings("ber primitives with bad ranges")
+    for i in range(5000):
+        b = rng.steering(rng.below(8))
+        check_ranges(fx, b, rng.below(len(b) + 4) - 2, rng.below(len(b) + 4) - 2)
+    fx.finish(5000)
+
+OPAQUE_KINDS: list[str] = ["Float", "Double", "I64", "U64", "Counter64"]
+
+def _test_opaque_special_random(t: testing.SyncT) -> None:
+    # Random net-snmp Opaque wrappers (9f 76/78/79/7a/7b and other second octets) with random
+    # and random-length contents; opaque_special returns a result or None and never raises.
+    t.timeout(60.0)
+    fx = Findings("opaque_special")
+    rng = Rng(0x6f7061717565)
+    kinds = [0x76, 0x78, 0x79, 0x7a, 0x7b]
+    for i in range(30000):
+        fx.input()
+        inner = kinds[rng.below(len(kinds))] if rng.below(8) != 0 else rng.below(256)
+        n = rng.below(11)
+        length = ber.BYTE_TABLE[n] if rng.below(4) != 0 else rng.steering(1 + rng.below(3))
+        c = b"\x9f" + ber.BYTE_TABLE[inner] + length + rng.steering(n)
+        if rng.below(4) == 0:
+            c = c[:rng.below(len(c) + 1)]
+        try:
+            r = values.opaque_special(Opaque(c))
+            if r is not None:
+                fx.ok()
+                if r.kind not in OPAQUE_KINDS or r.value == "":
+                    fx.fail("random", "", c, "opaque_special gives " + r.kind + " " + r.value)
+        except Exception as e:
+            fx.fail("random", "", c, "values.opaque_special raised " + str(e))
+    fx.finish(30000)
+
+
+# Tests: nesting and edge cases #####################################################################
+
+def _test_nesting_depth() -> None:
+    # Nested constructed TLVs: ber.dump stops at MAX_DEPTH levels with DecodeError; the
+    # other decoders do not recurse into values and must stay well-behaved.
+    fx = Findings("nesting")
+    rng = Rng(0x6e657374)
+    x = b"\x05\x00"
+    for depth in range(1, 41):
+        x = render(ber.TAG_SEQUENCE if depth % 2 == 0 else pdu.RESPONSE, x)
+        check_message(fx, "nesting", "depth %d" % depth, x)
+        for target in TARGETS:
+            check_at(fx, rng, target, "nesting", "depth %d" % depth, x)
+        dumped, err = attempt(lambda: ber.dump(x, 0, len(x)), 0, len(x))
+        if depth < ber.MAX_DEPTH:
+            testing.assertNotNone(dumped, "dump at depth %d: " % depth + err)
+        elif depth > ber.MAX_DEPTH:
+            testing.assertTrue(err.startswith("DecodeError"), "dump at depth %d: " % depth + outcome(err))
+    fx.finish(200)
+
+def _test_hostile_headers() -> None:
+    # Lengths far beyond the input, every unsupported length form, high-tag-number forms
+    # and empty input: message.decode raises DecodeError, and no decoder raises anything else.
+    rng = Rng(0x686f7374696c65)
+    fx = Findings("hostile headers")
+    cases = ["", "30", "30 80", "30 80 00 00", "30 81", "30 81 80", "30 82 ff", "30 84 ff ff ff ff",
+             "30 84 7f ff ff ff 02 01 00", "30 83 ff ff ff 02 01 00", "30 85 00 00 00 00 01 00", "30 88 00",
+             "30 ff 00", "1f 00", "3f 01 00", "bf 81 00", "ff ff", "30 03 02 01", "30 02 02 05",
+             "30 0b 02 01 01 04 00 a0 84 ff ff ff ff", "30 0b 02 01 03 30 84 7f ff ff ff 04 00"]
+    for hx in cases:
+        d = ber.from_hex(hx)
+        check_message(fx, "hostile", hx, d)
+        for target in TARGETS:
+            check_at(fx, rng, target, "hostile", hx, d)
+        testing.assertNone(attempt(lambda: message.decode(d), 0, len(d)).0, hx)
+    fx.finish(5 * len(cases))

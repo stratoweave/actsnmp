@@ -1,0 +1,1092 @@
+"""Tests for message
+
+MSG_A .. MSG_O are the SNMPv1/v2c reference packets, verified with pysnmp,
+tshark and net-snmp. The V3 vectors are the deterministic SNMPv3 messages
+and net-snmp captures; their MAC offsets were confirmed with Python hmac.
+The remaining messages were encoded independently with pysnmp 7.1 and
+pyasn1 0.6.
+"""
+
+import testing
+import ber
+import errors
+import message
+import pdu
+from oid import Oid
+from pdu import Pdu, TrapV1Pdu
+from message import CommunityMessage, V3Message, UsmSecurityParameters, ScopedPdu
+from values import VarBind, Value, Integer, OctetString, ObjectIdentifier, IpAddress, Counter32, Gauge32
+from values import TimeTicks, Opaque, Counter64, NoSuchObject, NoSuchInstance, EndOfMibView, UnknownValue
+from values import MalformedValue
+from testutil import h, decode_fails, encode_fails, Lcg
+
+def vb(oid: str, v: Value) -> VarBind:
+    return VarBind(Oid.parse(oid), v)
+
+def req(oid: str) -> VarBind:
+    return VarBind(Oid.parse(oid))
+
+def oidv(oid: str) -> ObjectIdentifier:
+    return ObjectIdentifier(Oid.parse(oid))
+
+def community_of(data: bytes) -> CommunityMessage:
+    c, v = message.decode(data)
+    testing.assertNone(v)
+    if c is not None:
+        return c
+    raise AssertionError("not a community message: " + data.hex())
+
+def v3_of(data: bytes) -> V3Message:
+    c, v = message.decode(data)
+    testing.assertNone(c)
+    if v is not None:
+        return v
+    raise AssertionError("not an SNMPv3 message: " + data.hex())
+
+def encode3(m: V3Message, payload: bytes) -> (bytes, int):
+    """message.encode_v3 as a plain tuple, for unpacking"""
+    r = message.encode_v3(m, payload)
+    return (r.msg, r.auth_offset)
+
+def zero_mac(data: bytes, offset: int, n: int) -> bytes:
+    return data[:offset] + b"\x00" * n + data[offset + n:]
+
+
+# SNMPv1/v2c known-answer messages #################################################################
+
+MSG_A = "30 29 02 01 01 04 06 70 75 62 6c 69 63 a0 1c 02 04 12 34 56 78 02 01 00 02 01 00 30 0e 30 0c 06 08 2b 06 01 02 01 01 01 00 05 00"
+MSG_B = """30 3b 02 01 01 04 06 70 75 62 6c 69 63 a2 2e 02 04 12 34 56 78 02 01 00 02 01 00 30 20 30 1e
+06 08 2b 06 01 02 01 01 01 00 04 12 4c 69 6e 75 78 20 72 6f 75 74 65 72 20 36 2e 31 2e 30"""
+MSG_C = "30 24 02 01 01 04 06 70 75 62 6c 69 63 a1 17 02 01 07 02 01 00 02 01 00 30 0c 30 0a 06 06 2b 06 01 02 01 01 05 00"
+MSG_D = """30 43 02 01 01 04 06 70 75 62 6c 69 63 a5 36 02 01 01 02 01 01 02 01 0a 30 2b
+30 0b 06 07 2b 06 01 02 01 01 03 05 00
+30 0d 06 09 2b 06 01 02 01 02 02 01 02 05 00
+30 0d 06 09 2b 06 01 02 01 02 02 01 03 05 00"""
+MSG_DB = """30 43 02 01 01 04 06 70 75 62 6c 69 63 a5 36 02 01 01 02 01 01 02 01 02 30 2b
+30 0b 06 07 2b 06 01 02 01 01 03 05 00
+30 0d 06 09 2b 06 01 02 01 02 02 01 02 05 00
+30 0d 06 09 2b 06 01 02 01 02 02 01 03 05 00"""
+MSG_E = """30 70 02 01 01 04 06 70 75 62 6c 69 63 a2 63 02 01 01 02 01 00 02 01 00 30 58
+30 0e 06 08 2b 06 01 02 01 01 03 00 43 02 0e f6
+30 10 06 0a 2b 06 01 02 01 02 02 01 02 01 04 02 6c 6f
+30 0f 06 0a 2b 06 01 02 01 02 02 01 03 01 02 01 18
+30 12 06 0a 2b 06 01 02 01 02 02 01 02 02 04 04 65 74 68 30
+30 0f 06 0a 2b 06 01 02 01 02 02 01 03 02 02 01 06"""
+MSG_F = """30 40 02 01 01 04 06 70 75 62 6c 69 63 a2 33 02 01 02 02 01 00 02 01 00 30 28
+30 0c 06 08 2b 06 01 02 01 01 63 00 80 00
+30 0c 06 08 2b 06 01 02 01 01 01 01 81 00
+30 0a 06 06 2b 06 01 06 03 01 82 00"""
+MSG_G = """30 34 02 01 00 04 06 70 75 62 6c 69 63 a0 27 02 01 03 02 01 00 02 01 00 30 1c
+30 0c 06 08 2b 06 01 02 01 01 03 00 05 00
+30 0c 06 08 2b 06 01 02 01 01 05 00 05 00"""
+MSG_H = """30 34 02 01 00 04 06 70 75 62 6c 69 63 a2 27 02 01 03 02 01 02 02 01 02 30 1c
+30 0c 06 08 2b 06 01 02 01 01 03 00 05 00
+30 0c 06 08 2b 06 01 02 01 01 05 00 05 00"""
+MSG_I = """30 81 c8 02 01 01 04 06 70 75 62 6c 69 63 a2 81 ba 02 01 ff 02 01 00 02 01 00 30 81 ae
+30 10 06 08 2b 06 01 02 01 01 03 00 43 04 00 bc 61 4e
+30 18 06 08 2b 06 01 02 01 01 02 00 06 0c 2b 06 01 04 01 94 4c 01 01 01 02 15
+30 13 06 0a 2b 06 01 02 01 02 02 01 0a 01 41 05 00 ff ff ff ff
+30 12 06 0a 2b 06 01 02 01 02 02 01 05 01 42 04 3b 9a ca 00
+30 15 06 0d 2b 06 01 02 01 04 14 01 01 0a 00 00 01 40 04 0a 00 00 01
+30 18 06 0b 2b 06 01 02 01 1f 01 01 01 06 01 46 09 00 ff ff ff ff ff ff ff ff
+30 14 06 0a 2b 06 01 02 01 02 02 01 06 01 04 06 00 50 56 9a bc de
+30 10 06 0a 2b 06 01 04 01 86 8d 1f 01 00 02 02 ff 7f"""
+MSG_J = """30 37 02 01 01 04 07 70 72 69 76 61 74 65 a3 29 02 02 03 e8 02 01 00 02 01 00 30 1d 30 1b
+06 08 2b 06 01 02 01 01 04 00 04 0f 6e 6f 63 40 65 78 61 6d 70 6c 65 2e 6e 65 74"""
+MSG_K = """30 37 02 01 01 04 07 70 72 69 76 61 74 65 a2 29 02 02 03 e8 02 01 11 02 01 01 30 1d 30 1b
+06 08 2b 06 01 02 01 01 04 00 04 0f 6e 6f 63 40 65 78 61 6d 70 6c 65 2e 6e 65 74"""
+MSG_L = "30 18 02 01 01 04 06 70 75 62 6c 69 63 a2 0b 02 01 05 02 01 01 02 01 00 30 00"
+MSG_M = """30 3d 02 01 00 04 06 70 75 62 6c 69 63 a4 30 06 0a 2b 06 01 04 01 bf 08 03 02 0a 40 04 c0 00 02 01
+02 01 02 02 01 00 43 03 01 e2 40 30 11 30 0f 06 0a 2b 06 01 02 01 02 02 01 01 03 02 01 03"""
+MSG_N = """30 75 02 01 01 04 06 70 75 62 6c 69 63 a7 68 02 01 2a 02 01 00 02 01 00 30 5d
+30 0f 06 08 2b 06 01 02 01 01 03 00 43 03 01 e2 40
+30 17 06 0a 2b 06 01 06 03 01 01 04 01 00 06 09 2b 06 01 06 03 01 01 05 03
+30 0f 06 0a 2b 06 01 02 01 02 02 01 01 03 02 01 03
+30 0f 06 0a 2b 06 01 02 01 02 02 01 07 03 02 01 02
+30 0f 06 0a 2b 06 01 02 01 02 02 01 08 03 02 01 02"""
+MSG_O = """30 30 02 01 01 04 06 70 75 62 6c 69 63 a2 23 02 01 09 02 01 00 02 01 00 30 18 30 16
+06 0b 2b 06 01 04 01 8f 65 0a 01 06 01 44 07 9f 78 04 3e 80 00 00"""
+MSG_INFORM = """305802010104067075626c6963a64b020204d2020100020100303f300f06082b06010201010300430301e240
+3017060a2b06010603010104010006092b0601060301010501301306082b060102010105000407726f7574657231"""
+MSG_INFORM_RESPONSE = """305802010104067075626c6963a24b020204d2020100020100303f300f06082b06010201010300430301e240
+3017060a2b06010603010104010006092b0601060301010501301306082b060102010105000407726f7574657231"""
+MSG_BULK_MAX = "302802010104067075626c6963a51b02047fffffff020100020119300d300b06072b0601020102020500"
+MSG_TRAP_SPECIFIC = """30818902010004067075626c6963a47c06092b06010401bf08ce0f4004c000020102010602012a43023039305f
+3012060d2b06010401bf08ce0f01010100020100301a060d2b06010401bf08ce0f0101020004096469736b2066756c6c
+3015060d2b06010401bf08ce0f0101030040040a0102033016060d2b06010401bf08ce0f01010400410500ffffffff"""
+MSG_TRAP_COLD = "3030020100040874726170636f6d6da421060a2b06010401bf0803020a40040a000001020100020100430500ffffffff3000"
+MSG_GETNEXT_V1 = """303602010004067075626c6963a129020480000000020100020100301b300a06062b06010201010500
+300d06092b06010201020201020500"""
+# pysnmp's encoding of MSG_GETNEXT_V1: pyasn1 writes -2^31 in 5 octets (decode-only)
+MSG_GETNEXT_V1_PYASN1 = """303702010004067075626c6963a12a0205ff80000000020100020100301b300a06062b06010201010500
+300d06092b06010201020201020500"""
+
+SYS_DESCR = "1.3.6.1.2.1.1.1.0"
+SYS_UPTIME = "1.3.6.1.2.1.1.3.0"
+TRAP_OID = "1.3.6.1.6.3.1.1.4.1.0"
+PUBLIC = b"public"
+
+def contact() -> VarBind:
+    return vb("1.3.6.1.2.1.1.4.0", OctetString(b"noc@example.net"))
+
+def inform_varbinds() -> list[VarBind]:
+    return [vb(SYS_UPTIME, TimeTicks(123456)), vb(TRAP_OID, oidv("1.3.6.1.6.3.1.1.5.1")),
+            vb("1.3.6.1.2.1.1.5.0", OctetString(b"router1"))]
+
+def bulk_request(max_repetitions: int) -> Pdu:
+    return Pdu(pdu.GETBULK, 1, 1, max_repetitions, [req("1.3.6.1.2.1.1.3"), req("1.3.6.1.2.1.2.2.1.2"),
+                                                     req("1.3.6.1.2.1.2.2.1.3")])
+
+def community_messages() -> list[(str, CommunityMessage)]:
+    v1 = message.SNMP_V1
+    v2 = message.SNMP_V2C
+    return [
+        (MSG_A, CommunityMessage(v2, PUBLIC, Pdu(pdu.GET, 0x12345678, varbinds=[req(SYS_DESCR)]))),
+        (MSG_B, CommunityMessage(v2, PUBLIC, Pdu(pdu.RESPONSE, 0x12345678, varbinds=[
+            vb(SYS_DESCR, OctetString(b"Linux router 6.1.0"))]))),
+        (MSG_C, CommunityMessage(v2, PUBLIC, Pdu(pdu.GETNEXT, 7, varbinds=[req("1.3.6.1.2.1.1")]))),
+        (MSG_D, CommunityMessage(v2, PUBLIC, bulk_request(10))),
+        (MSG_DB, CommunityMessage(v2, PUBLIC, bulk_request(2))),
+        (MSG_E, CommunityMessage(v2, PUBLIC, Pdu(pdu.RESPONSE, 1, varbinds=[
+            vb(SYS_UPTIME, TimeTicks(3830)),
+            vb("1.3.6.1.2.1.2.2.1.2.1", OctetString(b"lo")),
+            vb("1.3.6.1.2.1.2.2.1.3.1", Integer(24)),
+            vb("1.3.6.1.2.1.2.2.1.2.2", OctetString(b"eth0")),
+            vb("1.3.6.1.2.1.2.2.1.3.2", Integer(6))]))),
+        (MSG_F, CommunityMessage(v2, PUBLIC, Pdu(pdu.RESPONSE, 2, varbinds=[
+            vb("1.3.6.1.2.1.1.99.0", NoSuchObject()),
+            vb("1.3.6.1.2.1.1.1.1", NoSuchInstance()),
+            vb("1.3.6.1.6.3.1", EndOfMibView())]))),
+        (MSG_G, CommunityMessage(v1, PUBLIC, Pdu(pdu.GET, 3, varbinds=[req(SYS_UPTIME), req("1.3.6.1.2.1.1.5.0")]))),
+        (MSG_H, CommunityMessage(v1, PUBLIC, Pdu(pdu.RESPONSE, 3, pdu.NO_SUCH_NAME, 2,
+                                                 [req(SYS_UPTIME), req("1.3.6.1.2.1.1.5.0")]))),
+        (MSG_I, CommunityMessage(v2, PUBLIC, Pdu(pdu.RESPONSE, -1, varbinds=[
+            vb(SYS_UPTIME, TimeTicks(12345678)),
+            vb("1.3.6.1.2.1.1.2.0", oidv("1.3.6.1.4.1.2636.1.1.1.2.21")),
+            vb("1.3.6.1.2.1.2.2.1.10.1", Counter32(4294967295)),
+            vb("1.3.6.1.2.1.2.2.1.5.1", Gauge32(1000000000)),
+            vb("1.3.6.1.2.1.4.20.1.1.10.0.0.1", IpAddress(h("0a 00 00 01"))),
+            vb("1.3.6.1.2.1.31.1.1.1.6.1", Counter64(18446744073709551615)),
+            vb("1.3.6.1.2.1.2.2.1.6.1", OctetString(h("00 50 56 9a bc de"))),
+            vb("1.3.6.1.4.1.99999.1.0", Integer(-129))]))),
+        (MSG_J, CommunityMessage(v2, b"private", Pdu(pdu.SET, 1000, varbinds=[contact()]))),
+        (MSG_K, CommunityMessage(v2, b"private", Pdu(pdu.RESPONSE, 1000, pdu.NOT_WRITABLE, 1, [contact()]))),
+        (MSG_L, CommunityMessage(v2, PUBLIC, Pdu(pdu.RESPONSE, 5, pdu.TOO_BIG, 0, []))),
+        (MSG_M, CommunityMessage(v1, PUBLIC, None, TrapV1Pdu(Oid.parse("1.3.6.1.4.1.8072.3.2.10"), h("c0 00 02 01"),
+                                                             pdu.LINK_DOWN, 0, 123456,
+                                                             [vb("1.3.6.1.2.1.2.2.1.1.3", Integer(3))]))),
+        (MSG_N, CommunityMessage(v2, PUBLIC, Pdu(pdu.TRAP_V2, 42, varbinds=[
+            vb(SYS_UPTIME, TimeTicks(123456)),
+            vb(TRAP_OID, oidv("1.3.6.1.6.3.1.1.5.3")),
+            vb("1.3.6.1.2.1.2.2.1.1.3", Integer(3)),
+            vb("1.3.6.1.2.1.2.2.1.7.3", Integer(2)),
+            vb("1.3.6.1.2.1.2.2.1.8.3", Integer(2))]))),
+        (MSG_O, CommunityMessage(v2, PUBLIC, Pdu(pdu.RESPONSE, 9, varbinds=[
+            vb("1.3.6.1.4.1.2021.10.1.6.1", Opaque(h("9f 78 04 3e 80 00 00")))]))),
+        (MSG_INFORM, CommunityMessage(v2, PUBLIC, Pdu(pdu.INFORM, 1234, varbinds=inform_varbinds()))),
+        (MSG_INFORM_RESPONSE, CommunityMessage(v2, PUBLIC, Pdu(pdu.RESPONSE, 1234, varbinds=inform_varbinds()))),
+        (MSG_BULK_MAX, CommunityMessage(v2, PUBLIC, Pdu(pdu.GETBULK, 2147483647, 0, 25, [req("1.3.6.1.2.1.2.2")]))),
+        (MSG_TRAP_SPECIFIC, CommunityMessage(v1, PUBLIC, None, TrapV1Pdu(
+            Oid.parse("1.3.6.1.4.1.8072.9999"), h("c0 00 02 01"), pdu.ENTERPRISE_SPECIFIC, 42, 12345, [
+                vb("1.3.6.1.4.1.8072.9999.1.1.1.0", Integer(0)),
+                vb("1.3.6.1.4.1.8072.9999.1.1.2.0", OctetString(b"disk full")),
+                vb("1.3.6.1.4.1.8072.9999.1.1.3.0", IpAddress(h("0a 01 02 03"))),
+                vb("1.3.6.1.4.1.8072.9999.1.1.4.0", Counter32(4294967295))]))),
+        (MSG_TRAP_COLD, CommunityMessage(v1, b"trapcomm", None, TrapV1Pdu(
+            Oid.parse("1.3.6.1.4.1.8072.3.2.10"), h("0a 00 00 01"), pdu.COLD_START, 0, 4294967295, []))),
+        (MSG_GETNEXT_V1, CommunityMessage(v1, PUBLIC, Pdu(pdu.GETNEXT, -2147483648, varbinds=[
+            req("1.3.6.1.2.1.1"), req("1.3.6.1.2.1.2.2.1.2")]))),
+    ]
+
+def check_community(got: CommunityMessage, expected: CommunityMessage, what: str) -> None:
+    testing.assertEqual(got.version, expected.version, what)
+    testing.assertEqual(got.community, expected.community, what)
+    testing.assertEqual(got.pdu, expected.pdu, what)
+    testing.assertEqual(got.trap, expected.trap, what)
+
+def _test_community_messages_decode() -> None:
+    for hx, expected in community_messages():
+        check_community(community_of(h(hx)), expected, hx[:30])
+
+def _test_community_messages_encode() -> None:
+    for hx, m in community_messages():
+        testing.assertEqual(message.encode_community(m), h(hx), hx[:30])
+
+def _test_pyasn1_non_minimal_request_id() -> None:
+    # pyasn1 encodes -2^31 in 5 octets; we decode it and
+    # encode the minimal form
+    m = community_of(h(MSG_GETNEXT_V1_PYASN1))
+    check_community(m, community_of(h(MSG_GETNEXT_V1)), "pyasn1 form")
+    testing.assertEqual(message.encode_community(m), h(MSG_GETNEXT_V1))
+
+def _test_spec_lenient_vectors() -> None:
+    # non-minimal outer lengths and trailing octets are accepted
+    a = h(MSG_A)
+    body = a[2:]
+    expected = community_of(a)
+    for hdr in ["30 81 29", "30 82 00 29", "30 84 00 00 00 29"]:
+        check_community(community_of(h(hdr) + body), expected, hdr)
+    for junk in ["00 00", "ff", "30 00", "a2 03 02 01 01"]:
+        check_community(community_of(a + h(junk)), expected, "trailing " + junk)
+        testing.assertEqual(message.peek(a + h(junk)), (version=1, id=0x12345678))
+
+def _test_spec_reject_vectors() -> None:
+    # must-reject vectors
+    a = h(MSG_A)
+    decode_fails(lambda: message.decode(h("30 80") + a[2:] + h("00 00")), "indefinite outer length")
+    decode_fails(lambda: message.decode(h("30 2a") + a[2:]), "outer length one too long")
+    short = h("30 28") + a[2:]
+    decode_fails(lambda: message.decode(short), "outer length one too short")
+    bad_rid = h("30 25 02 01 01 04 06 70 75 62 6c 69 63 a0 18 02 00 02 01 00 02 01 00 30 0e 30 0c 06 08 2b 06 01 02 01 01 01 00 05 00")
+    decode_fails(lambda: message.decode(bad_rid), "empty request-id")
+    big_arc = h("""30 2b 02 01 01 04 06 70 75 62 6c 69 63 a0 1e 02 04 12 34 56 78 02 01 00 02 01 00 30 10 30 0e
+                   06 0a 2b 06 01 04 01 90 80 80 80 00 05 00""")
+    decode_fails(lambda: message.decode(big_arc), "varbind name with arc 2^32")
+    cut_arc = h("30 23 02 01 01 04 06 70 75 62 6c 69 63 a0 16 02 04 12 34 56 78 02 01 00 02 01 00 30 08 30 06 06 02 2b 86 05 00")
+    decode_fails(lambda: message.decode(cut_arc), "varbind name with a truncated sub-identifier")
+
+
+# SNMPv1/v2c structure ##############################################################################
+
+def community_raw(version: str, community: str, pdu_hex: str) -> bytes:
+    """A community message from hex parts, with correct outer length"""
+    return ber.enc_tlv(ber.TAG_SEQUENCE, h(version) + h(community) + h(pdu_hex))
+
+PDU_GET = "a0 0b 02 01 07 02 01 00 02 01 00 30 00"
+
+def _test_community_structure_rejects() -> None:
+    good = community_raw("02 01 01", "04 01 61", PDU_GET)
+    testing.assertEqual(community_of(good).pdu, Pdu(pdu.GET, 7))
+    bad = [
+        (community_raw("02 01 02", "04 01 61", PDU_GET), "version 2 (SNMPv2u)"),
+        (community_raw("02 01 04", "04 01 61", PDU_GET), "version 4"),
+        (community_raw("02 01 ff", "04 01 61", PDU_GET), "version -1"),
+        (community_raw("02 02 01 00", "04 01 61", PDU_GET), "version 256"),
+        (community_raw("02 05 00 80 00 00 01", "04 01 61", PDU_GET), "version 2^31+1"),
+        (community_raw("02 00", "04 01 61", PDU_GET), "empty version"),
+        (community_raw("04 01 01", "04 01 61", PDU_GET), "version is an OCTET STRING"),
+        (community_raw("", "04 01 61", PDU_GET), "no version"),
+        (community_raw("02 01 01", "02 01 61", PDU_GET), "community is an INTEGER"),
+        (community_raw("02 01 01", "", PDU_GET), "no community"),
+        (community_raw("02 01 01", "04 01 61", ""), "no PDU"),
+        (community_raw("02 01 01", "04 01 61", "a9 00"), "unknown PDU type"),
+        (community_raw("02 01 01", "04 01 61", "30 00"), "PDU is a SEQUENCE"),
+        (community_raw("02 01 01", "04 01 61", PDU_GET + " 05 00"), "data after the PDU"),
+        (community_raw("02 01 01", "04 01 61", PDU_GET + " " + PDU_GET), "two PDUs"),
+        (community_raw("02 01 01", "04 01 61", "a0 0b 02 01 07 02 01 00 02 01 00 31 00"), "broken PDU"),
+        (ber.enc_tlv(0x31, h("02 01 01 04 01 61 " + PDU_GET)), "outer SET"),
+        (h(""), "empty datagram"),
+        (h("30"), "lone tag"),
+        (h("30 00"), "empty SEQUENCE"),
+        (h("ff ff ff"), "garbage"),
+    ]
+    for data, what in bad:
+        decode_fails(lambda: message.decode(data), what)
+
+def _test_wrong_version_pdus_decode() -> None:
+    # Version/PDU compatibility is the receiver's business: an SNMPv1 Trap-PDU in an
+    # SNMPv2c message and an SNMPv2 PDU in an SNMPv1 message both decode.
+    m = community_of(community_raw("02 01 01", "04 06 70 75 62 6c 69 63", h(MSG_M)[13:].hex()))
+    testing.assertEqual(m.version, message.SNMP_V2C)
+    testing.assertNone(m.pdu)
+    testing.assertEqual(m.trap?.time_stamp, 123456)
+    m = community_of(community_raw("02 01 00", "04 00", h(MSG_D)[13:].hex()))
+    testing.assertEqual(m.version, message.SNMP_V1)
+    testing.assertEqual(m.community, b"")
+    testing.assertEqual(m.pdu, bulk_request(10))
+
+def _test_encode_community_rejects() -> None:
+    p = Pdu(pdu.GET, 1)
+    t = TrapV1Pdu(Oid.parse("1.3.6.1.4.1"), h("7f 00 00 01"), pdu.COLD_START, 0, 0)
+    encode_fails(lambda: message.encode_community(CommunityMessage(message.SNMP_V3, PUBLIC, p)), "version 3")
+    encode_fails(lambda: message.encode_community(CommunityMessage(2, PUBLIC, p)), "version 2")
+    encode_fails(lambda: message.encode_community(CommunityMessage(-1, PUBLIC, p)), "version -1")
+    encode_fails(lambda: message.encode_community(CommunityMessage(message.SNMP_V2C, PUBLIC)), "no PDU")
+    encode_fails(lambda: message.encode_community(CommunityMessage(message.SNMP_V1, PUBLIC, p, t)), "Pdu and trap")
+    encode_fails(lambda: message.encode_community(CommunityMessage(message.SNMP_V2C, PUBLIC, None, t)),
+                 "Trap-PDU in SNMPv2c")
+    encode_fails(lambda: message.encode_community(CommunityMessage(message.SNMP_V2C, PUBLIC, Pdu(pdu.GET, 2147483648))),
+                 "request-id out of range")
+    encode_fails(lambda: message.encode_community(CommunityMessage(message.SNMP_V2C, PUBLIC, Pdu(pdu.TRAP_V1, 1))),
+                 "TRAP_V1 as a Pdu")
+    testing.assertEqual(message.encode_community(CommunityMessage(message.SNMP_V1, b"", None, t)),
+                        h("30 1f 02 01 00 04 00 a4 18 06 05 2b 06 01 04 01 40 04 7f 00 00 01 02 01 00 02 01 00 43 01 00 30 00"))
+
+def _test_encode_v1_rejects_v2_only() -> None:
+    # SNMPv1 has no GETBULK, INFORM, SNMPv2-Trap or Report PDU and no Counter64 (RFC 3584
+    # 4.2); the SNMPv2c message of the same content encodes
+    for t in [pdu.GETBULK, pdu.INFORM, pdu.TRAP_V2, pdu.REPORT]:
+        encode_fails(lambda: message.encode_community(CommunityMessage(message.SNMP_V1, PUBLIC, Pdu(t, 1))),
+                     pdu.pdu_type_name(t) + " in SNMPv1")
+        message.encode_community(CommunityMessage(message.SNMP_V2C, PUBLIC, Pdu(t, 1)))
+    c64 = [vb("1.3.6.1.2.1.1.3.0", TimeTicks(5)), vb("1.3.6.1.2.1.31.1.1.1.6.1", Counter64(5))]
+    for t in [pdu.RESPONSE, pdu.SET, pdu.GET]:
+        encode_fails(lambda: message.encode_community(CommunityMessage(message.SNMP_V1, PUBLIC, Pdu(t, 1, varbinds=c64))),
+                     "Counter64 in an SNMPv1 " + pdu.pdu_type_name(t))
+    t1 = TrapV1Pdu(Oid.parse("1.3.6.1.4.1"), h("7f 00 00 01"), pdu.COLD_START, 0, 0, c64)
+    encode_fails(lambda: message.encode_community(CommunityMessage(message.SNMP_V1, PUBLIC, None, t1)),
+                 "Counter64 in an SNMPv1 Trap-PDU")
+    message.encode_community(CommunityMessage(message.SNMP_V2C, PUBLIC, Pdu(pdu.RESPONSE, 1, varbinds=c64)))
+    # the SNMPv1 PDU types stay allowed, and a raw Counter64 TLV is the escape hatch for tests
+    for t in [pdu.GET, pdu.GETNEXT, pdu.RESPONSE, pdu.SET]:
+        message.encode_community(CommunityMessage(message.SNMP_V1, PUBLIC, Pdu(t, 1, varbinds=[req("1.3.6")])))
+    raw = message.encode_community(CommunityMessage(message.SNMP_V1, PUBLIC, Pdu(pdu.RESPONSE, 1, varbinds=[
+        vb("1.3.6.1.2.1.31.1.1.1.6.1", UnknownValue(ber.TAG_COUNTER64, h("05")))])))
+    testing.assertEqual(community_of(raw).pdu?.varbinds, [vb("1.3.6.1.2.1.31.1.1.1.6.1", Counter64(5))])
+
+def _test_out_of_range_values_keep_the_pdu() -> None:
+    # An agent's unsigned value in an INTEGER object (hrStorageSize 2^31) or a 64-bit value in
+    # a Counter32 costs that varbind at most, never the whole Response (net-snmp shows both)
+    vbs = [vb("1.3.6.1.2.1.25.2.3.1.5.1", UnknownValue(ber.TAG_INTEGER, h("00 80 00 00 00"))),
+           vb("1.3.6.1.2.1.2.2.1.10.1", UnknownValue(ber.TAG_COUNTER32, h("01 00 00 00 05"))),
+           vb("1.3.6.1.2.1.1.3.0", TimeTicks(5))]
+    data = message.encode_community(CommunityMessage(message.SNMP_V2C, PUBLIC, Pdu(pdu.RESPONSE, 1, 0, 0, vbs)))
+    want = [vb("1.3.6.1.2.1.25.2.3.1.5.1", Integer(2147483648)),
+            vb("1.3.6.1.2.1.2.2.1.10.1", MalformedValue(ber.TAG_COUNTER32, h("01 00 00 00 05"), "")),
+            vb("1.3.6.1.2.1.1.3.0", TimeTicks(5))]
+    testing.assertEqual(community_of(data).pdu?.varbinds, want)
+    testing.assertEqual(message.peek(data), (version=1, id=1))
+    # the same inside an SNMPv3 ScopedPDU
+    sp = ScopedPdu(b"", b"", Pdu(pdu.RESPONSE, 2, 0, 0, vbs))
+    m = v3_of(encode3(V3Message(1, 65507, 0, UsmSecurityParameters()), message.encode_scoped(sp)).0)
+    testing.assertEqual(m.scoped?.pdu?.varbinds, want)
+    # a bad varbind name still fails the message
+    bad_name = community_raw("02 01 01", "04 06 70 75 62 6c 69 63",
+                             "a2 17 02 01 01 02 01 00 02 01 00 30 0c 30 0a 06 06 2b 06 01 02 01 86 05 00")
+    decode_fails(lambda: message.decode(bad_name), "varbind name with a truncated sub-identifier")
+
+def _test_long_community() -> None:
+    m = CommunityMessage(message.SNMP_V2C, b"c" * 300, Pdu(pdu.GET, 7))
+    data = message.encode_community(m)
+    testing.assertEqual(data[:4], h("30 82 01 40"))
+    check_community(community_of(data), m, "300-octet community")
+
+def _test_community_repr_hides_community() -> None:
+    m = CommunityMessage(message.SNMP_V2C, b"s3cret", Pdu(pdu.GET, 7))
+    r = repr(m)
+    testing.assertEqual(r, "CommunityMessage(version=1, community=<6 octets>, Pdu(GET, request_id=7, error_status=0, "
+                        + "error_index=0, varbinds=[]))")
+    testing.assertEqual(str(m), r)
+    testing.assertEqual(repr(CommunityMessage(message.SNMP_V1, b"x", None, TrapV1Pdu(Oid([1, 3]), b"", 0, 0, 0))),
+                        "CommunityMessage(version=0, community=<1 octets>, TrapV1Pdu(enterprise=1.3, agent_addr=b'', "
+                        + "generic_trap=0, specific_trap=0, time_stamp=0, varbinds=[]))")
+
+
+# SNMPv3 known-answer messages #####################################################################
+
+ENGINE = "80 00 1f 88 80 01 02 03 04 05 06 07 08"
+
+V_NOAUTH = """306c0201033011020401020304020300ffe304010402010304233021040d8000
+1f8880010203040506070802010002010004066e6f6175746804000400302f04
+0d80001f888001020304050607080400a01c02040a0b0c0d020100020100300e
+300c06082b060102010101000500"""
+V_SHA_AUTHNOPRIV = """307a0201033011020401020304020300ffe30401050201030431302f040d8000
+1f888001020304050607080201010202009604077368616f6e6c79040cf559bb
+6bc446b77acb582af50400302f040d80001f888001020304050607080400a01c
+02040a0b0c0d020100020100300e300c06082b060102010101000500"""
+V_SHA512_AUTHNOPRIV = """3081a10201033011020401020304020300ffe304010502010304583056040d80
+001f8880010203040506070802010102020096040a7368613531326f6e6c7904
+302c307a9806583640a8a4e8f5a480b1a1d7f87863f0e1a0e6076cc97491fe26
+896a41702840afebd9660caaf7ca8432230400302f040d80001f888001020304
+050607080400a01c02040a0b0c0d020100020100300e300c06082b0601020101
+01000500"""
+V_MD5_DES = """30818a0201033011020401020304020300ffe304010702010304383036040d80
+001f888001020304050607080201010202009604066d6435646573040c972432
+bea3b7105727ff5f1b0408000000010000002a043828468e6066b2c3d978d523
+2f7f7e56785d793d927d63c15db32b6afd75589c1ec76ce216b5d4b8a40c9178
+ddee5f9915c79a24204d99f04b"""
+V_SHA_AES = """3081830201033011020401020304020300ffe304010702010304383036040d80
+001f88800102030405060708020101020200960406736861616573040cf348b9
+14214305ef905cb2960408deadbeef000000010431de46c1433b208b758146de
+11e079276ee206bab469d6ce21038348f198816b713439d9e58ac5b4b2b45044
+c7e38c6a50ad"""
+V_SHA256_AES = """3081920201033011020401020304020300ffe304010702010304473045040d80
+001f888001020304050607080201010202009604097368613235366165730418
+d6751c0da3fe7040e062c22ec7860a29c7672659f71c9eb20408deadbeef0000
+00020431fe3e1e5c4c5796fe07c9bd16ce71174ee7de35ab7219fcafe3a8e612
+1bff78d6001a75ed00825f0460460a1bee412124bc"""
+V_SHA512_AES = """3081aa0201033011020401020304020300ffe3040107020103045f305d040d80
+001f888001020304050607080201010202009604097368613531326165730430
+6b11470be02819178940abc55f55ee61623e2c5e46ba6ede055765df22742fc2
+9819f7d3b571c40956850296bd5662e60408deadbeef00000003043100f6bd88
+5a2280d692f48d7235bf0253d53a61f9bea0f761968260557e1dc4d68cda4555
+9cff1ad1a3c4c64df1c9b39028"""
+V_SHA_AES256_BLUMENTHAL = """3081860201033011020401020304020300ffe3040107020103043b3039040d80
+001f88800102030405060708020101020200960409736861616573323536040c
+d2f58f68255ebe2c103852eb0408deadbeef000000040431b0b1388a10dd06ed
+7e9001f7be3fe765f8cfcc39780e43260f8cf10dc82dacba69fea90096724237
+b279da96eb01771f5b"""
+V_SHA_AES256C_REEDER = """3081870201033011020401020304020300ffe3040107020103043c303a040d80
+001f8880010203040506070802010102020096040a7368616165733235366304
+0cf89490fb29493054b2aca0fe0408deadbeef000000050431d36f8dda309897
+7e766a64088f2ca41c63858c002d198dbd50d1324a0d21888fcf013625023657
+588401df41961e1c8329"""
+V_SHA256_DES = """3081990201033011020401020304020300ffe304010702010304473045040d80
+001f888001020304050607080201010202009604097368613235366465730418
+5983f965061f1dc3dcc133a891482e5885bc94d6064b22320408000000010000
+002b04386f846754d1c7fe34ef066d97fef3cf748d540de2f60cb18404ebea28
+95d8f20dedf885de2f36d6f72039e5358278bf6690776cc96db61a43"""
+
+# Discovery and time synchronisation, captured with net-snmp
+DISCOVERY_REQUEST = """30 3a 02 01 03 30 0f 02 02 03 e9 02 03 00 ff e3 04 01 04 02 01 03 04 10 30 0e 04 00 02 01 00
+02 01 00 04 00 04 00 04 00 30 12 04 00 04 00 a0 0c 02 02 13 89 02 01 00 02 01 00 30 00"""
+DISCOVERY_REPORT = """30 65 02 01 03 30 0f 02 02 03 e9 02 03 00 ff e3 04 01 00 02 01 03 04 1d 30 1b
+04 0d 80 00 1f 88 80 01 02 03 04 05 06 07 08 02 01 01 02 01 31 04 00 04 00 04 00
+30 30 04 0d 80 00 1f 88 80 01 02 03 04 05 06 07 08 04 00 a8 1d 02 02 13 89 02 01 00 02 01 00
+30 11 30 0f 06 0a 2b 06 01 06 03 0f 01 01 04 00 41 01 0b"""
+SYNC_REQUEST = """30 7e 02 01 03 30 0f 02 02 03 ea 02 03 00 ff e3 04 01 07 02 01 03 04 37 30 35
+04 0d 80 00 1f 88 80 01 02 03 04 05 06 07 08 02 01 00 02 01 00 04 06 73 68 61 61 65 73
+04 0c 2a f6 0c 65 3f 8b 27 f6 a6 9b 48 38 04 08 70 30 3b cd 62 60 e5 b8
+04 2f e6 e8 3a 37 32 8a ae 89 ea bf c4 3d 2c 80 9a 34 1c e1 1f 7e 26 bd 7d e9 7a d5 ba fc c1 82
+25 81 e1 87 f4 a3 f6 e3 bc d2 0f 31 33 a0 09 f3 e0"""
+SYNC_REPORT = """30 76 02 01 03 30 0f 02 02 03 ea 02 03 00 ff e3 04 01 01 02 01 03 04 2f 30 2d
+04 0d 80 00 1f 88 80 01 02 03 04 05 06 07 08 02 01 01 02 01 31 04 06 73 68 61 61 65 73
+04 0c f9 ea 5b a4 26 55 e1 4b 7b cc 50 e6 04 00
+30 2f 04 0d 80 00 1f 88 80 01 02 03 04 05 06 07 08 04 00 a8 1c 02 01 00 02 01 00 02 01 00
+30 11 30 0f 06 0a 2b 06 01 06 03 0f 01 01 02 00 41 01 01"""
+
+# snmpget/snmpd 5.9.3 captures
+NS_DISCOVERY_REQUEST = """303e020103301102047e2724ee020300ffe30401040201030410300e04000201
+00020100040004000400301404000400a00e02047fd703ac0201000201003000"""
+NS_DISCOVERY_REPORT = """306a020103301102047e2724ee020300ffe3040100020103041e301c040d8000
+1f88800102030405060708020101020201330400040004003032040d80001f88
+8001020304050607080400a81f02047fd703ac0201000201003011300f060a2b
+060106030f01010400410101"""
+NS_SHAAES_GET = """308183020103301102047e2724ed020300ffe304010702010304383036040d80
+001f88800102030405060708020101020201330406736861616573040cc410a1
+3c02ddf2e4c746624404081ab1c1139c3a22650431cfab219671423932850d0f
+d0d1556ddf50ac3353011367715b9e188b13a8c1e33ecfd1697865793176483b
+469c86ba8aaa"""
+NS_SHAAES_RESPONSE = """308197020103301102047e2724ed020300ffe304010302010304383036040d80
+001f88800102030405060708020101020201330406736861616573040c1152ab
+d1076047dee28f835c04080ad9df2c507d65ce0445cdb34047a4d84a26e46c47
+107f0436c465dcce4e217a1240c97f750d12d57fb50744f706c9d25fbe189d23
+96aa75cb416ad220df8bf501944d085de1ff79adaaef8a8423ff"""
+NS_MD5DES_GET = """308189020103301102042b4f41c3020300ffe304010702010304373035040d80
+001f8880010203040506070802010102015a04066d6435646573040c069ccb74
+c6f521d8895a0151040800000001601ee48a0438d5ba42f90d1c4902e4d0e9e4
+a6e97bac8b7627395912b02f14e3610276e6738ae6a5da07119c01d044df61df
+7b7323a4f25efa460e8e55fd"""
+NS_MD5DES_RESPONSE = """308199020103301102042b4f41c3020300ffe304010302010304373035040d80
+001f8880010203040506070802010102015a04066d6435646573040c68362b69
+0688667f12eb106e04080000000141ce4c210448a06a7fc72123cafd18a35873
+73d0631d757624369ff4217695171fc12bacd9f6392a4b6d74d00ab91805658f
+d5c20ee49d619efaddf86d36362fb190db25a8f53cdccd19e11cf6e2"""
+NS_SHA256AES_GET = """30819102010330110204241e54ae020300ffe304010702010304463044040d80
+001f8880010203040506070802010102015a04097368613235366165730418fe
+39a24f22776a75ef37e781fa0c422b146a073e0b26d1090408cd64b2db1a6101
+c204314329a93fe1559fc83271d74e5e339291bedb31d694c8a67cb430758395
+73b7924f13375f6b01357b164d180568f65275e1"""
+NS_SHA256AES_RESPONSE = """3081a502010330110204241e54ae020300ffe304010302010304463044040d80
+001f8880010203040506070802010102015a04097368613235366165730418db
+b852d86a9d8f69e4c6f3f2a7feda7027728cd14da4be01040853c8002187c1d9
+c104452370ff96a2486f50dc98be84ace339b2103992931905a392a29428a592
+13e7a2a9955b44f71e498e9de87736e72a25c346c34fb210d441d892f4d55cc7
+e2ba32d2323d7b28"""
+
+# new vectors (pysnmp): a v3 SNMPv2-Trap (sender authoritative, noAuthNoPriv) and a v3
+# InformRequest (authNoPriv, HMAC-SHA-96 with the shaonly key, MAC at offset 62)
+V3_TRAP_NOAUTH = """308195020103300f02021000020300ffe304010002010304243022040d80001f88800102030405060708
+020107020203e804066e6f61757468040004003059040d80001f888001020304050607080400a746020163020100
+020100303b300f06082b0601020101030043030186a03017060a2b06010603010104010006092b0601060301010504
+300f060a2b060102010202010102020102"""
+V3_INFORM_SHA = """308195020103301102047fffffff020300ffe30401050201030431302f040d80001f88800102030405060708
+0201010202009604077368616f6e6c79040cb30de57fccf6670145130c020400304a040d80001f88800102030405
+06070804036374 78a63402014d0201000201003029300e06082b06010201010300430210923017060a2b0601060301
+0104010006092b0601060301010501"""
+
+def engine() -> bytes:
+    return h(ENGINE)
+
+def spec_scoped(request_id: int) -> ScopedPdu:
+    """The ScopedPDU of the deterministic vectors: GET sysDescr.0 in the default context"""
+    return ScopedPdu(engine(), b"", Pdu(pdu.GET, request_id, varbinds=[req(SYS_DESCR)]))
+
+def sysdescr_response(request_id: int) -> ScopedPdu:
+    return ScopedPdu(engine(), b"", Pdu(pdu.RESPONSE, request_id, varbinds=[
+        vb(SYS_DESCR, OctetString(b"actsnmp-v3-spec-test"))]))
+
+def report(request_id: int, counter: int, value: int) -> ScopedPdu:
+    return ScopedPdu(engine(), b"", Pdu(pdu.REPORT, request_id, varbinds=[
+        VarBind(Oid([1, 3, 6, 1, 6, 3, 15, 1, 1, counter, 0]), Counter32(value))]))
+
+class V3Case(object):
+    """An SNMPv3 vector and what decode() must make of it"""
+    name: str
+    data: bytes
+    msg_id: int
+    flags: int
+    usm: UsmSecurityParameters
+    auth_offset: int
+    scoped: ?ScopedPdu
+    encrypted_len: int
+
+    def __init__(self, name: str, hx: str, msg_id: int, flags: int, usm: UsmSecurityParameters,
+                 auth_offset: int, scoped: ?ScopedPdu, encrypted_len: int=-1):
+        self.name = name
+        self.data = h(hx)
+        self.msg_id = msg_id
+        self.flags = flags
+        self.usm = usm
+        self.auth_offset = auth_offset
+        self.scoped = scoped
+        self.encrypted_len = encrypted_len
+
+def spec9_usm(user: bytes, mac: str, salt: str) -> UsmSecurityParameters:
+    return UsmSecurityParameters(engine(), 1, 150, user, h(mac), h(salt))
+
+def v3_cases() -> list[V3Case]:
+    rid = 0x0a0b0c0d
+    mid = 0x01020304
+    return [
+        V3Case("V-NOAUTH", V_NOAUTH, mid, 0x04, UsmSecurityParameters(engine(), 0, 0, b"noauth"), 59, spec_scoped(rid)),
+        V3Case("V-SHA-AUTHNOPRIV", V_SHA_AUTHNOPRIV, mid, 0x05, spec9_usm(b"shaonly", "f559bb6bc446b77acb582af5", ""),
+               61, spec_scoped(rid)),
+        V3Case("V-SHA512-AUTHNOPRIV", V_SHA512_AUTHNOPRIV, mid, 0x05, spec9_usm(b"sha512only",
+               "2c307a9806583640a8a4e8f5a480b1a1d7f87863f0e1a0e6076cc97491fe26896a41702840afebd9660caaf7ca843223", ""),
+               65, spec_scoped(rid)),
+        V3Case("V-MD5-DES", V_MD5_DES, mid, 0x07, spec9_usm(b"md5des", "972432bea3b7105727ff5f1b", "000000010000002a"),
+               61, None, 56),
+        V3Case("V-SHA-AES", V_SHA_AES, mid, 0x07, spec9_usm(b"shaaes", "f348b914214305ef905cb296", "deadbeef00000001"),
+               61, None, 49),
+        V3Case("V-SHA256-AES", V_SHA256_AES, mid, 0x07, spec9_usm(b"sha256aes",
+               "d6751c0da3fe7040e062c22ec7860a29c7672659f71c9eb2", "deadbeef00000002"), 64, None, 49),
+        V3Case("V-SHA512-AES", V_SHA512_AES, mid, 0x07, spec9_usm(b"sha512aes",
+               "6b11470be02819178940abc55f55ee61623e2c5e46ba6ede055765df22742fc29819f7d3b571c40956850296bd5662e6",
+               "deadbeef00000003"), 64, None, 49),
+        V3Case("V-SHA-AES256-BLUMENTHAL", V_SHA_AES256_BLUMENTHAL, mid, 0x07, spec9_usm(b"shaaes256",
+               "d2f58f68255ebe2c103852eb", "deadbeef00000004"), 64, None, 49),
+        V3Case("V-SHA-AES256C-REEDER", V_SHA_AES256C_REEDER, mid, 0x07, spec9_usm(b"shaaes256c",
+               "f89490fb29493054b2aca0fe", "deadbeef00000005"), 65, None, 49),
+        V3Case("V-SHA256-DES", V_SHA256_DES, mid, 0x07, spec9_usm(b"sha256des",
+               "5983f965061f1dc3dcc133a891482e5885bc94d6064b2232", "000000010000002b"), 64, None, 56),
+        V3Case("discovery request", DISCOVERY_REQUEST, 1001, 0x04, UsmSecurityParameters(), 38,
+               ScopedPdu(b"", b"", Pdu(pdu.GET, 5001))),
+        V3Case("discovery report", DISCOVERY_REPORT, 1001, 0x00, UsmSecurityParameters(engine(), 1, 49), 51,
+               report(5001, 4, 11)),
+        V3Case("sync request", SYNC_REQUEST, 1002, 0x07, UsmSecurityParameters(engine(), 0, 0, b"shaaes",
+               h("2af60c653f8b27f6a69b4838"), h("70303bcd6260e5b8")), 57, None, 47),
+        V3Case("sync report", SYNC_REPORT, 1002, 0x01, UsmSecurityParameters(engine(), 1, 49, b"shaaes",
+               h("f9ea5ba42655e14b7bcc50e6")), 57, report(0, 2, 1)),
+        V3Case("net-snmp discovery request", NS_DISCOVERY_REQUEST, 0x7e2724ee, 0x04, UsmSecurityParameters(), 40,
+               ScopedPdu(b"", b"", Pdu(pdu.GET, 0x7fd703ac))),
+        V3Case("net-snmp discovery report", NS_DISCOVERY_REPORT, 0x7e2724ee, 0x00,
+               UsmSecurityParameters(engine(), 1, 307), 54, report(0x7fd703ac, 4, 1)),
+        V3Case("net-snmp shaaes GET", NS_SHAAES_GET, 0x7e2724ed, 0x07, UsmSecurityParameters(engine(), 1, 307,
+               b"shaaes", h("c410a13c02ddf2e4c7466244"), h("1ab1c1139c3a2265")), 61, None, 49),
+        V3Case("net-snmp shaaes Response", NS_SHAAES_RESPONSE, 0x7e2724ed, 0x03, UsmSecurityParameters(engine(), 1,
+               307, b"shaaes", h("1152abd1076047dee28f835c"), h("0ad9df2c507d65ce")), 61, None, 69),
+        V3Case("net-snmp md5des GET", NS_MD5DES_GET, 0x2b4f41c3, 0x07, UsmSecurityParameters(engine(), 1, 90,
+               b"md5des", h("069ccb74c6f521d8895a0151"), h("00000001601ee48a")), 60, None, 56),
+        V3Case("net-snmp md5des Response", NS_MD5DES_RESPONSE, 0x2b4f41c3, 0x03, UsmSecurityParameters(engine(), 1,
+               90, b"md5des", h("68362b690688667f12eb106e"), h("0000000141ce4c21")), 60, None, 72),
+        V3Case("net-snmp sha256aes GET", NS_SHA256AES_GET, 0x241e54ae, 0x07, UsmSecurityParameters(engine(), 1, 90,
+               b"sha256aes", h("fe39a24f22776a75ef37e781fa0c422b146a073e0b26d109"), h("cd64b2db1a6101c2")),
+               63, None, 49),
+        V3Case("net-snmp sha256aes Response", NS_SHA256AES_RESPONSE, 0x241e54ae, 0x03, UsmSecurityParameters(engine(),
+               1, 90, b"sha256aes", h("dbb852d86a9d8f69e4c6f3f2a7feda7027728cd14da4be01"), h("53c8002187c1d9c1")),
+               63, None, 69),
+        V3Case("v3 trap", V3_TRAP_NOAUTH, 0x1000, 0x00, UsmSecurityParameters(engine(), 7, 1000, b"noauth"), 59,
+               ScopedPdu(engine(), b"", Pdu(pdu.TRAP_V2, 99, varbinds=[
+                   vb(SYS_UPTIME, TimeTicks(100000)), vb(TRAP_OID, oidv("1.3.6.1.6.3.1.1.5.4")),
+                   vb("1.3.6.1.2.1.2.2.1.1.2", Integer(2))]))),
+        V3Case("v3 inform", V3_INFORM_SHA, 2147483647, 0x05, UsmSecurityParameters(engine(), 1, 150, b"shaonly",
+               h("b30de57fccf6670145130c02")), 62,
+               ScopedPdu(engine(), b"ctx", Pdu(pdu.INFORM, 77, varbinds=[
+                   vb(SYS_UPTIME, TimeTicks(4242)), vb(TRAP_OID, oidv("1.3.6.1.6.3.1.1.5.1"))]))),
+    ]
+
+# The documented ciphertexts of the deterministic vectors
+def spec9_ciphertexts() -> dict[str, bytes]:
+    return {
+        "V-MD5-DES": h("28468e6066b2c3d978d5232f7f7e56785d793d927d63c15db32b6afd75589c1ec76ce216b5d4b8a40c9178ddee5f9915c79a24204d99f04b"),
+        "V-SHA-AES": h("de46c1433b208b758146de11e079276ee206bab469d6ce21038348f198816b713439d9e58ac5b4b2b45044c7e38c6a50ad"),
+        "V-SHA256-AES": h("fe3e1e5c4c5796fe07c9bd16ce71174ee7de35ab7219fcafe3a8e6121bff78d6001a75ed00825f0460460a1bee412124bc"),
+        "V-SHA512-AES": h("00f6bd885a2280d692f48d7235bf0253d53a61f9bea0f761968260557e1dc4d68cda45559cff1ad1a3c4c64df1c9b39028"),
+        "V-SHA-AES256-BLUMENTHAL": h("b0b1388a10dd06ed7e9001f7be3fe765f8cfcc39780e43260f8cf10dc82dacba69fea90096724237b279da96eb01771f5b"),
+        "V-SHA-AES256C-REEDER": h("d36f8dda3098977e766a64088f2ca41c63858c002d198dbd50d1324a0d21888fcf013625023657588401df41961e1c8329"),
+        "V-SHA256-DES": h("6f846754d1c7fe34ef066d97fef3cf748d540de2f60cb18404ebea2895d8f20dedf885de2f36d6f72039e5358278bf6690776cc96db61a43"),
+    }
+
+def _test_v3_decode() -> None:
+    for c in v3_cases():
+        m = v3_of(c.data)
+        testing.assertEqual(m.msg_id, c.msg_id, c.name)
+        testing.assertEqual(m.max_size, 65507, c.name)
+        testing.assertEqual(m.flags, c.flags, c.name)
+        testing.assertEqual(m.security_model, message.SEC_MODEL_USM, c.name)
+        testing.assertEqual(m.usm, c.usm, c.name)
+        testing.assertEqual(m.auth_offset, c.auth_offset, c.name)
+        n = len(c.usm.auth_params)
+        testing.assertEqual(c.data[m.auth_offset:m.auth_offset + n], c.usm.auth_params, c.name)
+        testing.assertEqual(m.scoped, c.scoped, c.name)
+        if c.encrypted_len >= 0:
+            testing.assertEqual(m.encrypted, c.data[len(c.data) - c.encrypted_len:], c.name)
+        else:
+            testing.assertNone(m.encrypted, c.name)
+
+def _test_v3_spec9_ciphertexts() -> None:
+    cts = spec9_ciphertexts()
+    found = 0
+    for c in v3_cases():
+        ct = cts.get(c.name)
+        if ct is not None:
+            testing.assertEqual(v3_of(c.data).encrypted, ct, c.name)
+            found += 1
+    testing.assertEqual(found, 7)
+
+def _test_v3_reencode_up_to_mac() -> None:
+    # Every vector re-encodes from its decoded fields to the same octets, with the MAC
+    # zeroed at the same offset.
+    for c in v3_cases():
+        m = v3_of(c.data)
+        s = m.scoped
+        e = m.encrypted
+        if s is not None:
+            payload = message.encode_scoped(s)
+        elif e is not None:
+            payload = e
+        else:
+            raise AssertionError("no data in " + c.name)
+        msg, off = encode3(m, payload)
+        n = len(c.usm.auth_params)
+        testing.assertEqual(off, c.auth_offset, c.name)
+        testing.assertEqual(msg, zero_mac(c.data, off, n), c.name)
+
+def _test_v3_encode_noauth_exact() -> None:
+    # V-NOAUTH built from scratch reproduces the vector byte for byte
+    m = V3Message(0x01020304, 65507, message.FLAG_REPORTABLE, UsmSecurityParameters(engine(), 0, 0, b"noauth"))
+    msg, off = encode3(m, message.encode_scoped(spec_scoped(0x0a0b0c0d)))
+    testing.assertEqual(msg, h(V_NOAUTH))
+    testing.assertEqual(off, 59)
+    # the other noAuthNoPriv messages: discovery request and report, the v3 trap
+    m = V3Message(1001, 65507, message.FLAG_REPORTABLE, UsmSecurityParameters())
+    msg, off = encode3(m, message.encode_scoped(ScopedPdu(b"", b"", Pdu(pdu.GET, 5001))))
+    testing.assertEqual(msg, h(DISCOVERY_REQUEST))
+    testing.assertEqual(off, 38)
+    m = V3Message(1001, 65507, 0, UsmSecurityParameters(engine(), 1, 49))
+    msg, off = encode3(m, message.encode_scoped(report(5001, 4, 11)))
+    testing.assertEqual(msg, h(DISCOVERY_REPORT))
+    m = V3Message(0x1000, 65507, 0, UsmSecurityParameters(engine(), 7, 1000, b"noauth"))
+    sp = ScopedPdu(engine(), b"", Pdu(pdu.TRAP_V2, 99, varbinds=[
+        vb(SYS_UPTIME, TimeTicks(100000)), vb(TRAP_OID, oidv("1.3.6.1.6.3.1.1.5.4")),
+        vb("1.3.6.1.2.1.2.2.1.1.2", Integer(2))]))
+    msg, off = encode3(m, message.encode_scoped(sp))
+    testing.assertEqual(msg, h(V3_TRAP_NOAUTH))
+    testing.assertEqual(off, 59)
+
+def _test_v3_encode_authnopriv_up_to_mac() -> None:
+    # The placeholder is zero-filled whatever auth_params holds; only its length counts.
+    for auth in [b"\x00" * 12, b"\xff" * 12, h("f559bb6bc446b77acb582af5")]:
+        m = V3Message(0x01020304, 65507, message.FLAG_AUTH | message.FLAG_REPORTABLE,
+                      UsmSecurityParameters(engine(), 1, 150, b"shaonly", auth))
+        msg, off = encode3(m, message.encode_scoped(spec_scoped(0x0a0b0c0d)))
+        testing.assertEqual(off, 61)
+        testing.assertEqual(msg, zero_mac(h(V_SHA_AUTHNOPRIV), 61, 12))
+        testing.assertEqual(msg[:off] + h("f559bb6bc446b77acb582af5") + msg[off + 12:], h(V_SHA_AUTHNOPRIV))
+    m = V3Message(2147483647, 65507, message.FLAG_AUTH | message.FLAG_REPORTABLE,
+                  UsmSecurityParameters(engine(), 1, 150, b"shaonly", b"\x00" * 12))
+    sp = ScopedPdu(engine(), b"ctx", Pdu(pdu.INFORM, 77, varbinds=[
+        vb(SYS_UPTIME, TimeTicks(4242)), vb(TRAP_OID, oidv("1.3.6.1.6.3.1.1.5.1"))]))
+    msg, off = encode3(m, message.encode_scoped(sp))
+    testing.assertEqual(off, 62)
+    testing.assertEqual(msg, zero_mac(h(V3_INFORM_SHA), 62, 12))
+
+def _test_v3_encode_authpriv_up_to_mac() -> None:
+    m = V3Message(0x01020304, 65507, message.FLAG_AUTH | message.FLAG_PRIV | message.FLAG_REPORTABLE,
+                  UsmSecurityParameters(engine(), 1, 150, b"shaaes", b"\x00" * 12, h("deadbeef00000001")))
+    ct = spec9_ciphertexts()["V-SHA-AES"]
+    msg, off = encode3(m, ct)
+    testing.assertEqual(off, 61)
+    testing.assertEqual(msg, zero_mac(h(V_SHA_AES), 61, 12))
+
+def _test_v3_auth_offset_long_forms() -> None:
+    # Outer and inner lengths in long form move the placeholder; encode and decode agree.
+    for n in [0, 100, 200, 300, 70000]:
+        usm = UsmSecurityParameters(b"e" * 32, 2147483647, 2147483647, b"u" * 32, b"\x01" * 48, b"\x02" * 8)
+        m = V3Message(2147483647, 2147483647, message.FLAG_AUTH | message.FLAG_PRIV, usm)
+        msg, off = encode3(m, b"\xaa" * n)
+        d = v3_of(msg)
+        testing.assertEqual(d.auth_offset, off, "payload %d" % n)
+        testing.assertEqual(d.usm.auth_params, b"\x00" * 48)
+        testing.assertEqual(d.usm.user, b"u" * 32)
+        testing.assertEqual(d.encrypted, b"\xaa" * n)
+        testing.assertEqual(d.max_size, 2147483647)
+
+# Building blocks of SNMPv3 test messages
+
+HDR = "02 04 01 02 03 04 02 03 00 ff e3 04 01 04 02 01 03"
+USM = "30 21 04 0d 80 00 1f 88 80 01 02 03 04 05 06 07 08 02 01 00 02 01 00 04 06 6e 6f 61 75 74 68 04 00 04 00"
+USM_FIELDS = "04 0d 80 00 1f 88 80 01 02 03 04 05 06 07 08 02 01 00 02 01 00 04 06 6e 6f 61 75 74 68 04 00 04 00"
+TRAP_PDU = "a4 14 06 01 2b 40 04 01 02 03 04 02 01 00 02 01 00 43 01 00 30 00"
+SCOPED = "30 2f 04 0d 80 00 1f 88 80 01 02 03 04 05 06 07 08 04 00 a0 1c 02 04 0a 0b 0c 0d 02 01 00 02 01 00 30 0e 30 0c 06 08 2b 06 01 02 01 01 01 00 05 00"
+
+def v3raw(header: str, params: bytes, data: str) -> bytes:
+    """An SNMPv3 message from the HeaderData content, msgSecurityParameters content and msgData"""
+    return ber.enc_tlv(ber.TAG_SEQUENCE, h("02 01 03") + ber.enc_tlv(ber.TAG_SEQUENCE, h(header))
+                       + ber.enc_tlv(ber.TAG_OCTET_STRING, params) + h(data))
+
+def seq(content: str) -> bytes:
+    return ber.enc_tlv(ber.TAG_SEQUENCE, h(content))
+
+def _test_decode_scoped_plaintexts() -> None:
+    # Decrypted ScopedPDUs of the encryption examples and the net-snmp exchanges, with and without
+    # DES padding after the SEQUENCE (zeros, PKCS#5-style 07 x 7 and 03 x 3)
+    cases = [
+        ("302f040d80001f888001020304050607080400a01c02040a0b0c0d020100020100300e300c06082b06010201010100050000000000000000",
+         spec_scoped(0x0a0b0c0d)),
+        ("302d040d80001f888001020304050607080400a01a0202138a020100020100300e300c06082b060102010101000500",
+         spec_scoped(5002)),
+        ("302f040d80001f888001020304050607080400a01c02047fd703ab020100020100300e300c06082b060102010101000500",
+         spec_scoped(0x7fd703ab)),
+        ("3043040d80001f888001020304050607080400a23002047fd703ab0201000201003022302006082b060102010101000414616374736e6d702d76332d737065632d74657374",
+         sysdescr_response(0x7fd703ab)),
+        ("302f040d80001f888001020304050607080400a01c020401a95adc020100020100300e300c06082b06010201010100050007070707070707",
+         spec_scoped(0x01a95adc)),
+        ("3043040d80001f888001020304050607080400a230020401a95adc0201000201003022302006082b060102010101000414616374736e6d702d76332d737065632d74657374030303",
+         sysdescr_response(0x01a95adc)),
+        ("302f040d80001f888001020304050607080400a01c02045ca535b8020100020100300e300c06082b060102010101000500",
+         spec_scoped(0x5ca535b8)),
+        ("3043040d80001f888001020304050607080400a23002045ca535b80201000201003022302006082b060102010101000414616374736e6d702d76332d737065632d74657374",
+         sysdescr_response(0x5ca535b8)),
+    ]
+    for hx, expected in cases:
+        b = h(hx)
+        testing.assertEqual(message.decode_scoped(b, 0, len(b)), expected, hx[:40])
+    # decode_scoped also works at an offset, up to end
+    b = h("ff") + message.encode_scoped(spec_scoped(1)) + h("ee ee")
+    testing.assertEqual(message.decode_scoped(b, 1, len(b) - 1), spec_scoped(1))
+    decode_fails(lambda: message.decode_scoped(b, 1, len(b) - 3), "end inside the ScopedPDU")
+
+def _test_decode_scoped_rejects() -> None:
+    sp = "04 01 65 04 00 " + "a0 0b 02 01 07 02 01 00 02 01 00 30 00"
+    good = ber.enc_tlv(ber.TAG_SEQUENCE, h(sp))
+    testing.assertEqual(message.decode_scoped(good, 0, len(good)), ScopedPdu(b"e", b"", Pdu(pdu.GET, 7)))
+    bad = [
+        (ber.enc_tlv(ber.TAG_SEQUENCE, h(sp + " 05 00")), "data after the PDU"),
+        (ber.enc_tlv(ber.TAG_SEQUENCE, h("02 01 65 04 00 a0 0b 02 01 07 02 01 00 02 01 00 30 00")), "contextEngineID INTEGER"),
+        (ber.enc_tlv(ber.TAG_SEQUENCE, h("04 01 65 a0 0b 02 01 07 02 01 00 02 01 00 30 00")), "no contextName"),
+        (ber.enc_tlv(ber.TAG_SEQUENCE, h("04 01 65 04 00")), "no PDU"),
+        (ber.enc_tlv(ber.TAG_SEQUENCE, h("04 01 65 04 00 a9 00")), "unknown PDU type"),
+        (seq("04 00 04 00 " + TRAP_PDU), "SNMPv1 Trap-PDU"),
+        (ber.enc_tlv(ber.TAG_OCTET_STRING, h(sp)), "OCTET STRING instead of a SEQUENCE"),
+        (h("30 80") + h(sp) + h("00 00"), "indefinite length"),
+        (h(""), "empty"),
+        (h("ff 03 00 00 00"), "garbage (a wrong decryption key)"),
+    ]
+    for data, what in bad:
+        decode_fails(lambda: message.decode_scoped(data, 0, len(data)), what)
+
+
+# SNMPv3 structure ##################################################################################
+
+def _test_v3_raw_helper() -> None:
+    testing.assertEqual(v3raw(HDR, h(USM), SCOPED), h(V_NOAUTH))
+    testing.assertEqual(seq(USM_FIELDS), h(USM))
+
+def _test_v3_rejects() -> None:
+    usm = h(USM)
+    bad = [
+        (v3raw("02 01 ff 02 03 00 ff e3 04 01 04 02 01 03", usm, SCOPED), "msgID -1"),
+        (v3raw("02 05 00 80 00 00 00 02 03 00 ff e3 04 01 04 02 01 03", usm, SCOPED), "msgID 2^31"),
+        (v3raw("04 01 01 02 03 00 ff e3 04 01 04 02 01 03", usm, SCOPED), "msgID OCTET STRING"),
+        (v3raw("02 01 01 02 02 01 e3 04 01 04 02 01 03", usm, SCOPED), "msgMaxSize 483"),
+        (v3raw("02 01 01 02 05 00 80 00 00 00 04 01 04 02 01 03", usm, SCOPED), "msgMaxSize 2^31"),
+        (v3raw("02 01 01 02 03 00 ff e3 04 00 02 01 03", usm, SCOPED), "empty msgFlags"),
+        (v3raw("02 01 01 02 03 00 ff e3 04 02 04 00 02 01 03", usm, SCOPED), "2-octet msgFlags"),
+        (v3raw("02 01 01 02 03 00 ff e3 02 01 04 02 01 03", usm, SCOPED), "msgFlags INTEGER"),
+        (v3raw("02 01 01 02 03 00 ff e3 04 01 04 02 01 00", usm, SCOPED), "msgSecurityModel 0"),
+        (v3raw("02 01 01 02 03 00 ff e3 04 01 04 02 01 ff", usm, SCOPED), "msgSecurityModel -1"),
+        (v3raw("02 01 01 02 03 00 ff e3 04 01 04", usm, SCOPED), "no msgSecurityModel"),
+        (v3raw(HDR + " 05 00", usm, SCOPED), "data after msgSecurityModel"),
+        (v3raw("", usm, SCOPED), "empty HeaderData"),
+        (seq("02 01 03 31 11 " + HDR + " 04 23 " + USM + " " + SCOPED), "HeaderData is a SET"),
+        (seq("02 01 03 30 11 " + HDR + " 30 21 " + USM_FIELDS + " " + SCOPED), "msgSecurityParameters not wrapped"),
+        (seq("02 01 03 30 11 " + HDR + " " + SCOPED), "no msgSecurityParameters"),
+        (seq("02 01 03 30 11 " + HDR + " 04 23 " + USM), "no msgData"),
+        (seq("02 01 03"), "only a version"),
+        (v3raw(HDR, usm + h("05 00"), SCOPED), "data after UsmSecurityParameters"),
+        (v3raw(HDR, b"", SCOPED), "empty msgSecurityParameters"),
+        (v3raw(HDR, ber.enc_tlv(0x31, h(USM_FIELDS)), SCOPED), "UsmSecurityParameters is a SET"),
+        (v3raw(HDR, seq(USM_FIELDS + " 04 00"), SCOPED), "extra USM field"),
+        (v3raw(HDR, seq(USM_FIELDS[:-6]), SCOPED), "no msgPrivacyParameters"),
+        (v3raw(HDR, seq("02 0d 80 00 1f 88 80 01 02 03 04 05 06 07 08" + USM_FIELDS[44:]), SCOPED),
+         "engine ID INTEGER"),
+        (v3raw(HDR, seq("04 00 02 01 ff 02 01 00 04 00 04 00 04 00"), SCOPED), "boots -1"),
+        (v3raw(HDR, seq("04 00 02 05 00 80 00 00 00 02 01 00 04 00 04 00 04 00"), SCOPED), "boots 2^31"),
+        (v3raw(HDR, seq("04 00 02 01 00 02 05 00 80 00 00 00 04 00 04 00 04 00"), SCOPED), "time 2^31"),
+        (v3raw(HDR, seq("04 00 02 01 00 02 01 00 04 21 " + "61 " * 33 + "04 00 04 00"), SCOPED),
+         "33-octet user name"),
+        (v3raw(HDR, seq("04 00 02 01 00 02 01 00 04 00 02 01 00 04 00"), SCOPED), "authParams INTEGER"),
+        (v3raw(HDR, seq("04 00 02 01 00 02 01 00 04 00 04 00 05 00"), SCOPED), "privParams NULL"),
+        (v3raw("02 01 01 02 03 00 ff e3 04 01 07 02 01 03", usm, SCOPED), "privFlag with a plaintext ScopedPDU"),
+        (v3raw("02 01 01 02 03 00 ff e3 04 01 03 02 01 03", usm, SCOPED), "authPriv flags with a plaintext ScopedPDU"),
+        (v3raw(HDR, usm, "04 03 01 02 03"), "no privFlag with an encryptedPDU"),
+        (v3raw(HDR, usm, "a0 00"), "msgData is a PDU"),
+        (v3raw(HDR, usm, ""), "no msgData"),
+        (v3raw(HDR, usm, SCOPED + " 05 00"), "data after msgData"),
+        (v3raw(HDR, usm, SCOPED + " " + SCOPED), "two ScopedPDUs"),
+        (v3raw(HDR, usm, "30 05 04 00 04 00 a0"), "truncated ScopedPDU"),
+        (v3raw(HDR, usm, seq("04 00 04 00 " + TRAP_PDU).hex()), "Trap-PDU in the ScopedPDU"),
+    ]
+    for data, what in bad:
+        decode_fails(lambda: message.decode(data), what)
+
+def _test_v3_trailing_octets_rejected() -> None:
+    # Policy (message module documentation): SNMPv3 datagrams with octets after the
+    # outer SEQUENCE are dropped, also by peek.
+    for c in v3_cases():
+        for junk in ["00", "00 00", "30 00", "04 0c 00 00 00 00 00 00 00 00 00 00 00 00"]:
+            data = c.data + h(junk)
+            decode_fails(lambda: message.decode(data), c.name + " + " + junk)
+            decode_fails(lambda: message.peek(data), "peek " + c.name + " + " + junk)
+
+def _test_v3_lenient() -> None:
+    # non-minimal integers and lengths
+    m = v3_of(ber.enc_tlv(ber.TAG_SEQUENCE, h("02 02 00 03 30 82 00 11 " + HDR + " 04 81 23 " + USM + " " + SCOPED)))
+    testing.assertEqual(m.scoped, spec_scoped(0x0a0b0c0d))
+    testing.assertEqual(m.auth_offset, 59 + 4)
+    # a 32-octet user name, an empty engine ID with boots/time 2^31-1
+    m = v3_of(v3raw(HDR, seq("04 00 02 04 7f ff ff ff 02 04 7f ff ff ff 04 20 " + "61 " * 32 + "04 00 04 00"), SCOPED))
+    testing.assertEqual(m.usm, UsmSecurityParameters(b"", 2147483647, 2147483647, b"a" * 32))
+    # msgMaxSize at its minimum
+    m = v3_of(v3raw("02 01 00 02 02 01 e4 04 01 04 02 01 03", h(USM), SCOPED))
+    testing.assertEqual(m.max_size, 484)
+    testing.assertEqual(m.msg_id, 0)
+
+def _test_v3_flags() -> None:
+    usm = h(USM)
+    # undefined bits are cleared (RFC 3412 section 7.2 step 5e)
+    m = v3_of(v3raw("02 01 01 02 03 00 ff e3 04 01 fc 02 01 03", usm, SCOPED))
+    testing.assertEqual(m.flags, message.FLAG_REPORTABLE)
+    testing.assertEqual(m.scoped, spec_scoped(0x0a0b0c0d))
+    m = v3_of(v3raw("02 01 01 02 03 00 ff e3 04 01 ff 02 01 03", usm, "04 03 01 02 03"))
+    testing.assertEqual(m.flags, 0x07)
+    testing.assertEqual(m.encrypted, h("01 02 03"))
+    testing.assertNone(m.scoped)
+    # privFlag without authFlag is invalid (snmpInvalidMsgs), which the usm layer decides:
+    # the data is decoded as encrypted
+    m = v3_of(v3raw("02 01 01 02 03 00 ff e3 04 01 02 02 01 03", usm, "04 00"))
+    testing.assertEqual(m.flags, message.FLAG_PRIV)
+    testing.assertEqual(m.encrypted, b"")
+    # constants
+    testing.assertEqual([message.FLAG_AUTH, message.FLAG_PRIV, message.FLAG_REPORTABLE, message.SEC_MODEL_USM],
+                        [1, 2, 4, 3])
+    testing.assertEqual([message.SNMP_V1, message.SNMP_V2C, message.SNMP_V3], [0, 1, 3])
+
+def _test_v3_other_security_models() -> None:
+    # Decoded but flagged: the security model is kept, the parameters are not interpreted.
+    for model, params in [(1, "de ad be ef"), (2, ""), (4, USM), (2147483647, "30 00")]:
+        hdr = "02 01 01 02 03 00 ff e3 04 01 04 " + ber.enc_integer(model).hex()
+        m = v3_of(v3raw(hdr, h(params), SCOPED))
+        testing.assertEqual(m.security_model, model)
+        testing.assertEqual(m.usm, UsmSecurityParameters())
+        testing.assertEqual(m.auth_offset, -1)
+        testing.assertEqual(m.scoped, spec_scoped(0x0a0b0c0d))
+
+def _test_encode_v3_rejects() -> None:
+    sp = message.encode_scoped(spec_scoped(1))
+    usm = UsmSecurityParameters(engine(), 1, 2, b"user")
+    bad = [
+        (V3Message(-1, 65507, 4, usm), "msgID -1"),
+        (V3Message(2147483648, 65507, 4, usm), "msgID 2^31"),
+        (V3Message(1, 483, 4, usm), "msgMaxSize 483"),
+        (V3Message(1, 2147483648, 4, usm), "msgMaxSize 2^31"),
+        (V3Message(1, 65507, -1, usm), "msgFlags -1"),
+        (V3Message(1, 65507, 256, usm), "msgFlags 256"),
+        (V3Message(1, 65507, 4, usm, security_model=0), "msgSecurityModel 0"),
+        (V3Message(1, 65507, 4, UsmSecurityParameters(engine(), -1, 0, b"u")), "boots -1"),
+        (V3Message(1, 65507, 4, UsmSecurityParameters(engine(), 2147483648, 0, b"u")), "boots 2^31"),
+        (V3Message(1, 65507, 4, UsmSecurityParameters(engine(), 0, -1, b"u")), "time -1"),
+        (V3Message(1, 65507, 4, UsmSecurityParameters(engine(), 0, 2147483648, b"u")), "time 2^31"),
+        (V3Message(1, 65507, 4, UsmSecurityParameters(engine(), 0, 0, b"u" * 33)), "33-octet user"),
+    ]
+    for m, what in bad:
+        encode_fails(lambda: message.encode_v3(m, sp), what)
+    m = V3Message(1, 65507, 4, usm)
+    encode_fails(lambda: message.encode_v3(m, b""), "empty plaintext")
+    encode_fails(lambda: message.encode_v3(m, h("04 00")), "plaintext is not a SEQUENCE")
+    encode_fails(lambda: message.encode_scoped(ScopedPdu(b"", b"", Pdu(pdu.TRAP_V1, 1))), "Trap-PDU in a ScopedPDU")
+    encode_fails(lambda: message.encode_scoped(ScopedPdu(b"", b"", Pdu(pdu.GET, -2147483649))), "request-id")
+    # limits that are accepted
+    message.encode_v3(V3Message(0, 484, 255, UsmSecurityParameters(b"", 0, 0, b"u" * 32), security_model=2147483647),
+                      b"anything")
+    message.encode_v3(V3Message(2147483647, 2147483647, 0, UsmSecurityParameters(b"", 2147483647, 2147483647)), sp)
+
+def _test_v3_repr() -> None:
+    m = V3Message(5, 1500, 7, UsmSecurityParameters(h("80 00"), 1, 2, b"bob", h("aa"), h("bb")), None, h("01 02"))
+    testing.assertEqual(repr(m), "V3Message(msg_id=5, max_size=1500, flags=0x07, security_model=3, "
+                        + "UsmSecurityParameters(engine_id=8000, boots=1, time=2, user=b'bob', auth_params=aa, "
+                        + "priv_params=bb), encrypted=<2 octets>, auth_offset=-1)")
+    m = V3Message(5, 1500, 4, UsmSecurityParameters(), ScopedPdu(h("80"), b"c", Pdu(pdu.GET, 1)))
+    testing.assertEqual(str(m), "V3Message(msg_id=5, max_size=1500, flags=0x04, security_model=3, "
+                        + "UsmSecurityParameters(engine_id=, boots=0, time=0, user=b'', auth_params=, priv_params=), "
+                        + "ScopedPdu(context_engine_id=80, context_name=b'c', Pdu(GET, request_id=1, error_status=0, "
+                        + "error_index=0, varbinds=[])), auth_offset=-1)")
+    testing.assertEqual(repr(V3Message(1, 484, 0, UsmSecurityParameters())),
+                        "V3Message(msg_id=1, max_size=484, flags=0x00, security_model=3, UsmSecurityParameters("
+                        + "engine_id=, boots=0, time=0, user=b'', auth_params=, priv_params=), no data, "
+                        + "auth_offset=-1)")
+
+def _test_v3_equality() -> None:
+    u = UsmSecurityParameters(b"e", 1, 2, b"u", b"a", b"p")
+    testing.assertEqual(u, UsmSecurityParameters(b"e", 1, 2, b"u", b"a", b"p"))
+    others = [UsmSecurityParameters(b"f", 1, 2, b"u", b"a", b"p"), UsmSecurityParameters(b"e", 0, 2, b"u", b"a", b"p"),
+              UsmSecurityParameters(b"e", 1, 0, b"u", b"a", b"p"), UsmSecurityParameters(b"e", 1, 2, b"v", b"a", b"p"),
+              UsmSecurityParameters(b"e", 1, 2, b"u", b"b", b"p"), UsmSecurityParameters(b"e", 1, 2, b"u", b"a", b"q")]
+    for other in others:
+        testing.assertNotEqual(u, other)
+    s = ScopedPdu(b"e", b"c", Pdu(pdu.GET, 1))
+    testing.assertEqual(s, ScopedPdu(b"e", b"c", Pdu(pdu.GET, 1)))
+    testing.assertNotEqual(s, ScopedPdu(b"f", b"c", Pdu(pdu.GET, 1)))
+    testing.assertNotEqual(s, ScopedPdu(b"e", b"d", Pdu(pdu.GET, 1)))
+    testing.assertNotEqual(s, ScopedPdu(b"e", b"c", Pdu(pdu.GET, 2)))
+
+
+# peek ##############################################################################################
+
+def _test_peek() -> None:
+    for hx, m in community_messages():
+        p = m.pdu
+        expected_id = p.request_id if p is not None else 0
+        testing.assertEqual(message.peek(h(hx)), (version=m.version, id=expected_id), hx[:30])
+    testing.assertEqual(message.peek(h(MSG_GETNEXT_V1_PYASN1)), (version=0, id=-2147483648))
+    for c in v3_cases():
+        testing.assertEqual(message.peek(c.data), (version=3, id=c.msg_id), c.name)
+    # peek only reads up to the id: a datagram whose varbinds are broken peeks fine
+    broken = community_raw("02 01 01", "04 01 61", "a2 0b 02 01 2a 02 01 00 02 01 00 31 00")
+    decode_fails(lambda: message.decode(broken), "broken varbinds")
+    testing.assertEqual(message.peek(broken), (version=1, id=42))
+    v3broken = v3raw(HDR, h("ff"), "")
+    decode_fails(lambda: message.decode(v3broken), "broken SNMPv3 message")
+    testing.assertEqual(message.peek(v3broken), (version=3, id=0x01020304))
+
+def _test_peek_rejects() -> None:
+    bad = [
+        (h(""), "empty"),
+        (h("02 01 01"), "no SEQUENCE"),
+        (community_raw("02 01 02", "04 01 61", PDU_GET), "version 2"),
+        (community_raw("04 01 01", "04 01 61", PDU_GET), "version is not an INTEGER"),
+        (community_raw("02 01 01", "02 01 61", PDU_GET), "community is an INTEGER"),
+        (community_raw("02 01 01", "04 01 61", "a9 03 02 01 01"), "unknown PDU type"),
+        (community_raw("02 01 01", "04 01 61", "30 03 02 01 01"), "SEQUENCE instead of a PDU"),
+        (community_raw("02 01 01", "04 01 61", "a0 03 04 01 01"), "request-id is an OCTET STRING"),
+        (community_raw("02 01 01", "04 01 61", "a0 07 02 05 00 80 00 00 00"), "request-id 2^31"),
+        (community_raw("02 01 01", "04 01 61", "a0 00"), "empty PDU"),
+        (community_raw("02 01 01", "04 01 61", ""), "no PDU"),
+        (seq("02 01 03 31 03 02 01 01"), "SNMPv3 HeaderData is a SET"),
+        (seq("02 01 03 30 03 02 01 ff"), "msgID -1"),
+        (seq("02 01 03"), "no HeaderData"),
+    ]
+    for data, what in bad:
+        decode_fails(lambda: message.peek(data), what)
+
+
+# Robustness ########################################################################################
+
+def all_messages() -> list[bytes]:
+    return [h(hx) for hx, m in community_messages()] + [c.data for c in v3_cases()]
+
+def _test_truncation_at_every_offset() -> None:
+    for data in all_messages():
+        for k in range(len(data)):
+            cut = data[:k]
+            decode_fails(lambda: message.decode(cut), "%s cut to %d octets" % (data.hex()[:20], k))
+            decode_fails(lambda: message.peek(cut), "peek %s cut to %d octets" % (data.hex()[:20], k))
+
+def _test_mutations_raise_only_decode_error() -> None:
+    # Overwrite every octet of some messages with interesting values: decode and peek
+    # either succeed or raise DecodeError; any other exception makes the test an ERR.
+    ok = 0
+    for data in [h(MSG_I), h(MSG_TRAP_SPECIFIC), h(V_SHA_AES), h(DISCOVERY_REPORT), h(V3_INFORM_SHA)]:
+        for i in range(len(data)):
+            for x in [0x00, 0x01, 0x03, 0x7f, 0x80, 0x81, 0x84, 0xff, data[i] ^ 0x01, data[i] ^ 0x80]:
+                m = data[:i] + ber.BYTE_TABLE[x] + data[i + 1:]
+                try:
+                    message.decode(m)
+                    ok += 1
+                except errors.DecodeError:
+                    pass
+                try:
+                    message.peek(m)
+                except errors.DecodeError:
+                    pass
+    testing.assertTrue(ok > 0)
+
+
+# Randomised round trips ############################################################################
+
+def random_pdu(rng: Lcg, v1: bool=False) -> Pdu:
+    """A random PDU of any type, or of an SNMPv1 type with v1"""
+    types = ([pdu.GET, pdu.GETNEXT, pdu.RESPONSE, pdu.SET] if v1 else
+             [pdu.GET, pdu.GETNEXT, pdu.RESPONSE, pdu.SET, pdu.GETBULK, pdu.INFORM, pdu.TRAP_V2, pdu.REPORT])
+    vbs = [VarBind(Oid([1, 3, 6, 1, rng.next31(), rng.below(3)]), Gauge32(rng.next31())) for i in range(rng.below(4))]
+    return Pdu(types[rng.below(len(types))], rng.next31() - rng.next31(), rng.below(19), rng.below(4), vbs)
+
+def _test_random_v3_round_trip() -> None:
+    rng = Lcg(31337)
+    for i in range(150):
+        flags = rng.below(8)
+        usm = UsmSecurityParameters(rng.octets(rng.below(33)), rng.next31(), rng.next31(), rng.octets(rng.below(33)),
+                                    b"\x00" * [0, 12, 16, 24, 32, 48][rng.below(6)], rng.octets(8 * rng.below(2)))
+        m = V3Message(rng.next31(), 484 + rng.below(70000), flags, usm)
+        sp = ScopedPdu(rng.octets(rng.below(33)), rng.octets(rng.below(10)), random_pdu(rng))
+        priv = (flags & message.FLAG_PRIV) != 0
+        payload = rng.octets(rng.below(400)) if priv else message.encode_scoped(sp)
+        msg, off = encode3(m, payload)
+        d = v3_of(msg)
+        testing.assertEqual(d.msg_id, m.msg_id)
+        testing.assertEqual(d.max_size, m.max_size)
+        testing.assertEqual(d.flags, flags)
+        testing.assertEqual(d.usm, usm)
+        testing.assertEqual(d.auth_offset, off)
+        if priv:
+            testing.assertEqual(d.encrypted, payload)
+            testing.assertNone(d.scoped)
+        else:
+            testing.assertEqual(d.scoped, sp)
+            testing.assertNone(d.encrypted)
+        testing.assertEqual(message.peek(msg), (version=3, id=m.msg_id))
+
+def _test_random_community_round_trip() -> None:
+    rng = Lcg(4711)
+    for i in range(150):
+        version = rng.below(2)
+        community = rng.octets(rng.below(200))
+        if version == message.SNMP_V1 and rng.below(3) == 0:
+            t = TrapV1Pdu(Oid([1, 3, 6, rng.next31()]), rng.octets(4), rng.below(7), rng.next31(), rng.next31(), [])
+            m = CommunityMessage(version, community, None, t)
+            rid = 0
+        else:
+            p = random_pdu(rng, version == message.SNMP_V1)
+            m = CommunityMessage(version, community, p)
+            rid = p.request_id
+        data = message.encode_community(m)
+        check_community(community_of(data), m, "random %d" % i)
+        testing.assertEqual(message.peek(data), (version=version, id=rid))
+
+
+# Performance (acton test perf; in ordinary runs the bodies run once) ###############################
+
+def getresponse30() -> CommunityMessage:
+    """A 1412-octet GetResponse: 30 ifDescr.N = 30-octet strings"""
+    vbs = [VarBind(Oid([1, 3, 6, 1, 2, 1, 2, 2, 1, 2, i + 1]), OctetString(b"GigabitEthernet0/0/0 interface"))
+           for i in range(30)]
+    return CommunityMessage(message.SNMP_V2C, PUBLIC, Pdu(pdu.RESPONSE, 1, 0, 0, vbs))
+
+def _test_perf_decode_getresponse30(t: testing.SyncT) -> None:
+    m = getresponse30()
+    data = message.encode_community(m)
+    testing.assertEqual(len(data), 1412)
+    for n in t.loop():
+        for i in range(n):
+            message.decode(data)
+    check_community(community_of(data), m, "GetResponse of 30 varbinds")
+
+def _test_perf_encode_getresponse30(t: testing.SyncT) -> None:
+    m = getresponse30()
+    data = message.encode_community(m)
+    for n in t.loop():
+        for i in range(n):
+            message.encode_community(m)
+    testing.assertEqual(message.encode_community(m), data)

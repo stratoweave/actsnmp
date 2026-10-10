@@ -1,0 +1,124 @@
+"""Cryptographic primitives for the SNMPv3 User-based Security Model
+
+Thin, stateless bindings to the mbedtls that the Acton toolchain links into
+every program (see deps/mbedtls_headers). Every function is one-shot: bytes in,
+bytes out, no shared state, so it is safe to call from any actor.
+
+Used for USM authentication (RFC 3414 HMAC-MD5-96 / HMAC-SHA-96, RFC 7860
+HMAC-SHA-2), password to key derivation and key localization, the privacy
+protocols (RFC 3414 CBC-DES, RFC 3826 AES-CFB128 and its 192/256-bit variants,
+draft-reeder 3DES-EDE), constant-time MAC comparison, and salts and IVs.
+
+Ciphers work on whole messages: there is no padding (CBC input must already be
+a multiple of 8 bytes) and no state carried between calls. Arguments with the
+wrong length raise ValueError.
+
+The C implementation lives in usmcrypto.ext.c.
+"""
+
+# Hash algorithm ids for hash(), hmac() and password_to_key().
+HASH_MD5 = 1
+HASH_SHA1 = 2
+HASH_SHA224 = 3
+HASH_SHA256 = 4
+HASH_SHA384 = 5
+HASH_SHA512 = 6
+
+def hash(alg: int, data: bytes) -> bytes:
+    """Return the digest of data computed with hash algorithm alg
+
+    alg is one of the HASH_* constants. Raises ValueError for any other value.
+    The result is the full digest: 16 bytes for MD5, 20 for SHA-1, 28/32/48/64
+    for SHA-224/256/384/512.
+    """
+    NotImplemented
+
+def hmac(alg: int, key: bytes, data: bytes) -> bytes:
+    """Return the HMAC (RFC 2104) of data under key, using hash algorithm alg
+
+    alg is one of the HASH_* constants. Raises ValueError for any other value.
+    The result is the full HMAC, as long as the digest of alg. USM truncates
+    it to the length its authentication protocol uses (for example 12 bytes
+    for HMAC-SHA-96); that is up to the caller.
+    """
+    NotImplemented
+
+def password_to_key(alg: int, password: bytes) -> bytes:
+    """Return the USM master key Ku for password (RFC 3414 A.2, RFC 7860)
+
+    Ku is the digest, with hash algorithm alg, of the first 1048576 bytes of
+    the password repeated over and over. That is 1 MiB of hashing (a few
+    milliseconds), so callers should cache the result. The result is as long
+    as the digest of alg. Localize it to an engine with
+    hash(alg, ku + engine_id + ku).
+
+    Raises ValueError for an unknown alg or an empty password. A minimum
+    password length (8 for USM) is policy and is left to the caller.
+    """
+    NotImplemented
+
+def des_cbc_encrypt(key: bytes, iv: bytes, data: bytes) -> bytes:
+    """Encrypt data with DES in CBC mode (usmDESPrivProtocol, RFC 3414 8)
+
+    key and iv are 8 bytes each; the parity bits of key are ignored and weak
+    keys are accepted. len(data) must be a multiple of 8: pad before calling.
+    The result is as long as data. Raises ValueError for any other lengths.
+    """
+    NotImplemented
+
+def des_cbc_decrypt(key: bytes, iv: bytes, data: bytes) -> bytes:
+    """Decrypt data with DES in CBC mode; the inverse of des_cbc_encrypt()
+
+    Same arguments and length rules as des_cbc_encrypt(). The result keeps
+    any padding; the caller strips it.
+    """
+    NotImplemented
+
+def des3_cbc_encrypt(key: bytes, iv: bytes, data: bytes) -> bytes:
+    """Encrypt data with 3DES-EDE in CBC mode (usm3DESEDEPrivProtocol)
+
+    key is 24 bytes (K1, K2 and K3, 8 bytes each) and iv is 8 bytes.
+    len(data) must be a multiple of 8. The result is as long as data. Raises
+    ValueError for any other lengths.
+    """
+    NotImplemented
+
+def des3_cbc_decrypt(key: bytes, iv: bytes, data: bytes) -> bytes:
+    """Decrypt data with 3DES-EDE in CBC mode; the inverse of des3_cbc_encrypt()
+
+    Same arguments and length rules as des3_cbc_encrypt().
+    """
+    NotImplemented
+
+def aes_cfb128_encrypt(key: bytes, iv: bytes, data: bytes) -> bytes:
+    """Encrypt data with AES in CFB mode, 128-bit segments (RFC 3826)
+
+    key is 16, 24 or 32 bytes (AES-128/192/256) and iv is 16 bytes. data can
+    have any length, and the result is as long as data. Raises ValueError for
+    any other key or iv length.
+    """
+    NotImplemented
+
+def aes_cfb128_decrypt(key: bytes, iv: bytes, data: bytes) -> bytes:
+    """Decrypt data with AES in CFB mode; the inverse of aes_cfb128_encrypt()
+
+    Same arguments and length rules as aes_cfb128_encrypt().
+    """
+    NotImplemented
+
+def ct_equal(a: bytes, b: bytes) -> bool:
+    """Return True if a and b are equal, in time that does not depend on their content
+
+    Use it to compare MACs. Inputs of different lengths are unequal; the
+    lengths themselves are not treated as secret.
+    """
+    NotImplemented
+
+def random_bytes(n: int) -> bytes:
+    """Return n bytes from the operating system CSPRNG (getentropy)
+
+    Use it for privacy salts and IVs and anything else that must not be
+    predictable. Raises ValueError if n is negative and OSError if the
+    operating system cannot supply random bytes.
+    """
+    NotImplemented

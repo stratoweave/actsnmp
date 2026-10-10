@@ -1,0 +1,618 @@
+"""Tests for values
+
+Messages B, E, F, I, J, N and O are SNMPv1/v2c reference packets, checked
+with pysnmp. The Opaque float and double vectors were checked with glibc
+printf("%f"), which net-snmp uses, and Python struct.
+"""
+
+import testing
+import ber
+import errors
+import values
+from oid import Oid
+from values import Value, VarBind, Integer, OctetString, Null, ObjectIdentifier, IpAddress, Counter32, Gauge32
+from values import TimeTicks, Opaque, Counter64, NoSuchObject, NoSuchInstance, EndOfMibView, UnknownValue
+from values import MalformedValue
+from testutil import h, decode_fails, encode_fails, Lcg
+
+def op(s: str) -> Oid:
+    return Oid.parse(s)
+
+def value_of(hx: str) -> Value:
+    """Decode a single value TLV that must fill the whole input"""
+    b = h(hx)
+    v, n = values.decode_value(b, 0, len(b))
+    testing.assertEqual(n, len(b), "value end of " + hx)
+    return v
+
+def vbl_range(msg: bytes) -> (int, int):
+    """Return the content range of the VarBindList of a v1/v2c message"""
+    ms, me = ber.expect_tlv(msg, 0, len(msg), ber.TAG_SEQUENCE)
+    vs, ve = ber.expect_tlv(msg, ms, me, ber.TAG_INTEGER)
+    cs, ce = ber.expect_tlv(msg, ve, me, ber.TAG_OCTET_STRING)
+    tag, ps, pe = ber.read_tlv(msg, ce, me)
+    p = ps
+    for i in range(3):
+        s, p = ber.expect_tlv(msg, p, pe, ber.TAG_INTEGER)
+    return ber.expect_tlv(msg, p, pe, ber.TAG_SEQUENCE)
+
+
+# Spec example messages ##############################################################################
+
+MSG_B = "30 3b 02 01 01 04 06 70 75 62 6c 69 63 a2 2e 02 04 12 34 56 78 02 01 00 02 01 00 30 20 30 1e 06 08 2b 06 01 02 01 01 01 00 04 12 4c 69 6e 75 78 20 72 6f 75 74 65 72 20 36 2e 31 2e 30"
+MSG_E = """30 70 02 01 01 04 06 70 75 62 6c 69 63 a2 63 02 01 01 02 01 00 02 01 00 30 58
+30 0e 06 08 2b 06 01 02 01 01 03 00 43 02 0e f6
+30 10 06 0a 2b 06 01 02 01 02 02 01 02 01 04 02 6c 6f
+30 0f 06 0a 2b 06 01 02 01 02 02 01 03 01 02 01 18
+30 12 06 0a 2b 06 01 02 01 02 02 01 02 02 04 04 65 74 68 30
+30 0f 06 0a 2b 06 01 02 01 02 02 01 03 02 02 01 06"""
+MSG_F = """30 40 02 01 01 04 06 70 75 62 6c 69 63 a2 33 02 01 02 02 01 00 02 01 00 30 28
+30 0c 06 08 2b 06 01 02 01 01 63 00 80 00
+30 0c 06 08 2b 06 01 02 01 01 01 01 81 00
+30 0a 06 06 2b 06 01 06 03 01 82 00"""
+MSG_I = """30 81 c8 02 01 01 04 06 70 75 62 6c 69 63 a2 81 ba 02 01 ff 02 01 00 02 01 00 30 81 ae
+30 10 06 08 2b 06 01 02 01 01 03 00 43 04 00 bc 61 4e
+30 18 06 08 2b 06 01 02 01 01 02 00 06 0c 2b 06 01 04 01 94 4c 01 01 01 02 15
+30 13 06 0a 2b 06 01 02 01 02 02 01 0a 01 41 05 00 ff ff ff ff
+30 12 06 0a 2b 06 01 02 01 02 02 01 05 01 42 04 3b 9a ca 00
+30 15 06 0d 2b 06 01 02 01 04 14 01 01 0a 00 00 01 40 04 0a 00 00 01
+30 18 06 0b 2b 06 01 02 01 1f 01 01 01 06 01 46 09 00 ff ff ff ff ff ff ff ff
+30 14 06 0a 2b 06 01 02 01 02 02 01 06 01 04 06 00 50 56 9a bc de
+30 10 06 0a 2b 06 01 04 01 86 8d 1f 01 00 02 02 ff 7f"""
+MSG_J = "30 37 02 01 01 04 07 70 72 69 76 61 74 65 a3 29 02 02 03 e8 02 01 00 02 01 00 30 1d 30 1b 06 08 2b 06 01 02 01 01 04 00 04 0f 6e 6f 63 40 65 78 61 6d 70 6c 65 2e 6e 65 74"
+MSG_N = """30 75 02 01 01 04 06 70 75 62 6c 69 63 a7 68 02 01 2a 02 01 00 02 01 00 30 5d
+30 0f 06 08 2b 06 01 02 01 01 03 00 43 03 01 e2 40
+30 17 06 0a 2b 06 01 06 03 01 01 04 01 00 06 09 2b 06 01 06 03 01 01 05 03
+30 0f 06 0a 2b 06 01 02 01 02 02 01 01 03 02 01 03
+30 0f 06 0a 2b 06 01 02 01 02 02 01 07 03 02 01 02
+30 0f 06 0a 2b 06 01 02 01 02 02 01 08 03 02 01 02"""
+MSG_O = "30 30 02 01 01 04 06 70 75 62 6c 69 63 a2 23 02 01 09 02 01 00 02 01 00 30 18 30 16 06 0b 2b 06 01 04 01 8f 65 0a 01 06 01 44 07 9f 78 04 3e 80 00 00"
+
+def expected_varbinds() -> list[(str, list[VarBind])]:
+    return [
+        (MSG_B, [VarBind(op("1.3.6.1.2.1.1.1.0"), OctetString(b"Linux router 6.1.0"))]),
+        (MSG_E, [VarBind(op("1.3.6.1.2.1.1.3.0"), TimeTicks(3830)),
+                 VarBind(op("1.3.6.1.2.1.2.2.1.2.1"), OctetString(b"lo")),
+                 VarBind(op("1.3.6.1.2.1.2.2.1.3.1"), Integer(24)),
+                 VarBind(op("1.3.6.1.2.1.2.2.1.2.2"), OctetString(b"eth0")),
+                 VarBind(op("1.3.6.1.2.1.2.2.1.3.2"), Integer(6))]),
+        (MSG_F, [VarBind(op("1.3.6.1.2.1.1.99.0"), NoSuchObject()),
+                 VarBind(op("1.3.6.1.2.1.1.1.1"), NoSuchInstance()),
+                 VarBind(op("1.3.6.1.6.3.1"), EndOfMibView())]),
+        (MSG_I, [VarBind(op("1.3.6.1.2.1.1.3.0"), TimeTicks(12345678)),
+                 VarBind(op("1.3.6.1.2.1.1.2.0"), ObjectIdentifier(op("1.3.6.1.4.1.2636.1.1.1.2.21"))),
+                 VarBind(op("1.3.6.1.2.1.2.2.1.10.1"), Counter32(4294967295)),
+                 VarBind(op("1.3.6.1.2.1.2.2.1.5.1"), Gauge32(1000000000)),
+                 VarBind(op("1.3.6.1.2.1.4.20.1.1.10.0.0.1"), IpAddress(h("0a 00 00 01"))),
+                 VarBind(op("1.3.6.1.2.1.31.1.1.1.6.1"), Counter64(18446744073709551615)),
+                 VarBind(op("1.3.6.1.2.1.2.2.1.6.1"), OctetString(h("00 50 56 9a bc de"))),
+                 VarBind(op("1.3.6.1.4.1.99999.1.0"), Integer(-129))]),
+        (MSG_J, [VarBind(op("1.3.6.1.2.1.1.4.0"), OctetString(b"noc@example.net"))]),
+        (MSG_N, [VarBind(op("1.3.6.1.2.1.1.3.0"), TimeTicks(123456)),
+                 VarBind(op("1.3.6.1.6.3.1.1.4.1.0"), ObjectIdentifier(op("1.3.6.1.6.3.1.1.5.3"))),
+                 VarBind(op("1.3.6.1.2.1.2.2.1.1.3"), Integer(3)),
+                 VarBind(op("1.3.6.1.2.1.2.2.1.7.3"), Integer(2)),
+                 VarBind(op("1.3.6.1.2.1.2.2.1.8.3"), Integer(2))]),
+        (MSG_O, [VarBind(op("1.3.6.1.4.1.2021.10.1.6.1"), Opaque(h("9f 78 04 3e 80 00 00")))]),
+    ]
+
+def _test_spec_messages_decode() -> None:
+    for hx, expected in expected_varbinds():
+        msg = h(hx)
+        start, stop = vbl_range(msg)
+        testing.assertEqual(values.decode_varbinds(msg, start, stop), expected, hx[:30])
+
+def _test_spec_messages_encode() -> None:
+    for hx, expected in expected_varbinds():
+        msg = h(hx)
+        start, stop = vbl_range(msg)
+        # the VarBindList TLV is the tail of each of these messages
+        testing.assertEqual(stop, len(msg))
+        hdr = len(ber.enc_length(stop - start)) + 1
+        testing.assertEqual(values.encode_varbinds(expected), msg[start - hdr:], hx[:30])
+
+def _test_request_varbind() -> None:
+    # spec message A: a request varbind has a NULL value
+    vb = VarBind(op("1.3.6.1.2.1.1.1.0"))
+    testing.assertEqual(vb.value, Null())
+    testing.assertEqual(values.encode_varbind(vb), h("30 0c 06 08 2b 06 01 02 01 01 01 00 05 00"))
+    testing.assertEqual(values.encode_varbinds([]), h("30 00"))
+    b = h("30 00")
+    testing.assertEqual(values.decode_varbinds(b, 2, 2), [])
+
+
+# Every value type ##################################################################################
+
+def type_table() -> list[(Value, str)]:
+    return [
+        (Integer(-129), "02 02 ff 7f"),
+        (Integer(0), "02 01 00"),
+        (Integer(2147483647), "02 04 7f ff ff ff"),
+        (Integer(-2147483648), "02 04 80 00 00 00"),
+        (OctetString(b""), "04 00"),
+        (OctetString(b"Linux router 6.1.0"), "04 12 4c 69 6e 75 78 20 72 6f 75 74 65 72 20 36 2e 31 2e 30"),
+        (OctetString(h("00 ff")), "04 02 00 ff"),
+        (Null(), "05 00"),
+        (ObjectIdentifier(op("1.3.6.1.4.1.2636.1.1.1.2.21")), "06 0c 2b 06 01 04 01 94 4c 01 01 01 02 15"),
+        (ObjectIdentifier(op("0.0")), "06 01 00"),
+        (IpAddress(h("c0 00 02 01")), "40 04 c0 00 02 01"),
+        (Counter32(0), "41 01 00"),
+        (Counter32(4294967295), "41 05 00 ff ff ff ff"),
+        (Gauge32(1000000000), "42 04 3b 9a ca 00"),
+        (Gauge32(4294967295), "42 05 00 ff ff ff ff"),
+        (TimeTicks(0), "43 01 00"),
+        (TimeTicks(12345678), "43 04 00 bc 61 4e"),
+        (Opaque(h("9f 78 04 3f c0 00 00")), "44 07 9f 78 04 3f c0 00 00"),
+        (Opaque(b""), "44 00"),
+        (Counter64(0), "46 01 00"),
+        (Counter64(4294967296), "46 05 01 00 00 00 00"),
+        (Counter64(9223372036854775808), "46 09 00 80 00 00 00 00 00 00 00"),
+        (Counter64(18446744073709551615), "46 09 00 ff ff ff ff ff ff ff ff"),
+        (NoSuchObject(), "80 00"),
+        (NoSuchInstance(), "81 00"),
+        (EndOfMibView(), "82 00"),
+        (UnknownValue(0x45, h("47 00 05")), "45 03 47 00 05"),
+        (UnknownValue(0x47, h("2a")), "47 01 2a"),
+        (UnknownValue(0x03, h("00 80")), "03 02 00 80"),
+    ]
+
+def _test_each_type_encode() -> None:
+    for v, hx in type_table():
+        testing.assertEqual(v.encode(), h(hx), repr(v))
+        testing.assertEqual(v.tag(), h(hx)[0], repr(v))
+
+def _test_each_type_decode() -> None:
+    for v, hx in type_table():
+        testing.assertEqual(value_of(hx), v, hx)
+
+def _test_decode_value_offsets() -> None:
+    b = h("ff 02 01 05 04 02 61 62 ee")
+    v, p = values.decode_value(b, 1, 8)
+    testing.assertEqual((v, p), (Integer(5), 4))
+    v, p = values.decode_value(b, p, 8)
+    testing.assertEqual((v, p), (OctetString(b"ab"), 8))
+    decode_fails(lambda: values.decode_value(b, 8, 8), "at end")
+    decode_fails(lambda: values.decode_value(b, 4, 7), "value beyond end")
+
+def _test_lenient_decode() -> None:
+    # spec: non-minimal INTEGERs (pyasn1, padded request-ids)
+    testing.assertEqual(value_of("02 02 ff 80"), Integer(-128))
+    testing.assertEqual(value_of("02 05 ff 80 00 00 00"), Integer(-2147483648))
+    testing.assertEqual(value_of("02 04 00 00 00 05"), Integer(5))
+    # spec: Counter32 sent as ff ff ff ff; Counter64 2^32
+    testing.assertEqual(value_of("41 04 ff ff ff ff"), Counter32(4294967295))
+    testing.assertEqual(value_of("43 05 00 ff ff ff ff"), TimeTicks(4294967295))
+    testing.assertEqual(value_of("42 09 00 00 00 00 00 00 00 00 07"), Gauge32(7))
+    testing.assertEqual(value_of("46 05 01 00 00 00 00"), Counter64(4294967296))
+    # spec: padded long-form lengths
+    testing.assertEqual(value_of("04 81 03 61 62 63"), OctetString(b"abc"))
+    testing.assertEqual(value_of("04 82 00 03 61 62 63"), OctetString(b"abc"))
+    testing.assertEqual(value_of("04 84 00 00 00 03 61 62 63"), OctetString(b"abc"))
+    testing.assertEqual(value_of("41 81 01 07"), Counter32(7))
+    # spec: empty OID value and 0x80 padding
+    testing.assertEqual(value_of("06 00"), ObjectIdentifier(Oid([])))
+    testing.assertEqual(value_of("06 0a 2b 06 01 04 01 80 80 80 80 7f"), ObjectIdentifier(op("1.3.6.1.4.1.127")))
+    # spec: content of NULL and the exceptions is ignored
+    testing.assertEqual(value_of("80 01 00"), NoSuchObject())
+    testing.assertEqual(value_of("81 01 ff"), NoSuchInstance())
+    testing.assertEqual(value_of("82 02 00 00"), EndOfMibView())
+    testing.assertEqual(value_of("05 01 00"), Null())
+    # IpAddress keeps what was sent
+    testing.assertEqual(value_of("40 03 0a 00 00"), IpAddress(h("0a 00 00")))
+    # anything else is kept raw, also constructed forms
+    testing.assertEqual(value_of("24 03 04 01 61"), UnknownValue(0x24, h("04 01 61")))
+    testing.assertEqual(value_of("30 03 02 01 01"), UnknownValue(0x30, h("02 01 01")))
+    testing.assertEqual(value_of("c4 00"), UnknownValue(0xc4, b""))
+
+def malformed_vectors() -> list[(str, str)]:
+    """Value TLVs whose framing is intact but whose content is invalid for the tag, and why"""
+    return [
+        ("02 00", "empty INTEGER (spec section 8)"),
+        ("02 0a 00 00 00 00 00 00 00 00 00 01", "INTEGER of 10 octets"),
+        ("02 09 00 80 00 00 00 00 00 00 00", "INTEGER 2^63"),
+        ("02 09 ff 7f ff ff ff ff ff ff ff", "INTEGER -2^63-1"),
+        ("41 00", "empty Counter32 (spec section 8)"),
+        ("41 05 01 00 00 00 05", "Counter32 above 2^32-1 (a 64-bit counter sent as Counter32)"),
+        ("41 05 01 00 00 00 00", "Counter32 2^32"),
+        ("42 06 ff ff ff ff ff ff", "Gauge32 of 6 negative octets"),
+        ("42 05 80 00 00 00 00", "Gauge32 below -2^31"),
+        ("43 08 ff ff ff ff ff ff ff ff", "8-octet TimeTicks (spec section 8)"),
+        ("43 00", "empty TimeTicks"),
+        ("46 00", "empty Counter64"),
+        ("46 0a 00 00 00 00 00 00 00 00 00 01", "Counter64 of 10 octets"),
+        ("46 09 01 00 00 00 00 00 00 00 00", "Counter64 2^64"),
+        ("06 0a 2b 06 01 04 01 90 80 80 80 00", "OID value with arc 2^32 (spec section 8)"),
+        ("06 02 2b 86", "OID value with a truncated sub-identifier"),
+        ("06 81 81 2b" + " 01" * 128, "OID value with 129 arcs"),
+    ]
+
+def _test_malformed_values() -> None:
+    # A content problem in a well-framed value gives a MalformedValue with the raw tag and
+    # content and the reason of the strict decoder; it re-encodes to the same octets.
+    for hx, what in malformed_vectors():
+        b = h(hx)
+        v = value_of(hx)
+        start, stop = ber.read_length(b, 1, len(b))
+        if isinstance(v, MalformedValue):
+            testing.assertEqual((v.raw_tag, v.value), (b[0], b[start:stop]), what)
+            testing.assertTrue(v.reason != "", what + ": a reason")
+            testing.assertFalse(values.is_exception(v), what)
+            testing.assertEqual(v.encode(), ber.enc_tlv(b[0], b[start:stop]), what)
+            testing.assertEqual(value_of(v.encode().hex()), v, what + ": round trip")
+        else:
+            testing.error(what + ": decoded to " + repr(v))
+    testing.assertEqual(value_of("02 00"), MalformedValue(0x02, b"", "empty INTEGER"))
+    reasons: list[(str, str)] = [("02 00", "empty INTEGER"), ("41 05 01 00 00 00 05", "unsigned integer exceeds 2^32-1"),
+                                 ("06 02 2b 86", "truncated OID sub-identifier"),
+                                 ("46 09 01 00 00 00 00 00 00 00 00", "Counter64 exceeds 2^64-1")]
+    for hx, reason in reasons:
+        v = value_of(hx)
+        if isinstance(v, MalformedValue):
+            testing.assertEqual(v.reason, reason, hx)
+        else:
+            testing.error(hx + ": decoded to " + repr(v))
+
+def _test_integer_beyond_integer32() -> None:
+    # INTEGER content of 1 to 9 octets that fits 64 bits is an Integer, also outside
+    # Integer32 (agents put unsigned values into INTEGER objects; net-snmp shows them);
+    # encode() stays strict.
+    cases: list[(str, int)] = [
+        ("02 05 00 80 00 00 00", 2147483648), ("02 05 ff 7f ff ff ff", -2147483649),
+        ("02 07 01 00 00 00 00 00 00", 281474976710656), ("02 05 00 ff ff ff ff", 4294967295),
+        ("02 08 7f ff ff ff ff ff ff ff", 9223372036854775807), ("02 08 80 00 00 00 00 00 00 00", -9223372036854775807 - 1),
+        ("02 09 00 7f ff ff ff ff ff ff ff", 9223372036854775807), ("02 09 ff 80 00 00 00 00 00 00 00", -9223372036854775807 - 1)]
+    for hx, want in cases:
+        testing.assertEqual(value_of(hx), Integer(want), hx)
+        encode_fails(lambda: value_of(hx).encode(), hx + " re-encoded")
+
+def _test_unsigned_boundaries() -> None:
+    # The lengths where the direct decoding ends and the checked one begins
+    cases: list[(str, Value)] = [
+        ("41 04 ff ff ff ff", Counter32(4294967295)), ("41 05 00 ff ff ff ff", Counter32(4294967295)),
+        ("42 05 ff 80 00 00 00", Gauge32(2147483648)), ("43 06 00 00 ff ff ff ff", TimeTicks(4294967295)),
+        ("41 01 80", Counter32(4294967168)), ("46 08 ff ff ff ff ff ff ff ff", Counter64(18446744073709551615)),
+        ("46 09 00 ff ff ff ff ff ff ff ff", Counter64(18446744073709551615)),
+        ("46 09 ff ff ff ff ff ff ff ff ff", Counter64(18446744073709551615))]
+    for hx, want in cases:
+        testing.assertEqual(value_of(hx), want, hx)
+
+def _test_decode_rejects() -> None:
+    # Only broken framing fails a value (and with it the whole message)
+    bad = [
+        ("9f 78 04 3f c0 00 00", "high-tag-number form"),
+        ("1f 01 00", "universal high-tag-number form"),
+        ("04 05 61", "length beyond the input"),
+        ("02 05 00 80", "INTEGER length beyond the input"),
+        ("04 80 61 00 00", "indefinite length"),
+        ("04 85 00 00 00 00 01 61", "5 length octets"),
+        ("04", "missing length"),
+        ("", "no input"),
+    ]
+    for hx, what in bad:
+        b = h(hx)
+        decode_fails(lambda: values.decode_value(b, 0, len(b)), what)
+
+def _test_varbind_list_rejects() -> None:
+    bad = [
+        ("30 04 06 00 05 00", "empty name"),
+        ("30 07 06 01 2b 05 00 05 00", "two values"),
+        ("30 05 04 01 2b 05 00", "name is not an OID"),
+        ("31 05 06 01 2b 05 00", "varbind is not a SEQUENCE"),
+        ("30 03 06 01 2b", "no value"),
+        ("30 00", "empty varbind"),
+        ("30 05 06 01 2b 05 00 05", "trailing octet after the last varbind"),
+        ("30 05 06 01 2b 05 00 00 00", "trailing zero TLV after the last varbind"),
+        ("30 06 06 01 2b 05 00", "varbind longer than the list"),
+        ("30 05 06 02 2b 05 00", "name longer than the varbind"),
+        ("30 07 06 03 2b 06 81 05 00", "truncated name"),
+        ("30 0f 06 0a 2b 06 01 04 01 90 80 80 80 00 05 00", "name with arc 2^32"),
+        ("30 07 06 01 2b 1f 02 00 00", "high-tag value"),
+        ("30 06 06 01 2b 02 05 00", "value length beyond the varbind"),
+    ]
+    for hx, what in bad:
+        b = h(hx)
+        decode_fails(lambda: values.decode_varbinds(b, 0, len(b)), what)
+    b = h("30 05 06 01 2b 05 00")
+    decode_fails(lambda: values.decode_varbinds(b, 0, 8), "stop beyond the buffer")
+    decode_fails(lambda: values.decode_varbinds(b, -1, 7), "negative start")
+    decode_fails(lambda: values.decode_varbinds(b, 5, 4), "start after stop")
+    testing.assertEqual(values.decode_varbinds(b, 0, 7), [VarBind(op("1.3"))])
+
+def _test_varbind_list_keeps_malformed_values() -> None:
+    # One bad value does not cost the other varbinds
+    b = h("""30 0f 06 0a 2b 06 01 02 01 19 02 03 01 05 02 01 07
+             30 0a 06 06 2b 06 01 02 01 01 41 00
+             30 13 06 0a 2b 06 01 02 01 02 02 01 0a 01 41 05 01 00 00 00 05
+             30 0c 06 08 2b 06 01 02 01 01 03 00 43 00
+             30 10 06 08 2b 06 01 02 01 01 02 00 06 04 2b 06 01 86
+             30 0d 06 08 2b 06 01 02 01 01 07 00 02 01 48""")
+    want = [VarBind(op("1.3.6.1.2.1.25.2.3.1.5"), Integer(7)),
+            VarBind(op("1.3.6.1.2.1.1"), MalformedValue(0x41, b"", "")),
+            VarBind(op("1.3.6.1.2.1.2.2.1.10.1"), MalformedValue(0x41, h("01 00 00 00 05"), "")),
+            VarBind(op("1.3.6.1.2.1.1.3.0"), MalformedValue(0x43, b"", "")),
+            VarBind(op("1.3.6.1.2.1.1.2.0"), MalformedValue(0x06, h("2b 06 01 86"), "")),
+            VarBind(op("1.3.6.1.2.1.1.7.0"), Integer(72))]
+    testing.assertEqual(values.decode_varbinds(b, 0, len(b)), want)
+    # re-encoding gives the same octets: the malformed values pass through unchanged
+    testing.assertEqual(values.encode_varbinds(want), ber.enc_tlv(ber.TAG_SEQUENCE, b))
+
+def _test_varbind_list_truncation() -> None:
+    msg = h(MSG_I)
+    start, stop = vbl_range(msg)
+    full = values.decode_varbinds(msg, start, stop)
+    # the offsets where a varbind ends, relative to start
+    ends: list[int] = []
+    p = start
+    while p < stop:
+        s, p = ber.expect_tlv(msg, p, stop, ber.TAG_SEQUENCE)
+        ends.append(p - start)
+    for k in range(stop - start):
+        if k in ends or k == 0:
+            n = 0 if k == 0 else ends.index(k) + 1
+            testing.assertEqual(values.decode_varbinds(msg, start, start + k), full[:n], "boundary %d" % k)
+        else:
+            decode_fails(lambda: values.decode_varbinds(msg, start, start + k), "list cut at %d" % k)
+            cut = msg[:start + k]
+            decode_fails(lambda: values.decode_varbinds(cut, start, stop), "buffer cut at %d" % k)
+
+def _test_value_truncation() -> None:
+    for v, hx in type_table():
+        b = h(hx)
+        for k in range(len(b)):
+            decode_fails(lambda: values.decode_value(b, 0, k), "%s cut to %d octets" % (hx, k))
+
+def _test_mutations_raise_only_decode_error() -> None:
+    # Overwrite every octet of a varbind list with interesting values: decoding either
+    # succeeds or raises DecodeError; any other exception fails the test as an ERR.
+    msg = h(MSG_I)
+    start, stop = vbl_range(msg)
+    vbl = msg[start - 3:stop]
+    ok = 0
+    for i in range(len(vbl)):
+        for x in [0x00, 0x01, 0x7f, 0x80, 0x81, 0x84, 0xff, vbl[i] ^ 0x01, vbl[i] ^ 0x80]:
+            m = vbl[:i] + ber.BYTE_TABLE[x] + vbl[i + 1:]
+            try:
+                s, e = ber.expect_tlv(m, 0, len(m), ber.TAG_SEQUENCE)
+                values.decode_varbinds(m, s, e)
+                ok += 1
+            except errors.DecodeError:
+                pass
+    testing.assertTrue(ok > 0)
+
+
+# Encode errors #####################################################################################
+
+def _test_encode_rejects() -> None:
+    encode_fails(lambda: Integer(2147483648).encode(), "Integer32 2^31")
+    encode_fails(lambda: Integer(-2147483649).encode(), "Integer32 -2^31-1")
+    encode_fails(lambda: Counter32(-1).encode(), "Counter32 -1")
+    encode_fails(lambda: Counter32(4294967296).encode(), "Counter32 2^32")
+    encode_fails(lambda: Gauge32(-1).encode(), "Gauge32 -1")
+    encode_fails(lambda: TimeTicks(4294967296).encode(), "TimeTicks 2^32")
+    encode_fails(lambda: IpAddress(h("01 02 03")).encode(), "IpAddress of 3 octets")
+    encode_fails(lambda: IpAddress(b"").encode(), "empty IpAddress")
+    encode_fails(lambda: IpAddress(h("01 02 03 04 05")).encode(), "IpAddress of 5 octets")
+    encode_fails(lambda: ObjectIdentifier(Oid([])).encode(), "OID value without arcs")
+    encode_fails(lambda: ObjectIdentifier(Oid([1])).encode(), "OID value with one arc")
+    encode_fails(lambda: ObjectIdentifier(Oid([3, 1])).encode(), "OID value 3.1")
+    encode_fails(lambda: UnknownValue(0x1f, b"").encode(), "high-tag-number form")
+    encode_fails(lambda: UnknownValue(256, b"").encode(), "tag 256")
+    encode_fails(lambda: UnknownValue(-1, b"").encode(), "tag -1")
+    encode_fails(lambda: MalformedValue(0x1f, b"", "x").encode(), "Malformed in high-tag-number form")
+    encode_fails(lambda: MalformedValue(256, b"", "x").encode(), "Malformed tag 256")
+    encode_fails(lambda: OctetString(b"a" * 65536).encode(), "OCTET STRING of 65536 octets")
+    encode_fails(lambda: Opaque(b"a" * 65536).encode(), "Opaque of 65536 octets")
+    testing.assertEqual(len(OctetString(b"a" * 65535).encode()), 65539)
+    encode_fails(lambda: values.encode_varbind(VarBind(Oid([1]))), "varbind name with one arc")
+    encode_fails(lambda: values.encode_varbind(VarBind(Oid([]))), "varbind name without arcs")
+    encode_fails(lambda: values.encode_varbind(VarBind(op("1.3"), Integer(1 << 40))), "varbind value out of range")
+    encode_fails(lambda: values.encode_varbinds([VarBind(op("1.3")), VarBind(op("1.3.6"), Counter32(-5))]), "second varbind")
+
+
+# Equality, names, repr #############################################################################
+
+def same(a: Value, b: Value) -> bool:
+    """== through the base type, which must still compare the subclass values"""
+    return a == b
+
+def _test_equality() -> None:
+    testing.assertTrue(same(Integer(5), Integer(5)))
+    testing.assertFalse(same(Integer(5), Integer(6)))
+    testing.assertFalse(same(Integer(5), Counter32(5)))
+    testing.assertFalse(same(Counter32(5), Gauge32(5)))
+    testing.assertFalse(same(Gauge32(5), TimeTicks(5)))
+    testing.assertFalse(same(OctetString(b"x"), Opaque(b"x")))
+    testing.assertFalse(same(OctetString(h("0a 00 00 01")), IpAddress(h("0a 00 00 01"))))
+    testing.assertTrue(same(Counter64(5), Counter64(5)))
+    testing.assertFalse(same(Counter64(5), Counter64(6)))
+    testing.assertTrue(same(Null(), Null()))
+    testing.assertFalse(same(Null(), NoSuchObject()))
+    testing.assertTrue(same(NoSuchObject(), NoSuchObject()))
+    testing.assertFalse(same(NoSuchObject(), NoSuchInstance()))
+    testing.assertFalse(same(NoSuchInstance(), EndOfMibView()))
+    testing.assertTrue(same(ObjectIdentifier(op("1.3.6")), ObjectIdentifier(op(".1.3.6"))))
+    testing.assertFalse(same(ObjectIdentifier(op("1.3.6")), ObjectIdentifier(op("1.3.6.0"))))
+    testing.assertTrue(same(UnknownValue(0x45, b"a"), UnknownValue(0x45, b"a")))
+    testing.assertFalse(same(UnknownValue(0x45, b"a"), UnknownValue(0x47, b"a")))
+    testing.assertFalse(same(UnknownValue(0x04, b"a"), OctetString(b"a")))
+    testing.assertTrue(same(MalformedValue(0x41, b"", "x"), MalformedValue(0x41, b"", "y")), "the reason does not count")
+    testing.assertFalse(same(MalformedValue(0x41, b"", "x"), MalformedValue(0x42, b"", "x")))
+    testing.assertFalse(same(MalformedValue(0x41, b"\x01", "x"), MalformedValue(0x41, b"\x02", "x")))
+    testing.assertFalse(same(MalformedValue(0x47, b"a", "x"), UnknownValue(0x47, b"a")))
+    testing.assertFalse(same(UnknownValue(0x47, b"a"), MalformedValue(0x47, b"a", "x")))
+    testing.assertTrue(Integer(1) != Integer(2))
+    vals: list[Value] = [Integer(1), OctetString(b"x"), Null()]
+    testing.assertTrue(OctetString(b"x") in vals)
+    testing.assertFalse(Opaque(b"x") in vals)
+    testing.assertEqual(vals, [Integer(1), OctetString(b"x"), Null()])
+    testing.assertEqual(VarBind(op("1.3"), Integer(1)), VarBind(op(".1.3"), Integer(1)))
+    testing.assertNotEqual(VarBind(op("1.3"), Integer(1)), VarBind(op("1.3"), Gauge32(1)))
+    testing.assertNotEqual(VarBind(op("1.3"), Integer(1)), VarBind(op("1.3.0"), Integer(1)))
+
+def _test_type_names() -> None:
+    names = [
+        (Integer(1), "INTEGER"), (OctetString(b""), "STRING"), (Null(), "NULL"), (ObjectIdentifier(op("1.3")), "OID"),
+        (IpAddress(h("01 02 03 04")), "IpAddress"), (Counter32(1), "Counter32"), (Gauge32(1), "Gauge32"),
+        (TimeTicks(1), "Timeticks"), (Opaque(b""), "Opaque"), (Counter64(1), "Counter64"),
+        (NoSuchObject(), "noSuchObject"), (NoSuchInstance(), "noSuchInstance"), (EndOfMibView(), "endOfMibView"),
+        (UnknownValue(0x45, b""), "NsapAddress"), (UnknownValue(0x47, b""), "UInteger32"), (UnknownValue(0x03, b""), "Unknown"),
+        (MalformedValue(0x02, b"", "empty INTEGER"), "Malformed"),
+    ]
+    for v, name in names:
+        testing.assertEqual(v.type_name(), name)
+
+def _test_repr() -> None:
+    testing.assertEqual(repr(Integer(-5)), "Integer(-5)")
+    testing.assertEqual(repr(OctetString(b"ab")), "OctetString(b'ab')")
+    testing.assertEqual(repr(Null()), "Null()")
+    testing.assertEqual(repr(ObjectIdentifier(op("1.3.6"))), "ObjectIdentifier(1.3.6)")
+    testing.assertEqual(repr(IpAddress(h("c0 00 02 01"))), "IpAddress(192.0.2.1)")
+    testing.assertEqual(repr(IpAddress(h("01"))), "IpAddress(b'\\x01')")
+    testing.assertEqual(repr(Counter32(7)), "Counter32(7)")
+    testing.assertEqual(repr(Gauge32(7)), "Gauge32(7)")
+    testing.assertEqual(repr(TimeTicks(7)), "TimeTicks(7)")
+    testing.assertEqual(repr(Opaque(b"\x9f")), "Opaque(b'\\x9f')")
+    testing.assertEqual(repr(Counter64(18446744073709551615)), "Counter64(18446744073709551615)")
+    testing.assertEqual(repr(NoSuchObject()), "NoSuchObject()")
+    testing.assertEqual(repr(NoSuchInstance()), "NoSuchInstance()")
+    testing.assertEqual(repr(EndOfMibView()), "EndOfMibView()")
+    testing.assertEqual(repr(UnknownValue(0x45, b"G")), "UnknownValue(0x45, b'G')")
+    testing.assertEqual(repr(MalformedValue(0x41, b"", "empty unsigned integer")),
+                        "MalformedValue(0x41, b'', 'empty unsigned integer')")
+    testing.assertEqual(str(Integer(3)), "Integer(3)")
+    testing.assertEqual(repr(VarBind(op("1.3.6.1"), Integer(1))), "VarBind(1.3.6.1, Integer(1))")
+    testing.assertEqual(str(VarBind(op("1.3"))), "VarBind(1.3, Null())")
+
+def _test_is_exception() -> None:
+    testing.assertTrue(values.is_exception(NoSuchObject()))
+    testing.assertTrue(values.is_exception(NoSuchInstance()))
+    testing.assertTrue(values.is_exception(EndOfMibView()))
+    for v in [Integer(0), Null(), OctetString(b""), UnknownValue(0x80, b""), Counter64(0), MalformedValue(0x80, b"", "")]:
+        testing.assertFalse(values.is_exception(v), repr(v))
+
+
+# Opaque special types ##############################################################################
+
+def special(hx: str) -> ?(kind: str, value: str):
+    return values.opaque_special(Opaque(h(hx)))
+
+def check_special(hx: str, kind: str, text: str) -> None:
+    s = special(hx)
+    if s is not None:
+        testing.assertEqual(s.kind, kind, hx)
+        testing.assertEqual(s.value, text, hx)
+    else:
+        testing.error("not recognised: " + hx)
+
+def _test_opaque_special_spec() -> None:
+    # spec: net-snmp Opaque special types and message O
+    check_special("9f 78 04 3f c0 00 00", "Float", "1.500000")
+    check_special("9f 78 04 40 0b c8 00", "Float", "2.184082")
+    check_special("9f 78 04 3e 80 00 00", "Float", "0.250000")
+    check_special("9f 79 08 40 04 00 00 00 00 00 00", "Double", "2.500000")
+    check_special("9f 7a 01 fb", "I64", "-5")
+    check_special("9f 7b 01 05", "U64", "5")
+    check_special("9f 7b 09 00 ff ff ff ff ff ff ff ff", "U64", "18446744073709551615")
+    check_special("9f 76 06 01 00 00 00 00 00", "Counter64", "1099511627776")
+
+def _test_opaque_special_float() -> None:
+    # expected texts from glibc printf("%f") of the same bit patterns
+    floats = [
+        ("bf c0 00 00", "-1.500000"), ("3d cc cc cd", "0.100000"), ("4b 18 96 80", "10000000.000000"),
+        ("c2 f6 e9 79", "-123.456001"), ("7f 7f ff ff", "340282346638528859811704183484516925440.000000"),
+        ("00 00 00 01", "0.000000"), ("00 80 00 00", "0.000000"), ("80 00 00 00", "-0.000000"),
+        ("7f 80 00 00", "inf"), ("ff 80 00 00", "-inf"), ("7f c0 00 00", "nan"), ("ff c0 00 00", "-nan"),
+    ]
+    for bits, text in floats:
+        check_special("9f 78 04 " + bits, "Float", text)
+
+def _test_opaque_special_double() -> None:
+    # expected texts from glibc printf("%f") of the same bit patterns
+    doubles = [
+        ("bf f0 00 00 00 00 00 00", "-1.000000"), ("3f b9 99 99 99 99 99 9a", "0.100000"),
+        ("40 fe 24 0c 9f be 76 c9", "123456.789000"), ("80 00 00 00 00 00 00 00", "-0.000000"),
+        ("00 00 00 00 00 00 00 01", "0.000000"), ("00 10 00 00 00 00 00 00", "0.000000"),
+        ("7f f0 00 00 00 00 00 00", "inf"), ("ff f8 00 00 00 00 00 00", "-nan"), ("7f f8 00 00 00 00 00 01", "nan"),
+        ("7e 37 e4 3c 88 00 75 9c", "1000000000000000052504760255204420248704468581108159154915854115511802457988908195786371375080447864043704443832883878176942523235360430575644792184786706982848387200926575803737830233794788090059368953234970799945081119038967640880074652742780142494579258788820056842838115669472196386865459400540160.000000"),
+    ]
+    for bits, text in doubles:
+        check_special("9f 79 08 " + bits, "Double", text)
+
+def _test_opaque_special_ints() -> None:
+    check_special("9f 7a 08 80 00 00 00 00 00 00 00", "I64", "-9223372036854775808")
+    check_special("9f 7a 08 7f ff ff ff ff ff ff ff", "I64", "9223372036854775807")
+    check_special("9f 7a 02 00 ff", "I64", "255")
+    check_special("9f 7b 01 00", "U64", "0")
+    check_special("9f 76 09 00 80 00 00 00 00 00 00 00", "Counter64", "9223372036854775808")
+    check_special("9f 7b 81 01 07", "U64", "7")
+
+def _test_opaque_special_not_recognised() -> None:
+    for hx in ["", "de ad be ef", "9f", "9f 78", "9f 78 04 3f c0 00", "9f 78 03 3f c0 00", "9f 78 04 3f c0 00 00 00",
+               "9f 78 81 04 3f c0 00 00", "9f 79 04 3f c0 00 00", "9f 79 08 40 04 00 00 00 00 00", "9f 77 01 00",
+               "9f 7a 00", "9f 7a 02 05", "9f 7a 01 05 00", "9f 7a 80 05 00 00", "9f 7a 09 00 80 00 00 00 00 00 00 00",
+               "9f 7b 0a 00 00 00 00 00 00 00 00 00 05", "9f 7b 09 01 00 00 00 00 00 00 00 00", "9e 78 04 3f c0 00 00",
+               "44 07 9f 78 04 3f c0 00 00"]:
+        testing.assertNone(special(hx), hx)
+
+
+# Deterministic pseudo-random round trips ##########################################################
+
+def random_uint32(rng: Lcg) -> int:
+    return (rng.next64() >> 32) & (0xffffffff >> rng.below(32))
+
+def random_oid(rng: Lcg) -> Oid:
+    first = rng.below(3)
+    arcs = [first, rng.below(40) if first < 2 else rng.below(1000)]
+    for i in range(rng.below(20)):
+        arcs.append(random_uint32(rng))
+    return Oid(arcs)
+
+def random_value(rng: Lcg) -> Value:
+    k = rng.below(14)
+    if k == 0:
+        return Integer((rng.next64() >> 32) >> rng.below(32))
+    if k == 1:
+        return OctetString(rng.octets(rng.below(300)))
+    if k == 2:
+        return Null()
+    if k == 3:
+        return ObjectIdentifier(random_oid(rng))
+    if k == 4:
+        return IpAddress(rng.octets(4))
+    if k == 5:
+        return Counter32(random_uint32(rng))
+    if k == 6:
+        return Gauge32(random_uint32(rng))
+    if k == 7:
+        return TimeTicks(random_uint32(rng))
+    if k == 8:
+        return Opaque(rng.octets(rng.below(20)))
+    if k == 9:
+        return Counter64(u64(rng.next64() & 0x7fffffffffffffff) * u64(1 + rng.below(2)) >> rng.below(64))
+    if k == 10:
+        return NoSuchObject()
+    if k == 11:
+        return NoSuchInstance()
+    if k == 12:
+        return EndOfMibView()
+    tag = [0x45, 0x47, 0x03, 0x24, 0xc1][rng.below(5)]
+    return UnknownValue(tag, rng.octets(rng.below(10)))
+
+def _test_random_value_round_trip() -> None:
+    rng = Lcg(42)
+    for i in range(1000):
+        v = random_value(rng)
+        b = v.encode()
+        d, n = values.decode_value(b, 0, len(b))
+        testing.assertEqual(n, len(b))
+        testing.assertEqual(d, v, repr(v))
+        testing.assertEqual(d.encode(), b)
+
+def _test_random_varbind_list_round_trip() -> None:
+    rng = Lcg(7)
+    for i in range(50):
+        vbs = [VarBind(random_oid(rng), random_value(rng)) for j in range(rng.below(40))]
+        b = values.encode_varbinds(vbs)
+        s, e = ber.expect_tlv(b, 0, len(b), ber.TAG_SEQUENCE)
+        testing.assertEqual(e, len(b))
+        testing.assertEqual(values.decode_varbinds(b, s, e), vbs)

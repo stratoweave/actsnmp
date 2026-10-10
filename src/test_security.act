@@ -1,0 +1,246 @@
+"""Tests for security
+
+The key vectors are "maplesyrup" (RFC 3414 A.3) and the SNMPv3 reference
+vectors' passwords localized to engine 80001f88800102030405060708.
+"""
+
+import testing
+import message
+import pdu
+import usm
+from message import ScopedPdu, UsmSecurityParameters, V3Message
+from oid import Oid
+from pdu import Pdu
+from security import Community, Security, Usm
+from values import VarBind
+from testutil import h, value_fails
+
+ENGINE = "80001f88800102030405060708"
+MAPLE_ENGINE = "000000000000000000000002"
+
+def engine() -> bytes:
+    return h(ENGINE)
+
+
+# Community #########################################################################################
+
+def _test_community() -> None:
+    c = Community("public")
+    testing.assertEqual(c.version, message.SNMP_V2C)
+    testing.assertEqual(c.community, b"public")
+    v1 = Community("private", message.SNMP_V1)
+    testing.assertEqual(v1.version, message.SNMP_V1)
+    testing.assertEqual(Community("").community, b"")
+    testing.assertEqual(Community("é€").community, b"\xc3\xa9\xe2\x82\xac")
+    testing.assertTrue(isinstance(c, Security))
+    for bad in [message.SNMP_V3, 2, -1, 4]:
+        value_fails(lambda: Community("public", bad), "community for version %d" % bad)
+
+def _test_community_repr_hides_secret() -> None:
+    testing.assertEqual(repr(Community("s3cret-community")), "Community(v2c, community=<16 octets>)")
+    testing.assertEqual(str(Community("pub", message.SNMP_V1)), "Community(v1, community=<3 octets>)")
+    testing.assertFalse("s3cret" in repr(Community("s3cret-community")))
+
+
+# Usm from passwords ################################################################################
+
+def _test_maplesyrup_ku() -> None:
+    # RFC 3414 A.3
+    u = Usm.from_passwords("maple", usm.AUTH_MD5, "maplesyrup", usm.PRIV_DES, "maplesyrup")
+    testing.assertEqual(u.auth_ku.hex(), "9faf3283884e92834ebc9847d8edd963")
+    testing.assertEqual(u.priv_ku, u.auth_ku)
+    lu = u.localized(h(MAPLE_ENGINE))
+    testing.assertEqual(lu.auth_key.hex(), "526f5eed9fcce26f8964c2930787d82b")
+    testing.assertEqual(lu.priv_key.hex(), "526f5eed9fcce26f8964c2930787d82b")
+    s = Usm.from_passwords("maple", usm.AUTH_SHA1, "maplesyrup")
+    testing.assertEqual(s.auth_ku.hex(), "9fb5cc0381497b3793528939ff788d5d79145211")
+    testing.assertEqual(s.localized(h(MAPLE_ENGINE)).auth_key.hex(), "6695febc9288e36282235fc7151f128497b38f3f")
+
+def check_user(auth: int, priv: int, auth_key: str, priv_key: str) -> None:
+    u = Usm.from_passwords("someone", auth, "authpassword", priv, "privpassword")
+    lu = u.localized(engine())
+    what = usm.auth_name(auth) + "/" + usm.priv_name(priv)
+    testing.assertEqual(lu.user, b"someone", what)
+    testing.assertEqual(lu.engine_id, engine(), what)
+    testing.assertEqual((lu.auth, lu.priv), (auth, priv), what)
+    testing.assertEqual(lu.auth_key.hex(), auth_key, what)
+    testing.assertEqual(lu.priv_key.hex(), priv_key, what)
+
+# "authpassword"/"privpassword" localized to engine 80001f88800102030405060708
+def _test_localized_md5_des() -> None:
+    check_user(usm.AUTH_MD5, usm.PRIV_DES, "0750dc5d31704cd2601ae4b69b3e9021", "fc39a1c3d0320990e2f15aa313721ffb")
+
+def _test_localized_md5_aes256c() -> None:
+    check_user(usm.AUTH_MD5, usm.PRIV_AES256C, "0750dc5d31704cd2601ae4b69b3e9021",
+               "fc39a1c3d0320990e2f15aa313721ffbe06d730af954144ab02dec578cc69104")
+
+def _test_localized_sha_aes() -> None:
+    check_user(usm.AUTH_SHA1, usm.PRIV_AES128, "c3a7680bf9f2aafe04eb987ab75cfa5f32508b22", "d4b1c141c3730f4c2c41c7b686a631c3")
+
+def _test_localized_sha_aes192() -> None:
+    check_user(usm.AUTH_SHA1, usm.PRIV_AES192, "c3a7680bf9f2aafe04eb987ab75cfa5f32508b22",
+               "d4b1c141c3730f4c2c41c7b686a631c352f663050519c4a8")
+
+def _test_localized_sha_3des() -> None:
+    check_user(usm.AUTH_SHA1, usm.PRIV_3DES, "c3a7680bf9f2aafe04eb987ab75cfa5f32508b22",
+               "d4b1c141c3730f4c2c41c7b686a631c352f66305e82d4dd8e2cb43ffc22278cb")
+
+def _test_localized_sha224_aes256() -> None:
+    check_user(usm.AUTH_SHA224, usm.PRIV_AES256, "5bc31774e1c51521aa0262b7c5959c020cbe14aa28e544793ab3b386",
+               "f3b1e42f4ac5b00f70df032b23041f32e43356f16fb4dd03f97086c68c056923")
+
+def _test_localized_sha256_aes192c() -> None:
+    check_user(usm.AUTH_SHA256, usm.PRIV_AES192C, "2fbf9e6c9242eb3cb0b7112214fb905348c6585ed356b6b3fb93d0e97307e481",
+               "73969a6de41a3b4562c6bc74735fb4317b8f8dc4e0b12d44")
+
+def _test_localized_sha384_des() -> None:
+    check_user(usm.AUTH_SHA384, usm.PRIV_DES,
+               "d7d9edf28ce008fd9afdd3c242defdc83c99d264fa104c526b283e2871d40fb34d2e5b6cfaea76f06e29b85bc2dbfbd9",
+               "2db65efc4494840dae357e38e88e87a1")
+
+def _test_localized_sha512_auth_only() -> None:
+    u = Usm.from_passwords("sha512only", usm.AUTH_SHA512, "authpassword")
+    testing.assertEqual(u.priv_ku, b"")
+    lu = u.localized(engine())
+    testing.assertEqual(lu.auth_key.hex(), "024d7abfe5fc785269205f91b551804e72e2eb446c575f2affc853a9642ff575"
+                                           + "a64639912b19c87ea8910e5691379189dd9087bbbeb1938e2d382928146318eb")
+    testing.assertEqual((lu.priv, lu.priv_key), (usm.PRIV_NONE, b""))
+
+def _test_noauth_user() -> None:
+    u = Usm.from_passwords("noauth")
+    testing.assertEqual((u.auth_protocol, u.auth_ku, u.priv_protocol, u.priv_ku), (usm.AUTH_NONE, b"", usm.PRIV_NONE, b""))
+    testing.assertEqual(u.level(), 0)
+    lu = u.localized(engine())
+    testing.assertEqual((lu.user, lu.auth, lu.priv, lu.auth_key, lu.priv_key), (b"noauth", 0, 0, b"", b""))
+    # no keys to localize, so any engine ID will do, the empty one too
+    testing.assertEqual(u.localized(b"").engine_id, b"")
+
+def _test_from_passwords_validation() -> None:
+    value_fails(lambda: Usm.from_passwords("u", usm.AUTH_SHA1, "1234567"), "7-octet auth password")
+    value_fails(lambda: Usm.from_passwords("u", usm.AUTH_SHA1, ""), "empty auth password")
+    value_fails(lambda: Usm.from_passwords("u", usm.AUTH_SHA1, "authpassword", usm.PRIV_AES128, "short"),
+                "5-octet priv password")
+    value_fails(lambda: Usm.from_passwords("u", usm.AUTH_SHA1, "authpassword", usm.PRIV_AES128, ""), "empty priv password")
+    value_fails(lambda: Usm.from_passwords("u", usm.AUTH_NONE, "", usm.PRIV_DES, "privpassword"), "privacy without auth")
+    value_fails(lambda: Usm.from_passwords("u", usm.AUTH_NONE, "authpassword"), "auth password without auth protocol")
+    value_fails(lambda: Usm.from_passwords("u", usm.AUTH_SHA1, "authpassword", usm.PRIV_NONE, "privpassword"),
+                "priv password without priv protocol")
+    value_fails(lambda: Usm.from_passwords("u", 7, "authpassword"), "auth protocol 7")
+    value_fails(lambda: Usm.from_passwords("u", usm.AUTH_SHA1, "authpassword", 8, "privpassword"), "priv protocol 8")
+    value_fails(lambda: Usm.from_passwords("", usm.AUTH_SHA1, "authpassword"), "empty user name")
+    value_fails(lambda: Usm.from_passwords("x" * 33), "33-octet user name")
+    value_fails(lambda: Usm.from_passwords("é" * 17), "17 characters, 34 octets")
+    testing.assertEqual(Usm.from_passwords("x" * 32).user, "x" * 32)
+    # the minimum length counts octets: 4 two-octet characters are enough, 3 are not
+    testing.assertEqual(len(Usm.from_passwords("u", usm.AUTH_MD5, "éééé").auth_ku), 16)
+    value_fails(lambda: Usm.from_passwords("u", usm.AUTH_MD5, "ééé"), "6-octet password")
+    testing.assertEqual(len(Usm.from_passwords("u", usm.AUTH_MD5, "12345678").auth_ku), 16)
+
+
+# Usm from keys #####################################################################################
+
+def _test_from_keys() -> None:
+    ku20 = b"\x11" * 20
+    u = Usm.from_keys("k", usm.AUTH_SHA1, ku20, usm.PRIV_AES256, b"\x22" * 20, "ctx", b"\x80\x00\x00\x00\x06")
+    testing.assertEqual((u.user, u.auth_protocol, u.auth_ku, u.priv_protocol), ("k", usm.AUTH_SHA1, ku20, usm.PRIV_AES256))
+    testing.assertEqual(u.context_name, b"ctx")
+    testing.assertEqual(u.context_engine_id, b"\x80\x00\x00\x00\x06")
+    testing.assertEqual(u.version, message.SNMP_V3)
+    # the same Ku as from_passwords gives the same localized keys
+    p = Usm.from_passwords("k", usm.AUTH_MD5, "maplesyrup")
+    k = Usm.from_keys("k", usm.AUTH_MD5, h("9faf3283884e92834ebc9847d8edd963"), usm.PRIV_NONE, b"")
+    testing.assertEqual(k.localized(engine()).auth_key, p.localized(engine()).auth_key)
+    testing.assertEqual(Usm.from_keys("n", usm.AUTH_NONE, b"", usm.PRIV_NONE, b"").level(), 0)
+
+def _test_from_keys_validation() -> None:
+    k16 = b"\x01" * 16
+    k20 = b"\x02" * 20
+    value_fails(lambda: Usm.from_keys("u", usm.AUTH_SHA1, k16, usm.PRIV_NONE, b""), "16-octet SHA key")
+    value_fails(lambda: Usm.from_keys("u", usm.AUTH_MD5, k20, usm.PRIV_NONE, b""), "20-octet MD5 key")
+    value_fails(lambda: Usm.from_keys("u", usm.AUTH_SHA1, k20, usm.PRIV_AES128, k16), "priv Ku must use the auth hash")
+    value_fails(lambda: Usm.from_keys("u", usm.AUTH_SHA1, k20, usm.PRIV_NONE, k20), "priv key without priv protocol")
+    value_fails(lambda: Usm.from_keys("u", usm.AUTH_NONE, k20, usm.PRIV_NONE, b""), "auth key without auth protocol")
+    value_fails(lambda: Usm.from_keys("u", usm.AUTH_NONE, b"", usm.PRIV_DES, k16), "privacy without auth")
+    value_fails(lambda: Usm.from_keys("u", usm.AUTH_SHA1, b"", usm.PRIV_NONE, b""), "missing auth key")
+    value_fails(lambda: Usm.from_keys("u", -1, b"", usm.PRIV_NONE, b""), "auth protocol -1")
+    value_fails(lambda: Usm.from_keys("u", usm.AUTH_SHA1, k20, -1, b""), "priv protocol -1")
+    value_fails(lambda: Usm.from_keys("", usm.AUTH_SHA1, k20, usm.PRIV_NONE, b""), "empty user")
+    value_fails(lambda: Usm("u", usm.AUTH_SHA1, k16, usm.PRIV_NONE, b"", b"", None), "constructor checks too")
+
+
+# Usm properties ####################################################################################
+
+def _test_level() -> None:
+    k20 = b"\x02" * 20
+    testing.assertEqual(Usm.from_keys("a", usm.AUTH_NONE, b"", usm.PRIV_NONE, b"").level(), 0)
+    testing.assertEqual(Usm.from_keys("a", usm.AUTH_SHA1, k20, usm.PRIV_NONE, b"").level(), message.FLAG_AUTH)
+    testing.assertEqual(Usm.from_keys("a", usm.AUTH_SHA1, k20, usm.PRIV_DES, k20).level(),
+                        message.FLAG_AUTH | message.FLAG_PRIV)
+    lu = Usm.from_keys("a", usm.AUTH_SHA1, k20, usm.PRIV_AES128, k20).localized(engine())
+    testing.assertEqual(lu.level(), message.FLAG_AUTH | message.FLAG_PRIV)
+
+def _test_context() -> None:
+    u = Usm.from_passwords("c")
+    testing.assertEqual(u.context_name, b"")
+    testing.assertNone(u.context_engine_id)
+    v = Usm.from_passwords("c", context_name="vrf-é", context_engine_id=engine())
+    testing.assertEqual(v.context_name, b"vrf-\xc3\xa9")
+    testing.assertEqual(v.context_engine_id, engine())
+
+def _test_usm_repr_hides_secrets() -> None:
+    u = Usm.from_passwords("shaaes", usm.AUTH_SHA1, "authpassword", usm.PRIV_AES128, "privpassword", "ctx")
+    r = repr(u)
+    testing.assertEqual(r, "Usm(user='shaaes', level=authPriv, auth=SHA, priv=AES, context_name=b'ctx', "
+                        + "context_engine_id=None)")
+    testing.assertEqual(str(u), r)
+    for secret in [u.auth_ku.hex(), u.priv_ku.hex(), "authpassword", "privpassword"]:
+        testing.assertFalse(secret in r, secret)
+    lu = repr(u.localized(engine()))
+    testing.assertFalse(u.localized(engine()).priv_key.hex() in lu)
+    n = Usm.from_passwords("n", context_engine_id=h("8000000006"))
+    testing.assertEqual(repr(n), "Usm(user='n', level=noAuthNoPriv, auth=none, priv=none, context_name=b'', "
+                        + "context_engine_id=8000000006)")
+
+def _test_end_to_end_spec_vector() -> None:
+    # From passwords to the deterministic vector V-SHA-AES and back
+    u = Usm.from_passwords("shaaes", usm.AUTH_SHA1, "authpassword", usm.PRIV_AES128, "privpassword")
+    lu = u.localized(engine())
+    scoped = ScopedPdu(engine(), b"", Pdu(pdu.GET, 0x0a0b0c0d, varbinds=[VarBind(Oid.parse("1.3.6.1.2.1.1.1.0"))]))
+    hdr = V3Message(0x01020304, 65507, 0x04 | u.level(), UsmSecurityParameters(engine(), 1, 150, b"shaaes"))
+    data = usm.protect(hdr, message.encode_scoped(scoped), lu, 0xdeadbeef00000001)
+    want = ("3081830201033011020401020304020300ffe304010702010304383036040d80001f88800102030405060708020101020200"
+            + "960406736861616573040cf348b914214305ef905cb2960408deadbeef000000010431de46c1433b208b758146de11e079"
+            + "276ee206bab469d6ce21038348f198816b713439d9e58ac5b4b2b45044c7e38c6a50ad")
+    testing.assertEqual(data.hex(), want)
+    c, m = message.decode(data)
+    if m is not None:
+        testing.assertEqual(usm.unprotect(data, m, lu), scoped)
+    else:
+        testing.error("not an SNMPv3 message")
+
+def _test_localized_auth() -> None:
+    # The authentication key alone, without the Reeder round of AES-256-C with MD5: it verifies
+    # an authPriv message that the full keys protected, and only the full keys decrypt it
+    u = Usm.from_passwords("md5aes256c", usm.AUTH_MD5, "authpassword", usm.PRIV_AES256C, "privpassword")
+    full = u.localized(engine())
+    a = u.localized_auth(engine())
+    testing.assertEqual((a.user, a.auth, a.priv, a.engine_id), (b"md5aes256c", usm.AUTH_MD5, usm.PRIV_AES256C, engine()))
+    testing.assertEqual(a.auth_key, full.auth_key)
+    testing.assertEqual(a.priv_key, b"")
+    testing.assertEqual(a.level(), u.level())
+    testing.assertFalse(a.has_priv_key())
+    scoped = ScopedPdu(engine(), b"", Pdu(pdu.TRAP_V2, 7))
+    hdr = V3Message(1, 65507, u.level(), UsmSecurityParameters(engine(), 1, 100, b"md5aes256c"))
+    data = usm.protect(hdr, message.encode_scoped(scoped), full, 1)
+    c, m = message.decode(data)
+    if m is not None:
+        usm.authenticate(data, m, a)
+        testing.assertEqual(usm.decrypt_scoped(m, full), scoped)
+    else:
+        testing.error("not an SNMPv3 message")
+    # users without privacy, or without authentication, come out as from localized()
+    n = Usm.from_passwords("noauth").localized_auth(engine())
+    testing.assertEqual((n.auth_key, n.priv_key, n.level()), (b"", b"", 0))
+    s = Usm.from_passwords("shaonly", usm.AUTH_SHA1, "authpassword")
+    testing.assertEqual(s.localized_auth(engine()).auth_key, s.localized(engine()).auth_key)
+    testing.assertFalse(u.auth_ku.hex() in repr(a))

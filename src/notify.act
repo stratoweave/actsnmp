@@ -1,0 +1,360 @@
+"""Notifications: the Notification model, RFC 3584 v1 to v2 conversion, trap varbinds
+
+A Notification is a received trap or inform in SNMPv2 form, whatever SNMP
+version carried it. The SNMPv2 notification parameters (RFC 3584 section 3)
+are the uptime (sysUpTime.0, the first varbind of an SNMPv2-Trap-PDU or
+InformRequest-PDU), the trap OID (the value of snmpTrapOID.0, the second
+varbind) and the remaining varbinds. An SNMPv1 Trap-PDU is translated into
+them by v1_to_v2 following RFC 3584 section 3.1 the way net-snmp's
+snmptrapd does it for its trap handlers.
+
+Everything here is pure. The receiver decodes and authenticates datagrams
+and then builds a Notification with notification_from_v1,
+notification_from_v2c or notification_from_v3; a sender prepends the two
+leading varbinds with build_trap_v2.
+
+Received notifications are interpreted leniently: one whose first two
+varbinds are not sysUpTime.0 and snmpTrapOID.0, or an SNMPv1 trap with
+field values RFC 1157 does not allow, is still turned into a Notification,
+with a description of what is wrong in Notification.problem.
+"""
+
+import ber
+import message
+import pdu
+import usm
+from message import V3Message, ScopedPdu
+from oid import Oid
+from pdu import Pdu, TrapV1Pdu
+from values import VarBind, TimeTicks, ObjectIdentifier, IpAddress, OctetString
+
+# Objects of SNMPv2-MIB (RFC 3418) and SNMP-COMMUNITY-MIB (RFC 3584)
+SYS_UPTIME_0 = Oid([1, 3, 6, 1, 2, 1, 1, 3, 0])
+SNMP_TRAP_OID_0 = Oid([1, 3, 6, 1, 6, 3, 1, 1, 4, 1, 0])
+SNMP_TRAP_ENTERPRISE_0 = Oid([1, 3, 6, 1, 6, 3, 1, 1, 4, 3, 0])
+SNMP_TRAP_ADDRESS_0 = Oid([1, 3, 6, 1, 6, 3, 18, 1, 3, 0])
+SNMP_TRAP_COMMUNITY_0 = Oid([1, 3, 6, 1, 6, 3, 18, 1, 4, 0])
+
+# snmpTraps and the standard notifications under it (RFC 3418), the trap OIDs
+# of the SNMPv1 generic-trap values 0..5
+SNMP_TRAPS = Oid([1, 3, 6, 1, 6, 3, 1, 1, 5])
+TRAP_COLD_START = Oid([1, 3, 6, 1, 6, 3, 1, 1, 5, 1])
+TRAP_WARM_START = Oid([1, 3, 6, 1, 6, 3, 1, 1, 5, 2])
+TRAP_LINK_DOWN = Oid([1, 3, 6, 1, 6, 3, 1, 1, 5, 3])
+TRAP_LINK_UP = Oid([1, 3, 6, 1, 6, 3, 1, 1, 5, 4])
+TRAP_AUTHENTICATION_FAILURE = Oid([1, 3, 6, 1, 6, 3, 1, 1, 5, 5])
+TRAP_EGP_NEIGHBOR_LOSS = Oid([1, 3, 6, 1, 6, 3, 1, 1, 5, 6])
+
+
+class Notification(object):
+    """A received trap or inform
+
+    version is message.SNMP_V1, SNMP_V2C or SNMP_V3 and pdu_type is
+    pdu.TRAP_V1, TRAP_V2 or INFORM. source_address and source_port are the
+    sender of the datagram.
+
+    community is set for SNMPv1/v2c and empty for SNMPv3. The SNMPv3 fields
+    are user (msgUserName), security_level, engine_id
+    (msgAuthoritativeEngineID), context_engine_id and context_name; they
+    are empty or 0 for SNMPv1/v2c. security_level is the message's
+    FLAG_AUTH|FLAG_PRIV bits, the encoding of every security level in
+    actsnmp: usm.LEVEL_NO_AUTH_NO_PRIV (0), usm.LEVEL_AUTH_NO_PRIV (1) or
+    usm.LEVEL_AUTH_PRIV (3). Compare it with those constants, not with
+    numbers: RFC 3411's SnmpSecurityLevel (SNMP-TARGET-MIB, ietf-snmp
+    YANG) numbers the same levels 1, 2 and 3, and usm.rfc3411_level()
+    converts. request_id is 0 for an SNMPv1 trap, which has none.
+
+    uptime is the value of sysUpTime.0, or the time-stamp of an SNMPv1
+    trap, in hundredths of a second. trap_oid is the value of
+    snmpTrapOID.0, or the one derived from an SNMPv1 trap (RFC 3584 section
+    3.1). varbinds are the payload varbinds without sysUpTime.0 and
+    snmpTrapOID.0; for SNMPv1 they are the trap's varbinds followed by the
+    snmpTrapAddress.0, snmpTrapCommunity.0 and snmpTrapEnterprise.0 that
+    RFC 3584 adds (see v1_to_v2). all_varbinds are the varbinds exactly as
+    received (SNMPv2) or as converted (SNMPv1, sysUpTime.0 and
+    snmpTrapOID.0 first). v1 is the original SNMPv1 Trap-PDU, None
+    otherwise.
+
+    problem is empty for a well-formed notification. Otherwise it says what
+    is wrong; the notification is still usable. For SNMPv2 that means the
+    first two varbinds are not a Timeticks sysUpTime.0 and an OID-valued
+    snmpTrapOID.0: then uptime is -1 and trap_oid has no arcs unless such
+    varbinds occur elsewhere in the list, and varbinds holds all varbinds
+    (see split_v2). For SNMPv1 it means a generic-trap outside 0..6, an
+    enterprise-specific specific-trap outside 0..2^32-1 or an agent-addr
+    that is not 4 octets (see v1_trap_oid).
+
+    repr() hides the community, which is a credential, also as the value
+    of a snmpTrapCommunity.0 varbind.
+    """
+    version: int
+    pdu_type: int
+    source_address: str
+    source_port: int
+    community: bytes
+    user: bytes
+    security_level: int
+    engine_id: bytes
+    context_engine_id: bytes
+    context_name: bytes
+    request_id: int
+    uptime: int
+    trap_oid: Oid
+    varbinds: list[VarBind]
+    all_varbinds: list[VarBind]
+    v1: ?TrapV1Pdu
+    problem: str
+
+    def __init__(self, version: int, pdu_type: int, source_address: str, source_port: int, request_id: int,
+                 uptime: int, trap_oid: Oid, varbinds: list[VarBind], all_varbinds: list[VarBind],
+                 community: bytes=b"", user: bytes=b"", security_level: int=0, engine_id: bytes=b"",
+                 context_engine_id: bytes=b"", context_name: bytes=b"", v1: ?TrapV1Pdu=None, problem: str=""):
+        self.version = version
+        self.pdu_type = pdu_type
+        self.source_address = source_address
+        self.source_port = source_port
+        self.community = community
+        self.user = user
+        self.security_level = security_level
+        self.engine_id = engine_id
+        self.context_engine_id = context_engine_id
+        self.context_name = context_name
+        self.request_id = request_id
+        self.uptime = uptime
+        self.trap_oid = trap_oid
+        self.varbinds = varbinds
+        self.all_varbinds = all_varbinds
+        self.v1 = v1
+        self.problem = problem
+
+    def __repr__(self) -> str:
+        if self.version == message.SNMP_V3:
+            sec = ("user=" + repr(self.user) + ", security_level=" + usm.level_text(self.security_level) + ", engine_id="
+                   + self.engine_id.hex() + ", context_engine_id=" + self.context_engine_id.hex()
+                   + ", context_name=" + repr(self.context_name))
+        else:
+            sec = "community=<%d octets>" % len(self.community)
+        head = ("Notification(version=%d, " % self.version + pdu.pdu_type_name(self.pdu_type) + ", source="
+                + self.source_address + ":%d, " % self.source_port + sec
+                + ", request_id=%d, uptime=%d, trap_oid=" % (self.request_id, self.uptime) + str(self.trap_oid)
+                + ", varbinds=[" + ", ".join([_repr_varbind(vb) for vb in self.varbinds]) + "]")
+        if self.problem != "":
+            return head + ", problem=" + repr(self.problem) + ")"
+        return head + ")"
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
+
+def _repr_varbind(vb: VarBind) -> str:
+    # repr(vb), but with the value of snmpTrapCommunity.0, a community, hidden
+    v = vb.value
+    if vb.oid == SNMP_TRAP_COMMUNITY_0 and isinstance(v, OctetString):
+        return "VarBind(" + str(vb.oid) + ", OctetString(<%d octets>))" % len(v.value)
+    return repr(vb)
+
+def _same_trap(a: ?TrapV1Pdu, b: ?TrapV1Pdu) -> bool:
+    if a is not None and b is not None:
+        return a == b
+    return a is None and b is None
+
+extension Notification(Eq):
+    def __eq__(self, other: Notification) -> bool:
+        return (self.version == other.version and self.pdu_type == other.pdu_type
+                and self.source_address == other.source_address and self.source_port == other.source_port
+                and self.community == other.community and self.user == other.user
+                and self.security_level == other.security_level and self.engine_id == other.engine_id
+                and self.context_engine_id == other.context_engine_id and self.context_name == other.context_name
+                and self.request_id == other.request_id and self.uptime == other.uptime
+                and self.trap_oid == other.trap_oid and self.varbinds == other.varbinds
+                and self.all_varbinds == other.all_varbinds and _same_trap(self.v1, other.v1)
+                and self.problem == other.problem)
+
+
+# SNMPv2 notification varbinds #####################################################################
+
+def build_trap_v2(uptime: int, trap_oid: Oid, varbinds: list[VarBind]) -> list[VarBind]:
+    """Return the varbinds of an SNMPv2-Trap or InformRequest (RFC 3416 section 4.2.6)
+
+    That is sysUpTime.0 = Timeticks uptime, snmpTrapOID.0 = trap_oid, then
+    varbinds. Nothing is checked here; encoding the PDU raises
+    errors.EncodeError for an uptime outside 0..2^32-1 or a trap OID that
+    cannot be encoded.
+    """
+    return [VarBind(SYS_UPTIME_0, TimeTicks(uptime)), VarBind(SNMP_TRAP_OID_0, ObjectIdentifier(trap_oid))] + varbinds
+
+def _v2_problem(varbinds: list[VarBind]) -> str:
+    # The first deviation from RFC 3416 section 4.2.6 in the leading varbinds, "" if none.
+    n = len(varbinds)
+    if n == 0:
+        return "no variable bindings: sysUpTime.0 and snmpTrapOID.0 missing"
+    first = varbinds[0]
+    if first.oid != SYS_UPTIME_0:
+        return "first variable binding is " + first.oid.dotted() + ", not sysUpTime.0"
+    if not isinstance(first.value, TimeTicks):
+        return "sysUpTime.0 is " + first.value.type_name() + ", not Timeticks"
+    if n == 1:
+        return "snmpTrapOID.0 missing"
+    second = varbinds[1]
+    if second.oid != SNMP_TRAP_OID_0:
+        return "second variable binding is " + second.oid.dotted() + ", not snmpTrapOID.0"
+    if not isinstance(second.value, ObjectIdentifier):
+        return "snmpTrapOID.0 is " + second.value.type_name() + ", not OID"
+    return ""
+
+def split_v2(varbinds: list[VarBind]) -> (uptime: int, trap_oid: Oid, varbinds: list[VarBind], problem: str):
+    """Split the varbinds of a received SNMPv2-Trap or InformRequest into its parameters
+
+    When the first varbind is sysUpTime.0 with a Timeticks value and the
+    second snmpTrapOID.0 with an OID value (RFC 3416 section 4.2.6), returns
+    their values, the remaining varbinds and an empty problem.
+
+    Otherwise the notification is malformed but still usable: problem
+    describes the first deviation and varbinds is a copy of all varbinds.
+    uptime is the value of the first Timeticks sysUpTime.0 anywhere in the
+    list, -1 if there is none; trap_oid is the value of the first OID-valued
+    snmpTrapOID.0 anywhere in the list (net-snmp snmptrapd searches the
+    same way), an OID without arcs if there is none.
+    """
+    if len(varbinds) >= 2:
+        up = varbinds[0]
+        to = varbinds[1]
+        upv = up.value
+        tov = to.value
+        if up.oid == SYS_UPTIME_0 and to.oid == SNMP_TRAP_OID_0 and isinstance(upv, TimeTicks) and isinstance(tov, ObjectIdentifier):
+            return (uptime=upv.value, trap_oid=tov.value, varbinds=varbinds[2:], problem="")
+    uptime = -1
+    trap_oid = Oid([])
+    found_uptime = False
+    found_trap_oid = False
+    for vb in varbinds:
+        v = vb.value
+        if not found_uptime and vb.oid == SYS_UPTIME_0 and isinstance(v, TimeTicks):
+            uptime = v.value
+            found_uptime = True
+        elif not found_trap_oid and vb.oid == SNMP_TRAP_OID_0 and isinstance(v, ObjectIdentifier):
+            trap_oid = v.value
+            found_trap_oid = True
+    return (uptime=uptime, trap_oid=trap_oid, varbinds=varbinds.copy(), problem=_v2_problem(varbinds))
+
+def inform_response(inform: Pdu) -> Pdu:
+    """Return the Response to an InformRequest (RFC 3416 section 4.2.7)
+
+    It has the request-id and the varbinds of the request and error-status
+    and error-index 0. If the encoded response does not fit the size limit,
+    the receiver sends a tooBig Response without varbinds instead. Raises
+    ValueError if inform is not an InformRequest.
+    """
+    if inform.pdu_type != pdu.INFORM:
+        raise ValueError("not an InformRequest: " + pdu.pdu_type_name(inform.pdu_type))
+    return Pdu(pdu.RESPONSE, inform.request_id, pdu.NO_ERROR, 0, inform.varbinds)
+
+
+# SNMPv1 to SNMPv2 (RFC 3584 section 3.1) ###########################################################
+
+def v1_trap_oid(enterprise: Oid, generic_trap: int, specific_trap: int) -> Oid:
+    """Return the snmpTrapOID.0 value of an SNMPv1 trap (RFC 3584 section 3.1 steps 2 and 3)
+
+    enterpriseSpecific(6) gives enterprise.0.specific_trap; generic-trap
+    0..5 gives snmpTraps.(generic_trap + 1), for example linkDown(2) gives
+    1.3.6.1.6.3.1.1.5.3 (TRAP_LINK_DOWN).
+
+    specific_trap may be anything from 0 to 2^32-1, since RFC 3584 section
+    3.2 maps the last arc of an SNMPv2 trap OID to it. Out-of-range values
+    that a decoded Trap-PDU may hold still give an OID, so that the trap
+    can be delivered: any other generic-trap gives snmpTraps.(generic_trap
+    + 1), as in net-snmp, and arcs are taken modulo 2^32, so a negative
+    specific-trap (net-snmp's snmptrap sends arcs of 2^31 and up that way)
+    gives its 32-bit two's complement.
+    """
+    if generic_trap == pdu.ENTERPRISE_SPECIFIC:
+        return enterprise.child([0, specific_trap & ber.MAX_ARC])
+    return SNMP_TRAPS.child([(generic_trap + 1) & ber.MAX_ARC])
+
+def _contains(varbinds: list[VarBind], name: Oid) -> bool:
+    for vb in varbinds:
+        if vb.oid == name:
+            return True
+    return False
+
+def _all_zero(b: bytes) -> bool:
+    for c in b:
+        if c != 0:
+            return False
+    return True
+
+def v1_to_v2(t: TrapV1Pdu, community: bytes) -> (uptime: int, trap_oid: Oid, varbinds: list[VarBind]):
+    """Translate an SNMPv1 Trap-PDU into SNMPv2 notification parameters (RFC 3584 section 3.1)
+
+    community is the community of the SNMPv1 message that carried t. The
+    uptime is the time-stamp and the trap OID comes from v1_trap_oid. The
+    varbinds are those of the trap followed by the ones RFC 3584 section
+    3.1 (4) adds, each only if no varbind of that name is present:
+    snmpTrapAddress.0 (agent-addr, unless it is empty or 0.0.0.0, which
+    senders use when they do not know their address), snmpTrapCommunity.0
+    (unless the community is empty) and snmpTrapEnterprise.0. This matches
+    net-snmp's convert_v1pdu_to_v2, so the varbinds equal those snmptrapd
+    passes to its trap handlers. build_trap_v2 with the result gives the
+    complete SNMPv2-Trap varbinds.
+    """
+    vbs = t.varbinds.copy()
+    if not _all_zero(t.agent_addr) and not _contains(t.varbinds, SNMP_TRAP_ADDRESS_0):
+        vbs.append(VarBind(SNMP_TRAP_ADDRESS_0, IpAddress(t.agent_addr)))
+    if len(community) > 0 and not _contains(t.varbinds, SNMP_TRAP_COMMUNITY_0):
+        vbs.append(VarBind(SNMP_TRAP_COMMUNITY_0, OctetString(community)))
+    if not _contains(t.varbinds, SNMP_TRAP_ENTERPRISE_0):
+        vbs.append(VarBind(SNMP_TRAP_ENTERPRISE_0, ObjectIdentifier(t.enterprise)))
+    return (uptime=t.time_stamp, trap_oid=v1_trap_oid(t.enterprise, t.generic_trap, t.specific_trap), varbinds=vbs)
+
+def _v1_problem(t: TrapV1Pdu) -> str:
+    g = t.generic_trap
+    if g < pdu.COLD_START or g > pdu.ENTERPRISE_SPECIFIC:
+        return "generic-trap %d is not 0..6" % g
+    if g == pdu.ENTERPRISE_SPECIFIC and (t.specific_trap < 0 or t.specific_trap > ber.MAX_ARC):
+        return "specific-trap %d is not 0..4294967295" % t.specific_trap
+    if len(t.agent_addr) != 4:
+        return "agent-addr has %d octets, not 4" % len(t.agent_addr)
+    return ""
+
+
+# Constructors for the receiver ######################################################################
+
+def notification_from_v1(t: TrapV1Pdu, community: bytes, source_address: str, source_port: int) -> Notification:
+    """Return the Notification of an SNMPv1 Trap-PDU received in a message with community
+
+    The SNMPv2 parameters come from v1_to_v2; v1 keeps t.
+    """
+    r = v1_to_v2(t, community)
+    return Notification(message.SNMP_V1, pdu.TRAP_V1, source_address, source_port, 0, r.uptime, r.trap_oid,
+                        r.varbinds, build_trap_v2(r.uptime, r.trap_oid, r.varbinds), community=community, v1=t,
+                        problem=_v1_problem(t))
+
+def _from_v2(version: int, p: Pdu, source_address: str, source_port: int, community: bytes, user: bytes,
+             security_level: int, engine_id: bytes, context_engine_id: bytes, context_name: bytes) -> Notification:
+    if p.pdu_type != pdu.TRAP_V2 and p.pdu_type != pdu.INFORM:
+        raise ValueError("not a notification PDU: " + pdu.pdu_type_name(p.pdu_type))
+    s = split_v2(p.varbinds)
+    return Notification(version, p.pdu_type, source_address, source_port, p.request_id, s.uptime, s.trap_oid,
+                        s.varbinds, p.varbinds, community, user, security_level, engine_id, context_engine_id,
+                        context_name, None, s.problem)
+
+def notification_from_v2c(p: Pdu, community: bytes, source_address: str, source_port: int) -> Notification:
+    """Return the Notification of an SNMPv2-Trap or InformRequest received in an SNMPv2c message
+
+    The parameters come from split_v2, so malformed leading varbinds give a
+    Notification with a problem rather than an error. Raises ValueError
+    for any other PDU type; the receiver checks the type first.
+    """
+    return _from_v2(message.SNMP_V2C, p, source_address, source_port, community, b"", 0, b"", b"", b"")
+
+def notification_from_v3(msg: V3Message, scoped: ScopedPdu, source_address: str, source_port: int) -> Notification:
+    """Return the Notification of an SNMPv2-Trap or InformRequest received in an SNMPv3 message
+
+    msg is the decoded message and scoped its ScopedPDU (decrypted if it
+    was encrypted). user, engine_id and security_level come from msg (its
+    msgUserName, msgAuthoritativeEngineID and authFlag/privFlag), the
+    context from scoped. As notification_from_v2c otherwise.
+    """
+    level = msg.flags & (message.FLAG_AUTH | message.FLAG_PRIV)
+    return _from_v2(message.SNMP_V3, scoped.pdu, source_address, source_port, b"", msg.usm.user, level,
+                    msg.usm.engine_id, scoped.context_engine_id, scoped.context_name)

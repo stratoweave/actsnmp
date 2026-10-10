@@ -1,0 +1,536 @@
+"""Tests for pdu
+
+The known-answer PDUs come from the SNMPv1/v2c reference packets, the
+net-snmp discovery capture, pysnmp 7.1 encodings and a pysnmp SNMPv1 trap
+with specific-trap 3000000000 that net-snmp's snmptrapd also accepts. The
+error-status texts and PDU type names are those of net-snmp 5.9.4.
+"""
+
+import testing
+import ber
+import errors
+import pdu
+from oid import Oid
+from pdu import Pdu, TrapV1Pdu
+from values import VarBind, Value, Integer, OctetString, Null, ObjectIdentifier, IpAddress, Counter32
+from values import Gauge32, TimeTicks, Counter64, NoSuchObject, EndOfMibView, MalformedValue
+from testutil import h, decode_fails, encode_fails, Lcg
+
+def vb(oid: str, v: Value) -> VarBind:
+    return VarBind(Oid.parse(oid), v)
+
+def req(oid: str) -> VarBind:
+    return VarBind(Oid.parse(oid))
+
+def wrap(tag: int, content: str) -> bytes:
+    """Return a TLV with tag around the content given in hex, with the right length"""
+    return ber.enc_tlv(tag, h(content))
+
+def decode_whole(b: bytes) -> (?Pdu, ?TrapV1Pdu):
+    """Decode a PDU TLV that must fill all of b"""
+    p, t, n = pdu.decode_pdu(b, 0, len(b))
+    testing.assertEqual(n, len(b), "PDU end")
+    return (p, t)
+
+def decode_one(b: bytes) -> Pdu:
+    p, t = decode_whole(b)
+    testing.assertNone(t)
+    if p is not None:
+        return p
+    raise AssertionError("not a Pdu: " + b.hex())
+
+def decode_trap(b: bytes) -> TrapV1Pdu:
+    p, t = decode_whole(b)
+    testing.assertNone(p)
+    if t is not None:
+        return t
+    raise AssertionError("not a TrapV1Pdu: " + b.hex())
+
+
+# Known-answer PDUs ################################################################################
+
+PDU_A = "a0 1c 02 04 12 34 56 78 02 01 00 02 01 00 30 0e 30 0c 06 08 2b 06 01 02 01 01 01 00 05 00"
+PDU_B = """a2 2e 02 04 12 34 56 78 02 01 00 02 01 00 30 20 30 1e 06 08 2b 06 01 02 01 01 01 00
+04 12 4c 69 6e 75 78 20 72 6f 75 74 65 72 20 36 2e 31 2e 30"""
+PDU_C = "a1 17 02 01 07 02 01 00 02 01 00 30 0c 30 0a 06 06 2b 06 01 02 01 01 05 00"
+PDU_D = """a5 36 02 01 01 02 01 01 02 01 0a 30 2b 30 0b 06 07 2b 06 01 02 01 01 03 05 00
+30 0d 06 09 2b 06 01 02 01 02 02 01 02 05 00 30 0d 06 09 2b 06 01 02 01 02 02 01 03 05 00"""
+PDU_H = """a2 27 02 01 03 02 01 02 02 01 02 30 1c 30 0c 06 08 2b 06 01 02 01 01 03 00 05 00
+30 0c 06 08 2b 06 01 02 01 01 05 00 05 00"""
+PDU_J = """a3 29 02 02 03 e8 02 01 00 02 01 00 30 1d 30 1b 06 08 2b 06 01 02 01 01 04 00
+04 0f 6e 6f 63 40 65 78 61 6d 70 6c 65 2e 6e 65 74"""
+PDU_K = """a2 29 02 02 03 e8 02 01 11 02 01 01 30 1d 30 1b 06 08 2b 06 01 02 01 01 04 00
+04 0f 6e 6f 63 40 65 78 61 6d 70 6c 65 2e 6e 65 74"""
+PDU_L = "a2 0b 02 01 05 02 01 01 02 01 00 30 00"
+PDU_M = """a4 30 06 0a 2b 06 01 04 01 bf 08 03 02 0a 40 04 c0 00 02 01 02 01 02 02 01 00 43 03 01 e2 40
+30 11 30 0f 06 0a 2b 06 01 02 01 02 02 01 01 03 02 01 03"""
+PDU_N = """a7 68 02 01 2a 02 01 00 02 01 00 30 5d
+30 0f 06 08 2b 06 01 02 01 01 03 00 43 03 01 e2 40
+30 17 06 0a 2b 06 01 06 03 01 01 04 01 00 06 09 2b 06 01 06 03 01 01 05 03
+30 0f 06 0a 2b 06 01 02 01 02 02 01 01 03 02 01 03
+30 0f 06 0a 2b 06 01 02 01 02 02 01 07 03 02 01 02
+30 0f 06 0a 2b 06 01 02 01 02 02 01 08 03 02 01 02"""
+PDU_REPORT = "a8 1d 02 02 13 89 02 01 00 02 01 00 30 11 30 0f 06 0a 2b 06 01 06 03 0f 01 01 04 00 41 01 0b"
+PDU_INFORM = """a6 4b 02 02 04 d2 02 01 00 02 01 00 30 3f
+30 0f 06 08 2b 06 01 02 01 01 03 00 43 03 01 e2 40
+30 17 06 0a 2b 06 01 06 03 01 01 04 01 00 06 09 2b 06 01 06 03 01 01 05 01
+30 13 06 08 2b 06 01 02 01 01 05 00 04 07 72 6f 75 74 65 72 31"""
+PDU_BULK_MAX = "a5 1b 02 04 7f ff ff ff 02 01 00 02 01 19 30 0d 30 0b 06 07 2b 06 01 02 01 02 02 05 00"
+PDU_TRAP_SPECIFIC = """a4 7c 06 09 2b 06 01 04 01 bf 08 ce 0f 40 04 c0 00 02 01 02 01 06 02 01 2a 43 02 30 39
+30 5f
+30 12 06 0d 2b 06 01 04 01 bf 08 ce 0f 01 01 01 00 02 01 00
+30 1a 06 0d 2b 06 01 04 01 bf 08 ce 0f 01 01 02 00 04 09 64 69 73 6b 20 66 75 6c 6c
+30 15 06 0d 2b 06 01 04 01 bf 08 ce 0f 01 01 03 00 40 04 0a 01 02 03
+30 16 06 0d 2b 06 01 04 01 bf 08 ce 0f 01 01 04 00 41 05 00 ff ff ff ff"""
+PDU_TRAP_SPECIFIC_3E9 = "a4 20 06 09 2b 06 01 04 01 bf 08 ce 0f 40 04 c0 00 02 01 02 01 06 02 05 00 b2 d0 5e 00 43 01 64 30 00"
+PDU_TRAP_COLD = "a4 21 06 0a 2b 06 01 04 01 bf 08 03 02 0a 40 04 0a 00 00 01 02 01 00 02 01 00 43 05 00 ff ff ff ff 30 00"
+
+SYS_DESCR = "1.3.6.1.2.1.1.1.0"
+SYS_UPTIME = "1.3.6.1.2.1.1.3.0"
+TRAP_OID = "1.3.6.1.6.3.1.1.4.1.0"
+
+def contact() -> VarBind:
+    return vb("1.3.6.1.2.1.1.4.0", OctetString(b"noc@example.net"))
+
+def known_pdus() -> list[(str, Pdu)]:
+    return [
+        (PDU_A, Pdu(pdu.GET, 305419896, varbinds=[req(SYS_DESCR)])),
+        (PDU_B, Pdu(pdu.RESPONSE, 305419896, varbinds=[vb(SYS_DESCR, OctetString(b"Linux router 6.1.0"))])),
+        (PDU_C, Pdu(pdu.GETNEXT, 7, varbinds=[req("1.3.6.1.2.1.1")])),
+        (PDU_D, Pdu(pdu.GETBULK, 1, 1, 10, [req("1.3.6.1.2.1.1.3"), req("1.3.6.1.2.1.2.2.1.2"),
+                                             req("1.3.6.1.2.1.2.2.1.3")])),
+        (PDU_H, Pdu(pdu.RESPONSE, 3, pdu.NO_SUCH_NAME, 2, [req(SYS_UPTIME), req("1.3.6.1.2.1.1.5.0")])),
+        (PDU_J, Pdu(pdu.SET, 1000, varbinds=[contact()])),
+        (PDU_K, Pdu(pdu.RESPONSE, 1000, pdu.NOT_WRITABLE, 1, [contact()])),
+        (PDU_L, Pdu(pdu.RESPONSE, 5, pdu.TOO_BIG, 0, [])),
+        (PDU_N, Pdu(pdu.TRAP_V2, 42, varbinds=[
+            vb(SYS_UPTIME, TimeTicks(123456)),
+            vb(TRAP_OID, ObjectIdentifier(Oid.parse("1.3.6.1.6.3.1.1.5.3"))),
+            vb("1.3.6.1.2.1.2.2.1.1.3", Integer(3)),
+            vb("1.3.6.1.2.1.2.2.1.7.3", Integer(2)),
+            vb("1.3.6.1.2.1.2.2.1.8.3", Integer(2))])),
+        (PDU_REPORT, Pdu(pdu.REPORT, 5001, varbinds=[vb("1.3.6.1.6.3.15.1.1.4.0", Counter32(11))])),
+        (PDU_INFORM, Pdu(pdu.INFORM, 1234, varbinds=[
+            vb(SYS_UPTIME, TimeTicks(123456)),
+            vb(TRAP_OID, ObjectIdentifier(Oid.parse("1.3.6.1.6.3.1.1.5.1"))),
+            vb("1.3.6.1.2.1.1.5.0", OctetString(b"router1"))])),
+        (PDU_BULK_MAX, Pdu(pdu.GETBULK, 2147483647, 0, 25, [req("1.3.6.1.2.1.2.2")])),
+    ]
+
+def known_traps() -> list[(str, TrapV1Pdu)]:
+    return [
+        (PDU_M, TrapV1Pdu(Oid.parse("1.3.6.1.4.1.8072.3.2.10"), h("c0 00 02 01"), pdu.LINK_DOWN, 0, 123456,
+                          [vb("1.3.6.1.2.1.2.2.1.1.3", Integer(3))])),
+        (PDU_TRAP_SPECIFIC, TrapV1Pdu(Oid.parse("1.3.6.1.4.1.8072.9999"), h("c0 00 02 01"), pdu.ENTERPRISE_SPECIFIC,
+                                      42, 12345, [
+            vb("1.3.6.1.4.1.8072.9999.1.1.1.0", Integer(0)),
+            vb("1.3.6.1.4.1.8072.9999.1.1.2.0", OctetString(b"disk full")),
+            vb("1.3.6.1.4.1.8072.9999.1.1.3.0", IpAddress(h("0a 01 02 03"))),
+            vb("1.3.6.1.4.1.8072.9999.1.1.4.0", Counter32(4294967295))])),
+        (PDU_TRAP_COLD, TrapV1Pdu(Oid.parse("1.3.6.1.4.1.8072.3.2.10"), h("0a 00 00 01"), pdu.COLD_START, 0,
+                                  4294967295, [])),
+        (PDU_TRAP_SPECIFIC_3E9, TrapV1Pdu(Oid.parse("1.3.6.1.4.1.8072.9999"), h("c0 00 02 01"), pdu.ENTERPRISE_SPECIFIC,
+                                          3000000000, 100)),
+    ]
+
+def _test_known_pdus_decode() -> None:
+    for hx, expected in known_pdus():
+        testing.assertEqual(decode_one(h(hx)), expected, hx[:20])
+
+def _test_known_pdus_encode() -> None:
+    for hx, p in known_pdus():
+        testing.assertEqual(pdu.encode_pdu(p), h(hx), hx[:20])
+
+def _test_known_traps_decode() -> None:
+    for hx, expected in known_traps():
+        testing.assertEqual(decode_trap(h(hx)), expected, hx[:20])
+
+def _test_known_traps_encode() -> None:
+    for hx, t in known_traps():
+        testing.assertEqual(pdu.encode_trap_v1(t), h(hx), hx[:20])
+
+def _test_all_pdu_types_decoded() -> None:
+    seen: set[int] = set()
+    for hx, p in known_pdus():
+        seen.add(decode_one(h(hx)).pdu_type)
+    for hx, t in known_traps():
+        decode_trap(h(hx))
+        seen.add(pdu.TRAP_V1)
+    testing.assertEqual(len(seen), 9)
+    for t in range(pdu.GET, pdu.REPORT + 1):
+        testing.assertIn(t, seen)
+
+def _test_getbulk_fields() -> None:
+    d = decode_one(h(PDU_D))
+    testing.assertEqual(d.non_repeaters(), 1)
+    testing.assertEqual(d.max_repetitions(), 10)
+    # D(b): the same request with max-repetitions 2
+    db = decode_one(h(PDU_D.replace("02 01 0a", "02 01 02")))
+    testing.assertEqual(db.non_repeaters(), 1)
+    testing.assertEqual(db.max_repetitions(), 2)
+    m = decode_one(h(PDU_BULK_MAX))
+    testing.assertEqual(m.non_repeaters(), 0)
+    testing.assertEqual(m.max_repetitions(), 25)
+    testing.assertEqual(m.request_id, 2147483647)
+
+def _test_bulk_counts() -> None:
+    # RFC 3416 4.2.3: N = max(min(non-repeaters, number of varbinds), 0), M = max(max-repetitions, 0)
+    vbs = [req("1.3.6.1.2.1.1.3"), req("1.3.6.1.2.1.2.2.1.2"), req("1.3.6.1.2.1.2.2.1.3")]
+    testing.assertEqual(decode_one(h(PDU_D)).bulk_counts(), (1, 10))
+    cases: list[(int, int, int, int)] = [(0, 0, 0, 0), (1, 10, 1, 10), (3, 5, 3, 5), (4, 5, 3, 5), (-1, 5, 0, 5),
+                                         (-2147483648, -2147483648, 0, 0), (2147483647, 2147483647, 3, 2147483647),
+                                         (2, -1, 2, 0)]
+    for nr, mr, n, m in cases:
+        testing.assertEqual(Pdu(pdu.GETBULK, 1, nr, mr, vbs).bulk_counts(), (n, m), "%d, %d" % (nr, mr))
+    testing.assertEqual(Pdu(pdu.GETBULK, 1, 5, 5).bulk_counts(), (0, 5), "no varbinds")
+
+def _test_constructor_defaults() -> None:
+    p = Pdu(pdu.GET, 9)
+    testing.assertEqual(p.error_status, 0)
+    testing.assertEqual(p.error_index, 0)
+    testing.assertEqual(p.varbinds, [])
+    testing.assertEqual(pdu.encode_pdu(p), h("a0 0b 02 01 09 02 01 00 02 01 00 30 00"))
+    t = TrapV1Pdu(Oid.parse("1.3.6.1.4.1.8072"), h("7f 00 00 01"), pdu.WARM_START, 0, 0)
+    testing.assertEqual(t.varbinds, [])
+    testing.assertEqual(pdu.encode_trap_v1(t),
+                        h("a4 1a 06 07 2b 06 01 04 01 bf 08 40 04 7f 00 00 01 02 01 01 02 01 00 43 01 00 30 00"))
+
+
+# Names and texts ###################################################################################
+
+def _test_constants() -> None:
+    testing.assertEqual([pdu.GET, pdu.GETNEXT, pdu.RESPONSE, pdu.SET, pdu.TRAP_V1, pdu.GETBULK, pdu.INFORM,
+                         pdu.TRAP_V2, pdu.REPORT], [0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8])
+    testing.assertEqual([pdu.NO_ERROR, pdu.TOO_BIG, pdu.NO_SUCH_NAME, pdu.BAD_VALUE, pdu.READ_ONLY, pdu.GEN_ERR,
+                         pdu.NO_ACCESS, pdu.WRONG_TYPE, pdu.WRONG_LENGTH, pdu.WRONG_ENCODING, pdu.WRONG_VALUE,
+                         pdu.NO_CREATION, pdu.INCONSISTENT_VALUE, pdu.RESOURCE_UNAVAILABLE, pdu.COMMIT_FAILED,
+                         pdu.UNDO_FAILED, pdu.AUTHORIZATION_ERROR, pdu.NOT_WRITABLE, pdu.INCONSISTENT_NAME],
+                        list(range(19)))
+    testing.assertEqual([pdu.COLD_START, pdu.WARM_START, pdu.LINK_DOWN, pdu.LINK_UP, pdu.AUTHENTICATION_FAILURE,
+                         pdu.EGP_NEIGHBOR_LOSS, pdu.ENTERPRISE_SPECIFIC], list(range(7)))
+
+def _test_error_status_names() -> None:
+    names = ["noError", "tooBig", "noSuchName", "badValue", "readOnly", "genErr", "noAccess", "wrongType",
+             "wrongLength", "wrongEncoding", "wrongValue", "noCreation", "inconsistentValue",
+             "resourceUnavailable", "commitFailed", "undoFailed", "authorizationError", "notWritable",
+             "inconsistentName"]
+    testing.assertEqual([pdu.error_status_name(s) for s in range(19)], names)
+    testing.assertEqual(pdu.error_status_name(19), "unknown(19)")
+    testing.assertEqual(pdu.error_status_name(-1), "unknown(-1)")
+
+def _test_error_status_texts() -> None:
+    texts = [
+        "(noError) No Error",
+        "(tooBig) Response message would have been too large.",
+        "(noSuchName) There is no such variable name in this MIB.",
+        "(badValue) The value given has the wrong type or length.",
+        "(readOnly) The two parties used do not have access to use the specified SNMP PDU.",
+        "(genError) A general failure occured",
+        "noAccess",
+        "wrongType (The set datatype does not match the data type the agent expects)",
+        "wrongLength (The set value has an illegal length from what the agent expects)",
+        "wrongEncoding",
+        "wrongValue (The set value is illegal or unsupported in some way)",
+        "noCreation (That table does not support row creation or that object can not ever be created)",
+        "inconsistentValue (The set value is illegal or unsupported in some way)",
+        "resourceUnavailable (This is likely a out-of-memory failure within the agent)",
+        "commitFailed",
+        "undoFailed",
+        "authorizationError (access denied to that object)",
+        "notWritable (That object does not support modification)",
+        "inconsistentName (That object can not currently be created)"]
+    testing.assertEqual([pdu.error_status_text(s) for s in range(19)], texts)
+    testing.assertEqual(pdu.error_status_text(19), "Unknown Error")
+    testing.assertEqual(pdu.error_status_text(-1), "Unknown Error")
+    testing.assertEqual(pdu.error_status_text(2147483647), "Unknown Error")
+
+def _test_pdu_type_names() -> None:
+    testing.assertEqual([pdu.pdu_type_name(t) for t in range(0xa0, 0xa9)],
+                        ["GET", "GETNEXT", "RESPONSE", "SET", "TRAP", "GETBULK", "INFORM", "TRAP2", "REPORT"])
+    testing.assertEqual(pdu.pdu_type_name(0xa9), "?0xA9?")
+    testing.assertEqual(pdu.pdu_type_name(0x30), "?0x30?")
+    testing.assertEqual(pdu.pdu_type_name(0x05), "?0x 5?")
+    testing.assertEqual(pdu.pdu_type_name(0x9f), "?0x9F?")
+
+
+# Decoding: offsets and leniency ####################################################################
+
+def _test_decode_offsets() -> None:
+    # A PDU in the middle of a buffer: decode_pdu returns the position after it and
+    # ignores what follows up to end.
+    b = h("ff ff") + h(PDU_L) + h("05 00 ee")
+    p, t, n = pdu.decode_pdu(b, 2, len(b))
+    testing.assertEqual(n, 2 + len(h(PDU_L)))
+    testing.assertEqual(p, Pdu(pdu.RESPONSE, 5, pdu.TOO_BIG, 0, []))
+    testing.assertNone(t)
+    p2, t2, n2 = pdu.decode_pdu(b, 2, n)
+    testing.assertEqual(n2, n)
+    decode_fails(lambda: pdu.decode_pdu(b, 2, n - 1), "end inside the PDU")
+    decode_fails(lambda: pdu.decode_pdu(b, 2, len(b) + 1), "end beyond the buffer")
+    decode_fails(lambda: pdu.decode_pdu(b, -1, len(b)), "negative position")
+    decode_fails(lambda: pdu.decode_pdu(b, len(b), len(b)), "nothing to decode")
+
+def _test_lenient_decode() -> None:
+    # pyasn1 encodes -2^31 non-minimally
+    p = decode_one(wrap(pdu.GETNEXT, "02 05 ff 80 00 00 00 02 01 00 02 01 00 30 00"))
+    testing.assertEqual(p.request_id, -2147483648)
+    # long-form and padded lengths, non-minimal integers
+    p = decode_one(h("a0 81 19 02 84 00 00 00 01 07 02 02 00 00 02 01 00 30 82 00 07 30 05 06 01 2b 05 00"))
+    testing.assertEqual(p, Pdu(pdu.GET, 7, varbinds=[req("1.3")]))
+    # error-status and error-index outside the defined values are kept for the caller
+    p = decode_one(wrap(pdu.RESPONSE, "02 01 01 02 01 ff 02 04 7f ff ff ff 30 00"))
+    testing.assertEqual(p.error_status, -1)
+    testing.assertEqual(p.error_index, 2147483647)
+    p = decode_one(wrap(pdu.RESPONSE, "02 01 01 02 01 63 02 01 05 30 00"))
+    testing.assertEqual(p.error_status, 99)
+    # negative GETBULK fields are for the agent to handle (RFC 3416 4.2.3: taken as 0)
+    p = decode_one(wrap(pdu.GETBULK, "02 01 01 02 01 ff 02 01 fe 30 00"))
+    testing.assertEqual(p.non_repeaters(), -1)
+    testing.assertEqual(p.max_repetitions(), -2)
+    # Trap-PDU: an enterprise without arcs, agent-addr of any length, time-stamp as
+    # negative two's complement or with leading zero octets, generic-trap above 6
+    t = decode_trap(wrap(pdu.TRAP_V1, "06 00 40 00 02 01 06 02 01 01 43 04 ff ff ff ff 30 00"))
+    testing.assertEqual(t.enterprise, Oid([]))
+    testing.assertEqual(t.agent_addr, b"")
+    testing.assertEqual(t.time_stamp, 4294967295)
+    t = decode_trap(wrap(pdu.TRAP_V1, "06 02 2b 06 40 06 00 00 00 00 00 01 02 01 00 02 01 00 43 05 00 00 00 00 05 30 00"))
+    testing.assertEqual(t.agent_addr, h("00 00 00 00 00 01"))
+    testing.assertEqual(t.time_stamp, 5)
+    t = decode_trap(wrap(pdu.TRAP_V1, "06 01 2b 40 04 01 02 03 04 02 01 07 02 01 ff 43 01 00 30 00"))
+    testing.assertEqual(t.generic_trap, 7)
+    testing.assertEqual(t.specific_trap, -1)
+    # generic-trap and specific-trap: any INTEGER that fits 64 bits
+    t = decode_trap(wrap(pdu.TRAP_V1, "06 01 2b 40 04 01 02 03 04 02 05 00 80 00 00 00 02 09 ff ff ff ff ff ff ff ff ff"
+                                      + " 43 01 00 30 00"))
+    testing.assertEqual((t.generic_trap, t.specific_trap), (2147483648, -1))
+    t = decode_trap(wrap(pdu.TRAP_V1, "06 01 2b 40 04 01 02 03 04 02 01 06 02 08 80 00 00 00 00 00 00 00 43 01 00 30 00"))
+    testing.assertEqual(t.specific_trap, -9223372036854775807 - 1)
+    # a malformed varbind value keeps the trap
+    t = decode_trap(wrap(pdu.TRAP_V1, "06 01 2b 40 04 01 02 03 04 02 01 06 02 01 01 43 01 00 30 07 30 05 06 01 2b 41 00"))
+    testing.assertEqual(t.varbinds, [VarBind(Oid([1, 3]), MalformedValue(0x41, b"", "empty unsigned integer"))])
+
+def _test_trap_specific_unsigned32() -> None:
+    # RFC 3584 3.2 maps the last arc of an SNMPv2 trap OID (up to 2^32-1) to specific-trap;
+    # pysnmp sends 3000000000 as a 5-octet INTEGER. It decodes and encodes back exactly.
+    # (PDU_TRAP_SPECIFIC_3E9 is a known trap: decoded and encoded by the KAT tests)
+    for v in [2147483648, 4294967295, -2147483648, -1]:
+        t = TrapV1Pdu(Oid.parse("1.3.6.1.4.1"), h("c0 00 02 01"), pdu.ENTERPRISE_SPECIFIC, v, 0)
+        testing.assertEqual(decode_trap(pdu.encode_trap_v1(t)), t, "specific-trap %d" % v)
+
+def _test_decode_rejects() -> None:
+    raw = [
+        ("", "no input"),
+        ("a9 03 02 01 01", "unknown context tag 0xa9"),
+        ("80 00", "primitive context tag"),
+        ("9f 00", "primitive high-tag-number form"),
+        ("bf 1f 00", "constructed high-tag-number form"),
+        ("a0 80 02 01 01 02 01 00 02 01 00 30 00 00 00", "indefinite length"),
+        ("a0 0b 02 01 01 02 01 00 02 01 00 30", "length beyond the input"),
+    ]
+    for hx, what in raw:
+        b = h(hx)
+        decode_fails(lambda: pdu.decode_pdu(b, 0, len(b)), what)
+    content = [
+        (0x30, "02 01 01 02 01 00 02 01 00 30 00", "a SEQUENCE is not a PDU"),
+        (pdu.GET, "02 00 02 01 00 02 01 00 30 00", "empty request-id (spec section 8)"),
+        (pdu.GET, "02 05 00 80 00 00 00 02 01 00 02 01 00 30 00", "request-id 2^31"),
+        (pdu.GET, "02 05 ff 7f ff ff ff 02 01 00 02 01 00 30 00", "request-id -2^31-1"),
+        (pdu.GET, "04 01 01 02 01 00 02 01 00 30 00", "request-id is not an INTEGER"),
+        (pdu.RESPONSE, "02 01 01 02 05 00 80 00 00 00 02 01 00 30 00", "error-status 2^31"),
+        (pdu.RESPONSE, "02 01 01 02 01 00 02 05 ff 7f ff ff ff 30 00", "error-index -2^31-1"),
+        (pdu.GET, "02 01 01 05 00 02 01 00 30 00", "NULL instead of error-status"),
+        (pdu.GET, "02 01 01 02 01 00", "no error-index"),
+        (pdu.GET, "02 01 01 02 01 00 02 01 00", "no variable bindings"),
+        (pdu.GET, "", "empty PDU"),
+        (pdu.GET, "02 01 01 02 01 00 02 01 00 31 00", "variable bindings are a SET"),
+        (pdu.GET, "02 01 01 02 01 00 02 01 00 30 00 05 00", "data after the variable bindings"),
+        (pdu.GET, "02 01 01 02 01 00 02 01 00 30 00 30 00", "two variable binding lists"),
+        (pdu.GET, "02 01 01 02 01 00 02 01 00 30 03 06 01 2b", "varbind without a SEQUENCE"),
+        (pdu.GET, "02 01 01 02 01 00 02 01 00 30 0a 30 08 06 04 2b 06 01 86 05 00",
+         "name with a truncated sub-identifier (spec section 8)"),
+        (pdu.GET, "02 01 01 02 01 00 02 01 00 30 10 30 0e 06 0a 2b 06 01 04 01 90 80 80 80 00 05 00",
+         "name with arc 2^32 (spec section 8)"),
+        (pdu.RESPONSE, "02 01 01 02 01 00 02 01 00 30 07 30 05 06 01 2b 02 05 00", "value length beyond the varbind"),
+    ]
+    for tag, hx, what in content:
+        b = wrap(tag, hx)
+        decode_fails(lambda: pdu.decode_pdu(b, 0, len(b)), what)
+
+def _test_decode_trap_rejects() -> None:
+    good = "06 01 2b 40 04 01 02 03 04 02 01 06 02 01 01 43 01 00 30 00"
+    t = decode_trap(wrap(pdu.TRAP_V1, good))
+    testing.assertEqual(t, TrapV1Pdu(Oid([1, 3]), h("01 02 03 04"), 6, 1, 0))
+    bad = [
+        ("04 01 2b 40 04 01 02 03 04 02 01 06 02 01 01 43 01 00 30 00", "enterprise is not an OID"),
+        ("06 01 ab 40 04 01 02 03 04 02 01 06 02 01 01 43 01 00 30 00", "truncated enterprise OID"),
+        ("06 01 2b 04 04 01 02 03 04 02 01 06 02 01 01 43 01 00 30 00", "agent-addr is an OCTET STRING"),
+        ("06 01 2b 40 04 01 02 03 04 0a 01 06 02 01 01 43 01 00 30 00", "generic-trap is ENUMERATED"),
+        ("06 01 2b 40 04 01 02 03 04 02 09 00 80 00 00 00 00 00 00 00 02 01 01 43 01 00 30 00", "generic-trap 2^63"),
+        ("06 01 2b 40 04 01 02 03 04 02 00 02 01 01 43 01 00 30 00", "empty generic-trap"),
+        ("06 01 2b 40 04 01 02 03 04 02 01 06 02 0a 00 00 00 00 00 00 00 00 00 01 43 01 00 30 00",
+         "specific-trap of 10 octets"),
+        ("06 01 2b 40 04 01 02 03 04 02 01 06 41 01 01 43 01 00 30 00", "specific-trap is a Counter32"),
+        ("06 01 2b 40 04 01 02 03 04 02 01 06 02 01 01 02 01 00 30 00", "time-stamp is an INTEGER"),
+        ("06 01 2b 40 04 01 02 03 04 02 01 06 02 01 01 43 05 01 00 00 00 00 30 00", "time-stamp 2^32"),
+        ("06 01 2b 40 04 01 02 03 04 02 01 06 02 01 01 43 00 30 00", "empty time-stamp"),
+        ("06 01 2b 40 04 01 02 03 04 02 01 06 02 01 01 43 01 00", "no variable bindings"),
+        ("06 01 2b 40 04 01 02 03 04 02 01 06 02 01 01 43 01 00 30 00 05 00", "data after the bindings"),
+        ("06 01 2b 40 04 01 02 03 04 02 01 06", "no specific-trap"),
+        ("06 01 2b", "only an enterprise"),
+        ("", "empty Trap-PDU"),
+    ]
+    for hx, what in bad:
+        b = wrap(pdu.TRAP_V1, hx)
+        decode_fails(lambda: pdu.decode_pdu(b, 0, len(b)), what)
+
+def all_known_hex() -> list[str]:
+    return [hx for hx, p in known_pdus()] + [hx for hx, t in known_traps()]
+
+def _test_truncation_at_every_offset() -> None:
+    for hx in all_known_hex():
+        b = h(hx)
+        for k in range(len(b)):
+            decode_fails(lambda: pdu.decode_pdu(b, 0, k), "%s cut to %d octets" % (hx[:20], k))
+            cut = b[:k]
+            decode_fails(lambda: pdu.decode_pdu(cut, 0, k), "%s buffer cut to %d octets" % (hx[:20], k))
+
+def _test_mutations_raise_only_decode_error() -> None:
+    # Overwrite every octet of some known PDUs with interesting values: decoding either
+    # succeeds or raises DecodeError; any other exception makes the test an ERR.
+    decoded = 0
+    for hx in [PDU_D, PDU_N, PDU_TRAP_SPECIFIC, PDU_REPORT]:
+        b = h(hx)
+        for i in range(len(b)):
+            for x in [0x00, 0x01, 0x7f, 0x80, 0x81, 0x84, 0xa4, 0xff, b[i] ^ 0x01, b[i] ^ 0x80]:
+                m = b[:i] + ber.BYTE_TABLE[x] + b[i + 1:]
+                try:
+                    pdu.decode_pdu(m, 0, len(m))
+                    decoded += 1
+                except errors.DecodeError:
+                    pass
+    testing.assertTrue(decoded > 0)
+
+
+# Encoding: boundaries and rejects ##################################################################
+
+def _test_encode_boundaries() -> None:
+    testing.assertEqual(pdu.encode_pdu(Pdu(pdu.GET, -2147483648)),
+                        h("a0 0e 02 04 80 00 00 00 02 01 00 02 01 00 30 00"))
+    testing.assertEqual(pdu.encode_pdu(Pdu(pdu.GETNEXT, 2147483647)),
+                        h("a1 0e 02 04 7f ff ff ff 02 01 00 02 01 00 30 00"))
+    testing.assertEqual(pdu.encode_pdu(Pdu(pdu.RESPONSE, 0, 2147483647, 128)),
+                        h("a2 0f 02 01 00 02 04 7f ff ff ff 02 02 00 80 30 00"))
+    testing.assertEqual(pdu.encode_pdu(Pdu(pdu.GETBULK, 1, 0, 2147483647)),
+                        h("a5 0e 02 01 01 02 01 00 02 04 7f ff ff ff 30 00"))
+    t = TrapV1Pdu(Oid.parse("0.0"), h("00 00 00 00"), pdu.ENTERPRISE_SPECIFIC, -2147483648, 0)
+    testing.assertEqual(pdu.encode_trap_v1(t),
+                        h("a4 17 06 01 00 40 04 00 00 00 00 02 01 06 02 04 80 00 00 00 43 01 00 30 00"))
+    # a PDU of more than 127 octets has a long-form length
+    p = Pdu(pdu.SET, 1, varbinds=[vb(SYS_DESCR, OctetString(b"x" * 200))])
+    b = pdu.encode_pdu(p)
+    testing.assertEqual(b[:3], h("a3 81 e4"))
+    testing.assertEqual(len(b), 3 + 0xe4)
+    testing.assertEqual(decode_one(b), p)
+
+def _test_encode_rejects() -> None:
+    encode_fails(lambda: pdu.encode_pdu(Pdu(pdu.TRAP_V1, 1)), "TRAP_V1 as a Pdu")
+    encode_fails(lambda: pdu.encode_pdu(Pdu(0x9f, 1)), "type 0x9f")
+    encode_fails(lambda: pdu.encode_pdu(Pdu(0xa9, 1)), "type 0xa9")
+    encode_fails(lambda: pdu.encode_pdu(Pdu(0x30, 1)), "type 0x30")
+    encode_fails(lambda: pdu.encode_pdu(Pdu(pdu.GET, 2147483648)), "request-id 2^31")
+    encode_fails(lambda: pdu.encode_pdu(Pdu(pdu.GET, -2147483649)), "request-id -2^31-1")
+    encode_fails(lambda: pdu.encode_pdu(Pdu(pdu.RESPONSE, 1, -1)), "error-status -1")
+    encode_fails(lambda: pdu.encode_pdu(Pdu(pdu.RESPONSE, 1, 0, -1)), "error-index -1")
+    encode_fails(lambda: pdu.encode_pdu(Pdu(pdu.RESPONSE, 1, 2147483648)), "error-status 2^31")
+    encode_fails(lambda: pdu.encode_pdu(Pdu(pdu.GETBULK, 1, -1, 10)), "non-repeaters -1")
+    encode_fails(lambda: pdu.encode_pdu(Pdu(pdu.GETBULK, 1, 0, -1)), "max-repetitions -1")
+    encode_fails(lambda: pdu.encode_pdu(Pdu(pdu.GET, 1, varbinds=[VarBind(Oid([1]))])), "name with one arc")
+    encode_fails(lambda: pdu.encode_pdu(Pdu(pdu.SET, 1, varbinds=[vb(SYS_DESCR, Integer(2147483648))])),
+                 "Integer32 out of range")
+    addr = h("0a 00 00 01")
+    pdu.encode_trap_v1(TrapV1Pdu(Oid.parse("1.3"), addr, pdu.LINK_UP, 0, 1))
+    encode_fails(lambda: pdu.encode_trap_v1(TrapV1Pdu(Oid([1]), addr, 0, 0, 0)), "enterprise with one arc")
+    encode_fails(lambda: pdu.encode_trap_v1(TrapV1Pdu(Oid.parse("1.3"), h("0a 00 00"), 0, 0, 0)),
+                 "agent-addr of 3 octets")
+    encode_fails(lambda: pdu.encode_trap_v1(TrapV1Pdu(Oid.parse("1.3"), h("0a 00 00 01 02"), 0, 0, 0)),
+                 "agent-addr of 5 octets")
+    encode_fails(lambda: pdu.encode_trap_v1(TrapV1Pdu(Oid.parse("1.3"), addr, 7, 0, 0)), "generic-trap 7")
+    encode_fails(lambda: pdu.encode_trap_v1(TrapV1Pdu(Oid.parse("1.3"), addr, -1, 0, 0)), "generic-trap -1")
+    encode_fails(lambda: pdu.encode_trap_v1(TrapV1Pdu(Oid.parse("1.3"), addr, 6, 4294967296, 0)), "specific-trap 2^32")
+    encode_fails(lambda: pdu.encode_trap_v1(TrapV1Pdu(Oid.parse("1.3"), addr, 6, -2147483649, 0)),
+                 "specific-trap -2^31-1")
+    encode_fails(lambda: pdu.encode_trap_v1(TrapV1Pdu(Oid.parse("1.3"), addr, 6, 0, -1)), "time-stamp -1")
+    encode_fails(lambda: pdu.encode_trap_v1(TrapV1Pdu(Oid.parse("1.3"), addr, 6, 0, 4294967296)), "time-stamp 2^32")
+    encode_fails(lambda: pdu.encode_trap_v1(TrapV1Pdu(Oid.parse("1.3"), addr, 6, 0, 0, [VarBind(Oid([]))])),
+                 "varbind name without arcs")
+
+
+# Equality and repr #################################################################################
+
+def _test_equality() -> None:
+    vbs = [vb(SYS_DESCR, OctetString(b"a"))]
+    p = Pdu(pdu.RESPONSE, 1, 2, 3, vbs)
+    testing.assertEqual(p, Pdu(pdu.RESPONSE, 1, 2, 3, [vb(SYS_DESCR, OctetString(b"a"))]))
+    testing.assertNotEqual(p, Pdu(pdu.REPORT, 1, 2, 3, vbs))
+    testing.assertNotEqual(p, Pdu(pdu.RESPONSE, 9, 2, 3, vbs))
+    testing.assertNotEqual(p, Pdu(pdu.RESPONSE, 1, 9, 3, vbs))
+    testing.assertNotEqual(p, Pdu(pdu.RESPONSE, 1, 2, 9, vbs))
+    testing.assertNotEqual(p, Pdu(pdu.RESPONSE, 1, 2, 3, [vb(SYS_DESCR, OctetString(b"b"))]))
+    testing.assertNotEqual(p, Pdu(pdu.RESPONSE, 1, 2, 3, []))
+    addr = h("01 02 03 04")
+    t = TrapV1Pdu(Oid.parse("1.3.6"), addr, 6, 5, 4, vbs)
+    testing.assertEqual(t, TrapV1Pdu(Oid.parse("1.3.6"), h("01 02 03 04"), 6, 5, 4, vbs))
+    testing.assertNotEqual(t, TrapV1Pdu(Oid.parse("1.3.7"), addr, 6, 5, 4, vbs))
+    testing.assertNotEqual(t, TrapV1Pdu(Oid.parse("1.3.6"), h("01 02 03 05"), 6, 5, 4, vbs))
+    testing.assertNotEqual(t, TrapV1Pdu(Oid.parse("1.3.6"), addr, 5, 5, 4, vbs))
+    testing.assertNotEqual(t, TrapV1Pdu(Oid.parse("1.3.6"), addr, 6, 6, 4, vbs))
+    testing.assertNotEqual(t, TrapV1Pdu(Oid.parse("1.3.6"), addr, 6, 5, 5, vbs))
+    testing.assertNotEqual(t, TrapV1Pdu(Oid.parse("1.3.6"), addr, 6, 5, 4, []))
+
+def _test_repr() -> None:
+    testing.assertEqual(repr(Pdu(pdu.GET, 7, varbinds=[req("1.3.6")])),
+                        "Pdu(GET, request_id=7, error_status=0, error_index=0, varbinds=[VarBind(1.3.6, Null())])")
+    testing.assertEqual(str(Pdu(pdu.GETBULK, 7, 1, 25)),
+                        "Pdu(GETBULK, request_id=7, non_repeaters=1, max_repetitions=25, varbinds=[])")
+    testing.assertEqual(repr(TrapV1Pdu(Oid.parse("1.3.6"), b"\x7f\x00\x00\x01", 6, 42, 100)),
+                        "TrapV1Pdu(enterprise=1.3.6, agent_addr=b'\\x7f\\x00\\x00\\x01', generic_trap=6, "
+                        + "specific_trap=42, time_stamp=100, varbinds=[])")
+
+
+# Randomised round trip #############################################################################
+
+def random_value(rng: Lcg) -> Value:
+    kind = rng.below(7)
+    if kind == 0:
+        return Null()
+    if kind == 1:
+        return Integer(rng.next31() - 1073741824)
+    if kind == 2:
+        return OctetString(b"z" * rng.below(300))
+    if kind == 3:
+        return Gauge32(rng.next31() * 2)
+    if kind == 4:
+        return Counter64(u64(rng.next31()) * u64(rng.next31()) * u64(4))
+    if kind == 5:
+        return NoSuchObject()
+    return EndOfMibView()
+
+def random_varbinds(rng: Lcg) -> list[VarBind]:
+    vbs: list[VarBind] = []
+    for i in range(rng.below(6)):
+        name = Oid([1, 3, 6, 1] + [rng.next31() for k in range(rng.below(8))])
+        vbs.append(VarBind(name, random_value(rng)))
+    return vbs
+
+def _test_random_round_trip() -> None:
+    rng = Lcg(20261010)
+    types = [pdu.GET, pdu.GETNEXT, pdu.RESPONSE, pdu.SET, pdu.GETBULK, pdu.INFORM, pdu.TRAP_V2, pdu.REPORT]
+    for i in range(200):
+        if rng.below(5) == 0:
+            t = TrapV1Pdu(Oid([1, 3, 6, 1, 4, 1, rng.next31()]), ber.BYTE_TABLE[rng.below(256)] * 4, rng.below(7),
+                          rng.next31() - 1073741824, rng.next31() * 2, random_varbinds(rng))
+            testing.assertEqual(decode_trap(pdu.encode_trap_v1(t)), t)
+        else:
+            p = Pdu(types[rng.below(len(types))], rng.next31() - rng.next31(), rng.below(19),
+                    rng.below(2) * rng.next31(), random_varbinds(rng))
+            testing.assertEqual(decode_one(pdu.encode_pdu(p)), p)

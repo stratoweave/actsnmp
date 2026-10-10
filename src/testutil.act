@@ -1,0 +1,92 @@
+"""Helpers shared by the test modules
+
+Not part of the library API: only the test_* modules import it. It holds the
+hex shorthand for vectors, the "must raise" checks, a deterministic
+pseudo-random generator and the file reader of the env tests, so that every
+test module uses the same ones.
+"""
+
+import file
+import testing
+import ber
+import errors
+
+def h(s: str) -> bytes:
+    """Return the bytes written as hex in s; spaces, colons and line breaks are ignored (ber.from_hex)"""
+    return ber.from_hex(s)
+
+def decode_fails[T](f: mut() -> T, what: str) -> None:
+    """Fail the test unless f raises errors.DecodeError (any other exception propagates)"""
+    try:
+        f()
+    except errors.DecodeError:
+        return
+    testing.error("no DecodeError: " + what)
+
+def encode_fails[T](f: mut() -> T, what: str) -> None:
+    """Fail the test unless f raises errors.EncodeError (any other exception propagates)"""
+    try:
+        f()
+    except errors.EncodeError:
+        return
+    testing.error("no EncodeError: " + what)
+
+def value_fails[T](f: mut() -> T, what: str) -> None:
+    """Fail the test unless f raises ValueError (any other exception propagates)"""
+    try:
+        f()
+    except ValueError:
+        return
+    testing.error("no ValueError: " + what)
+
+
+class Lcg(object):
+    """Deterministic pseudo-random numbers: a 64-bit LCG with Knuth's MMIX constants
+
+    The state wraps modulo 2^64, so a seed always gives the same
+    sequence.
+    """
+    state: int
+
+    def __init__(self, seed: int):
+        self.state = seed
+
+    def next64(self) -> int:
+        """Advance and return the whole 64-bit state (any int, negative ones included)"""
+        self.state = self.state * 6364136223846793005 + 1442695040888963407
+        return self.state
+
+    def next31(self) -> int:
+        """Advance and return the high bits of the state as a number in 0..2^31-1"""
+        return (self.next64() >> 33) & 0x7fffffff
+
+    def below(self, n: int) -> int:
+        """Return a number in 0..n-1; n must be at least 1"""
+        return self.next31() % n
+
+    def octets(self, n: int) -> bytes:
+        """Return n pseudo-random octets"""
+        return b"".join([ber.BYTE_TABLE[self.below(256)] for i in range(n)])
+
+
+def pseudo_random(n: int, seed: int) -> bytes:
+    """Return n deterministic octets without short repeats (31-bit LCG with glibc's constants, high byte)"""
+    t = ber.BYTE_TABLE
+    parts: list[bytes] = []
+    x = seed
+    for _ in range(n):
+        x = (x * 1103515245 + 12345) % 2147483648
+        parts.append(t[x >> 23])
+    return b"".join(parts)
+
+
+proc def read_text(t: testing.EnvT, path: str) -> str:
+    """The text of the file at path, relative to the project root when run by `acton test`
+
+    Test results are cached by source hash, so tests that read files need
+    --no-cache after those files change.
+    """
+    f = file.ReadFile(file.ReadFileCap(file.FileCap(t.env.cap)), path)
+    data = f.read()
+    f.close()
+    return data.decode()

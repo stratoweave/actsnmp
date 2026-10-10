@@ -1,0 +1,533 @@
+"""Tests for usmcrypto
+
+Vectors come from the RFC or NIST publication named at each test, or from
+the SNMPv3 reference vectors. "Python-computed" vectors were produced with
+hashlib, hmac and the cryptography package, which share no code with
+mbedtls. Results are compared as hex for readable failures.
+"""
+
+import testing
+import usmcrypto
+from testutil import h, pseudo_random
+
+def zeros(n: int) -> bytes:
+    return b"\x00" * n
+
+def all_algs() -> list[int]:
+    return [usmcrypto.HASH_MD5, usmcrypto.HASH_SHA1, usmcrypto.HASH_SHA224,
+            usmcrypto.HASH_SHA256, usmcrypto.HASH_SHA384, usmcrypto.HASH_SHA512]
+
+def raises_value_error(f: (bytes, bytes, bytes) -> bytes, key: bytes, iv: bytes, data: bytes) -> bool:
+    try:
+        f(key, iv, data)
+        return False
+    except ValueError:
+        return True
+
+# --- hash ---------------------------------------------------------------------
+
+def _test_hash_kat() -> None:
+    # RFC 1321 A.5 (MD5); FIPS 180-2 appendices / NIST examples (SHA)
+    m448 = b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
+    m896 = b"abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu"
+    vectors: list[(int, bytes, str)] = [
+        (usmcrypto.HASH_MD5, b"", "d41d8cd98f00b204e9800998ecf8427e"),
+        (usmcrypto.HASH_MD5, b"abc", "900150983cd24fb0d6963f7d28e17f72"),
+        (usmcrypto.HASH_MD5, b"message digest", "f96b697d7cb7938d525a2f31aaf161d0"),
+        (usmcrypto.HASH_MD5, b"12345678901234567890123456789012345678901234567890123456789012345678901234567890",
+         "57edf4a22be3c955ac49da2e2107b67a"),
+        (usmcrypto.HASH_SHA1, b"", "da39a3ee5e6b4b0d3255bfef95601890afd80709"),
+        (usmcrypto.HASH_SHA1, b"abc", "a9993e364706816aba3e25717850c26c9cd0d89d"),
+        (usmcrypto.HASH_SHA1, m448, "84983e441c3bd26ebaae4aa1f95129e5e54670f1"),
+        (usmcrypto.HASH_SHA224, b"", "d14a028c2a3a2bc9476102bb288234c415a2b01f828ea62ac5b3e42f"),
+        (usmcrypto.HASH_SHA224, b"abc", "23097d223405d8228642a477bda255b32aadbce4bda0b3f7e36c9da7"),
+        (usmcrypto.HASH_SHA224, m448, "75388b16512776cc5dba5da1fd890150b0c6455cb4f58b1952522525"),
+        (usmcrypto.HASH_SHA256, b"", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+        (usmcrypto.HASH_SHA256, b"abc", "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
+        (usmcrypto.HASH_SHA256, m448, "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"),
+        (usmcrypto.HASH_SHA384, b"",
+         "38b060a751ac96384cd9327eb1b1e36a21fdb71114be07434c0cc7bf63f6e1da274edebfe76f65fbd51ad2f14898b95b"),
+        (usmcrypto.HASH_SHA384, b"abc",
+         "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7"),
+        (usmcrypto.HASH_SHA384, m896,
+         "09330c33f71147e83d192fc782cd1b4753111b173b3b05d22fa08086e3b0f712fcc7c71a557e2db966c3e9fa91746039"),
+        (usmcrypto.HASH_SHA512, b"",
+         "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e"),
+        (usmcrypto.HASH_SHA512, b"abc",
+         "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"),
+        (usmcrypto.HASH_SHA512, m896,
+         "8e959b75dae313da8cf4f72814fc143f8f7779c6eb9f7fa17299aeadb6889018501d289e4900f7e4331b99dec4b5433ac7d329eeb6dd26545e96e55b874be909"),
+    ]
+    for alg, data, want in vectors:
+        testing.assertEqual(usmcrypto.hash(alg, data).hex(), want, f"hash alg {alg}, {len(data)} bytes")
+
+def _test_output_lengths() -> None:
+    lengths = [16, 20, 28, 32, 48, 64]
+    for i, alg in enumerate(all_algs()):
+        testing.assertEqual(len(usmcrypto.hash(alg, b"d")), lengths[i], f"hash length for alg {alg}")
+        testing.assertEqual(len(usmcrypto.hmac(alg, b"k", b"d")), lengths[i], f"hmac length for alg {alg}")
+
+def _test_bad_alg_raises() -> None:
+    for alg in [0, 7, -1, 1000]:
+        try:
+            usmcrypto.hash(alg, b"d")
+            testing.error(f"hash({alg}) did not raise")
+        except ValueError:
+            pass
+        try:
+            usmcrypto.hmac(alg, b"k", b"d")
+            testing.error(f"hmac({alg}) did not raise")
+        except ValueError:
+            pass
+        try:
+            usmcrypto.password_to_key(alg, b"maplesyrup")
+            testing.error(f"password_to_key({alg}) did not raise")
+        except ValueError:
+            pass
+
+# --- hmac ---------------------------------------------------------------------
+
+def rfc2202_cases(key_len: int) -> list[(bytes, bytes)]:
+    """(key, data) of RFC 2202 test cases 1 to 7; key_len is 16 for MD5, 20 for SHA-1"""
+    return [
+        (b"\x0b" * key_len, b"Hi There"),
+        (b"Jefe", b"what do ya want for nothing?"),
+        (b"\xaa" * key_len, b"\xdd" * 50),
+        (h("0102030405060708090a0b0c0d0e0f10111213141516171819"), b"\xcd" * 50),
+        (b"\x0c" * key_len, b"Test With Truncation"),
+        (b"\xaa" * 80, b"Test Using Larger Than Block-Size Key - Hash Key First"),
+        (b"\xaa" * 80, b"Test Using Larger Than Block-Size Key and Larger Than One Block-Size Data"),
+    ]
+
+def _test_hmac_md5_rfc2202() -> None:
+    want = [
+        "9294727a3638bb1c13f48ef8158bfc9d",
+        "750c783e6ab0b503eaa86e310a5db738",
+        "56be34521d144c88dbb8c733f0e8b3f6",
+        "697eaf0aca3a3aea3a75164746ffaa79",
+        "56461ef2342edc00f9bab995690efd4c",
+        "6b1ab7fe4bd7bf8f0b62e6ce61b9d0cd",
+        "6f630fad67cda0ee1fb1f562db3aa53e",
+    ]
+    for i, case in enumerate(rfc2202_cases(16)):
+        key, data = case
+        testing.assertEqual(usmcrypto.hmac(usmcrypto.HASH_MD5, key, data).hex(), want[i], f"RFC 2202 MD5 case {i + 1}")
+
+def _test_hmac_sha1_rfc2202() -> None:
+    want = [
+        "b617318655057264e28bc0b6fb378c8ef146be00",
+        "effcdf6ae5eb2fa2d27416d5f184df9c259a7c79",
+        "125d7342b9ac11cd91a39af48aa17b4f63f175d3",
+        "4c9007f4026250c6bc8414f9bf50c86c2d7235da",
+        "4c1a03424b55e07fe7f27be1d58bb9324a9a5a04",
+        "aa4ae5e15272d00e95705637ce8a3b55ed402112",
+        "e8e99d0f45237d786d6bbaa7965c7808bbff1a91",
+    ]
+    for i, case in enumerate(rfc2202_cases(20)):
+        key, data = case
+        testing.assertEqual(usmcrypto.hmac(usmcrypto.HASH_SHA1, key, data).hex(), want[i], f"RFC 2202 SHA-1 case {i + 1}")
+
+def _test_hmac_sha2_rfc4231() -> None:
+    # RFC 4231 test cases 1 to 7. Case 5 publishes only the first 128 bits,
+    # so every result is compared on the length of the published value.
+    long_key = b"\xaa" * 131
+    cases: list[(bytes, bytes, list[str])] = [
+        (b"\x0b" * 20, b"Hi There", [
+            "896fb1128abbdf196832107cd49df33f47b4b1169912ba4f53684b22",
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7",
+            "afd03944d84895626b0825f4ab46907f15f9dadbe4101ec682aa034c7cebc59cfaea9ea9076ede7f4af152e8b2fa9cb6",
+            "87aa7cdea5ef619d4ff0b4241a1d6cb02379f4e2ce4ec2787ad0b30545e17cdedaa833b7d6b8a702038b274eaea3f4e4be9d914eeb61f1702e696c203a126854"]),
+        (b"Jefe", b"what do ya want for nothing?", [
+            "a30e01098bc6dbbf45690f3a7e9e6d0f8bbea2a39e6148008fd05e44",
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843",
+            "af45d2e376484031617f78d2b58a6b1b9c7ef464f5a01b47e42ec3736322445e8e2240ca5e69e2c78b3239ecfab21649",
+            "164b7a7bfcf819e2e395fbe73b56e0a387bd64222e831fd610270cd7ea2505549758bf75c05a994a6d034f65f8f0e6fdcaeab1a34d4a6b4b636e070a38bce737"]),
+        (b"\xaa" * 20, b"\xdd" * 50, [
+            "7fb3cb3588c6c1f6ffa9694d7d6ad2649365b0c1f65d69d1ec8333ea",
+            "773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe",
+            "88062608d3e6ad8a0aa2ace014c8a86f0aa635d947ac9febe83ef4e55966144b2a5ab39dc13814b94e3ab6e101a34f27",
+            "fa73b0089d56a284efb0f0756c890be9b1b5dbdd8ee81a3655f83e33b2279d39bf3e848279a722c806b485a47e67c807b946a337bee8942674278859e13292fb"]),
+        (h("0102030405060708090a0b0c0d0e0f10111213141516171819"), b"\xcd" * 50, [
+            "6c11506874013cac6a2abc1bb382627cec6a90d86efc012de7afec5a",
+            "82558a389a443c0ea4cc819899f2083a85f0faa3e578f8077a2e3ff46729665b",
+            "3e8a69b7783c25851933ab6290af6ca77a9981480850009cc5577c6e1f573b4e6801dd23c4a7d679ccf8a386c674cffb",
+            "b0ba465637458c6990e5a8c5f61d4af7e576d97ff94b872de76f8050361ee3dba91ca5c11aa25eb4d679275cc5788063a5f19741120c4f2de2adebeb10a298dd"]),
+        (b"\x0c" * 20, b"Test With Truncation", [
+            "0e2aea68a90c8d37c988bcdb9fca6fa8",
+            "a3b6167473100ee06e0c796c2955552b",
+            "3abf34c3503b2a23a46efc619baef897",
+            "415fad6271580a531d4179bc891d87a6"]),
+        (long_key, b"Test Using Larger Than Block-Size Key - Hash Key First", [
+            "95e9a0db962095adaebe9b2d6f0dbce2d499f112f2d2b7273fa6870e",
+            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54",
+            "4ece084485813e9088d2c63a041bc5b44f9ef1012a2b588f3cd11f05033ac4c60c2ef6ab4030fe8296248df163f44952",
+            "80b24263c7c1a3ebb71493c1dd7be8b49b46d1f41b4aeec1121b013783f8f3526b56d037e05f2598bd0fd2215d6a1e5295e64f73f63f0aec8b915a985d786598"]),
+        (long_key, b"This is a test using a larger than block-size key and a larger than block-size data. The key needs to be hashed before being used by the HMAC algorithm.", [
+            "3a854166ac5d9f023f54d517d0b39dbd946770db9c2b95c9f6f565d1",
+            "9b09ffa71b942fcb27635fbcd5b0e944bfdc63644f0713938a7f51535c3a35e2",
+            "6617178e941f020d351e2f254e8fd32c602420feb0b8fb9adccebb82461e99c5a678cc31e799176d3860e6110c46523e",
+            "e37b6a775dc87dbaa4dfa9f96e5e3ffddebd71f8867289865df5a32d20cdc944b6022cac3c4982b10d5eeb55c3e4de15134676fb6de0446065c97440fa8c6a58"]),
+    ]
+    algs = [usmcrypto.HASH_SHA224, usmcrypto.HASH_SHA256, usmcrypto.HASH_SHA384, usmcrypto.HASH_SHA512]
+    for i, case in enumerate(cases):
+        key, data, want = case
+        for j, alg in enumerate(algs):
+            mac = usmcrypto.hmac(alg, key, data)
+            testing.assertEqual(mac[:len(want[j]) // 2].hex(), want[j], f"RFC 4231 case {i + 1}, alg {alg}")
+
+def _test_hmac_fox() -> None:
+    # Widely published examples, Python-computed
+    data = b"The quick brown fox jumps over the lazy dog"
+    testing.assertEqual(usmcrypto.hmac(usmcrypto.HASH_MD5, b"key", data).hex(), "80070713463e7749b90c2dc24911e275")
+    testing.assertEqual(usmcrypto.hmac(usmcrypto.HASH_SHA1, b"key", data).hex(), "de7c9b85b8b78aa6bc8a7a36f70a90701c9db4d9")
+
+def _test_hmac_empty_key_and_data() -> None:
+    # Python-computed: hmac.new(b"", b"", alg)
+    want = [
+        "74e6f7298a9c2d168935f58c001bad88",
+        "fbdb1d1b18aa6c08324b7d64b71fb76370690e1d",
+        "5ce14f72894662213e2748d2a6ba234b74263910cedde2f5a9271524",
+        "b613679a0814d9ec772f95d778c35fc5ff1697c493715653c6c712144292c5ad",
+        "6c1f2ee938fad2e24bd91298474382ca218c75db3d83e114b3d4367776d14d3551289e75e8209cd4b792302840234adc",
+        "b936cee86c9f87aa5d3c6f2e84cb5a4239a5fe50480a6ec66b70ab5b1f4ac6730c6c515421b327ec1d69402e53dfb49ad7381eb067b338fd7b0cb22247225d47",
+    ]
+    for i, alg in enumerate(all_algs()):
+        testing.assertEqual(usmcrypto.hmac(alg, b"", b"").hex(), want[i], f"alg {alg}")
+
+# --- password_to_key ----------------------------------------------------------
+
+def expand(password: bytes) -> bytes:
+    """Return the RFC 3414 A.2 hash input: password repeated, cut to 1 MiB"""
+    return (password * (1048576 // len(password) + 1))[:1048576]
+
+def check_maplesyrup(alg: int, ku: str, kul: str) -> None:
+    # Ku, and Kul for engine ID 00..02 (localization is a plain hash()), from
+    # the maplesyrup vectors; the MD5 and SHA-1 rows are RFC 3414 A.3.1/A.3.2
+    engine_id = h("000000000000000000000002")
+    k = usmcrypto.password_to_key(alg, b"maplesyrup")
+    testing.assertEqual(k.hex(), ku, f"Ku, alg {alg}")
+    testing.assertEqual(usmcrypto.hash(alg, k + engine_id + k).hex(), kul, f"Kul, alg {alg}")
+
+def _test_password_to_key_md5() -> None:
+    check_maplesyrup(usmcrypto.HASH_MD5, "9faf3283884e92834ebc9847d8edd963", "526f5eed9fcce26f8964c2930787d82b")
+
+def _test_password_to_key_sha1() -> None:
+    check_maplesyrup(usmcrypto.HASH_SHA1, "9fb5cc0381497b3793528939ff788d5d79145211",
+                     "6695febc9288e36282235fc7151f128497b38f3f")
+
+def _test_password_to_key_sha224() -> None:
+    check_maplesyrup(usmcrypto.HASH_SHA224, "282a5867ee9aac639ad59df9572c7d3ac0fbc13a905b6df07dbbf00b",
+                     "0bd8827c6e29f8065e08e09237f177e410f69b90e1782be682075674")
+
+def _test_password_to_key_sha256() -> None:
+    check_maplesyrup(usmcrypto.HASH_SHA256, "ab51014d1e077f6017df2b12bee5f5aa72993177e9bb569c4dff5a4ca0b4afac",
+                     "8982e0e549e866db361a6b625d84cccc11162d453ee8ce3a6445c2d6776f0f8b")
+
+def _test_password_to_key_sha384() -> None:
+    check_maplesyrup(usmcrypto.HASH_SHA384,
+                     "e06eccdf2c68a06ed034723c9c26e0db3b669e1e2efed49150b55377a2e98f383c86fb836857444654b287c93f51ff64",
+                     "3b298f16164a11184279d5432bf169e2d2a48307de02b3d3f7e2b4f36eb6f0455a53689a3937eea07319a633d2ccba78")
+
+def _test_password_to_key_sha512() -> None:
+    check_maplesyrup(usmcrypto.HASH_SHA512,
+                     "7e4396de5aadc77be853819b98c9406265b3a9c37cc3176569847a4e4f6fba63dd3a73d04924d31a63f95a601f9385af6be4ed1b37f87d040f7c6ed6f8d38a91",
+                     "22a5a36cedfcc085807a128d7bc6c2382167ad6c0dbc5fdff856740f3d84c099ad1ea87a8db096714d9788bd544047c9021e4229ce27e4c0a69250adfcffbb0b")
+
+def _test_password_to_key_newsyrup() -> None:
+    # RFC 3414 A.5
+    testing.assertEqual(usmcrypto.password_to_key(usmcrypto.HASH_MD5, b"newsyrup").hex(), "01add273107c4e596b4b00f82b1d42a7")
+    testing.assertEqual(usmcrypto.password_to_key(usmcrypto.HASH_SHA1, b"newsyrup").hex(), "3a51a6d736aa347b83dc4a87e3e55ee4d698ac71")
+
+def _test_password_to_key_odd_lengths() -> None:
+    # Python-computed: hash of the 1 MiB expansion
+    testing.assertEqual(usmcrypto.password_to_key(usmcrypto.HASH_SHA1, b"a").hex(), "454027d64e3b855735552d42230eea1cbd645fa0")
+    password = bytes([(i * 7 + 3) % 256 for i in range(5000)])
+    testing.assertEqual(usmcrypto.password_to_key(usmcrypto.HASH_SHA256, password).hex(),
+                        "1ef103acbbe927ca8f48e165de15a61954ee39b1d94fce77e58ab2fe080417a3")
+
+def check_expansion(t: testing.SyncT, lengths: list[int]) -> None:
+    # Ku == hash(expansion of the password). The C code hashes the expansion
+    # in chunks; what can go wrong there depends on the password length, not
+    # on the hash, so the cheapest hashes are used.
+    t.timeout(20.0)
+    algs = [usmcrypto.HASH_MD5, usmcrypto.HASH_SHA1]
+    for i, n in enumerate(lengths):
+        alg = algs[i % len(algs)]
+        # a prime period keeps the password free of short repeats
+        password = (pseudo_random(4099, n) * (n // 4099 + 1))[:n]
+        testing.assertEqual(usmcrypto.password_to_key(alg, password).hex(), usmcrypto.hash(alg, expand(password)).hex(),
+                            f"password length {n}, alg {alg}")
+
+def _test_password_to_key_short_passwords(t: testing.SyncT) -> None:
+    # shorter and longer than the 4096-byte chunk the C code feeds the hash,
+    # dividing 1 MiB or not
+    check_expansion(t, [1, 3, 8, 63, 64, 65, 100, 2049, 4095, 4096, 4097, 5000])
+
+def _test_password_to_key_long_passwords(t: testing.SyncT) -> None:
+    # 1 MiB or longer: only the first 1 MiB counts
+    check_expansion(t, [1048575, 1048576, 1048577, 3 * 1048576 + 5])
+
+def _test_password_to_key_periodic_passwords() -> None:
+    # RFC 3414 11.2: "bertbert" and "bertbertbert" expand to the same 1 MiB
+    a = usmcrypto.password_to_key(usmcrypto.HASH_SHA1, b"bertbert")
+    testing.assertEqual(a.hex(), usmcrypto.password_to_key(usmcrypto.HASH_SHA1, b"bertbertbert").hex())
+    testing.assertNotEqual(a.hex(), usmcrypto.password_to_key(usmcrypto.HASH_SHA1, b"bertbertber").hex())
+
+def _test_password_to_key_empty_password_raises() -> None:
+    for alg in all_algs():
+        try:
+            usmcrypto.password_to_key(alg, b"")
+            testing.error(f"password_to_key({alg}, empty) did not raise")
+        except ValueError as e:
+            testing.assertEqual(e.error_message, "usmcrypto: password_to_key: password must not be empty")
+
+# --- DES and 3DES -------------------------------------------------------------
+
+# The 49-byte ScopedPDU of the worked encryption examples
+SCOPED_PDU = "302f040d80001f888001020304050607080400a01c02040a0b0c0d020100020100300e300c06082b060102010101000500"
+
+def _test_des_cbc_fips81() -> None:
+    # FIPS 81 appendix C, CBC example
+    key = h("0123456789abcdef")
+    iv = h("1234567890abcdef")
+    plain = b"Now is the time for all "
+    cipher = "e5c7cdde872bf27c43e934008c389c0f683788499a7c05f6"
+    testing.assertEqual(usmcrypto.des_cbc_encrypt(key, iv, plain).hex(), cipher)
+    testing.assertEqual(usmcrypto.des_cbc_decrypt(key, iv, h(cipher)), plain)
+
+def _test_des_cbc_usm_vector() -> None:
+    # V-MD5-DES: DES key and IV = preIV XOR salt, plaintext
+    # zero-padded to 56 bytes
+    key = h("fc39a1c3d0320990")
+    iv = h("e2f15aa213721fd1")
+    plain = h(SCOPED_PDU) + zeros(7)
+    cipher = "28468e6066b2c3d978d5232f7f7e56785d793d927d63c15db32b6afd75589c1ec76ce216b5d4b8a40c9178ddee5f9915c79a24204d99f04b"
+    testing.assertEqual(usmcrypto.des_cbc_encrypt(key, iv, plain).hex(), cipher)
+    testing.assertEqual(usmcrypto.des_cbc_decrypt(key, iv, h(cipher)).hex(), plain.hex())
+
+def _test_des3_cbc_usm_vector() -> None:
+    # 3DES with SHA (Reeder-extended key): K1|K2|K3 and
+    # IV = preIV XOR salt, plaintext zero-padded to 56 bytes
+    key = h("d4b1c141c3730f4c2c41c7b686a631c352f66305e82d4dd8")
+    iv = h("e2cb43fec22278e7")
+    plain = h(SCOPED_PDU) + zeros(7)
+    cipher = "84763491a07f02ea6dbe7fd4cb800caec757fbec1ff4b60d190689ad62109b5190ca5d3d18588ef8f5fac265abbef6733e889043dddca89b"
+    testing.assertEqual(usmcrypto.des3_cbc_encrypt(key, iv, plain).hex(), cipher)
+    testing.assertEqual(usmcrypto.des3_cbc_decrypt(key, iv, h(cipher)).hex(), plain.hex())
+
+def _test_des3_with_equal_keys_is_des() -> None:
+    # EDE with K1 = K2 = K3 reduces to single DES
+    key = h("0123456789abcdef")
+    iv = h("1234567890abcdef")
+    plain = pseudo_random(64, 3)
+    cipher = usmcrypto.des_cbc_encrypt(key, iv, plain)
+    testing.assertEqual(usmcrypto.des3_cbc_encrypt(key + key + key, iv, plain).hex(), cipher.hex())
+    testing.assertEqual(usmcrypto.des3_cbc_decrypt(key + key + key, iv, cipher).hex(), plain.hex())
+
+# --- AES-CFB128 ---------------------------------------------------------------
+
+def check_sp800_38a(key: str, cipher: str) -> None:
+    # NIST SP 800-38A F.3.13 to F.3.18 share the IV and the plaintext
+    iv = h("000102030405060708090a0b0c0d0e0f")
+    plain = "6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e5130c81c46a35ce411e5fbc1191a0a52eff69f2445df4f9b17ad2b417be66c3710"
+    testing.assertEqual(usmcrypto.aes_cfb128_encrypt(h(key), iv, h(plain)).hex(), cipher, "encrypt")
+    testing.assertEqual(usmcrypto.aes_cfb128_decrypt(h(key), iv, h(cipher)).hex(), plain, "decrypt")
+
+def _test_aes128_cfb128_sp800_38a() -> None:
+    # F.3.13 CFB128-AES128.Encrypt, F.3.14 CFB128-AES128.Decrypt
+    check_sp800_38a("2b7e151628aed2a6abf7158809cf4f3c",
+                    "3b3fd92eb72dad20333449f8e83cfb4ac8a64537a0b3a93fcde3cdad9f1ce58b26751f67a3cbb140b1808cf187a4f4dfc04b05357c5d1c0eeac4c66f9ff7f2e6")
+
+def _test_aes192_cfb128_sp800_38a() -> None:
+    # F.3.15 CFB128-AES192.Encrypt, F.3.16 CFB128-AES192.Decrypt
+    check_sp800_38a("8e73b0f7da0e6452c810f32b809079e562f8ead2522c6b7b",
+                    "cdc80d6fddf18cab34c25909c99a417467ce7f7f81173621961a2b70171d3d7a2e1e8a1dd59b88b1c8e60fed1efac4c9c05f9f9ca9834fa042ae8fba584b09ff")
+
+def _test_aes256_cfb128_sp800_38a() -> None:
+    # F.3.17 CFB128-AES256.Encrypt, F.3.18 CFB128-AES256.Decrypt
+    check_sp800_38a("603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4",
+                    "dc7e84bfda79164b7ecd8486985d386039ffed143b28b1c832113c6331e5407bdf10132415e54b92a13ed0a8267ae2f975a385741ab9cef82031623d55b1e471")
+
+def _test_aes_cfb128_usm_vectors() -> None:
+    # IV = boots | time | salt; the 49-byte plaintext ends
+    # in a partial block, which CFB encrypts without padding
+    plain = h(SCOPED_PDU)
+    vectors: list[(str, str, str)] = [
+        # V-SHA-AES (AES-128)
+        ("d4b1c141c3730f4c2c41c7b686a631c3", "0000000100000096deadbeef00000001",
+         "de46c1433b208b758146de11e079276ee206bab469d6ce21038348f198816b713439d9e58ac5b4b2b45044c7e38c6a50ad"),
+        # V-SHA-AES256-BLUMENTHAL
+        ("d4b1c141c3730f4c2c41c7b686a631c352f663050519c4a879c36c1d75641535", "0000000100000096deadbeef00000004",
+         "b0b1388a10dd06ed7e9001f7be3fe765f8cfcc39780e43260f8cf10dc82dacba69fea90096724237b279da96eb01771f5b"),
+        # V-SHA-AES256C-REEDER
+        ("d4b1c141c3730f4c2c41c7b686a631c352f66305e82d4dd8e2cb43ffc22278cb", "0000000100000096deadbeef00000005",
+         "d36f8dda3098977e766a64088f2ca41c63858c002d198dbd50d1324a0d21888fcf013625023657588401df41961e1c8329"),
+        # AES192 with SHA-256
+        ("73969a6de41a3b4562c6bc74735fb4317b8f8dc4e0b12d44", "0000000100000096deadbeef00000006",
+         "d971a70d2d9814e69d3e39091a0fba374f939619f3f633a7ba6d9eed516c0228a2665fa84333093b61ae1d7e37e2aa2248"),
+    ]
+    for key, iv, cipher in vectors:
+        testing.assertEqual(usmcrypto.aes_cfb128_encrypt(h(key), h(iv), plain).hex(), cipher, f"encrypt, key {key}")
+        testing.assertEqual(usmcrypto.aes_cfb128_decrypt(h(key), h(iv), h(cipher)).hex(), SCOPED_PDU, f"decrypt, key {key}")
+
+def _test_aes_cfb128_is_a_stream_cipher() -> None:
+    # Every prefix of the plaintext encrypts to the same prefix of the
+    # ciphertext: no padding, no state kept between calls
+    key = pseudo_random(16, 11)
+    iv = pseudo_random(16, 12)
+    plain = pseudo_random(70, 13)
+    cipher = usmcrypto.aes_cfb128_encrypt(key, iv, plain)
+    for n in range(len(plain) + 1):
+        testing.assertEqual(usmcrypto.aes_cfb128_encrypt(key, iv, plain[:n]).hex(), cipher[:n].hex(), f"encrypt {n} bytes")
+        testing.assertEqual(usmcrypto.aes_cfb128_decrypt(key, iv, cipher[:n]).hex(), plain[:n].hex(), f"decrypt {n} bytes")
+
+# --- all ciphers --------------------------------------------------------------
+
+def check_round_trip(name: str, enc: (bytes, bytes, bytes) -> bytes, dec: (bytes, bytes, bytes) -> bytes,
+                     key: bytes, iv: bytes, plain: bytes) -> None:
+    cipher = enc(key, iv, plain)
+    what = f"{name}, key {len(key)} bytes, data {len(plain)} bytes"
+    testing.assertEqual(len(cipher), len(plain), what)
+    testing.assertEqual(dec(key, iv, cipher).hex(), plain.hex(), what)
+    if len(plain) > 0:
+        testing.assertNotEqual(cipher.hex(), plain.hex(), what)
+        # a different key or IV gives different output
+        other_key = key[:-1] + bytes([key[-1] ^ 0x80])
+        other_iv = iv[:-1] + bytes([iv[-1] ^ 0x80])
+        testing.assertNotEqual(enc(other_key, iv, plain).hex(), cipher.hex(), what)
+        testing.assertNotEqual(enc(key, other_iv, plain).hex(), cipher.hex(), what)
+        testing.assertNotEqual(dec(other_key, iv, cipher).hex(), plain.hex(), what)
+
+def _test_cipher_round_trips() -> None:
+    for n in [0, 8, 16, 48, 1024]:
+        plain = pseudo_random(n, n + 1)
+        check_round_trip("des", usmcrypto.des_cbc_encrypt, usmcrypto.des_cbc_decrypt,
+                         pseudo_random(8, 21), pseudo_random(8, 22), plain)
+        check_round_trip("des3", usmcrypto.des3_cbc_encrypt, usmcrypto.des3_cbc_decrypt,
+                         pseudo_random(24, 23), pseudo_random(8, 24), plain)
+    for n in [0, 1, 15, 16, 17, 31, 32, 33, 49, 1000]:
+        plain = pseudo_random(n, n + 2)
+        for key_len in [16, 24, 32]:
+            check_round_trip("aes", usmcrypto.aes_cfb128_encrypt, usmcrypto.aes_cfb128_decrypt,
+                             pseudo_random(key_len, key_len), pseudo_random(16, 25), plain)
+
+def check_repeatable(name: str, f: (bytes, bytes, bytes) -> bytes, key: bytes, iv: bytes, data: bytes) -> None:
+    first = f(key, iv, data)
+    testing.assertEqual(f(key, iv, data).hex(), first.hex(), name)
+
+def _test_ciphers_leave_iv_unchanged() -> None:
+    # mbedtls advances the IV in place; the C side must work on a copy. Two
+    # calls with the same iv object give the same result, and iv keeps its value.
+    iv8 = h("0001020304050607")
+    iv16 = h("000102030405060708090a0b0c0d0e0f")
+    key = pseudo_random(32, 5)
+    data = pseudo_random(40, 6)
+    check_repeatable("des_cbc_encrypt", usmcrypto.des_cbc_encrypt, key[:8], iv8, data)
+    check_repeatable("des_cbc_decrypt", usmcrypto.des_cbc_decrypt, key[:8], iv8, data)
+    check_repeatable("des3_cbc_encrypt", usmcrypto.des3_cbc_encrypt, key[:24], iv8, data)
+    check_repeatable("des3_cbc_decrypt", usmcrypto.des3_cbc_decrypt, key[:24], iv8, data)
+    check_repeatable("aes_cfb128_encrypt", usmcrypto.aes_cfb128_encrypt, key, iv16, data)
+    check_repeatable("aes_cfb128_decrypt", usmcrypto.aes_cfb128_decrypt, key, iv16, data)
+    testing.assertEqual(iv8.hex(), "0001020304050607")
+    testing.assertEqual(iv16.hex(), "000102030405060708090a0b0c0d0e0f")
+
+def _test_des_bad_lengths_raise() -> None:
+    fs: list[(bytes, bytes, bytes) -> bytes] = [usmcrypto.des_cbc_encrypt, usmcrypto.des_cbc_decrypt]
+    for f in fs:
+        for n in [0, 7, 9, 16, 24]:
+            testing.assertTrue(raises_value_error(f, zeros(n), zeros(8), zeros(16)), f"key length {n}")
+        for n in [0, 7, 9, 16]:
+            testing.assertTrue(raises_value_error(f, zeros(8), zeros(n), zeros(16)), f"iv length {n}")
+        for n in [1, 7, 9, 15, 17]:
+            testing.assertTrue(raises_value_error(f, zeros(8), zeros(8), zeros(n)), f"data length {n}")
+
+def _test_des3_bad_lengths_raise() -> None:
+    fs: list[(bytes, bytes, bytes) -> bytes] = [usmcrypto.des3_cbc_encrypt, usmcrypto.des3_cbc_decrypt]
+    for f in fs:
+        for n in [0, 8, 16, 23, 25, 32]:
+            testing.assertTrue(raises_value_error(f, zeros(n), zeros(8), zeros(16)), f"key length {n}")
+        for n in [0, 7, 9, 16]:
+            testing.assertTrue(raises_value_error(f, zeros(24), zeros(n), zeros(16)), f"iv length {n}")
+        for n in [1, 7, 12, 23]:
+            testing.assertTrue(raises_value_error(f, zeros(24), zeros(8), zeros(n)), f"data length {n}")
+
+def _test_aes_bad_lengths_raise() -> None:
+    fs: list[(bytes, bytes, bytes) -> bytes] = [usmcrypto.aes_cfb128_encrypt, usmcrypto.aes_cfb128_decrypt]
+    for f in fs:
+        for n in [0, 8, 15, 17, 20, 23, 25, 31, 33, 64]:
+            testing.assertTrue(raises_value_error(f, zeros(n), zeros(16), zeros(16)), f"key length {n}")
+        for n in [0, 8, 15, 17, 32]:
+            testing.assertTrue(raises_value_error(f, zeros(16), zeros(n), zeros(16)), f"iv length {n}")
+
+def _test_cipher_error_messages() -> None:
+    try:
+        usmcrypto.des_cbc_decrypt(zeros(8), zeros(8), zeros(7))
+        testing.error("did not raise")
+    except ValueError as e:
+        testing.assertEqual(e.error_message, "usmcrypto: des_cbc_decrypt: data length must be a multiple of 8, got 7")
+    try:
+        usmcrypto.des3_cbc_encrypt(zeros(16), zeros(8), zeros(8))
+        testing.error("did not raise")
+    except ValueError as e:
+        testing.assertEqual(e.error_message, "usmcrypto: des3_cbc_encrypt: key must be 24 bytes, got 16")
+    try:
+        usmcrypto.aes_cfb128_decrypt(zeros(20), zeros(16), b"")
+        testing.error("did not raise")
+    except ValueError as e:
+        testing.assertEqual(e.error_message, "usmcrypto: aes_cfb128_decrypt: key must be 16, 24 or 32 bytes, got 20")
+    try:
+        usmcrypto.aes_cfb128_encrypt(zeros(16), zeros(8), b"")
+        testing.error("did not raise")
+    except ValueError as e:
+        testing.assertEqual(e.error_message, "usmcrypto: aes_cfb128_encrypt: iv must be 16 bytes, got 8")
+
+# --- ct_equal -----------------------------------------------------------------
+
+def _test_ct_equal() -> None:
+    mac = h("f559bb6bc446b77acb582af5")
+    testing.assertTrue(usmcrypto.ct_equal(mac, h("f559bb6bc446b77acb582af5")))
+    testing.assertTrue(usmcrypto.ct_equal(b"", b""))
+    testing.assertFalse(usmcrypto.ct_equal(mac, h("f459bb6bc446b77acb582af5")), "first byte differs")
+    testing.assertFalse(usmcrypto.ct_equal(mac, h("f559bb6bc446b77acb582af4")), "last byte differs")
+    testing.assertFalse(usmcrypto.ct_equal(mac, zeros(12)), "all bytes differ")
+    testing.assertFalse(usmcrypto.ct_equal(mac, mac[:11]), "b is a prefix of a")
+    testing.assertFalse(usmcrypto.ct_equal(mac[:11], mac), "a is a prefix of b")
+    testing.assertFalse(usmcrypto.ct_equal(mac, b""), "b empty")
+    testing.assertFalse(usmcrypto.ct_equal(b"", mac), "a empty")
+
+def _test_ct_equal_every_byte_position() -> None:
+    a = pseudo_random(64, 9)
+    for i in range(len(a)):
+        for bit in [0x01, 0x80]:
+            b = a[:i] + bytes([a[i] ^ bit]) + a[i + 1:]
+            testing.assertFalse(usmcrypto.ct_equal(a, b), f"byte {i}, bit {bit}")
+
+# --- random_bytes -------------------------------------------------------------
+
+def _test_random_bytes() -> None:
+    testing.assertEqual(len(usmcrypto.random_bytes(0)), 0)
+    testing.assertEqual(len(usmcrypto.random_bytes(1)), 1)
+    testing.assertEqual(len(usmcrypto.random_bytes(8)), 8)
+    testing.assertEqual(len(usmcrypto.random_bytes(100000)), 100000)
+    a = usmcrypto.random_bytes(300)     # more than one getentropy() call
+    b = usmcrypto.random_bytes(300)
+    testing.assertEqual(len(a), 300)
+    testing.assertNotEqual(a, b, "two 300-byte draws are equal", print_vals=False)
+
+def _test_random_bytes_spread() -> None:
+    # 4096 uniform bytes leave on average 256 * (255/256)**4096 < 0.0001 of
+    # the 256 byte values unseen, so fewer than 200 distinct values means a
+    # broken source
+    r = usmcrypto.random_bytes(4096)
+    testing.assertTrue(len(set(r)) >= 200, f"only {len(set(r))} distinct byte values")
+    # each 256-byte getentropy() chunk is filled
+    for start in range(0, 4096, 256):
+        testing.assertNotEqual(r[start:start + 32].hex(), zeros(32).hex(), f"chunk at {start}")
+
+def _test_random_bytes_bad_n_raises() -> None:
+    for n in [-1, -1000, 1 << 62]:
+        try:
+            usmcrypto.random_bytes(n)
+            testing.error(f"random_bytes({n}) did not raise")
+        except ValueError:
+            pass

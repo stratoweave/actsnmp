@@ -1,0 +1,444 @@
+"""BER primitives for SNMP (the X.690 subset of RFC 3417 section 8)
+
+Encoders build bytes bottom-up: content first, then the tag and length are
+prefixed. Single octets come from BYTE_TABLE and pieces are joined with
+b"".join. Encoding is strict: minimal lengths and integers, valid ranges,
+otherwise errors.EncodeError.
+
+Decoders work on (buf, pos, end) offsets and only slice the leaf values the
+caller keeps. A TLV is described by its content range [start, stop); the
+next TLV starts at stop. Decoding is lenient where net-snmp is (non-minimal
+lengths and integers, unsigned values sent as negative two's complement, OID
+sub-identifiers with 0x80 padding) and strict about structure. Every
+malformed input raises errors.DecodeError and nothing else. Hard limits:
+long-form lengths of at most 4 octets, no indefinite length, single-octet
+tags only, INTEGER content of at most 9 octets, unsigned32 values up to
+2^32-1, Counter64 content of at most 9 octets, OIDs of at most 128 arcs of at
+most 2^32-1 each, and at most MAX_DEPTH levels of nested TLVs (dump).
+"""
+
+import errors
+
+TAG_INTEGER = 0x02
+TAG_OCTET_STRING = 0x04
+TAG_NULL = 0x05
+TAG_OID = 0x06
+TAG_SEQUENCE = 0x30
+TAG_IPADDRESS = 0x40
+TAG_COUNTER32 = 0x41
+TAG_GAUGE32 = 0x42
+TAG_TIMETICKS = 0x43
+TAG_OPAQUE = 0x44
+TAG_NSAP = 0x45
+TAG_COUNTER64 = 0x46
+TAG_UINTEGER32 = 0x47
+TAG_NO_SUCH_OBJECT = 0x80
+TAG_NO_SUCH_INSTANCE = 0x81
+TAG_END_OF_MIB_VIEW = 0x82
+
+# Hard limits (RFC 3416 section 4.1, RFC 2578 section 7.1.3)
+MAX_DEPTH = 16
+MAX_OID_ARCS = 128
+MAX_ARC = 4294967295
+
+# BYTE_TABLE[i] == bytes([i]), built once: the cheapest way to get one octet.
+BYTE_TABLE: list[bytes] = [bytes([i]) for i in range(256)]
+
+
+# Encoding ##########################################################################################
+
+def enc_length(n: int) -> bytes:
+    """Return the minimal definite-form length octets for a content length n
+
+    Raises EncodeError if n is negative or does not fit in 4 length octets.
+    """
+    if n < 0x80:
+        if n < 0:
+            raise errors.EncodeError("negative length %d" % n)
+        return BYTE_TABLE[n]
+    if n <= 0xff:
+        return BYTE_TABLE[0x81] + BYTE_TABLE[n]
+    if n <= 0xffff:
+        return b"".join([BYTE_TABLE[0x82], BYTE_TABLE[n >> 8], BYTE_TABLE[n & 0xff]])
+    if n <= 0xffffff:
+        return b"".join([BYTE_TABLE[0x83], BYTE_TABLE[n >> 16], BYTE_TABLE[(n >> 8) & 0xff], BYTE_TABLE[n & 0xff]])
+    if n <= 0xffffffff:
+        return b"".join([BYTE_TABLE[0x84], BYTE_TABLE[n >> 24], BYTE_TABLE[(n >> 16) & 0xff],
+                         BYTE_TABLE[(n >> 8) & 0xff], BYTE_TABLE[n & 0xff]])
+    raise errors.EncodeError("length %d does not fit in 4 octets" % n)
+
+def enc_header(tag: int, n: int) -> bytes:
+    """Return the identifier and length octets of a TLV with tag and content length n
+
+    tag must be a single-octet tag (0..255, not the high-tag-number form
+    xxx11111), otherwise EncodeError.
+    """
+    if tag < 0 or tag > 0xff or (tag & 0x1f) == 0x1f:
+        raise errors.EncodeError("invalid tag %d" % tag)
+    if n < 0x80 and n >= 0:
+        return BYTE_TABLE[tag] + BYTE_TABLE[n]
+    return BYTE_TABLE[tag] + enc_length(n)
+
+def enc_tlv(tag: int, content: bytes) -> bytes:
+    """Return the TLV with tag and content"""
+    return enc_header(tag, len(content)) + content
+
+def enc_int_content(v: int) -> bytes:
+    """Return the minimal two's complement content octets of v (1 to 8 octets)"""
+    top: int = v & 0xff                 # most significant octet emitted so far
+    out = BYTE_TABLE[top]
+    x: int = v >> 8                     # arithmetic shift: ends at 0 or -1
+    while not ((x == 0 and top < 0x80) or (x == -1 and top >= 0x80)):
+        top = x & 0xff
+        out = BYTE_TABLE[top] + out
+        x >>= 8
+    return out
+
+def enc_uint_content(v: int) -> bytes:
+    """Return the content octets of an unsigned32 value (Counter32, Gauge32, TimeTicks)
+
+    The encoding is the minimal two's complement of the non-negative value, so
+    it has a leading 0x00 octet when the top bit of the magnitude is set.
+    Raises EncodeError unless 0 <= v <= 2^32-1.
+    """
+    if v < 0 or v > 0xffffffff:
+        raise errors.EncodeError("unsigned32 value out of range: %d" % v)
+    return enc_int_content(v)
+
+def enc_u64_content(v: u64) -> bytes:
+    """Return the content octets of a Counter64 value (1 to 9 octets)"""
+    if v <= u64(0x7fffffffffffffff):
+        return enc_int_content(int(v))
+    parts: list[bytes] = [BYTE_TABLE[0]]
+    for i in range(7, -1, -1):
+        parts.append(BYTE_TABLE[int((v >> (8 * i)) & u64(0xff))])
+    return b"".join(parts)
+
+def _put_subid(parts: list[bytes], v: int) -> None:
+    """Append the base-128 octets of one OID sub-identifier (0 <= v < 2^35) to parts"""
+    if v < 0x80:
+        parts.append(BYTE_TABLE[v])
+        return
+    shift: int = 28 if v >= 0x10000000 else 21 if v >= 0x200000 else 14 if v >= 0x4000 else 7
+    while shift > 0:
+        parts.append(BYTE_TABLE[0x80 | ((v >> shift) & 0x7f)])
+        shift -= 7
+    parts.append(BYTE_TABLE[v & 0x7f])
+
+def put_oid_content(parts: list[bytes], arcs: list[int]) -> int:
+    """Append the content octets of an OBJECT IDENTIFIER to parts; return how many octets were appended
+
+    For encoders that collect a whole structure in one list and join it
+    once. Raises EncodeError like enc_oid_content, possibly after appending
+    some octets.
+    """
+    n = len(arcs)
+    if n < 2:
+        raise errors.EncodeError("OID needs at least 2 arcs, got %d" % n)
+    if n > MAX_OID_ARCS:
+        raise errors.EncodeError("OID has %d arcs, at most %d allowed" % (n, MAX_OID_ARCS))
+    a0 = arcs[0]
+    a1 = arcs[1]
+    if a0 < 0 or a0 > 2:
+        raise errors.EncodeError("first OID arc must be 0, 1 or 2, got %d" % a0)
+    if a1 < 0 or (a0 < 2 and a1 > 39):
+        raise errors.EncodeError("second OID arc out of range: %d" % a1)
+    # compared before adding: 40 * a0 + a1 wraps around for a1 near 2^63
+    if a1 > MAX_ARC - a0 * 40:
+        raise errors.EncodeError("first OID sub-identifier %d * 40 + %d exceeds 2^32-1" % (a0, a1))
+    k0 = len(parts)
+    _put_subid(parts, a0 * 40 + a1)
+    t = BYTE_TABLE
+    for i in range(2, n):
+        a = arcs[i]
+        if a < 0x80:
+            if a < 0:
+                raise errors.EncodeError("OID arc out of range: %d" % a)
+            parts.append(t[a])
+        else:
+            if a > MAX_ARC:
+                raise errors.EncodeError("OID arc out of range: %d" % a)
+            _put_subid(parts, a)
+    return len(parts) - k0
+
+def enc_oid_content(arcs: list[int]) -> bytes:
+    """Return the content octets of an OBJECT IDENTIFIER
+
+    Raises EncodeError for fewer than 2 or more than 128 arcs, a first arc
+    other than 0, 1 or 2, a second arc above 39 under 0 or 1, an arc outside
+    0..2^32-1, or a first sub-identifier (40 * first + second) above 2^32-1,
+    which no decoder (this one or net-snmp's) accepts.
+    """
+    parts: list[bytes] = []
+    put_oid_content(parts, arcs)
+    return b"".join(parts)
+
+def check_range(v: int, lo: int, hi: int, what: str) -> None:
+    """Raise EncodeError unless lo <= v <= hi; what names the field in the message
+
+    The encode-side counterpart of read_integer, for fields whose ASN.1
+    type is a subrange of INTEGER (request-id, msgID, engine boots, ...).
+    """
+    if v < lo or v > hi:
+        raise errors.EncodeError("%s out of range: %d" % (what, v))
+
+def enc_integer(v: int) -> bytes:
+    """Return an INTEGER TLV for any 64-bit v (callers check narrower ranges, see check_range)"""
+    return enc_tlv(TAG_INTEGER, enc_int_content(v))
+
+def enc_octets(tag: int, b: bytes) -> bytes:
+    """Return a primitive TLV with tag whose content is b (OCTET STRING, IpAddress, Opaque, ...)"""
+    return enc_tlv(tag, b)
+
+def enc_null() -> bytes:
+    """Return the NULL TLV 05 00"""
+    return b"\x05\x00"
+
+def enc_sequence(tag: int, parts: list[bytes]) -> bytes:
+    """Return a constructed TLV with tag whose content is the concatenation of parts"""
+    content = b"".join(parts)
+    return enc_header(tag, len(content)) + content
+
+
+# Decoding ##########################################################################################
+
+def check_bounds(buf: bytes, pos: int, end: int) -> None:
+    """Raise DecodeError unless 0 <= pos <= end <= len(buf)"""
+    if pos < 0 or end > len(buf) or pos > end:
+        raise errors.DecodeError("range [%d, %d) outside a buffer of %d octets" % (pos, end, len(buf)), pos)
+
+def _length(buf: bytes, pos: int, end: int) -> (int, int):
+    # length octets at pos, already bounds-checked by the caller: pos <= end <= len(buf)
+    if pos >= end:
+        raise errors.DecodeError("missing length octets", pos)
+    first = buf[pos]
+    if first < 0x80:
+        if pos + 1 + first > end:
+            raise errors.DecodeError("length %d exceeds the enclosing structure" % first, pos)
+        return (pos + 1, pos + 1 + first)
+    if first == 0x80:
+        raise errors.DecodeError("indefinite length", pos)
+    if first > 0x84:
+        raise errors.DecodeError("unsupported length form 0x%02x" % first, pos)
+    start = pos + 1 + (first & 0x7f)
+    if start > end:
+        raise errors.DecodeError("truncated length octets", pos)
+    n: int = 0
+    for i in range(pos + 1, start):
+        n = n * 256 + buf[i]
+    if start + n > end:
+        raise errors.DecodeError("length %d exceeds the enclosing structure" % n, pos)
+    return (start, start + n)
+
+def read_length(buf: bytes, pos: int, end: int) -> (int, int):
+    """Decode the length octets at pos; return the content range [start, stop)
+
+    Accepts the short form and the long form with 1 to 4 octets, also when
+    non-minimal. Rejects the indefinite form and lengths beyond end.
+    """
+    check_bounds(buf, pos, end)
+    return _length(buf, pos, end)
+
+def read_tlv(buf: bytes, pos: int, end: int) -> (int, int, int):
+    """Decode the TLV header at pos; return its tag and content range [start, stop)
+
+    The next TLV starts at stop. Raises DecodeError when pos is at or beyond
+    end, for the high-tag-number form, and for every invalid length (see
+    read_length).
+    """
+    check_bounds(buf, pos, end)
+    if pos >= end:
+        raise errors.DecodeError("truncated: TLV expected", pos)
+    tag = buf[pos]
+    if (tag & 0x1f) == 0x1f:
+        raise errors.DecodeError("high-tag-number form 0x%02x not supported" % tag, pos)
+    if pos + 1 < end:
+        first = buf[pos + 1]
+        if first < 0x80 and pos + 2 + first <= end:
+            return (tag, pos + 2, pos + 2 + first)     # short form, the common case
+    start, stop = _length(buf, pos + 1, end)
+    return (tag, start, stop)
+
+def expect_tlv(buf: bytes, pos: int, end: int, tag: int) -> (int, int):
+    """Like read_tlv, but the TLV must have the given tag; return its content range"""
+    t, start, stop = read_tlv(buf, pos, end)
+    if t != tag:
+        raise errors.DecodeError("expected tag 0x%02x, got 0x%02x" % (tag, t), pos)
+    return (start, stop)
+
+def dec_int(buf: bytes, start: int, stop: int) -> int:
+    """Decode INTEGER content octets as a signed 64-bit value
+
+    Redundant leading 0x00/0xff octets are accepted, so the content may be 1
+    to 9 octets long; it must represent a value in the int range.
+    """
+    check_bounds(buf, start, stop)
+    n = stop - start
+    if n < 1:
+        raise errors.DecodeError("empty INTEGER", start)
+    first = buf[start]
+    if n > 9 or (n == 9 and not ((first == 0 and buf[start + 1] < 0x80) or (first == 0xff and buf[start + 1] >= 0x80))):
+        raise errors.DecodeError("INTEGER of %d octets out of range" % n, start)
+    v: int = first - 256 if first >= 0x80 else first
+    for i in range(start + 1, stop):
+        v = v * 256 + buf[i]
+    return v
+
+def read_integer(buf: bytes, pos: int, end: int, lo: int, hi: int, what: str) -> (int, int):
+    """Decode the INTEGER TLV at pos (not beyond end); return its value and the position after it
+
+    A building block for the PDU and message decoders. Raises DecodeError if
+    there is no well-formed INTEGER TLV at pos or its value is outside
+    lo..hi; what names the field in the error.
+    """
+    start, stop = expect_tlv(buf, pos, end, TAG_INTEGER)
+    v = dec_int(buf, start, stop)
+    if v < lo or v > hi:
+        raise errors.DecodeError("%s out of range: %d" % (what, v), start)
+    return (v, stop)
+
+def dec_uint32(buf: bytes, start: int, stop: int) -> int:
+    """Decode the content octets of Counter32, Gauge32/Unsigned32 or TimeTicks
+
+    Like net-snmp, the octets are read as two's complement and the result is
+    masked to 32 bits, so agents that send 4294967295 as ff ff ff ff (or any
+    32-bit pattern as a negative number) are understood. Any number of
+    leading zero octets is accepted. Values outside -2^31..2^32-1 and negative
+    forms longer than 5 octets raise DecodeError.
+    """
+    check_bounds(buf, start, stop)
+    n = stop - start
+    if n < 1:
+        raise errors.DecodeError("empty unsigned integer", start)
+    first = buf[start]
+    if first >= 0x80:
+        if n > 5:
+            raise errors.DecodeError("unsigned integer of %d octets out of range" % n, start)
+        neg: int = first - 256
+        for i in range(start + 1, stop):
+            neg = neg * 256 + buf[i]
+        if neg < -0x80000000:
+            raise errors.DecodeError("unsigned integer out of range: %d" % neg, start)
+        return neg & 0xffffffff
+    i: int = start
+    while i < stop and buf[i] == 0:
+        i += 1
+    if stop - i > 4:
+        raise errors.DecodeError("unsigned integer exceeds 2^32-1", start)
+    v: int = 0
+    for j in range(i, stop):
+        v = v * 256 + buf[j]
+    return v
+
+def dec_u64(buf: bytes, start: int, stop: int) -> u64:
+    """Decode Counter64 content octets (1 to 9 octets)
+
+    Like dec_uint32, a negative two's complement form is masked to 64 bits.
+    Leading zero octets are accepted within the 9-octet limit; values above
+    2^64-1 raise DecodeError.
+    """
+    check_bounds(buf, start, stop)
+    n = stop - start
+    if n < 1:
+        raise errors.DecodeError("empty Counter64", start)
+    if n > 9:
+        raise errors.DecodeError("Counter64 of %d octets out of range" % n, start)
+    if buf[start] >= 0x80:
+        v = dec_int(buf, start, stop)
+        return u64(v & 0x7fffffffffffffff) + u64(0x8000000000000000)
+    i: int = start
+    while i < stop and buf[i] == 0:
+        i += 1
+    if stop - i > 8:
+        raise errors.DecodeError("Counter64 exceeds 2^64-1", start)
+    acc: u64 = 0
+    for j in range(i, stop):
+        acc = (acc << 8) | u64(buf[j])
+    return acc
+
+def dec_oid(buf: bytes, start: int, stop: int) -> list[int]:
+    """Decode OBJECT IDENTIFIER content octets into arcs
+
+    Non-minimal sub-identifiers (0x80 padding octets) are accepted. Empty
+    content (06 00, an X.690 violation that net-snmp tolerates) gives an
+    empty list. A sub-identifier above 2^32-1, more than 128 arcs or a
+    truncated last sub-identifier raise DecodeError.
+    """
+    check_bounds(buf, start, stop)
+    if start == stop:
+        return []
+    if buf[stop - 1] >= 0x80:
+        raise errors.DecodeError("truncated OID sub-identifier", stop - 1)
+    # Count the sub-identifiers first: filling a preallocated list is faster than appending.
+    n: int = 0
+    for i in range(start, stop):
+        if buf[i] < 0x80:
+            n += 1
+    if n + 1 > MAX_OID_ARCS:
+        raise errors.DecodeError("OID has more than %d arcs" % MAX_OID_ARCS, start)
+    arcs = [0] * (n + 1)        # arcs[0] is set below: the first sub-identifier holds two arcs
+    k: int = 1
+    v: int = 0
+    for i in range(start, stop):
+        b = buf[i]
+        if v > (MAX_ARC >> 7):
+            raise errors.DecodeError("OID sub-identifier exceeds 2^32-1", i)
+        v = (v << 7) | (b & 0x7f)
+        if b < 0x80:
+            arcs[k] = v
+            k += 1
+            v = 0
+    first = arcs[1]
+    if first >= 80:
+        arcs[0] = 2
+        arcs[1] = first - 80
+    elif first >= 40:
+        arcs[0] = 1
+        arcs[1] = first - 40
+    return arcs
+
+def _dump(buf: bytes, pos: int, end: int, depth: int, lines: list[str]) -> None:
+    if depth >= MAX_DEPTH:
+        raise errors.DecodeError("TLVs nested deeper than %d levels" % MAX_DEPTH, pos)
+    indent = "  " * depth
+    p = pos
+    while p < end:
+        tag, start, stop = read_tlv(buf, p, end)
+        if (tag & 0x20) != 0:
+            lines.append("%s%02x len=%d" % (indent, tag, stop - start))
+            _dump(buf, start, stop, depth + 1, lines)
+        else:
+            lines.append("%s%02x len=%d: %s" % (indent, tag, stop - start, buf[start:stop].hex()))
+        p = stop
+
+def dump(buf: bytes, pos: int, end: int) -> str:
+    """Return a TLV tree of buf[pos:end], one indented line per TLV, for debugging
+
+    Constructed TLVs (bit 0x20 of the tag) are expanded; primitive ones show
+    their content in hex. The output contains every octet, communities and
+    USM parameters included, so it is not for production logs. Raises
+    DecodeError if the data is not a sequence of well-formed TLVs or nests
+    deeper than MAX_DEPTH.
+    """
+    check_bounds(buf, pos, end)
+    lines: list[str] = []
+    _dump(buf, pos, end, 0, lines)
+    return "\n".join(lines)
+
+
+# Hex helpers #######################################################################################
+
+def to_hex(b: bytes) -> str:
+    """Return b as lowercase hex without separators"""
+    return b.hex()
+
+def from_hex(s: str) -> bytes:
+    """Return the bytes written as hex in s
+
+    Spaces, colons, tabs and line breaks between digits are ignored, so test
+    vectors can be pasted as "30 29 02 01 01" or "de:ad:be:ef". Upper and
+    lower case digits are accepted. Raises ValueError for any other character
+    or an odd number of digits.
+    """
+    t = s.replace(" ", "").replace(":", "").replace("\n", "").replace("\r", "").replace("\t", "")
+    return bytes.from_hex(t)

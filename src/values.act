@@ -1,0 +1,709 @@
+"""SMI values, variable bindings and their BER codec
+
+A Value keeps what was on the wire: its type (tag) and its raw content.
+OCTET STRING stays bytes and is never turned into str, so formatting and a
+later SMI-to-YANG mapping lose nothing. Equality (==) compares type and
+value: Counter32(5) != Gauge32(5).
+
+Value constructors accept any value of the field's type; encode() is where
+ranges are enforced (errors.EncodeError). Decoding is lenient in the ways
+documented in ber, and per value: a value whose TLV is intact but whose
+content is invalid for its type becomes a MalformedValue, so that one bad
+value does not cost the whole message. Broken TLV framing and a bad varbind
+name raise errors.DecodeError.
+"""
+
+import math
+import ber
+import errors
+from oid import Oid
+
+INTEGER32_MIN = -2147483648
+INTEGER32_MAX = 2147483647
+# SMI limit for OCTET STRING and Opaque (RFC 2578 section 7.1.2)
+MAX_OCTETS = 65535
+
+
+class Value(object):
+    """Base class of all SNMP values; not used directly"""
+    def __init__(self):
+        pass
+
+    def tag(self) -> int:
+        """Return the BER tag of the value on the wire"""
+        raise NotImplementedError("Value.tag")
+
+    def encode(self) -> bytes:
+        """Return the complete TLV; raises errors.EncodeError if the value is out of range"""
+        raise NotImplementedError("Value.encode")
+
+    def equals(self, other: Value) -> bool:
+        """Return True if other has the same type and value; == calls this"""
+        raise NotImplementedError("Value.equals")
+
+    def type_name(self) -> str:
+        """Return the type's name as net-snmp prints it: "INTEGER", "STRING", "Counter32", ..."""
+        raise NotImplementedError("Value.type_name")
+
+    def __repr__(self) -> str:
+        raise NotImplementedError("Value.__repr__")
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
+
+extension Value(Eq):
+    def __eq__(self, other: Value) -> bool:
+        return self.equals(other)
+
+
+def _enc_octets(tag: int, v: bytes) -> bytes:
+    if len(v) > MAX_OCTETS:
+        raise errors.EncodeError("octet string of %d octets exceeds %d" % (len(v), MAX_OCTETS))
+    return ber.enc_tlv(tag, v)
+
+
+class Integer(Value):
+    """INTEGER / Integer32 (tag 0x02), also used for enumerations
+
+    encode() raises EncodeError outside -2^31..2^31-1. A decoded Integer
+    may hold any 64-bit value: some agents put unsigned values such as
+    2^31 into INTEGER objects, and net-snmp shows them as they are.
+    """
+    value: int
+
+    def __init__(self, value: int):
+        self.value = value
+
+    def tag(self) -> int:
+        return ber.TAG_INTEGER
+
+    def encode(self) -> bytes:
+        v = self.value
+        if v < INTEGER32_MIN or v > INTEGER32_MAX:
+            raise errors.EncodeError("Integer32 value out of range: %d" % v)
+        return ber.enc_tlv(ber.TAG_INTEGER, ber.enc_int_content(v))
+
+    def equals(self, other: Value) -> bool:
+        return isinstance(other, Integer) and self.value == other.value
+
+    def type_name(self) -> str:
+        return "INTEGER"
+
+    def __repr__(self) -> str:
+        return "Integer(%d)" % self.value
+
+
+class OctetString(Value):
+    """OCTET STRING (tag 0x04): text, binary data and BITS
+
+    encode() raises EncodeError above 65535 octets.
+    """
+    value: bytes
+
+    def __init__(self, value: bytes):
+        self.value = value
+
+    def tag(self) -> int:
+        return ber.TAG_OCTET_STRING
+
+    def encode(self) -> bytes:
+        return _enc_octets(ber.TAG_OCTET_STRING, self.value)
+
+    def equals(self, other: Value) -> bool:
+        return isinstance(other, OctetString) and self.value == other.value
+
+    def type_name(self) -> str:
+        return "STRING"
+
+    def __repr__(self) -> str:
+        return "OctetString(" + repr(self.value) + ")"
+
+
+class Null(Value):
+    """NULL (tag 0x05), the value of every varbind in a GET/GETNEXT/GETBULK request"""
+    def __init__(self):
+        pass
+
+    def tag(self) -> int:
+        return ber.TAG_NULL
+
+    def encode(self) -> bytes:
+        return b"\x05\x00"
+
+    def equals(self, other: Value) -> bool:
+        return isinstance(other, Null)
+
+    def type_name(self) -> str:
+        return "NULL"
+
+    def __repr__(self) -> str:
+        return "Null()"
+
+
+class ObjectIdentifier(Value):
+    """OBJECT IDENTIFIER (tag 0x06) as a value
+
+    Decoding keeps any arc list, also the empty one that 06 00 produces;
+    encode() needs 2 to 128 arcs (see ber.enc_oid_content).
+    """
+    value: Oid
+
+    def __init__(self, value: Oid):
+        self.value = value
+
+    def tag(self) -> int:
+        return ber.TAG_OID
+
+    def encode(self) -> bytes:
+        return ber.enc_tlv(ber.TAG_OID, ber.enc_oid_content(self.value.arcs))
+
+    def equals(self, other: Value) -> bool:
+        return isinstance(other, ObjectIdentifier) and self.value == other.value
+
+    def type_name(self) -> str:
+        return "OID"
+
+    def __repr__(self) -> str:
+        return "ObjectIdentifier(" + str(self.value) + ")"
+
+
+class IpAddress(Value):
+    """IpAddress (tag 0x40): an IPv4 address in network byte order
+
+    Decoding keeps whatever length was sent; encode() requires 4 octets.
+    """
+    value: bytes
+
+    def __init__(self, value: bytes):
+        self.value = value
+
+    def tag(self) -> int:
+        return ber.TAG_IPADDRESS
+
+    def encode(self) -> bytes:
+        if len(self.value) != 4:
+            raise errors.EncodeError("IpAddress must be 4 octets, got %d" % len(self.value))
+        return ber.enc_tlv(ber.TAG_IPADDRESS, self.value)
+
+    def equals(self, other: Value) -> bool:
+        return isinstance(other, IpAddress) and self.value == other.value
+
+    def type_name(self) -> str:
+        return "IpAddress"
+
+    def __repr__(self) -> str:
+        v = self.value
+        if len(v) == 4:
+            return "IpAddress(%d.%d.%d.%d)" % (v[0], v[1], v[2], v[3])
+        return "IpAddress(" + repr(v) + ")"
+
+
+def _enc_unsigned(tag: int, v: int) -> bytes:
+    return ber.enc_tlv(tag, ber.enc_uint_content(v))
+
+
+class Counter32(Value):
+    """Counter32 (tag 0x41); encode() raises EncodeError outside 0..2^32-1"""
+    value: int
+
+    def __init__(self, value: int):
+        self.value = value
+
+    def tag(self) -> int:
+        return ber.TAG_COUNTER32
+
+    def encode(self) -> bytes:
+        return _enc_unsigned(ber.TAG_COUNTER32, self.value)
+
+    def equals(self, other: Value) -> bool:
+        return isinstance(other, Counter32) and self.value == other.value
+
+    def type_name(self) -> str:
+        return "Counter32"
+
+    def __repr__(self) -> str:
+        return "Counter32(%d)" % self.value
+
+
+class Gauge32(Value):
+    """Gauge32, identical on the wire to Unsigned32 (tag 0x42)
+
+    encode() raises EncodeError outside 0..2^32-1.
+    """
+    value: int
+
+    def __init__(self, value: int):
+        self.value = value
+
+    def tag(self) -> int:
+        return ber.TAG_GAUGE32
+
+    def encode(self) -> bytes:
+        return _enc_unsigned(ber.TAG_GAUGE32, self.value)
+
+    def equals(self, other: Value) -> bool:
+        return isinstance(other, Gauge32) and self.value == other.value
+
+    def type_name(self) -> str:
+        return "Gauge32"
+
+    def __repr__(self) -> str:
+        return "Gauge32(%d)" % self.value
+
+
+class TimeTicks(Value):
+    """TimeTicks (tag 0x43) in hundredths of a second
+
+    encode() raises EncodeError outside 0..2^32-1.
+    """
+    value: int
+
+    def __init__(self, value: int):
+        self.value = value
+
+    def tag(self) -> int:
+        return ber.TAG_TIMETICKS
+
+    def encode(self) -> bytes:
+        return _enc_unsigned(ber.TAG_TIMETICKS, self.value)
+
+    def equals(self, other: Value) -> bool:
+        return isinstance(other, TimeTicks) and self.value == other.value
+
+    def type_name(self) -> str:
+        return "Timeticks"
+
+    def __repr__(self) -> str:
+        return "TimeTicks(%d)" % self.value
+
+
+class Opaque(Value):
+    """Opaque (tag 0x44): raw content octets
+
+    net-snmp wraps floats and 64-bit integers in Opaque; opaque_special()
+    recognises those forms. encode() raises EncodeError above 65535 octets.
+    """
+    value: bytes
+
+    def __init__(self, value: bytes):
+        self.value = value
+
+    def tag(self) -> int:
+        return ber.TAG_OPAQUE
+
+    def encode(self) -> bytes:
+        return _enc_octets(ber.TAG_OPAQUE, self.value)
+
+    def equals(self, other: Value) -> bool:
+        return isinstance(other, Opaque) and self.value == other.value
+
+    def type_name(self) -> str:
+        return "Opaque"
+
+    def __repr__(self) -> str:
+        return "Opaque(" + repr(self.value) + ")"
+
+
+class Counter64(Value):
+    """Counter64 (tag 0x46); not allowed in SNMPv1 messages"""
+    value: u64
+
+    def __init__(self, value: u64):
+        self.value = value
+
+    def tag(self) -> int:
+        return ber.TAG_COUNTER64
+
+    def encode(self) -> bytes:
+        return ber.enc_tlv(ber.TAG_COUNTER64, ber.enc_u64_content(self.value))
+
+    def equals(self, other: Value) -> bool:
+        return isinstance(other, Counter64) and self.value == other.value
+
+    def type_name(self) -> str:
+        return "Counter64"
+
+    def __repr__(self) -> str:
+        return "Counter64(" + str(self.value) + ")"
+
+
+class NoSuchObject(Value):
+    """noSuchObject exception value (tag 0x80) of an SNMPv2 response"""
+    def __init__(self):
+        pass
+
+    def tag(self) -> int:
+        return ber.TAG_NO_SUCH_OBJECT
+
+    def encode(self) -> bytes:
+        return b"\x80\x00"
+
+    def equals(self, other: Value) -> bool:
+        return isinstance(other, NoSuchObject)
+
+    def type_name(self) -> str:
+        return "noSuchObject"
+
+    def __repr__(self) -> str:
+        return "NoSuchObject()"
+
+
+class NoSuchInstance(Value):
+    """noSuchInstance exception value (tag 0x81) of an SNMPv2 response"""
+    def __init__(self):
+        pass
+
+    def tag(self) -> int:
+        return ber.TAG_NO_SUCH_INSTANCE
+
+    def encode(self) -> bytes:
+        return b"\x81\x00"
+
+    def equals(self, other: Value) -> bool:
+        return isinstance(other, NoSuchInstance)
+
+    def type_name(self) -> str:
+        return "noSuchInstance"
+
+    def __repr__(self) -> str:
+        return "NoSuchInstance()"
+
+
+class EndOfMibView(Value):
+    """endOfMibView exception value (tag 0x82) of an SNMPv2 response"""
+    def __init__(self):
+        pass
+
+    def tag(self) -> int:
+        return ber.TAG_END_OF_MIB_VIEW
+
+    def encode(self) -> bytes:
+        return b"\x82\x00"
+
+    def equals(self, other: Value) -> bool:
+        return isinstance(other, EndOfMibView)
+
+    def type_name(self) -> str:
+        return "endOfMibView"
+
+    def __repr__(self) -> str:
+        return "EndOfMibView()"
+
+
+class UnknownValue(Value):
+    """A value of any other tag, kept as raw content so that it round-trips
+
+    Covers the historic NsapAddress (0x45) and UInteger32 (0x47) and anything
+    else an agent sends. Also usable to send arbitrary TLVs in tests. encode()
+    raises EncodeError for a tag outside 0..255 or in high-tag-number form.
+    """
+    raw_tag: int
+    value: bytes
+
+    def __init__(self, raw_tag: int, value: bytes):
+        self.raw_tag = raw_tag
+        self.value = value
+
+    def tag(self) -> int:
+        return self.raw_tag
+
+    def encode(self) -> bytes:
+        return ber.enc_tlv(self.raw_tag, self.value)
+
+    def equals(self, other: Value) -> bool:
+        return isinstance(other, UnknownValue) and self.raw_tag == other.raw_tag and self.value == other.value
+
+    def type_name(self) -> str:
+        if self.raw_tag == ber.TAG_NSAP:
+            return "NsapAddress"
+        if self.raw_tag == ber.TAG_UINTEGER32:
+            return "UInteger32"
+        return "Unknown"
+
+    def __repr__(self) -> str:
+        return "UnknownValue(0x%02x, " % self.raw_tag + repr(self.value) + ")"
+
+
+class MalformedValue(Value):
+    """A value whose TLV is well-formed but whose content is invalid for its tag
+
+    Decoding produces it instead of failing the whole message, for content
+    that the strict decoder of its type rejects: an empty INTEGER or one
+    that does not fit 64 bits; a Counter32, Gauge32 or TimeTicks that is
+    empty, above 2^32-1 or a negative form longer than 5 octets; a
+    Counter64 that is empty, longer than 9 octets or above 2^64-1; an OID
+    value with a truncated or too large sub-identifier or more than 128
+    arcs. raw_tag and value are the tag and content octets as received and
+    reason says what is wrong with them. encode() re-emits tag and content
+    unchanged (the length octets in minimal form), so a proxy or a test can
+    pass the value on, and raises EncodeError only for a tag outside 0..255
+    or in high-tag-number form; == compares tag and content, not the
+    reason. is_exception() is False for it.
+    """
+    raw_tag: int
+    value: bytes
+    reason: str
+
+    def __init__(self, raw_tag: int, value: bytes, reason: str):
+        self.raw_tag = raw_tag
+        self.value = value
+        self.reason = reason
+
+    def tag(self) -> int:
+        return self.raw_tag
+
+    def encode(self) -> bytes:
+        return ber.enc_tlv(self.raw_tag, self.value)
+
+    def equals(self, other: Value) -> bool:
+        return isinstance(other, MalformedValue) and self.raw_tag == other.raw_tag and self.value == other.value
+
+    def type_name(self) -> str:
+        return "Malformed"
+
+    def __repr__(self) -> str:
+        return "MalformedValue(0x%02x, " % self.raw_tag + repr(self.value) + ", " + repr(self.reason) + ")"
+
+
+class VarBind(object):
+    """A variable binding: an OID and its value (NULL in requests)"""
+    oid: Oid
+    value: Value
+
+    def __init__(self, oid: Oid, value: Value=Null()):
+        self.oid = oid
+        self.value = value
+
+    def __repr__(self) -> str:
+        return "VarBind(" + str(self.oid) + ", " + repr(self.value) + ")"
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
+
+extension VarBind(Eq):
+    def __eq__(self, other: VarBind) -> bool:
+        return self.oid == other.oid and self.value == other.value
+
+
+def is_exception(v: Value) -> bool:
+    """Return True for noSuchObject, noSuchInstance and endOfMibView"""
+    return isinstance(v, NoSuchObject) or isinstance(v, NoSuchInstance) or isinstance(v, EndOfMibView)
+
+
+def _checked_content(buf: bytes, tag: int, start: int, stop: int) -> Value:
+    # The slow path of _decode_content for content its strict decoder may reject: the value,
+    # or a MalformedValue that says why it was rejected
+    try:
+        if tag == ber.TAG_INTEGER:
+            return Integer(ber.dec_int(buf, start, stop))
+        if tag == ber.TAG_OID:
+            return ObjectIdentifier(Oid(ber.dec_oid(buf, start, stop)))
+        if tag == ber.TAG_COUNTER64:
+            return Counter64(ber.dec_u64(buf, start, stop))
+        v = ber.dec_uint32(buf, start, stop)
+        if tag == ber.TAG_COUNTER32:
+            return Counter32(v)
+        if tag == ber.TAG_GAUGE32:
+            return Gauge32(v)
+        return TimeTicks(v)
+    except errors.DecodeError as e:
+        return MalformedValue(tag, buf[start:stop], e.reason)
+
+def _decode_content(buf: bytes, tag: int, start: int, stop: int) -> Value:
+    # The value of the TLV with tag and content [start, stop), which lies within buf. Most
+    # frequent types first. Content that cannot be invalid for its type is decoded directly;
+    # the rest takes _checked_content.
+    n = stop - start
+    if tag == ber.TAG_OCTET_STRING:
+        return OctetString(buf[start:stop])
+    if tag == ber.TAG_INTEGER:
+        if n >= 1 and n <= 8:
+            return Integer(ber.dec_int(buf, start, stop))
+        return _checked_content(buf, tag, start, stop)
+    if tag == ber.TAG_COUNTER32 or tag == ber.TAG_GAUGE32 or tag == ber.TAG_TIMETICKS:
+        if n >= 1 and (n <= 4 or (n == 5 and buf[start] == 0)):
+            v = ber.dec_uint32(buf, start, stop)
+            if tag == ber.TAG_COUNTER32:
+                return Counter32(v)
+            if tag == ber.TAG_GAUGE32:
+                return Gauge32(v)
+            return TimeTicks(v)
+        return _checked_content(buf, tag, start, stop)
+    if tag == ber.TAG_OID or tag == ber.TAG_COUNTER64:
+        return _checked_content(buf, tag, start, stop)
+    if tag == ber.TAG_IPADDRESS:
+        return IpAddress(buf[start:stop])
+    # NULL and the exceptions must be empty; like net-snmp, content is ignored.
+    if tag == ber.TAG_NULL:
+        return Null()
+    if tag == ber.TAG_NO_SUCH_OBJECT:
+        return NoSuchObject()
+    if tag == ber.TAG_NO_SUCH_INSTANCE:
+        return NoSuchInstance()
+    if tag == ber.TAG_END_OF_MIB_VIEW:
+        return EndOfMibView()
+    if tag == ber.TAG_OPAQUE:
+        return Opaque(buf[start:stop])
+    return UnknownValue(tag, buf[start:stop])
+
+def decode_value(buf: bytes, pos: int, end: int) -> (Value, int):
+    """Decode the value TLV at pos (not beyond end); return it and the position after it
+
+    Unknown tags give an UnknownValue, and content that is invalid for its
+    type (an empty INTEGER, an unsigned32 above 2^32-1, a bad OID, ...) a
+    MalformedValue. An INTEGER outside Integer32 that fits 64 bits is an
+    Integer (whose encode() refuses it). Raises errors.DecodeError only for
+    a broken TLV: truncated, a length beyond end, the indefinite or an
+    unsupported length form, or a high-tag-number tag.
+    """
+    tag, start, stop = ber.read_tlv(buf, pos, end)
+    return (_decode_content(buf, tag, start, stop), stop)
+
+def encode_varbind(vb: VarBind) -> bytes:
+    """Return the VarBind SEQUENCE TLV; raises errors.EncodeError for an invalid name or value"""
+    name = ber.enc_tlv(ber.TAG_OID, ber.enc_oid_content(vb.oid.arcs))
+    return ber.enc_sequence(ber.TAG_SEQUENCE, [name, vb.value.encode()])
+
+def encode_varbinds(vbs: list[VarBind]) -> bytes:
+    """Return the complete VarBindList SEQUENCE TLV; raises errors.EncodeError like encode_varbind"""
+    # One parts list for the whole list, with the headers computed from the lengths, and one
+    # join: encode_varbind per element costs a list, a join and concatenations at every level.
+    parts: list[bytes] = [b""]
+    total: int = 0
+    for vb in vbs:
+        hpos = len(parts)
+        parts.append(b"")                       # the varbind SEQUENCE header, set below
+        parts.append(b"")                       # the name header, set below
+        olen = ber.put_oid_content(parts, vb.oid.arcs)
+        val = vb.value.encode()
+        nh = ber.enc_header(ber.TAG_OID, olen)
+        inner = len(nh) + olen + len(val)
+        sh = ber.enc_header(ber.TAG_SEQUENCE, inner)
+        parts[hpos] = sh
+        parts[hpos + 1] = nh
+        parts.append(val)
+        total += len(sh) + inner
+    parts[0] = ber.enc_header(ber.TAG_SEQUENCE, total)
+    return b"".join(parts)
+
+def decode_varbinds(buf: bytes, start: int, stop: int) -> list[VarBind]:
+    """Decode the content [start, stop) of a VarBindList SEQUENCE
+
+    Pass the content range that ber.expect_tlv(buf, pos, end, TAG_SEQUENCE)
+    returns. Every element must be a SEQUENCE of a non-empty, well-formed
+    OID name and one value TLV that fills it exactly; otherwise
+    errors.DecodeError. Values are decoded as decode_value does, so invalid
+    content in a value gives a MalformedValue, not an error.
+    """
+    ber.check_bounds(buf, start, stop)
+    vbs: list[VarBind] = []
+    p: int = start
+    while p < stop:
+        # Short-form headers, the common case, are parsed inline. Anything else takes the ber
+        # path, which raises the same errors at the same offsets.
+        s: int = p + 2
+        e: int = 0
+        if s <= stop and buf[p] == ber.TAG_SEQUENCE and buf[p + 1] < 0x80 and s + buf[p + 1] <= stop:
+            e = s + buf[p + 1]
+        else:
+            r = ber.expect_tlv(buf, p, stop, ber.TAG_SEQUENCE)
+            s = r.0
+            e = r.1
+        ns: int = s + 2
+        ne: int = 0
+        if ns <= e and buf[s] == ber.TAG_OID and buf[s + 1] < 0x80 and ns + buf[s + 1] <= e:
+            ne = ns + buf[s + 1]
+        else:
+            r2 = ber.expect_tlv(buf, s, e, ber.TAG_OID)
+            ns = r2.0
+            ne = r2.1
+        if ns == ne:
+            raise errors.DecodeError("empty varbind name", s)
+        name = Oid(ber.dec_oid(buf, ns, ne))
+        tag: int = 0
+        vs: int = ne + 2
+        ve: int = 0
+        if vs <= e and (buf[ne] & 0x1f) != 0x1f and buf[ne + 1] < 0x80 and vs + buf[ne + 1] <= e:
+            tag = buf[ne]
+            ve = vs + buf[ne + 1]
+        else:
+            r3 = ber.read_tlv(buf, ne, e)
+            tag = r3.0
+            vs = r3.1
+            ve = r3.2
+        if ve != e:
+            raise errors.DecodeError("unexpected data after the varbind value", ve)
+        vbs.append(VarBind(name, _decode_content(buf, tag, vs, ve)))
+        p = e
+    return vbs
+
+
+# net-snmp Opaque special types ######################################################################
+#
+# net-snmp (draft-perkins-opaque) wraps floats and 64-bit integers in an
+# Opaque whose content is a TLV with the two-octet tag 9f xx.
+
+_OPAQUE_COUNTER64 = 0x76
+_OPAQUE_FLOAT = 0x78
+_OPAQUE_DOUBLE = 0x79
+_OPAQUE_I64 = 0x7a
+_OPAQUE_U64 = 0x7b
+
+def _ieee_text(c: bytes, start: int, n: int, exp_bits: int) -> str:
+    # IEEE 754 binary32 (n=4, exp_bits=8) or binary64 (n=8, exp_bits=11), big-endian,
+    # formatted like C printf("%f") with glibc, which is what net-snmp prints.
+    frac_bits = 8 * n - 1 - exp_bits
+    negative = c[start] >= 0x80
+    bits = c[start] & 0x7f
+    for i in range(start + 1, start + n):
+        bits = bits * 256 + c[i]
+    exp_max = (1 << exp_bits) - 1
+    bias = exp_max >> 1
+    e = bits >> frac_bits
+    f = bits & ((1 << frac_bits) - 1)
+    if e == exp_max:
+        text = "inf" if f == 0 else "nan"
+        return "-" + text if negative else text
+    if e == 0:
+        x = math.ldexp(float(f), 1 - bias - frac_bits)
+    else:
+        x = math.ldexp(float(f | (1 << frac_bits)), e - bias - frac_bits)
+    return "%f" % (-x if negative else x)
+
+def opaque_special(v: Opaque) -> ?(kind: str, value: str):
+    """Recognise net-snmp's Opaque-wrapped float and 64-bit integer types
+
+    Returns (kind, value) with kind "Float" (9f 78), "Double" (9f 79), "I64"
+    (9f 7a), "U64" (9f 7b) or "Counter64" (9f 76), and value formatted the way
+    net-snmp prints it: "%f" for both float kinds, decimal for the integers.
+    net-snmp labels them "Opaque: Float:" (also for Double), "Opaque: Int64:",
+    "Opaque: UInt64:" and "Opaque: Counter64:". Returns None for anything else,
+    including a malformed wrapper, which is then just an Opaque.
+    """
+    c = v.value
+    n = len(c)
+    if n < 3 or c[0] != 0x9f:
+        return None
+    t = c[1]
+    if t == _OPAQUE_FLOAT:
+        if n == 7 and c[2] == 4:
+            return (kind="Float", value=_ieee_text(c, 3, 4, 8))
+        return None
+    if t == _OPAQUE_DOUBLE:
+        if n == 11 and c[2] == 8:
+            return (kind="Double", value=_ieee_text(c, 3, 8, 11))
+        return None
+    if t != _OPAQUE_I64 and t != _OPAQUE_U64 and t != _OPAQUE_COUNTER64:
+        return None
+    try:
+        start, stop = ber.read_length(c, 2, n)
+        if stop != n:
+            return None
+        if t == _OPAQUE_I64:
+            return (kind="I64", value=str(ber.dec_int(c, start, stop)))
+        kind = "U64" if t == _OPAQUE_U64 else "Counter64"
+        return (kind=kind, value=str(ber.dec_u64(c, start, stop)))
+    except errors.DecodeError:
+        return None

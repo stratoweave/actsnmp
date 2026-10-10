@@ -1,0 +1,429 @@
+"""SNMP messages: v1/v2c community messages and the SNMPv3 message structures
+
+A CommunityMessage is a complete SNMPv1 or SNMPv2c datagram (RFC 1157,
+RFC 1901). For SNMPv3 (RFC 3412, RFC 3414) this module only does the BER
+part: V3Message with its UsmSecurityParameters, and the ScopedPdu that is
+sent in clear or encrypted. Authentication and privacy belong to usm, which
+uses encode_v3 to build a message with a zero-filled MAC placeholder and the
+auth_offset of a decoded message to verify one; decoding never needs keys.
+
+The fields of the message headers must satisfy their ASN.1 ranges (RFC 3412
+section 6, RFC 3414 section 2.4): msgID 0..2^31-1, msgMaxSize 484..2^31-1,
+msgFlags exactly one octet, msgSecurityModel 1..2^31-1, engine boots and
+time 0..2^31-1, msgUserName at most 32 octets. Encoding raises
+errors.EncodeError and decoding errors.DecodeError otherwise.
+
+Policy for octets after the outer SEQUENCE of a datagram: SNMPv1/v2c
+ignores them, as net-snmp and pysnmp do. SNMPv3 rejects them with
+DecodeError: RFC 3412 does not say whether they belong to the wholeMsg
+that the MAC covers, so such a datagram cannot be authenticated
+unambiguously and is dropped. Octets after the ScopedPDU inside the
+decrypted plaintext are a different matter: they are DES padding, and
+decode_scoped ignores them.
+"""
+
+import ber
+import errors
+import pdu
+import values
+from pdu import Pdu, TrapV1Pdu
+
+# msgVersion / version values
+SNMP_V1 = 0
+SNMP_V2C = 1
+SNMP_V3 = 3
+
+# msgFlags bits (RFC 3412 section 6.4); decode clears all other bits
+FLAG_AUTH = 0x01
+FLAG_PRIV = 0x02
+FLAG_REPORTABLE = 0x04
+
+SEC_MODEL_USM = 3
+
+# Limits from the ASN.1 of RFC 3412 / RFC 3414 (the upper bound of msgID,
+# msgMaxSize, msgSecurityModel and the engine boots and time is 2^31-1,
+# values.INTEGER32_MAX)
+MIN_MAX_SIZE = 484
+MAX_USER_NAME = 32
+
+
+class CommunityMessage(object):
+    """An SNMPv1 or SNMPv2c message
+
+    version is SNMP_V1 or SNMP_V2C. Exactly one of pdu and trap is set.
+    Encoding is strict about the versions: trap (an SNMPv1 Trap-PDU) only
+    with SNMP_V1, and with SNMP_V1 neither the SNMPv2 PDU types GETBULK,
+    INFORM, TRAP_V2 and REPORT nor Counter64 values (RFC 3584 section
+    4.2). Decoding accepts every PDU type and value in either version, so
+    a receiver can count a v1 Trap-PDU in an SNMPv2c message, or an SNMPv2
+    PDU in an SNMPv1 message, as a version mismatch rather than a decoding
+    error.
+
+    repr() hides the community, which is a credential.
+    """
+    version: int
+    community: bytes
+    pdu: ?Pdu
+    trap: ?TrapV1Pdu
+
+    def __init__(self, version: int, community: bytes, pdu: ?Pdu=None, trap: ?TrapV1Pdu=None):
+        self.version = version
+        self.community = community
+        self.pdu = pdu
+        self.trap = trap
+
+    def __repr__(self) -> str:
+        p = self.pdu
+        body = repr(p) if p is not None else repr(self.trap)
+        return "CommunityMessage(version=%d, community=<%d octets>, " % (self.version, len(self.community)) + body + ")"
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
+
+class UsmSecurityParameters(object):
+    """The UsmSecurityParameters of an SNMPv3 message (RFC 3414 section 2.4)
+
+    engine_id is msgAuthoritativeEngineID, boots and time the
+    msgAuthoritativeEngineBoots/Time, user the msgUserName. auth_params
+    holds the MAC (empty without authentication) and priv_params the salt
+    (empty without privacy). The defaults are those of a discovery request.
+    """
+    engine_id: bytes
+    boots: int
+    time: int
+    user: bytes
+    auth_params: bytes
+    priv_params: bytes
+
+    def __init__(self, engine_id: bytes=b"", boots: int=0, time: int=0, user: bytes=b"",
+                 auth_params: bytes=b"", priv_params: bytes=b""):
+        self.engine_id = engine_id
+        self.boots = boots
+        self.time = time
+        self.user = user
+        self.auth_params = auth_params
+        self.priv_params = priv_params
+
+    def __repr__(self) -> str:
+        return ("UsmSecurityParameters(engine_id=" + self.engine_id.hex()
+                + ", boots=%d, time=%d, user=" % (self.boots, self.time) + repr(self.user)
+                + ", auth_params=" + self.auth_params.hex() + ", priv_params=" + self.priv_params.hex() + ")")
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
+
+extension UsmSecurityParameters(Eq):
+    def __eq__(self, other: UsmSecurityParameters) -> bool:
+        return (self.engine_id == other.engine_id and self.boots == other.boots and self.time == other.time
+                and self.user == other.user and self.auth_params == other.auth_params
+                and self.priv_params == other.priv_params)
+
+
+class ScopedPdu(object):
+    """An SNMPv3 ScopedPDU: the context and the PDU (RFC 3412 section 6)"""
+    context_engine_id: bytes
+    context_name: bytes
+    pdu: Pdu
+
+    def __init__(self, context_engine_id: bytes, context_name: bytes, pdu: Pdu):
+        self.context_engine_id = context_engine_id
+        self.context_name = context_name
+        self.pdu = pdu
+
+    def __repr__(self) -> str:
+        return ("ScopedPdu(context_engine_id=" + self.context_engine_id.hex() + ", context_name="
+                + repr(self.context_name) + ", " + repr(self.pdu) + ")")
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
+
+extension ScopedPdu(Eq):
+    def __eq__(self, other: ScopedPdu) -> bool:
+        return (self.context_engine_id == other.context_engine_id and self.context_name == other.context_name
+                and self.pdu == other.pdu)
+
+
+class V3Message(object):
+    """An SNMPv3 message (RFC 3412 section 6) with USM security parameters
+
+    flags holds the msgFlags bits FLAG_AUTH, FLAG_PRIV and FLAG_REPORTABLE.
+    A decoded message has either scoped (the plaintext ScopedPDU, when
+    FLAG_PRIV is clear) or encrypted (the encryptedPDU octets, when it is
+    set), and auth_offset is the position of the msgAuthenticationParameters
+    content in the decoded datagram, where the MAC is verified. encode_v3
+    takes the ScopedPDU or the ciphertext as a separate argument and ignores
+    scoped, encrypted and auth_offset (-1 by default).
+
+    Decoding is purely structural. It does not reject a security model
+    other than SEC_MODEL_USM: such a message keeps its security_model,
+    empty usm fields and auth_offset -1, and the usm layer refuses it
+    (snmpUnknownSecurityModels). Neither does it reject FLAG_PRIV without
+    FLAG_AUTH (snmpInvalidMsgs); data of such a message is decoded as
+    encrypted.
+    """
+    msg_id: int
+    max_size: int
+    flags: int
+    security_model: int
+    usm: UsmSecurityParameters
+    scoped: ?ScopedPdu
+    encrypted: ?bytes
+    auth_offset: int
+
+    def __init__(self, msg_id: int, max_size: int, flags: int, usm: UsmSecurityParameters,
+                 scoped: ?ScopedPdu=None, encrypted: ?bytes=None, security_model: int=SEC_MODEL_USM,
+                 auth_offset: int=-1):
+        self.msg_id = msg_id
+        self.max_size = max_size
+        self.flags = flags
+        self.security_model = security_model
+        self.usm = usm
+        self.scoped = scoped
+        self.encrypted = encrypted
+        self.auth_offset = auth_offset
+
+    def __repr__(self) -> str:
+        s = self.scoped
+        e = self.encrypted
+        if s is not None:
+            data = repr(s)
+        elif e is not None:
+            data = "encrypted=<%d octets>" % len(e)
+        else:
+            data = "no data"
+        head = ("V3Message(msg_id=%d, max_size=%d, flags=0x%02x, security_model=%d, "
+                % (self.msg_id, self.max_size, self.flags, self.security_model))
+        return head + repr(self.usm) + ", " + data + ", auth_offset=%d)" % self.auth_offset
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
+
+# Encoding ##########################################################################################
+
+def encode_community(m: CommunityMessage) -> bytes:
+    """Return the complete SNMPv1/v2c datagram of m
+
+    Raises errors.EncodeError if version is not SNMP_V1 or SNMP_V2C, if not
+    exactly one of pdu and trap is set, for a trap in an SNMPv2c message,
+    for an SNMPv2-only PDU type or a Counter64 value in an SNMPv1 message
+    (a manager sends GETBULK as GETNEXT to an SNMPv1 agent, an agent
+    leaves Counter64 objects out of SNMPv1 responses), or when the PDU
+    cannot be encoded (see pdu.encode_pdu and pdu.encode_trap_v1). Tests
+    that must put such content into an SNMPv1 message can send a
+    values.UnknownValue with the Counter64 tag.
+    """
+    if m.version != SNMP_V1 and m.version != SNMP_V2C:
+        raise errors.EncodeError("a community message must be version 0 or 1, got %d" % m.version)
+    p = m.pdu
+    t = m.trap
+    if p is not None:
+        if t is not None:
+            raise errors.EncodeError("a community message carries a Pdu or a TrapV1Pdu, not both")
+        if m.version == SNMP_V1:
+            _check_v1(p.pdu_type, p.varbinds)
+        body = pdu.encode_pdu(p)
+    elif t is not None:
+        if m.version != SNMP_V1:
+            raise errors.EncodeError("an SNMPv1 Trap-PDU needs version 0 (SNMPv1)")
+        _check_v1(pdu.TRAP_V1, t.varbinds)
+        body = pdu.encode_trap_v1(t)
+    else:
+        raise errors.EncodeError("a community message needs a Pdu or a TrapV1Pdu")
+    return ber.enc_sequence(ber.TAG_SEQUENCE, [ber.enc_integer(m.version),
+                                               ber.enc_tlv(ber.TAG_OCTET_STRING, m.community), body])
+
+def _check_v1(pdu_type: int, varbinds: list[values.VarBind]) -> None:
+    # What SNMPv1 cannot carry (RFC 3584 sections 4.2.1 and 4.2.2.1)
+    t = pdu_type
+    if t == pdu.GETBULK or t == pdu.INFORM or t == pdu.TRAP_V2 or t == pdu.REPORT:
+        raise errors.EncodeError("SNMPv1 has no " + pdu.pdu_type_name(t) + " PDU")
+    for vb in varbinds:
+        if isinstance(vb.value, values.Counter64):
+            raise errors.EncodeError("SNMPv1 cannot carry the Counter64 value of " + str(vb.oid))
+
+def encode_scoped(s: ScopedPdu) -> bytes:
+    """Return the ScopedPDU SEQUENCE TLV of s; raises errors.EncodeError if the PDU cannot be encoded"""
+    return ber.enc_sequence(ber.TAG_SEQUENCE, [ber.enc_tlv(ber.TAG_OCTET_STRING, s.context_engine_id),
+                                               ber.enc_tlv(ber.TAG_OCTET_STRING, s.context_name),
+                                               pdu.encode_pdu(s.pdu)])
+
+def encode_v3(m: V3Message, scoped_or_encrypted: bytes) -> (msg: bytes, auth_offset: int):
+    """Return the SNMPv3 datagram of m and the offset of its MAC placeholder
+
+    scoped_or_encrypted is the encoded ScopedPDU (encode_scoped) when
+    FLAG_PRIV is clear, and the encryptedPDU ciphertext when it is set;
+    m.scoped and m.encrypted are not used. The msgAuthenticationParameters
+    are len(m.usm.auth_params) zero octets, whatever m.usm.auth_params
+    holds, and auth_offset is the position of the first of them in msg: the
+    caller computes the MAC over msg and writes it there (RFC 3414 section
+    3.1 step 8). The parameters are always encoded in the USM format.
+
+    Raises errors.EncodeError for a field outside its ASN.1 range (see the
+    module documentation), flags outside 0..255, or plaintext data that is
+    not a SEQUENCE.
+    """
+    ber.check_range(m.msg_id, 0, values.INTEGER32_MAX, "msgID")
+    ber.check_range(m.max_size, MIN_MAX_SIZE, values.INTEGER32_MAX, "msgMaxSize")
+    ber.check_range(m.flags, 0, 0xff, "msgFlags")
+    ber.check_range(m.security_model, 1, values.INTEGER32_MAX, "msgSecurityModel")
+    u = m.usm
+    ber.check_range(u.boots, 0, values.INTEGER32_MAX, "msgAuthoritativeEngineBoots")
+    ber.check_range(u.time, 0, values.INTEGER32_MAX, "msgAuthoritativeEngineTime")
+    if len(u.user) > MAX_USER_NAME:
+        raise errors.EncodeError("msgUserName of %d octets exceeds %d" % (len(u.user), MAX_USER_NAME))
+    if (m.flags & FLAG_PRIV) != 0:
+        data = ber.enc_tlv(ber.TAG_OCTET_STRING, scoped_or_encrypted)
+    elif len(scoped_or_encrypted) > 0 and scoped_or_encrypted[0] == ber.TAG_SEQUENCE:
+        data = scoped_or_encrypted
+    else:
+        raise errors.EncodeError("plaintext msgData must be an encoded ScopedPDU")
+
+    flags_tlv = ber.enc_tlv(ber.TAG_OCTET_STRING, ber.BYTE_TABLE[m.flags])
+    header = ber.enc_sequence(ber.TAG_SEQUENCE, [ber.enc_integer(m.msg_id), ber.enc_integer(m.max_size), flags_tlv,
+                                                 ber.enc_integer(m.security_model)])
+    n_auth = len(u.auth_params)
+    # UsmSecurityParameters content: the fields before the MAC, the MAC header, the zero
+    # placeholder and the privacy parameters; it is wrapped in a SEQUENCE and an OCTET STRING.
+    before = b"".join([ber.enc_tlv(ber.TAG_OCTET_STRING, u.engine_id), ber.enc_integer(u.boots),
+                       ber.enc_integer(u.time), ber.enc_tlv(ber.TAG_OCTET_STRING, u.user)])
+    auth_header = ber.enc_header(ber.TAG_OCTET_STRING, n_auth)
+    priv = ber.enc_tlv(ber.TAG_OCTET_STRING, u.priv_params)
+    usm_len = len(before) + len(auth_header) + n_auth + len(priv)
+    usm_header = ber.enc_header(ber.TAG_SEQUENCE, usm_len)
+    params_header = ber.enc_header(ber.TAG_OCTET_STRING, len(usm_header) + usm_len)
+    version = b"\x02\x01\x03"
+    body_len = len(version) + len(header) + len(params_header) + len(usm_header) + usm_len + len(data)
+    outer = ber.enc_header(ber.TAG_SEQUENCE, body_len)
+    auth_offset = (len(outer) + len(version) + len(header) + len(params_header) + len(usm_header)
+                   + len(before) + len(auth_header))
+    msg = b"".join([outer, version, header, params_header, usm_header, before, auth_header,
+                    b"\x00" * n_auth, priv, data])
+    return (msg=msg, auth_offset=auth_offset)
+
+
+# Decoding ##########################################################################################
+
+def _outer(data: bytes) -> (int, int, int):
+    # Decode the outer SEQUENCE and the version; return (version, position after the version,
+    # end of the SEQUENCE), applying the trailing-octets policy of the module documentation.
+    n = len(data)
+    start, stop = ber.expect_tlv(data, 0, n, ber.TAG_SEQUENCE)
+    vs, ve = ber.expect_tlv(data, start, stop, ber.TAG_INTEGER)
+    version = ber.dec_int(data, vs, ve)
+    if version == SNMP_V3:
+        if stop != n:
+            raise errors.DecodeError("%d octets after the SNMPv3 message" % (n - stop), stop)
+    elif version != SNMP_V1 and version != SNMP_V2C:
+        raise errors.DecodeError("unsupported SNMP version %d" % version, vs)
+    return (version, ve, stop)
+
+def _decode_community(data: bytes, version: int, pos: int, end: int) -> CommunityMessage:
+    cs, ce = ber.expect_tlv(data, pos, end, ber.TAG_OCTET_STRING)
+    p, t, q = pdu.decode_pdu(data, ce, end)
+    if q != end:
+        raise errors.DecodeError("unexpected data after the PDU", q)
+    return CommunityMessage(version, data[cs:ce], p, t)
+
+def _decode_usm(data: bytes, start: int, stop: int) -> (UsmSecurityParameters, int):
+    # The content [start, stop) of msgSecurityParameters must be exactly one
+    # UsmSecurityParameters SEQUENCE. Returns it and the msgAuthenticationParameters offset.
+    us, ue = ber.expect_tlv(data, start, stop, ber.TAG_SEQUENCE)
+    if ue != stop:
+        raise errors.DecodeError("unexpected data after UsmSecurityParameters", ue)
+    es, ee = ber.expect_tlv(data, us, ue, ber.TAG_OCTET_STRING)
+    boots, p = ber.read_integer(data, ee, ue, 0, values.INTEGER32_MAX, "msgAuthoritativeEngineBoots")
+    etime, q = ber.read_integer(data, p, ue, 0, values.INTEGER32_MAX, "msgAuthoritativeEngineTime")
+    ns, ne = ber.expect_tlv(data, q, ue, ber.TAG_OCTET_STRING)
+    if ne - ns > MAX_USER_NAME:
+        raise errors.DecodeError("msgUserName of %d octets exceeds %d" % (ne - ns, MAX_USER_NAME), ns)
+    aa, ae = ber.expect_tlv(data, ne, ue, ber.TAG_OCTET_STRING)
+    ps, pe = ber.expect_tlv(data, ae, ue, ber.TAG_OCTET_STRING)
+    if pe != ue:
+        raise errors.DecodeError("unexpected data after msgPrivacyParameters", pe)
+    usm = UsmSecurityParameters(data[es:ee], boots, etime, data[ns:ne], data[aa:ae], data[ps:pe])
+    return (usm, aa)
+
+def _decode_v3(data: bytes, pos: int, end: int) -> V3Message:
+    hs, he = ber.expect_tlv(data, pos, end, ber.TAG_SEQUENCE)
+    msg_id, p = ber.read_integer(data, hs, he, 0, values.INTEGER32_MAX, "msgID")
+    max_size, q = ber.read_integer(data, p, he, MIN_MAX_SIZE, values.INTEGER32_MAX, "msgMaxSize")
+    fs, fe = ber.expect_tlv(data, q, he, ber.TAG_OCTET_STRING)
+    if fe - fs != 1:
+        raise errors.DecodeError("msgFlags must be 1 octet, got %d" % (fe - fs), fs)
+    flags = data[fs] & (FLAG_AUTH | FLAG_PRIV | FLAG_REPORTABLE)
+    model, r = ber.read_integer(data, fe, he, 1, values.INTEGER32_MAX, "msgSecurityModel")
+    if r != he:
+        raise errors.DecodeError("unexpected data after msgSecurityModel", r)
+    ss, se = ber.expect_tlv(data, he, end, ber.TAG_OCTET_STRING)
+    usm, auth_offset = _decode_usm(data, ss, se) if model == SEC_MODEL_USM else (UsmSecurityParameters(), -1)
+    tag, ds, de = ber.read_tlv(data, se, end)
+    if de != end:
+        raise errors.DecodeError("unexpected data after msgData", de)
+    if (flags & FLAG_PRIV) != 0:
+        if tag != ber.TAG_OCTET_STRING:
+            raise errors.DecodeError("privFlag set but msgData is not an encryptedPDU OCTET STRING", se)
+        return V3Message(msg_id, max_size, flags, usm, None, data[ds:de], model, auth_offset)
+    if tag != ber.TAG_SEQUENCE:
+        raise errors.DecodeError("privFlag clear but msgData is not a ScopedPDU SEQUENCE", se)
+    return V3Message(msg_id, max_size, flags, usm, decode_scoped(data, se, de), None, model, auth_offset)
+
+def decode_scoped(buf: bytes, pos: int, end: int) -> ScopedPdu:
+    """Decode the ScopedPDU SEQUENCE at pos (not beyond end)
+
+    Octets between the end of the SEQUENCE and end are ignored: decrypted
+    DES data carries padding there. Raises errors.DecodeError for a
+    malformed ScopedPDU, data after its PDU inside the SEQUENCE, or an
+    SNMPv1 Trap-PDU (which SNMPv3 cannot carry).
+    """
+    ss, se = ber.expect_tlv(buf, pos, end, ber.TAG_SEQUENCE)
+    cs, ce = ber.expect_tlv(buf, ss, se, ber.TAG_OCTET_STRING)
+    ns, ne = ber.expect_tlv(buf, ce, se, ber.TAG_OCTET_STRING)
+    p, t, q = pdu.decode_pdu(buf, ne, se)
+    if q != se:
+        raise errors.DecodeError("unexpected data after the PDU", q)
+    if p is not None:
+        return ScopedPdu(buf[cs:ce], buf[ns:ne], p)
+    raise errors.DecodeError("SNMPv1 Trap-PDU in a ScopedPDU", ne)
+
+def decode(data: bytes) -> (?CommunityMessage, ?V3Message):
+    """Decode an SNMP datagram of any version
+
+    Returns (message, None) for SNMPv1/v2c and (None, message) for SNMPv3.
+    Raises errors.DecodeError for a version other than 0, 1 or 3 and for
+    any malformed datagram, including octets after an SNMPv3 message (see
+    the module documentation for the policy). Octets after an SNMPv1/v2c
+    message are ignored. A varbind value with invalid content but intact
+    framing does not fail the datagram: it decodes to a
+    values.MalformedValue.
+    """
+    version, pos, end = _outer(data)
+    if version == SNMP_V3:
+        return (None, _decode_v3(data, pos, end))
+    return (_decode_community(data, version, pos, end), None)
+
+def peek(data: bytes) -> (version: int, id: int):
+    """Return the version and the id that matches a datagram to a request, without decoding it
+
+    The id is the request-id for SNMPv1/v2c (0 for an SNMPv1 Trap-PDU,
+    which has none) and the msgID for SNMPv3. Only the outer structure and
+    the fields on the way to the id are checked, so a datagram that peeks
+    fine may still fail decode(). Raises errors.DecodeError like decode()
+    for what it reads.
+    """
+    version, pos, end = _outer(data)
+    if version == SNMP_V3:
+        hs, he = ber.expect_tlv(data, pos, end, ber.TAG_SEQUENCE)
+        msg_id, p = ber.read_integer(data, hs, he, 0, values.INTEGER32_MAX, "msgID")
+        return (version=version, id=msg_id)
+    cs, ce = ber.expect_tlv(data, pos, end, ber.TAG_OCTET_STRING)
+    tag, ps, pe = ber.read_tlv(data, ce, end)
+    if tag == pdu.TRAP_V1:
+        return (version=version, id=0)
+    if tag < pdu.GET or tag > pdu.REPORT:
+        raise errors.DecodeError("unknown PDU type 0x%02x" % tag, ce)
+    request_id, q = ber.read_integer(data, ps, pe, values.INTEGER32_MIN, values.INTEGER32_MAX, "request-id")
+    return (version=version, id=request_id)

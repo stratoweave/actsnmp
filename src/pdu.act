@@ -1,0 +1,330 @@
+"""SNMP PDUs: type and error-status constants, Pdu, TrapV1Pdu and their codec
+
+Every PDU of RFC 3416 (GetRequest 0xA0 to Report 0xA8) has the same layout:
+request-id, error-status, error-index and the variable bindings.
+GetBulkRequest reuses the two middle fields for non-repeaters and
+max-repetitions. Pdu models all of them. The SNMPv1 Trap-PDU (0xA4,
+RFC 1157 section 4.1.6) has a layout of its own and is a TrapV1Pdu.
+
+Encoding is strict: the fields must be within their ASN.1 ranges, otherwise
+errors.EncodeError. Decoding is lenient where net-snmp is (see ber and
+values), but integer fields must fit their type (Integer32; error-status and
+error-index may be negative or above 18, which a manager reports as an
+unknown error; the generic-trap and specific-trap of a Trap-PDU may be any
+64-bit value), every element must have its expected tag, and the PDU must
+end right after its variable bindings. Malformed input raises
+errors.DecodeError and nothing else.
+
+Which PDU types are valid in which SNMP version is checked by the users of
+the codec, not here: decode_pdu accepts all of them.
+"""
+
+import ber
+import errors
+import values
+from oid import Oid
+from values import VarBind
+
+# PDU types (context-specific constructed tags, RFC 3416 section 3 and RFC 1157)
+GET = 0xA0
+GETNEXT = 0xA1
+RESPONSE = 0xA2
+SET = 0xA3
+TRAP_V1 = 0xA4
+GETBULK = 0xA5
+INFORM = 0xA6
+TRAP_V2 = 0xA7
+REPORT = 0xA8
+
+# error-status values (RFC 3416 section 3; 0..5 are also SNMPv1's)
+NO_ERROR = 0
+TOO_BIG = 1
+NO_SUCH_NAME = 2
+BAD_VALUE = 3
+READ_ONLY = 4
+GEN_ERR = 5
+NO_ACCESS = 6
+WRONG_TYPE = 7
+WRONG_LENGTH = 8
+WRONG_ENCODING = 9
+WRONG_VALUE = 10
+NO_CREATION = 11
+INCONSISTENT_VALUE = 12
+RESOURCE_UNAVAILABLE = 13
+COMMIT_FAILED = 14
+UNDO_FAILED = 15
+AUTHORIZATION_ERROR = 16
+NOT_WRITABLE = 17
+INCONSISTENT_NAME = 18
+
+# generic-trap values of the SNMPv1 Trap-PDU (RFC 1157 section 4.1.6)
+COLD_START = 0
+WARM_START = 1
+LINK_DOWN = 2
+LINK_UP = 3
+AUTHENTICATION_FAILURE = 4
+EGP_NEIGHBOR_LOSS = 5
+ENTERPRISE_SPECIFIC = 6
+
+_ERROR_NAMES: list[str] = [
+    "noError", "tooBig", "noSuchName", "badValue", "readOnly", "genErr", "noAccess", "wrongType",
+    "wrongLength", "wrongEncoding", "wrongValue", "noCreation", "inconsistentValue",
+    "resourceUnavailable", "commitFailed", "undoFailed", "authorizationError", "notWritable",
+    "inconsistentName"]
+
+# net-snmp's snmp_errstring() texts, byte for byte (read from libnetsnmp 5.9.4 in the
+# actsnmp-interop:1 image), including its "occured" misspelling.
+_ERROR_TEXTS: list[str] = [
+    "(noError) No Error",
+    "(tooBig) Response message would have been too large.",
+    "(noSuchName) There is no such variable name in this MIB.",
+    "(badValue) The value given has the wrong type or length.",
+    "(readOnly) The two parties used do not have access to use the specified SNMP PDU.",
+    "(genError) A general failure occured",
+    "noAccess",
+    "wrongType (The set datatype does not match the data type the agent expects)",
+    "wrongLength (The set value has an illegal length from what the agent expects)",
+    "wrongEncoding",
+    "wrongValue (The set value is illegal or unsupported in some way)",
+    "noCreation (That table does not support row creation or that object can not ever be created)",
+    "inconsistentValue (The set value is illegal or unsupported in some way)",
+    "resourceUnavailable (This is likely a out-of-memory failure within the agent)",
+    "commitFailed",
+    "undoFailed",
+    "authorizationError (access denied to that object)",
+    "notWritable (That object does not support modification)",
+    "inconsistentName (That object can not currently be created)"]
+
+# net-snmp's snmp_pdu_type() names, indexed by type - GET
+_TYPE_NAMES: list[str] = ["GET", "GETNEXT", "RESPONSE", "SET", "TRAP", "GETBULK", "INFORM", "TRAP2", "REPORT"]
+
+
+def error_status_name(s: int) -> str:
+    """Return the RFC 3416 name of an error-status: "noError", "tooBig", ... "inconsistentName"
+
+    Values outside 0..18 give "unknown(<s>)".
+    """
+    if s >= 0 and s < len(_ERROR_NAMES):
+        return _ERROR_NAMES[s]
+    return "unknown(%d)" % s
+
+def error_status_text(s: int) -> str:
+    """Return the description net-snmp prints for an error-status (its snmp_errstring())
+
+    For example "(noSuchName) There is no such variable name in this MIB."
+    and, with net-snmp's spelling, "(genError) A general failure occured".
+    Values outside 0..18 give "Unknown Error", as in net-snmp.
+    """
+    if s >= 0 and s < len(_ERROR_TEXTS):
+        return _ERROR_TEXTS[s]
+    return "Unknown Error"
+
+def pdu_type_name(t: int) -> str:
+    """Return the name net-snmp uses for a PDU type (its snmp_pdu_type())
+
+    "GET", "GETNEXT", "RESPONSE", "SET", "TRAP" (SNMPv1), "GETBULK",
+    "INFORM", "TRAP2" (SNMPv2-Trap) or "REPORT"; any other value gives
+    net-snmp's "?0x%2X?" form, for example "?0xA9?".
+    """
+    if t >= GET and t <= REPORT:
+        return _TYPE_NAMES[t - GET]
+    return "?0x%2X?" % t
+
+
+class Pdu(object):
+    """A PDU with the RFC 3416 layout: every PDU type except the SNMPv1 Trap-PDU
+
+    For GETBULK, error_status holds non-repeaters and error_index holds
+    max-repetitions, as on the wire; non_repeaters() and max_repetitions()
+    read them under their own names.
+    """
+    pdu_type: int
+    request_id: int
+    error_status: int
+    error_index: int
+    varbinds: list[VarBind]
+
+    def __init__(self, pdu_type: int, request_id: int, error_status: int=0, error_index: int=0,
+                 varbinds: list[VarBind]=[]):
+        self.pdu_type = pdu_type
+        self.request_id = request_id
+        self.error_status = error_status
+        self.error_index = error_index
+        self.varbinds = varbinds
+
+    def non_repeaters(self) -> int:
+        """Return the non-repeaters field of a GETBULK PDU (the error_status slot)"""
+        return self.error_status
+
+    def max_repetitions(self) -> int:
+        """Return the max-repetitions field of a GETBULK PDU (the error_index slot)"""
+        return self.error_index
+
+    def bulk_counts(self) -> (int, int):
+        """Return (N, M) of a GETBULK request as an agent must use them (RFC 3416 section 4.2.3)
+
+        N, the number of non-repeating varbinds, is non-repeaters clamped to
+        0..len(varbinds); M, the number of repetitions, is max-repetitions,
+        at least 0. Both fields arrive as any Integer32, so an agent must not
+        use them raw; it also caps M by its own limit (snmpd answers at most
+        a configured number of varbinds).
+        """
+        n = self.error_status
+        if n < 0:
+            n = 0
+        elif n > len(self.varbinds):
+            n = len(self.varbinds)
+        m = self.error_index
+        return (n, m if m > 0 else 0)
+
+    def __repr__(self) -> str:
+        if self.pdu_type == GETBULK:
+            fields = "non_repeaters=%d, max_repetitions=%d" % (self.error_status, self.error_index)
+        else:
+            fields = "error_status=%d, error_index=%d" % (self.error_status, self.error_index)
+        return ("Pdu(" + pdu_type_name(self.pdu_type) + ", request_id=%d, " % self.request_id + fields
+                + ", varbinds=" + repr(self.varbinds) + ")")
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
+
+extension Pdu(Eq):
+    def __eq__(self, other: Pdu) -> bool:
+        return (self.pdu_type == other.pdu_type and self.request_id == other.request_id
+                and self.error_status == other.error_status and self.error_index == other.error_index
+                and self.varbinds == other.varbinds)
+
+
+class TrapV1Pdu(object):
+    """An SNMPv1 Trap-PDU (RFC 1157 section 4.1.6)
+
+    agent_addr is the NetworkAddress (an IPv4 address in network byte
+    order); decoding keeps whatever length was sent, encoding requires 4
+    octets. generic_trap is one of COLD_START .. ENTERPRISE_SPECIFIC and
+    specific_trap the enterprise-specific code. RFC 3584 section 3.2 maps
+    the last arc of an SNMPv2 trap OID to specific_trap, so it may be
+    anything from 0 to 2^32-1, and pysnmp sends 2^31 and up as positive
+    INTEGERs; net-snmp's snmptrap wraps them to negative Integer32 values.
+    Decoding accepts any 64-bit generic_trap and specific_trap (notify
+    flags the odd ones); encoding requires generic_trap 0..6 and
+    specific_trap -2^31..2^32-1. time_stamp is the sysUpTime of the
+    sender in hundredths of a second.
+    """
+    enterprise: Oid
+    agent_addr: bytes
+    generic_trap: int
+    specific_trap: int
+    time_stamp: int
+    varbinds: list[VarBind]
+
+    def __init__(self, enterprise: Oid, agent_addr: bytes, generic_trap: int, specific_trap: int,
+                 time_stamp: int, varbinds: list[VarBind]=[]):
+        self.enterprise = enterprise
+        self.agent_addr = agent_addr
+        self.generic_trap = generic_trap
+        self.specific_trap = specific_trap
+        self.time_stamp = time_stamp
+        self.varbinds = varbinds
+
+    def __repr__(self) -> str:
+        numbers = (", generic_trap=%d, specific_trap=%d, time_stamp=%d"
+                   % (self.generic_trap, self.specific_trap, self.time_stamp))
+        return ("TrapV1Pdu(enterprise=" + str(self.enterprise) + ", agent_addr=" + repr(self.agent_addr) + numbers
+                + ", varbinds=" + repr(self.varbinds) + ")")
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
+
+extension TrapV1Pdu(Eq):
+    def __eq__(self, other: TrapV1Pdu) -> bool:
+        return (self.enterprise == other.enterprise and self.agent_addr == other.agent_addr
+                and self.generic_trap == other.generic_trap and self.specific_trap == other.specific_trap
+                and self.time_stamp == other.time_stamp and self.varbinds == other.varbinds)
+
+
+# Encoding ##########################################################################################
+
+def encode_pdu(p: Pdu) -> bytes:
+    """Return the PDU TLV of p
+
+    Raises errors.EncodeError for a type other than GET .. REPORT (TRAP_V1
+    has its own layout: use encode_trap_v1), a request-id outside
+    Integer32, an error-status or error-index (GETBULK: non-repeaters or
+    max-repetitions) outside 0..2^31-1, or an invalid varbind.
+    """
+    t = p.pdu_type
+    if t < GET or t > REPORT or t == TRAP_V1:
+        raise errors.EncodeError("cannot encode PDU type " + pdu_type_name(t) + " as a Pdu")
+    ber.check_range(p.request_id, values.INTEGER32_MIN, values.INTEGER32_MAX, "request-id")
+    if t == GETBULK:
+        ber.check_range(p.error_status, 0, values.INTEGER32_MAX, "non-repeaters")
+        ber.check_range(p.error_index, 0, values.INTEGER32_MAX, "max-repetitions")
+    else:
+        ber.check_range(p.error_status, 0, values.INTEGER32_MAX, "error-status")
+        ber.check_range(p.error_index, 0, values.INTEGER32_MAX, "error-index")
+    return ber.enc_sequence(t, [ber.enc_integer(p.request_id), ber.enc_integer(p.error_status),
+                                ber.enc_integer(p.error_index), values.encode_varbinds(p.varbinds)])
+
+def encode_trap_v1(p: TrapV1Pdu) -> bytes:
+    """Return the Trap-PDU TLV (tag 0xA4) of p
+
+    Raises errors.EncodeError for an enterprise OID that cannot be encoded,
+    an agent_addr that is not 4 octets, a generic_trap outside 0..6, a
+    specific_trap outside -2^31..2^32-1 (Integer32 or an OID arc), a
+    time_stamp outside 0..2^32-1, or an invalid varbind.
+    """
+    if len(p.agent_addr) != 4:
+        raise errors.EncodeError("agent-addr must be 4 octets, got %d" % len(p.agent_addr))
+    ber.check_range(p.generic_trap, COLD_START, ENTERPRISE_SPECIFIC, "generic-trap")
+    ber.check_range(p.specific_trap, values.INTEGER32_MIN, ber.MAX_ARC, "specific-trap")
+    return ber.enc_sequence(TRAP_V1, [
+        ber.enc_tlv(ber.TAG_OID, ber.enc_oid_content(p.enterprise.arcs)),
+        ber.enc_tlv(ber.TAG_IPADDRESS, p.agent_addr),
+        ber.enc_integer(p.generic_trap),
+        ber.enc_integer(p.specific_trap),
+        ber.enc_tlv(ber.TAG_TIMETICKS, ber.enc_uint_content(p.time_stamp)),
+        values.encode_varbinds(p.varbinds)])
+
+
+# Decoding ##########################################################################################
+
+def _decode_varbind_list(buf: bytes, pos: int, end: int) -> list[VarBind]:
+    # The VarBindList is the last element of every PDU.
+    start, stop = ber.expect_tlv(buf, pos, end, ber.TAG_SEQUENCE)
+    if stop != end:
+        raise errors.DecodeError("unexpected data after the variable bindings", stop)
+    return values.decode_varbinds(buf, start, stop)
+
+def _decode_trap_v1(buf: bytes, start: int, stop: int) -> TrapV1Pdu:
+    es, ee = ber.expect_tlv(buf, start, stop, ber.TAG_OID)
+    enterprise = Oid(ber.dec_oid(buf, es, ee))
+    aa, ae = ber.expect_tlv(buf, ee, stop, ber.TAG_IPADDRESS)
+    # generic-trap and specific-trap: any INTEGER that fits 64 bits (see TrapV1Pdu)
+    gs, ge = ber.expect_tlv(buf, ae, stop, ber.TAG_INTEGER)
+    generic = ber.dec_int(buf, gs, ge)
+    ss, se = ber.expect_tlv(buf, ge, stop, ber.TAG_INTEGER)
+    specific = ber.dec_int(buf, ss, se)
+    ts, te = ber.expect_tlv(buf, se, stop, ber.TAG_TIMETICKS)
+    time_stamp = ber.dec_uint32(buf, ts, te)
+    return TrapV1Pdu(enterprise, buf[aa:ae], generic, specific, time_stamp, _decode_varbind_list(buf, te, stop))
+
+def decode_pdu(buf: bytes, pos: int, end: int) -> (?Pdu, ?TrapV1Pdu, int):
+    """Decode the PDU TLV at pos (not beyond end)
+
+    Returns (pdu, None, next) for the types GET .. REPORT and
+    (None, trap, next) for an SNMPv1 Trap-PDU, where next is the position
+    after the PDU. Raises errors.DecodeError for any other tag, a field
+    with the wrong tag or out of range, malformed variable bindings, or
+    data after the variable bindings inside the PDU.
+    """
+    tag, start, stop = ber.read_tlv(buf, pos, end)
+    if tag == TRAP_V1:
+        return (None, _decode_trap_v1(buf, start, stop), stop)
+    if tag < GET or tag > REPORT:
+        raise errors.DecodeError("unknown PDU type 0x%02x" % tag, pos)
+    request_id, p = ber.read_integer(buf, start, stop, values.INTEGER32_MIN, values.INTEGER32_MAX, "request-id")
+    error_status, q = ber.read_integer(buf, p, stop, values.INTEGER32_MIN, values.INTEGER32_MAX, "error-status")
+    error_index, r = ber.read_integer(buf, q, stop, values.INTEGER32_MIN, values.INTEGER32_MAX, "error-index")
+    return (Pdu(tag, request_id, error_status, error_index, _decode_varbind_list(buf, r, stop)), None, stop)

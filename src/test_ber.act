@@ -1,0 +1,581 @@
+"""Tests for ber, and for errors
+
+Vectors marked "spec" are the SNMPv1/v2c reference vectors, verified
+against pyasn1, net-snmp and tshark. Vectors marked "pyasn1" were
+cross-checked with pyasn1 0.6 and pysnmp 7.1.
+"""
+
+import testing
+import ber
+import errors
+from testutil import h, decode_fails, encode_fails, Lcg
+
+def int_of(b: bytes) -> int:
+    return ber.dec_int(b, 0, len(b))
+
+def uint_of(b: bytes) -> int:
+    return ber.dec_uint32(b, 0, len(b))
+
+def u64_of(b: bytes) -> u64:
+    return ber.dec_u64(b, 0, len(b))
+
+def oid_of(b: bytes) -> list[int]:
+    return ber.dec_oid(b, 0, len(b))
+
+
+# INTEGER ###########################################################################################
+
+# spec, all rows (value, complete TLV)
+INTEGER_TABLE: list[(int, str)] = [
+    (0, "02 01 00"), (1, "02 01 01"), (127, "02 01 7f"), (128, "02 02 00 80"), (255, "02 02 00 ff"),
+    (256, "02 02 01 00"), (32767, "02 02 7f ff"), (32768, "02 03 00 80 00"), (8388607, "02 03 7f ff ff"),
+    (8388608, "02 04 00 80 00 00"), (2147483647, "02 04 7f ff ff ff"),
+    (-1, "02 01 ff"), (-127, "02 01 81"), (-128, "02 01 80"), (-129, "02 02 ff 7f"), (-256, "02 02 ff 00"),
+    (-32768, "02 02 80 00"), (-32769, "02 03 ff 7f ff"), (-8388608, "02 03 80 00 00"),
+    (-8388609, "02 04 ff 7f ff ff"), (-2147483647, "02 04 80 00 00 01"), (-2147483648, "02 04 80 00 00 00"),
+    # pyasn1: the int extremes
+    (9223372036854775807, "02 08 7f ff ff ff ff ff ff ff"), (-9223372036854775807, "02 08 80 00 00 00 00 00 00 01"),
+    (-9223372036854775808, "02 08 80 00 00 00 00 00 00 00"),
+]
+
+def _test_integer_table_encode() -> None:
+    for v, hx in INTEGER_TABLE:
+        testing.assertEqual(ber.enc_integer(v), h(hx), "encode %d" % v)
+
+def _test_integer_table_decode() -> None:
+    for v, hx in INTEGER_TABLE:
+        b = h(hx)
+        start, stop = ber.expect_tlv(b, 0, len(b), ber.TAG_INTEGER)
+        testing.assertEqual(stop, len(b))
+        testing.assertEqual(ber.dec_int(b, start, stop), v, "decode " + hx)
+
+def _test_integer_lenient_decode() -> None:
+    # spec: pyasn1's non-minimal negative powers of two, decode only
+    testing.assertEqual(int_of(h("ff 80")), -128)
+    testing.assertEqual(int_of(h("ff 80 00")), -32768)
+    testing.assertEqual(int_of(h("ff 80 00 00")), -8388608)
+    testing.assertEqual(int_of(h("ff 80 00 00 00")), -2147483648)
+    # pyasn1 also encodes int min with 9 octets
+    testing.assertEqual(int_of(h("ff 80 00 00 00 00 00 00 00")), -9223372036854775808)
+    # spec: redundant leading zeros
+    testing.assertEqual(int_of(h("00 00 00 05")), 5)
+    testing.assertEqual(int_of(h("00 00 00 00 15")), 0x15)
+    testing.assertEqual(int_of(h("00 7f ff ff ff ff ff ff ff")), 9223372036854775807)
+    testing.assertEqual(int_of(h("ff ff ff ff ff ff ff ff ff")), -1)
+    testing.assertEqual(int_of(h("00 00 00 00 00 00 00 00 00")), 0)
+
+def _test_integer_rejects() -> None:
+    decode_fails(lambda: int_of(b""), "empty INTEGER")
+    decode_fails(lambda: int_of(h("00 00 00 00 00 00 00 00 00 05")), "10 octets")
+    decode_fails(lambda: int_of(h("00 80 00 00 00 00 00 00 00")), "2^63")
+    decode_fails(lambda: int_of(h("01 00 00 00 00 00 00 00 00")), "2^64")
+    decode_fails(lambda: int_of(h("ff 7f ff ff ff ff ff ff ff")), "-2^63-1")
+    decode_fails(lambda: int_of(h("80 00 00 00 00 00 00 00 00")), "9 octets, first 80")
+
+def _test_dec_int_in_place() -> None:
+    # offsets into a larger buffer, as the decoders use them
+    b = h("aa 02 02 ff 7f bb")
+    start, stop = ber.expect_tlv(b, 1, 5, ber.TAG_INTEGER)
+    testing.assertEqual((start, stop), (3, 5))
+    testing.assertEqual(ber.dec_int(b, start, stop), -129)
+
+
+# Unsigned ##########################################################################################
+
+# spec (content octets only; the tag is the type's)
+UNSIGNED_TABLE: list[(int, str)] = [
+    (0, "00"), (127, "7f"), (128, "00 80"), (65535, "00 ff ff"), (2147483647, "7f ff ff ff"),
+    (2147483648, "00 80 00 00 00"), (4294967295, "00 ff ff ff ff"), (1000000000, "3b 9a ca 00"), (100, "64"),
+    (12345678, "00 bc 61 4e"),
+]
+
+def _test_uint_table() -> None:
+    for v, hx in UNSIGNED_TABLE:
+        testing.assertEqual(ber.enc_uint_content(v), h(hx), "encode %d" % v)
+        testing.assertEqual(uint_of(h(hx)), v, "decode " + hx)
+    # spec: complete TLVs
+    testing.assertEqual(ber.enc_tlv(ber.TAG_COUNTER32, ber.enc_uint_content(4294967295)), h("41 05 00 ff ff ff ff"))
+    testing.assertEqual(ber.enc_tlv(ber.TAG_GAUGE32, ber.enc_uint_content(1000000000)), h("42 04 3b 9a ca 00"))
+    testing.assertEqual(ber.enc_tlv(ber.TAG_TIMETICKS, ber.enc_uint_content(4294967295)), h("43 05 00 ff ff ff ff"))
+
+def _test_uint_lenient_decode() -> None:
+    # spec: Counter32 4294967295 sent without the leading 00 (net-snmp accepts)
+    testing.assertEqual(uint_of(h("ff ff ff ff")), 4294967295)
+    # any number of redundant leading zeros
+    testing.assertEqual(uint_of(h("00 00 00 00 00 00 00 00 00 00 05")), 5)
+    testing.assertEqual(uint_of(h("00 00 ff ff ff ff")), 4294967295)
+    # negative two's complement masked to 32 bits like net-snmp (asn_parse_unsigned_int)
+    testing.assertEqual(uint_of(h("80")), 4294967168)
+    testing.assertEqual(uint_of(h("ff")), 4294967295)
+    testing.assertEqual(uint_of(h("ff ff ff ff ff")), 4294967295)
+    testing.assertEqual(uint_of(h("80 00 00 00")), 2147483648)
+    testing.assertEqual(uint_of(h("ff 80 00 00 00")), 2147483648)
+
+def _test_uint_rejects() -> None:
+    decode_fails(lambda: uint_of(b""), "empty")
+    decode_fails(lambda: uint_of(h("01 00 00 00 00")), "2^32")
+    decode_fails(lambda: uint_of(h("00 01 00 00 00 00")), "2^32 with a leading zero")
+    decode_fails(lambda: uint_of(h("ff ff ff ff ff ff ff ff")), "8 octets of ff (spec section 8)")
+    decode_fails(lambda: uint_of(h("ff 7f ff ff ff")), "-2^31-1")
+    decode_fails(lambda: uint_of(h("80 00 00 00 00")), "-2^39")
+    encode_fails(lambda: ber.enc_uint_content(-1), "-1")
+    encode_fails(lambda: ber.enc_uint_content(4294967296), "2^32")
+
+# spec and pyasn1 (content octets)
+U64_TABLE: list[(u64, str)] = [
+    (0, "00"), (255, "00 ff"), (4294967296, "01 00 00 00 00"), (1099511627776, "01 00 00 00 00 00"),
+    (9223372036854775807, "7f ff ff ff ff ff ff ff"), (9223372036854775808, "00 80 00 00 00 00 00 00 00"),
+    (18446744073709551615, "00 ff ff ff ff ff ff ff ff"),
+]
+
+def _test_u64_table() -> None:
+    for v, hx in U64_TABLE:
+        testing.assertEqual(ber.enc_u64_content(v), h(hx), "encode " + str(v))
+        testing.assertEqual(u64_of(h(hx)), v, "decode " + hx)
+    testing.assertEqual(ber.enc_tlv(ber.TAG_COUNTER64, ber.enc_u64_content(18446744073709551615)),
+                        h("46 09 00 ff ff ff ff ff ff ff ff"))
+
+def _test_u64_lenient_decode() -> None:
+    testing.assertEqual(u64_of(h("00 00 00 00 05")), u64(5))
+    # negative two's complement masked to 64 bits
+    testing.assertEqual(u64_of(h("ff ff ff ff ff ff ff ff")), u64(18446744073709551615))
+    testing.assertEqual(u64_of(h("80")), u64(18446744073709551488))
+    testing.assertEqual(u64_of(h("80 00 00 00 00 00 00 00")), u64(9223372036854775808))
+    testing.assertEqual(u64_of(h("ff 80 00 00 00 00 00 00 00")), u64(9223372036854775808))
+
+def _test_u64_rejects() -> None:
+    decode_fails(lambda: u64_of(b""), "empty")
+    decode_fails(lambda: u64_of(h("01 00 00 00 00 00 00 00 00")), "2^64")
+    decode_fails(lambda: u64_of(h("00 00 00 00 00 00 00 00 00 05")), "10 octets")
+    decode_fails(lambda: u64_of(h("ff ff ff ff ff ff ff ff ff ff")), "10 octets negative")
+    decode_fails(lambda: u64_of(h("80 00 00 00 00 00 00 00 00")), "9 octets, first 80")
+
+
+# OBJECT IDENTIFIER ##################################################################################
+
+# spec, all rows; pyasn1 for the extremes at the end
+OID_TABLE: list[(list[int], str)] = [
+    ([1, 3, 6, 1, 2, 1, 1, 1, 0], "06 08 2b 06 01 02 01 01 01 00"),
+    ([1, 3, 6, 1, 2, 1, 1, 3, 0], "06 08 2b 06 01 02 01 01 03 00"),
+    ([1, 3, 6, 1, 4, 1, 127], "06 06 2b 06 01 04 01 7f"),
+    ([1, 3, 6, 1, 4, 1, 128], "06 07 2b 06 01 04 01 81 00"),
+    ([1, 3, 6, 1, 4, 1, 2636], "06 07 2b 06 01 04 01 94 4c"),
+    ([1, 3, 6, 1, 4, 1, 8072, 3, 2, 10], "06 0a 2b 06 01 04 01 bf 08 03 02 0a"),
+    ([1, 3, 6, 1, 4, 1, 16383], "06 07 2b 06 01 04 01 ff 7f"),
+    ([1, 3, 6, 1, 4, 1, 16384], "06 08 2b 06 01 04 01 81 80 00"),
+    ([1, 3, 6, 1, 4, 1, 2097151], "06 08 2b 06 01 04 01 ff ff 7f"),
+    ([1, 3, 6, 1, 4, 1, 268435456], "06 0a 2b 06 01 04 01 81 80 80 80 00"),
+    ([1, 3, 6, 1, 4, 1, 4294967295], "06 0a 2b 06 01 04 01 8f ff ff ff 7f"),
+    ([1, 3, 6, 1, 6, 3, 1, 1, 4, 1, 0], "06 0a 2b 06 01 06 03 01 01 04 01 00"),
+    ([0, 0], "06 01 00"),
+    ([1, 3], "06 01 2b"),
+    ([2, 5], "06 01 55"),
+    ([2, 100, 3], "06 03 81 34 03"),
+    ([2, 999], "06 02 88 37"),
+    ([0, 39], "06 01 27"),
+    ([1, 39, 4294967295], "06 06 4f 8f ff ff ff 7f"),
+    ([2, 4294967215], "06 05 8f ff ff ff 7f"),
+    ([2, 4294967215, 1], "06 06 8f ff ff ff 7f 01"),
+]
+
+def _test_oid_table_encode() -> None:
+    for arcs, hx in OID_TABLE:
+        testing.assertEqual(ber.enc_tlv(ber.TAG_OID, ber.enc_oid_content(arcs)), h(hx), "encode " + str(arcs))
+
+def _test_oid_table_decode() -> None:
+    for arcs, hx in OID_TABLE:
+        b = h(hx)
+        start, stop = ber.expect_tlv(b, 0, len(b), ber.TAG_OID)
+        testing.assertEqual(ber.dec_oid(b, start, stop), arcs, "decode " + hx)
+
+def _test_oid_128_arcs() -> None:
+    # pyasn1: 1.3 followed by 126 arcs of 2^32-1 is 631 content octets (06 82 02 77 2b 8f ff ff ff 7f ...)
+    arcs = [1, 3] + [4294967295] * 126
+    tlv = ber.enc_tlv(ber.TAG_OID, ber.enc_oid_content(arcs))
+    testing.assertEqual(len(tlv), 635)
+    testing.assertEqual(tlv[:10], h("06 82 02 77 2b 8f ff ff ff 7f"))
+    testing.assertEqual(oid_of(tlv[4:]), arcs)
+    small = [1, 3] + [7] * 126
+    testing.assertEqual(oid_of(ber.enc_oid_content(small)), small)
+
+def _test_oid_lenient_decode() -> None:
+    # spec: 0x80 padding in a sub-identifier (net-snmp accepts)
+    testing.assertEqual(oid_of(h("2b 06 01 04 01 80 80 80 80 7f")), [1, 3, 6, 1, 4, 1, 127])
+    testing.assertEqual(oid_of(h("80 2b 06")), [1, 3, 6])
+    testing.assertEqual(oid_of(h("2b 80 80 80 80 80 80 80 80 80 80 80 01")), [1, 3, 1])
+    # spec: 06 00 is accepted and has no arcs
+    testing.assertEqual(oid_of(b""), [])
+    # first sub-identifier >= 80 always means first arc 2
+    testing.assertEqual(oid_of(h("50")), [2, 0])
+    testing.assertEqual(oid_of(h("4f")), [1, 39])
+
+def _test_oid_rejects() -> None:
+    # spec: arc 2^32, truncated last sub-identifier
+    decode_fails(lambda: oid_of(h("2b 06 01 04 01 90 80 80 80 00")), "arc 2^32")
+    decode_fails(lambda: oid_of(h("2b 86")), "truncated sub-identifier")
+    decode_fails(lambda: oid_of(h("2b 06 81")), "truncated sub-identifier at the end")
+    decode_fails(lambda: oid_of(h("90 80 80 80 00")), "first sub-identifier 2^32")
+    decode_fails(lambda: oid_of(h("2b ff ff ff ff 7f")), "sub-identifier 2^35-1")
+    decode_fails(lambda: oid_of(h("2b 81 80 80 80 80 00")), "sub-identifier 2^35")
+    decode_fails(lambda: oid_of(ber.enc_oid_content([1, 3] + [7] * 126) + b"\x07"), "129 arcs")
+    decode_fails(lambda: oid_of(h("2b") + h("01") * 200), "201 arcs")
+
+def _test_oid_encode_rejects() -> None:
+    encode_fails(lambda: ber.enc_oid_content([]), "no arcs")
+    encode_fails(lambda: ber.enc_oid_content([1]), "one arc")
+    encode_fails(lambda: ber.enc_oid_content([3, 1]), "first arc 3")
+    encode_fails(lambda: ber.enc_oid_content([-1, 1]), "first arc -1")
+    encode_fails(lambda: ber.enc_oid_content([0, 40]), "0.40")
+    encode_fails(lambda: ber.enc_oid_content([1, 40]), "1.40")
+    encode_fails(lambda: ber.enc_oid_content([1, -1]), "1.-1")
+    encode_fails(lambda: ber.enc_oid_content([2, 4294967216]), "first sub-identifier 2^32")
+    encode_fails(lambda: ber.enc_oid_content([1, 3, 4294967296]), "arc 2^32")
+    encode_fails(lambda: ber.enc_oid_content([1, 3, -1]), "negative arc")
+    encode_fails(lambda: ber.enc_oid_content([1, 3] + [1] * 127), "129 arcs")
+    # 40 * first + second must not wrap around for a second arc near 2^63 (an EncodeError, not
+    # an IndexError)
+    for a1 in [9223372036854775807, 9223372036854775728, 9223372036854775000, 4294967296]:
+        for a0 in [0, 1, 2]:
+            encode_fails(lambda: ber.enc_oid_content([a0, a1]), "[%d, %d]" % (a0, a1))
+    testing.assertEqual(ber.enc_oid_content([2, 4294967215]), h("8f ff ff ff 7f"))
+
+def _test_put_oid_content() -> None:
+    parts: list[bytes] = [b"x"]
+    testing.assertEqual(ber.put_oid_content(parts, [1, 3, 6, 1, 4, 1, 4294967295]), 10)
+    testing.assertEqual(b"".join(parts), b"x" + h("2b 06 01 04 01 8f ff ff ff 7f"))
+    testing.assertEqual(ber.put_oid_content(parts, [0, 0]), 1)
+    testing.assertEqual(b"".join(parts[11:]), h("00"))
+    for arcs, hx in OID_TABLE:
+        each: list[bytes] = []
+        content = h(hx)[2:]
+        testing.assertEqual(ber.put_oid_content(each, arcs), len(content), str(arcs))
+        testing.assertEqual(b"".join(each), content, str(arcs))
+    encode_fails(lambda: ber.put_oid_content(parts, [1]), "one arc")
+
+
+# Lengths and TLV headers ###########################################################################
+
+LENGTH_TABLE: list[(int, str)] = [
+    (0, "00"), (1, "01"), (127, "7f"), (128, "81 80"), (200, "81 c8"), (255, "81 ff"), (256, "82 01 00"),
+    (300, "82 01 2c"), (65535, "82 ff ff"), (65536, "83 01 00 00"), (70000, "83 01 11 70"),
+    (16777215, "83 ff ff ff"), (16777216, "84 01 00 00 00"), (4294967295, "84 ff ff ff ff"),
+]
+
+def _test_length_table() -> None:
+    for n, hx in LENGTH_TABLE:
+        testing.assertEqual(ber.enc_length(n), h(hx), "length %d" % n)
+        hb = h(hx)
+        # decode against a virtual end far enough out: read_length only needs the header octets
+        if n <= 300:
+            buf = hb + b"\x00" * n
+            start, stop = ber.read_length(buf, 0, len(buf))
+            testing.assertEqual((start, stop), (len(hb), len(hb) + n), "decode length %d" % n)
+    encode_fails(lambda: ber.enc_length(-1), "negative")
+    encode_fails(lambda: ber.enc_length(4294967296), "2^32")
+
+def _test_octet_string_lengths() -> None:
+    # spec (pyasn1): 200 -> 04 81 c8, 300 -> 04 82 01 2c, 70000 -> 04 83 01 11 70
+    testing.assertEqual(ber.enc_octets(ber.TAG_OCTET_STRING, b"a" * 200)[:3], h("04 81 c8"))
+    testing.assertEqual(ber.enc_octets(ber.TAG_OCTET_STRING, b"a" * 300)[:4], h("04 82 01 2c"))
+    big = ber.enc_octets(ber.TAG_OCTET_STRING, b"a" * 70000)
+    testing.assertEqual(big[:5], h("04 83 01 11 70"))
+    testing.assertEqual(len(big), 70005)
+    t, start, stop = ber.read_tlv(big, 0, len(big))
+    testing.assertEqual((t, start, stop), (4, 5, 70005))
+
+def _test_enc_header_rejects() -> None:
+    encode_fails(lambda: ber.enc_tlv(256, b""), "tag 256")
+    encode_fails(lambda: ber.enc_tlv(-1, b""), "tag -1")
+    encode_fails(lambda: ber.enc_tlv(0x1f, b""), "high-tag-number form")
+    encode_fails(lambda: ber.enc_tlv(0x9f, b""), "context high-tag-number form")
+    testing.assertEqual(ber.enc_tlv(0xfe, b"\x01"), h("fe 01 01"))
+
+def _test_enc_misc() -> None:
+    testing.assertEqual(ber.enc_null(), h("05 00"))
+    testing.assertEqual(ber.enc_sequence(ber.TAG_SEQUENCE, []), h("30 00"))
+    testing.assertEqual(ber.enc_sequence(0xa2, [h("02 01 00"), h("05 00")]), h("a2 05 02 01 00 05 00"))
+    testing.assertEqual(ber.enc_octets(ber.TAG_IPADDRESS, h("c0 00 02 01")), h("40 04 c0 00 02 01"))
+
+# spec example packet A: v2c GetRequest sysDescr.0, community "public"
+MSG_A = "30 29 02 01 01 04 06 70 75 62 6c 69 63 a0 1c 02 04 12 34 56 78 02 01 00 02 01 00 30 0e 30 0c 06 08 2b 06 01 02 01 01 01 00 05 00"
+
+def _test_build_message_a() -> None:
+    name = ber.enc_tlv(ber.TAG_OID, ber.enc_oid_content([1, 3, 6, 1, 2, 1, 1, 1, 0]))
+    vbl = ber.enc_sequence(ber.TAG_SEQUENCE, [ber.enc_sequence(ber.TAG_SEQUENCE, [name, ber.enc_null()])])
+    pdu = ber.enc_sequence(0xa0, [ber.enc_integer(0x12345678), ber.enc_integer(0), ber.enc_integer(0), vbl])
+    msg = ber.enc_sequence(ber.TAG_SEQUENCE, [ber.enc_integer(1), ber.enc_octets(ber.TAG_OCTET_STRING, b"public"), pdu])
+    testing.assertEqual(msg, h(MSG_A))
+
+def _walk_message_a(b: bytes, end: int) -> int:
+    """Decode message A structurally between 0 and end; return the request-id"""
+    ms, me = ber.expect_tlv(b, 0, end, ber.TAG_SEQUENCE)
+    vs, ve = ber.expect_tlv(b, ms, me, ber.TAG_INTEGER)
+    testing.assertEqual(ber.dec_int(b, vs, ve), 1)
+    cs, ce = ber.expect_tlv(b, ve, me, ber.TAG_OCTET_STRING)
+    testing.assertEqual(b[cs:ce], b"public")
+    ps, pe = ber.expect_tlv(b, ce, me, 0xa0)
+    rs, re = ber.expect_tlv(b, ps, pe, ber.TAG_INTEGER)
+    es, ee = ber.expect_tlv(b, re, pe, ber.TAG_INTEGER)
+    xs, xe = ber.expect_tlv(b, ee, pe, ber.TAG_INTEGER)
+    ls, le = ber.expect_tlv(b, xe, pe, ber.TAG_SEQUENCE)
+    bs, be = ber.expect_tlv(b, ls, le, ber.TAG_SEQUENCE)
+    os, oe = ber.expect_tlv(b, bs, be, ber.TAG_OID)
+    testing.assertEqual(ber.dec_oid(b, os, oe), [1, 3, 6, 1, 2, 1, 1, 1, 0])
+    ns, ne = ber.expect_tlv(b, oe, be, ber.TAG_NULL)
+    testing.assertEqual((ns, ne, be, le, pe, me), (ne, be, le, pe, me, me))
+    return ber.dec_int(b, rs, re)
+
+def _test_decode_message_a() -> None:
+    b = h(MSG_A)
+    testing.assertEqual(_walk_message_a(b, len(b)), 0x12345678)
+    # spec: trailing bytes after the message are outside the outer TLV
+    t = b + b"\x00\x00"
+    testing.assertEqual(_walk_message_a(t, len(t)), 0x12345678)
+
+def _test_padded_lengths_accepted() -> None:
+    # spec: 30 81 29, 30 82 00 29, 30 84 00 00 00 29 (snmpd and net-snmp accept them)
+    body = h(MSG_A)[2:]
+    for hdr in ["30 81 29", "30 82 00 29", "30 84 00 00 00 29"]:
+        b = h(hdr) + body
+        t, start, stop = ber.read_tlv(b, 0, len(b))
+        testing.assertEqual((t, start, stop), (0x30, len(h(hdr)), len(b)), hdr)
+        testing.assertEqual(b[start:stop], body)
+    # padded value lengths
+    for hx in ["04 81 03 61 62 63", "04 82 00 03 61 62 63", "04 83 00 00 03 61 62 63", "04 84 00 00 00 03 61 62 63"]:
+        b = h(hx)
+        t, start, stop = ber.read_tlv(b, 0, len(b))
+        testing.assertEqual(b[start:stop], b"abc", hx)
+
+def _test_truncation_at_every_offset() -> None:
+    b = h(MSG_A)
+    for k in range(len(b)):
+        decode_fails(lambda: _walk_message_a(b, k), "message A truncated to %d octets" % k)
+        cut = b[:k]
+        decode_fails(lambda: _walk_message_a(cut, len(cut)), "message A sliced to %d octets" % k)
+        decode_fails(lambda: ber.read_tlv(cut, 0, len(cut)), "outer TLV sliced to %d octets" % k)
+        if k > 0:
+            decode_fails(lambda: ber.dump(cut, 0, len(cut)), "dump of %d octets" % k)
+        if k >= 2:
+            # a consistent outer TLV around truncated content: the inner TLVs must catch it
+            inner = ber.enc_tlv(ber.TAG_SEQUENCE, b[2:k])
+            decode_fails(lambda: _walk_message_a(inner, len(inner)), "content truncated to %d octets" % (k - 2))
+
+def _test_length_errors() -> None:
+    body = h(MSG_A)[2:]
+    decode_fails(lambda: ber.read_tlv(h("30 80") + body, 0, 43), "indefinite length (spec section 8)")
+    decode_fails(lambda: ber.read_tlv(h("30 85 00 00 00 00 29") + body, 0, 48), "5 length octets")
+    decode_fails(lambda: ber.read_tlv(h("30 ff") + body, 0, 43), "length octet ff")
+    decode_fails(lambda: ber.read_tlv(h("30 2a") + body, 0, 43), "outer length one too long (spec section 8)")
+    # one too short: the outer TLV ends one octet early, so its last element is cut
+    short = h("30 28") + body
+    decode_fails(lambda: _walk_message_a(short, len(short)), "outer length one too short (spec section 8)")
+    decode_fails(lambda: ber.read_tlv(h("04 84 ff ff ff ff 00"), 0, 7), "length 2^32-1 beyond end")
+    decode_fails(lambda: ber.read_tlv(h("04 82 01"), 0, 3), "truncated length octets")
+    decode_fails(lambda: ber.read_tlv(h("04"), 0, 1), "missing length")
+    decode_fails(lambda: ber.read_tlv(b"", 0, 0), "empty input")
+    decode_fails(lambda: ber.read_length(h("05"), 0, 1), "length beyond end")
+    # the enclosing structure bounds the length, not the buffer
+    decode_fails(lambda: ber.read_tlv(h("04 03 61 62 63"), 0, 4), "length beyond end of enclosing TLV")
+
+def _test_high_tag_rejected() -> None:
+    decode_fails(lambda: ber.read_tlv(h("1f 01 00"), 0, 3), "universal high tag")
+    decode_fails(lambda: ber.read_tlv(h("9f 78 04 3f c0 00 00"), 0, 7), "net-snmp opaque inner tag at the top")
+    decode_fails(lambda: ber.read_tlv(h("bf 81 00 00"), 0, 4), "constructed high tag")
+    decode_fails(lambda: ber.read_tlv(h("ff 00"), 0, 2), "private high tag")
+
+def _test_bad_ranges() -> None:
+    b = h("02 01 05")
+    decode_fails(lambda: ber.read_tlv(b, 0, 4), "end beyond buffer")
+    decode_fails(lambda: ber.read_tlv(b, -1, 3), "negative position")
+    decode_fails(lambda: ber.read_tlv(b, 3, 3), "position at end")
+    decode_fails(lambda: ber.read_tlv(b, 4, 3), "position beyond end")
+    decode_fails(lambda: ber.dec_int(b, 2, 4), "content beyond buffer")
+    decode_fails(lambda: ber.dec_int(b, 3, 2), "start after stop")
+    decode_fails(lambda: ber.dec_uint32(b, -1, 3), "negative start")
+    decode_fails(lambda: ber.dec_u64(b, 0, 9), "content beyond buffer")
+    decode_fails(lambda: ber.dec_oid(b, 1, 10), "content beyond buffer")
+    decode_fails(lambda: ber.dump(b, 0, 9), "dump beyond buffer")
+
+def _test_expect_tlv() -> None:
+    b = h("02 01 05")
+    testing.assertEqual(ber.expect_tlv(b, 0, 3, ber.TAG_INTEGER), (2, 3))
+    decode_fails(lambda: ber.expect_tlv(b, 0, 3, ber.TAG_OCTET_STRING), "wrong tag")
+    try:
+        ber.expect_tlv(b, 0, 3, ber.TAG_SEQUENCE)
+        testing.error("no DecodeError")
+    except errors.DecodeError as e:
+        testing.assertEqual(e.offset, 0)
+        testing.assertEqual(e.reason, "expected tag 0x30, got 0x02")
+        testing.assertEqual(e.error_message, "expected tag 0x30, got 0x02 at offset 0")
+        testing.assertFalse(e.transient)
+
+
+# Nesting depth and dump ############################################################################
+
+def _nested(levels: int) -> bytes:
+    b = h("05 00")
+    for i in range(levels):
+        b = ber.enc_tlv(ber.TAG_SEQUENCE, b)
+    return b
+
+def _test_dump() -> None:
+    b = h(MSG_A)
+    expected = "\n".join([
+        "30 len=41",
+        "  02 len=1: 01",
+        "  04 len=6: 7075626c6963",
+        "  a0 len=28",
+        "    02 len=4: 12345678",
+        "    02 len=1: 00",
+        "    02 len=1: 00",
+        "    30 len=14",
+        "      30 len=12",
+        "        06 len=8: 2b06010201010100",
+        "        05 len=0: ",
+    ])
+    testing.assertEqual(ber.dump(b, 0, len(b)), expected, print_diff=False)
+    testing.assertEqual(ber.dump(b"", 0, 0), "")
+
+def _test_nesting_depth() -> None:
+    # 15 SEQUENCEs around a NULL are 16 levels of TLVs: the limit
+    ok = _nested(ber.MAX_DEPTH - 1)
+    testing.assertEqual(len(ber.dump(ok, 0, len(ok)).split("\n")), ber.MAX_DEPTH)
+    deep = _nested(ber.MAX_DEPTH)
+    decode_fails(lambda: ber.dump(deep, 0, len(deep)), "17 levels")
+    deeper = _nested(200)
+    decode_fails(lambda: ber.dump(deeper, 0, len(deeper)), "201 levels")
+    try:
+        ber.dump(deep, 0, len(deep))
+        testing.error("no DecodeError")
+    except errors.DecodeError as e:
+        testing.assertEqual(e.offset, 32)
+
+
+# Hex helpers #######################################################################################
+
+def _test_hex_helpers() -> None:
+    testing.assertEqual(ber.to_hex(b""), "")
+    testing.assertEqual(ber.to_hex(h("00 01 7f 80 fe ff")), "00017f80feff")
+    testing.assertEqual(ber.from_hex("de:ad:BE:EF"), b"\xde\xad\xbe\xef")
+    testing.assertEqual(ber.from_hex(" 30 29\n\t02 01 "), b"\x30\x29\x02\x01")
+    testing.assertEqual(ber.from_hex(""), b"")
+    for bad in ["0", "zz", "0x10", "30 2", "30-29"]:
+        try:
+            ber.from_hex(bad)
+            testing.error("from_hex(%r) did not raise" % bad)
+        except ValueError:
+            pass
+
+
+# Deterministic pseudo-random round trips ##########################################################
+
+def int_bits(rng: Lcg) -> int:
+    """Return a signed value whose magnitude has a random bit length 0..63"""
+    v = rng.next64() >> rng.below(64)
+    return v
+
+def _test_random_int_round_trip() -> None:
+    rng = Lcg(1)
+    for i in range(2000):
+        v = int_bits(rng)
+        c = ber.enc_int_content(v)
+        testing.assertEqual(ber.dec_int(c, 0, len(c)), v, "int %d" % v)
+        # minimal: no redundant leading octet
+        if len(c) > 1:
+            testing.assertFalse((c[0] == 0 and c[1] < 0x80) or (c[0] == 0xff and c[1] >= 0x80), "minimal %d" % v)
+
+def _test_random_unsigned_round_trip() -> None:
+    rng = Lcg(2)
+    for i in range(2000):
+        v = (rng.next64() >> 32) & (0xffffffff >> rng.below(32))
+        c = ber.enc_uint_content(v)
+        testing.assertEqual(ber.dec_uint32(c, 0, len(c)), v, "uint %d" % v)
+        w = u64(rng.next64() & 0x7fffffffffffffff) * u64(1 + rng.below(2)) >> rng.below(64)
+        d = ber.enc_u64_content(w)
+        testing.assertEqual(ber.dec_u64(d, 0, len(d)), w, "u64 " + str(w))
+
+def _test_random_oid_round_trip() -> None:
+    rng = Lcg(3)
+    for i in range(500):
+        first = rng.below(3)
+        arcs = [first, rng.below(40) if first < 2 else rng.below(100000)]
+        for j in range(rng.below(30)):
+            arcs.append((rng.next64() >> 32) & (0xffffffff >> rng.below(32)))
+        c = ber.enc_oid_content(arcs)
+        testing.assertEqual(ber.dec_oid(c, 0, len(c)), arcs, "oid " + str(arcs))
+
+
+# errors (no module of its own to test it; ber is its first user) ##################################
+
+class FakeResponse(object):
+    """Stands in for client.Response, which ErrorStatusError carries as ?value"""
+    request_id: int
+
+    def __init__(self, request_id: int):
+        self.request_id = request_id
+
+def response_of(e: errors.ErrorStatusError) -> ?FakeResponse:
+    r = e.response
+    if isinstance(r, FakeResponse):
+        return r
+    return None
+
+def _test_error_classes() -> None:
+    d = errors.DecodeError("truncated", 7)
+    testing.assertEqual((d.reason, d.offset, d.error_message, d.transient), ("truncated", 7, "truncated at offset 7", False))
+    testing.assertFalse(errors.EncodeError("bad").transient)
+    t = errors.TimeoutError(4, 3.0, "ICMP port unreachable")
+    testing.assertEqual(t.error_message, "no response after 4 attempts in 3.00 s (ICMP port unreachable)")
+    testing.assertEqual((t.attempts, t.elapsed, t.transient), (4, 3.0, True))
+    testing.assertEqual(errors.TimeoutError(1, 0.5).error_message, "no response after 1 attempts in 0.50 s")
+    testing.assertNone(errors.TimeoutError(1, 0.5).hint)
+    testing.assertTrue(errors.TransportError("connection refused").transient)
+    r = errors.ReportError([1, 3, 6, 1, 6, 3, 15, 1, 1, 3, 0], "usmStatsUnknownUserNames", 2)
+    testing.assertEqual(r.error_message, "report usmStatsUnknownUserNames (.1.3.6.1.6.3.15.1.1.3.0) = 2")
+    testing.assertEqual((r.name, r.value, r.transient), ("usmStatsUnknownUserNames", 2, False))
+    testing.assertEqual(errors.ReportError([1, 3], "x").error_message, "report x (.1.3)")
+    n = errors.OidNotIncreasingError([1, 3, 6, 2], [1, 3, 6, 1])
+    testing.assertEqual(n.error_message, "OID not increasing: .1.3.6.2 >= .1.3.6.1")
+    testing.assertEqual((n.previous, n.received), ([1, 3, 6, 2], [1, 3, 6, 1]))
+    testing.assertEqual(errors.CancelledError().error_message, "cancelled")
+    testing.assertFalse(errors.AuthError("wrong digest").transient)
+    testing.assertFalse(errors.InvalidResponseError("varbind count").transient)
+
+def _test_error_status_error() -> None:
+    e = errors.ErrorStatusError(2, 1, [1, 3, 6, 1, 2, 1, 1, 99, 0], "(noSuchName) There is no such variable name in this MIB.",
+                                FakeResponse(42))
+    testing.assertEqual(e.error_message, "(noSuchName) There is no such variable name in this MIB., error-index 1 (.1.3.6.1.2.1.1.99.0)")
+    testing.assertEqual((e.status, e.index, e.oid, e.transient), (2, 1, [1, 3, 6, 1, 2, 1, 1, 99, 0], False))
+    fr = response_of(e)
+    if fr is not None:
+        testing.assertEqual(fr.request_id, 42)
+    else:
+        testing.error("response not kept")
+    plain = errors.ErrorStatusError(17, 0)
+    testing.assertEqual(plain.error_message, "error-status 17, error-index 0")
+    testing.assertNone(plain.oid)
+    testing.assertNone(response_of(plain))
+    # genErr and resourceUnavailable are worth retrying
+    testing.assertTrue(errors.ErrorStatusError(5, 1).transient)
+    testing.assertTrue(errors.ErrorStatusError(13, 1).transient)
+    testing.assertFalse(errors.ErrorStatusError(1, 0).transient)
+
+def classify(e: errors.SnmpError) -> str:
+    if isinstance(e, errors.DecodeError):
+        return "decode %d" % e.offset
+    if isinstance(e, errors.ErrorStatusError):
+        return "status %d" % e.status
+    return "other"
+
+def _test_error_hierarchy() -> None:
+    testing.assertEqual(classify(errors.DecodeError("x", 3)), "decode 3")
+    testing.assertEqual(classify(errors.ErrorStatusError(5, 1)), "status 5")
+    testing.assertEqual(classify(errors.CancelledError()), "other")
+    try:
+        raise errors.DecodeError("deep", 9)
+    except errors.SnmpError as e:
+        testing.assertEqual(e.error_message, "deep at offset 9")
+    try:
+        raise errors.TimeoutError(2, 1.0)
+    except Exception as e:
+        testing.assertTrue(isinstance(e, errors.SnmpError))
