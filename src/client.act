@@ -1,0 +1,1785 @@
+"""SNMP manager: the Client actor (command generator and notification originator)
+
+A Client talks to ONE SNMP engine, an agent (or, for notifications, a
+receiver), over a Transport: a connected UDP socket made from a
+net.UDPConnectCap, or any Transport given to it (transport.MemNet in tests,
+a shared-socket dispatcher later). Its Security decides the version:
+security.Community for SNMPv1/v2c, security.Usm for SNMPv3 with USM.
+
+Operations take the callback first; the Client itself is the callback's
+first argument (the stratoweave house style, so that callers can tell stale
+clients apart). Every request callback is called exactly once:
+
+  * cb(c, r, None): success, r.error_status == 0;
+  * cb(c, r, errors.ErrorStatusError): the agent answered with an
+    error-status; r is kept for inspection, also as e.response
+    (error_response(e) narrows it to a Response);
+  * cb(c, None, e) for every other error. Invalid arguments are reported
+    this way as errors.EncodeError, never raised; cancel() and close()
+    deliver errors.CancelledError.
+
+The request engine:
+
+  * Every attempt gets a fresh random id: the request-id for SNMPv1/v2c, the
+    msgID (with a fresh salt and MAC) for SNMPv3, whose request-id stays the
+    same. All attempt ids of a request stay mapped to it until it completes,
+    so a late reply to an earlier attempt is accepted. The exception is an
+    SNMPv2c InformRequest: its retransmissions keep the request-id, so that
+    the receiver's duplicate suppression recognises them.
+  * Timers use `after now` with the attempt number as generation: Acton
+    timers cannot be cancelled, so a timer of a superseded attempt or of a
+    completed request finds nothing to do. Attempt n (from 0) waits
+    timeout * backoff^n seconds, capped at max_timeout (but never below
+    timeout).
+  * A datagram is checked in this order: decode, version, id lookup,
+    source address and port, community (with Options.check_community) or
+    USM, PDU type, then the shape of the response. One that fails a check
+    up to the PDU type is dropped and counted in Stats, because it may be
+    spoofed; if the request then times out, TimeoutError.hint summarises
+    what was dropped while it was pending. A response of the wrong shape
+    fails the request with errors.InvalidResponseError.
+  * GET and GETNEXT requests with more than Options.max_oids_per_request
+    varbinds are sent in parts, and a tooBig answer to one with more than
+    one varbind splits it in half, recursively. A SET is never split (that
+    would not be atomic): it reports tooBig. A tooBig GETBULK is resent
+    with half the max-repetitions.
+  * SNMPv1: GETBULK is sent as GETNEXT; with Options.v1_fix_errors a
+    noSuchName answer to a GET drops that varbind, resends the rest and
+    reports NoSuchObject for it (EndOfMibView for a GETNEXT).
+  * SNMPv3: lazy engine discovery shared by all requests, the 2-round-trip
+    time synchronisation with the discovery Report's boots and time as an
+    unauthenticated hint, resynchronisation on an authenticated
+    notInTimeWindows Report (one resend), rediscovery on unknownEngineIDs
+    (one resend), errors.ReportError for every other Report, and a reset
+    of the engine state after repeated timeouts or time-window failures.
+
+Notifications: trap() sends an SNMPv2-Trap (v2c, or v3 where the Client is
+the authoritative engine: local_engine_id, local_engine_boots, time since
+the Client started), trap_v1() an SNMPv1 Trap-PDU, inform() an InformRequest that is
+retried like a request (for v3 the receiver is authoritative and is
+discovered like an agent).
+
+Communities, passwords and keys are never logged; trace logging shows
+decoded messages, whose repr() hides the community.
+"""
+
+import logging
+import net
+import time
+
+import errors
+import message
+import notify
+import pdu
+import usm
+import usmcrypto
+from message import CommunityMessage, ScopedPdu, UsmSecurityParameters, V3Message
+from oid import Oid
+from pdu import Pdu, TrapV1Pdu
+from security import Community, Security, Usm
+from transport import Transport, is_unreachable, normalize_address, udp_transport
+from usm import EngineTime, LocalizedUser, SaltCounter
+from values import Counter32, EndOfMibView, NoSuchObject, VarBind
+
+# msgMaxSize of our SNMPv3 messages: the largest UDP payload over IPv4, as net-snmp and pysnmp send
+MAX_MSG_SIZE = 65507
+
+# Consecutive SNMPv3 request timeouts after which the engine's ID and time are
+# forgotten and discovered again before the next request
+RESET_AFTER_TIMEOUTS = 2
+
+# Enterprise number in the default local engine ID (RFC 3411 format 5,
+# "octets"): net-snmp's 8072, as the actsnmp agent's default engine ID uses
+_ENGINE_ID_PREFIX = b"\x80\x00\x1f\x88\x05"
+
+_MASK31 = 0x7fffffff
+_MASK15 = 0x7fff
+_TICKS_WRAP = 0x100000000
+
+# Indexes of the counters a request snapshots for TimeoutError.hint (_Exchange.counters)
+_C_DECODE = 0
+_C_UNKNOWN_ID = 1
+_C_SOURCE = 2
+_C_AUTH = 3
+_C_VERSION = 4
+_C_PDU = 5
+_C_UNREACHABLE = 6
+_C_SEND_ERRORS = 7
+_C_TIME_WINDOW = 8
+
+
+def _now() -> float:
+    # Monotonic time in seconds
+    return float(time.monotonic_ns()) / 1000000000.0
+
+def _random_id(mask: int) -> int:
+    # A random id in 1..mask from the system's random source: request-ids and
+    # msgIDs are not predictable, so a blind spoofer cannot match them
+    v = 0
+    while v == 0:
+        b = usmcrypto.random_bytes(4)
+        v = ((b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3]) & mask
+    return v
+
+def _default_engine_id() -> bytes:
+    # RFC 3411 format 5 (administratively assigned octets): 8 random octets
+    return _ENGINE_ID_PREFIX + usmcrypto.random_bytes(8)
+
+def _plural(n: int, one: str, many: str) -> str:
+    return "%d " % n + (one if n == 1 else many)
+
+def _finite_positive(x: float) -> bool:
+    return x > 0.0 and x <= 86400.0
+
+
+class Options(object):
+    """Tunables of a Client, per Client and per request
+
+    timeout is the time in seconds the first attempt of a request waits for
+    an answer, and retries the number of further attempts. Attempt n (from
+    0) waits timeout * backoff^n seconds, at most max_timeout but never
+    less than timeout (backoff 1.0 waits the same each time, like net-snmp).
+    Retrying a SET is not idempotent in practice (a retried createAndGo can
+    fail although the first attempt succeeded): consider retries=0 for it.
+
+    max_in_flight is the number of requests that may be outstanding at the
+    agent at the same time; more are queued in order. max_queued bounds
+    that queue (0: no bound): a request beyond it fails at once with
+    errors.QueueFullError (transient), so a poller of a dead device cannot
+    grow memory without limit. Both are read from the Client's own options
+    only, not per request.
+
+    max_oids_per_request splits GET and GETNEXT requests with more varbinds
+    into several PDUs (0: never). A SET is never split, because a split
+    SET is not atomic. max_repetitions is the GETBULK default.
+
+    use_bulk, adaptive_bulk, check_increasing, get_root_if_empty and
+    max_walk_varbinds are reserved for walks and tables.
+
+    v1_fix_errors: with SNMPv1, a GET answered with noSuchName drops that
+    varbind, sends the rest again and reports NoSuchObject for it; a GETNEXT
+    reports EndOfMibView (net-snmp's snmpget default; -Cf turns it off).
+    strict_response_oids: a GET, SET or InformRequest response must name
+    the requested OIDs in order. check_community: drop SNMPv1/v2c responses
+    whose community differs from ours (net-snmp does not check).
+    request_id_bits is 31, or 16 for old agents: request-ids then stay in
+    1..32767, like net-snmp's 16-bit id mode.
+
+    The constructor raises ValueError for a timeout, backoff or max_timeout
+    that is not a positive number of at most 86400, negative retries,
+    max_in_flight below 1, a negative max_oids_per_request, max_repetitions
+    or max_queued, max_walk_varbinds below 1, or request_id_bits other
+    than 31 and 16. with_() returns a copy with some fields replaced.
+    """
+    timeout: float
+    retries: int
+    backoff: float
+    max_timeout: float
+    max_in_flight: int
+    max_oids_per_request: int
+    max_repetitions: int
+    use_bulk: bool
+    adaptive_bulk: bool
+    check_increasing: bool
+    get_root_if_empty: bool
+    max_walk_varbinds: int
+    v1_fix_errors: bool
+    strict_response_oids: bool
+    check_community: bool
+    request_id_bits: int
+    max_queued: int
+
+    def __init__(self, timeout: float=1.0, retries: int=3, backoff: float=1.0, max_timeout: float=8.0,
+                 max_in_flight: int=1, max_oids_per_request: int=32, max_repetitions: int=25,
+                 use_bulk: bool=True, adaptive_bulk: bool=True, check_increasing: bool=True,
+                 get_root_if_empty: bool=True, max_walk_varbinds: int=1000000, v1_fix_errors: bool=True,
+                 strict_response_oids: bool=True, check_community: bool=False, request_id_bits: int=31,
+                 max_queued: int=0):
+        if not _finite_positive(timeout):
+            raise ValueError("Options.timeout must be a positive number of seconds up to 86400")
+        if not _finite_positive(backoff):
+            raise ValueError("Options.backoff must be a positive number up to 86400")
+        if not _finite_positive(max_timeout):
+            raise ValueError("Options.max_timeout must be a positive number of seconds up to 86400")
+        if retries < 0:
+            raise ValueError("Options.retries must not be negative")
+        if max_in_flight < 1:
+            raise ValueError("Options.max_in_flight must be at least 1")
+        if max_oids_per_request < 0:
+            raise ValueError("Options.max_oids_per_request must not be negative (0: no limit)")
+        if max_repetitions < 0:
+            raise ValueError("Options.max_repetitions must not be negative")
+        if max_walk_varbinds < 1:
+            raise ValueError("Options.max_walk_varbinds must be at least 1")
+        if request_id_bits != 31 and request_id_bits != 16:
+            raise ValueError("Options.request_id_bits must be 31 or 16")
+        if max_queued < 0:
+            raise ValueError("Options.max_queued must not be negative (0: no limit)")
+        self.timeout = timeout
+        self.retries = retries
+        self.backoff = backoff
+        self.max_timeout = max_timeout
+        self.max_in_flight = max_in_flight
+        self.max_oids_per_request = max_oids_per_request
+        self.max_repetitions = max_repetitions
+        self.use_bulk = use_bulk
+        self.adaptive_bulk = adaptive_bulk
+        self.check_increasing = check_increasing
+        self.get_root_if_empty = get_root_if_empty
+        self.max_walk_varbinds = max_walk_varbinds
+        self.v1_fix_errors = v1_fix_errors
+        self.strict_response_oids = strict_response_oids
+        self.check_community = check_community
+        self.request_id_bits = request_id_bits
+        self.max_queued = max_queued
+
+    def with_(self, timeout: ?float=None, retries: ?int=None, backoff: ?float=None, max_timeout: ?float=None,
+              max_in_flight: ?int=None, max_oids_per_request: ?int=None, max_repetitions: ?int=None,
+              use_bulk: ?bool=None, adaptive_bulk: ?bool=None, check_increasing: ?bool=None,
+              get_root_if_empty: ?bool=None, max_walk_varbinds: ?int=None, v1_fix_errors: ?bool=None,
+              strict_response_oids: ?bool=None, check_community: ?bool=None,
+              request_id_bits: ?int=None, max_queued: ?int=None) -> Options:
+        """Return a copy with the given fields replaced; raises ValueError like the constructor"""
+        return Options(timeout if timeout is not None else self.timeout,
+                       retries if retries is not None else self.retries,
+                       backoff if backoff is not None else self.backoff,
+                       max_timeout if max_timeout is not None else self.max_timeout,
+                       max_in_flight if max_in_flight is not None else self.max_in_flight,
+                       max_oids_per_request if max_oids_per_request is not None else self.max_oids_per_request,
+                       max_repetitions if max_repetitions is not None else self.max_repetitions,
+                       use_bulk if use_bulk is not None else self.use_bulk,
+                       adaptive_bulk if adaptive_bulk is not None else self.adaptive_bulk,
+                       check_increasing if check_increasing is not None else self.check_increasing,
+                       get_root_if_empty if get_root_if_empty is not None else self.get_root_if_empty,
+                       max_walk_varbinds if max_walk_varbinds is not None else self.max_walk_varbinds,
+                       v1_fix_errors if v1_fix_errors is not None else self.v1_fix_errors,
+                       strict_response_oids if strict_response_oids is not None else self.strict_response_oids,
+                       check_community if check_community is not None else self.check_community,
+                       request_id_bits if request_id_bits is not None else self.request_id_bits,
+                       max_queued if max_queued is not None else self.max_queued)
+
+    def attempt_timeout(self, n: int) -> float:
+        """Return the seconds attempt n (0 = the first) waits: timeout * backoff^n, capped as described above"""
+        t = self.timeout
+        for _ in range(n):
+            t = t * self.backoff
+            if t >= self.max_timeout:
+                break
+        if t > self.max_timeout:
+            t = self.max_timeout
+        return t if t > self.timeout else self.timeout
+
+    def __repr__(self) -> str:
+        return ("Options(timeout=%s, retries=%d, backoff=%s, max_timeout=%s, max_in_flight=%d, "
+                % (str(self.timeout), self.retries, str(self.backoff), str(self.max_timeout), self.max_in_flight)
+                + "max_oids_per_request=%d, max_repetitions=%d, " % (self.max_oids_per_request, self.max_repetitions)
+                + "use_bulk=" + str(self.use_bulk) + ", adaptive_bulk=" + str(self.adaptive_bulk)
+                + ", check_increasing=" + str(self.check_increasing) + ", get_root_if_empty="
+                + str(self.get_root_if_empty) + ", max_walk_varbinds=%d, " % self.max_walk_varbinds
+                + "v1_fix_errors=" + str(self.v1_fix_errors) + ", strict_response_oids="
+                + str(self.strict_response_oids) + ", check_community=" + str(self.check_community)
+                + ", request_id_bits=%d, max_queued=%d)" % (self.request_id_bits, self.max_queued))
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
+
+class Response(object):
+    """The answer to a request
+
+    pdu_type is pdu.RESPONSE. request_id is the request-id of the answered
+    PDU (for a request sent in several PDUs, the last one). error_status
+    and error_index are the agent's (error_index is 1-based and refers to
+    the varbinds of the request as the caller gave them). varbinds are the
+    response varbinds, in request order for GET, GETNEXT and SET; for a
+    request that was split, or fixed for SNMPv1, they are merged from all
+    parts. attempts is the number of datagrams sent for the request and rtt
+    the seconds from sending the answered attempt to receiving the answer.
+    context_engine_id and context_name are the SNMPv3 context of the
+    response (empty for SNMPv1/v2c).
+    """
+    pdu_type: int
+    request_id: int
+    error_status: int
+    error_index: int
+    varbinds: list[VarBind]
+    attempts: int
+    rtt: float
+    context_engine_id: bytes
+    context_name: bytes
+
+    def __init__(self, pdu_type: int, request_id: int, error_status: int, error_index: int, varbinds: list[VarBind],
+                 attempts: int, rtt: float, context_engine_id: bytes=b"", context_name: bytes=b""):
+        self.pdu_type = pdu_type
+        self.request_id = request_id
+        self.error_status = error_status
+        self.error_index = error_index
+        self.varbinds = varbinds
+        self.attempts = attempts
+        self.rtt = rtt
+        self.context_engine_id = context_engine_id
+        self.context_name = context_name
+
+    def __repr__(self) -> str:
+        return ("Response(" + pdu.pdu_type_name(self.pdu_type) + ", request_id=%d, error_status=%d, error_index=%d, "
+                % (self.request_id, self.error_status, self.error_index) + "varbinds=" + repr(self.varbinds)
+                + ", attempts=%d, rtt=%f)" % (self.attempts, self.rtt))
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
+
+def error_response(e: errors.ErrorStatusError) -> ?Response:
+    """Return the Response an ErrorStatusError came with, or None
+
+    errors cannot name client.Response (it is below this module), so
+    e.response is typed ?value; this narrows it.
+    """
+    r = e.response
+    if isinstance(r, Response):
+        return r
+    return None
+
+
+class EngineInfo(object):
+    """What a Client knows about the SNMPv3 engine of its agent
+
+    engine_id is the snmpEngineID; boots and time the snmpEngineBoots and
+    snmpEngineTime as learned at learned_at (monotonic seconds of this
+    process, as time.monotonic_ns() / 1e9), so the engine's time now is
+    about time + (now - learned_at). Pass one to a new Client (engine=...)
+    to skip discovery; its boots and time are then only a hint, like those
+    of a discovery Report, until an authenticated message confirms them.
+    """
+    engine_id: bytes
+    boots: int
+    time: int
+    learned_at: float
+
+    def __init__(self, engine_id: bytes, boots: int, time: int, learned_at: float):
+        self.engine_id = engine_id
+        self.boots = boots
+        self.time = time
+        self.learned_at = learned_at
+
+    def __repr__(self) -> str:
+        return "EngineInfo(engine_id=" + self.engine_id.hex() + ", boots=%d, time=%d)" % (self.boots, self.time)
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
+
+class Stats(object):
+    """Counters of a Client (a snapshot from Client.stats())
+
+    requests: requests accepted (invalid ones are not counted).
+    retries: attempts resent after a timeout. timeouts: PDU exchanges,
+        discovery included, that ran out of attempts.
+    responses: answers accepted. reports: SNMPv3 Reports that passed the
+        security checks.
+    Dropped datagrams, by the first check they failed:
+        drops_decode: not a decodable SNMP message;
+        drops_version: another SNMP version than ours;
+        drops_unknown_id: no pending attempt has its id (late duplicates,
+            answers to cancelled requests, guessed ids);
+        drops_source: not from the agent's address and port;
+        drops_auth: wrong community (check_community), or failed SNMPv3
+            security processing (wrong digest, outside the time window,
+            wrong engine ID, user or security level, undecryptable);
+        drops_pdu: an unexpected PDU type, or (SNMPv3) a request-id or
+            context that differs from the request's.
+    unreachable: ICMP port unreachable reports from the transport.
+    rtt_last and rtt_avg: round-trip times in seconds of the answered
+        attempts.
+    queued: requests waiting for a free max_in_flight slot; in_flight:
+        requests being worked on (sent, or waiting for SNMPv3 discovery).
+        A caller that submits faster than the agent answers sees queued
+        grow and can hold back; Options.max_queued bounds it.
+    """
+    requests: int
+    retries: int
+    timeouts: int
+    responses: int
+    drops_decode: int
+    drops_unknown_id: int
+    drops_source: int
+    drops_auth: int
+    drops_version: int
+    drops_pdu: int
+    reports: int
+    unreachable: int
+    rtt_last: float
+    rtt_avg: float
+    queued: int
+    in_flight: int
+
+    def __init__(self, requests: int, retries: int, timeouts: int, responses: int, drops_decode: int,
+                 drops_unknown_id: int, drops_source: int, drops_auth: int, drops_version: int, drops_pdu: int,
+                 reports: int, unreachable: int, rtt_last: float, rtt_avg: float, queued: int=0, in_flight: int=0):
+        self.requests = requests
+        self.retries = retries
+        self.timeouts = timeouts
+        self.responses = responses
+        self.drops_decode = drops_decode
+        self.drops_unknown_id = drops_unknown_id
+        self.drops_source = drops_source
+        self.drops_auth = drops_auth
+        self.drops_version = drops_version
+        self.drops_pdu = drops_pdu
+        self.reports = reports
+        self.unreachable = unreachable
+        self.rtt_last = rtt_last
+        self.rtt_avg = rtt_avg
+        self.queued = queued
+        self.in_flight = in_flight
+
+    def __repr__(self) -> str:
+        counts = [("requests", self.requests), ("retries", self.retries), ("timeouts", self.timeouts),
+                  ("responses", self.responses), ("drops_decode", self.drops_decode),
+                  ("drops_unknown_id", self.drops_unknown_id), ("drops_source", self.drops_source),
+                  ("drops_auth", self.drops_auth), ("drops_version", self.drops_version),
+                  ("drops_pdu", self.drops_pdu), ("reports", self.reports), ("unreachable", self.unreachable),
+                  ("queued", self.queued), ("in_flight", self.in_flight)]
+        return "Stats(" + ", ".join([c.0 + "=" + str(c.1) for c in counts]) + ")"
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
+
+# Internal request state #############################################################################
+
+class _Op(object):
+    # One request of the caller (get, get_next, get_bulk, set, inform). It has
+    # at most one PDU exchange in flight at a time: chunks lists the positions
+    # (in varbinds) still to fetch, chunks[0] being the current one; results
+    # collects the answers per position, bulk the answer of a GETBULK.
+    handle: int
+    kind: int
+    opts: Options
+    varbinds: list[VarBind]
+    non_repeaters: int
+    max_repetitions: int
+    chunks: list[list[int]]
+    results: list[VarBind]
+    bulk: list[VarBind]
+    active: bool
+    exchange: int
+    attempts: int
+    request_id: int
+    rtt: float
+    context_engine_id: bytes
+    context_name: bytes
+    resync_left: int
+    rediscover_left: int
+    wait_gen: int
+
+    def __init__(self, handle: int, kind: int, opts: Options, varbinds: list[VarBind], non_repeaters: int,
+                 max_repetitions: int, chunks: list[list[int]]):
+        self.handle = handle
+        self.kind = kind
+        self.opts = opts
+        self.varbinds = varbinds
+        self.non_repeaters = non_repeaters
+        self.max_repetitions = max_repetitions
+        self.chunks = chunks
+        self.results = varbinds.copy()
+        self.bulk = []
+        self.active = False
+        self.exchange = 0
+        self.attempts = 0
+        self.request_id = 0
+        self.rtt = 0.0
+        self.context_engine_id = b""
+        self.context_name = b""
+        self.resync_left = 1
+        self.rediscover_left = 1
+        self.wait_gen = 0
+
+    def single(self, positions: list[int]) -> bool:
+        # The op is answered by one PDU covering all its varbinds in order
+        return len(positions) == len(self.varbinds) and len(self.chunks) == 1
+
+
+class _Exchange(object):
+    # One PDU and its attempts. handle is the op, 0 for a discovery probe.
+    # ids holds every attempt id (request-ids for SNMPv1/v2c, msgIDs for
+    # SNMPv3), all mapped to this exchange until it ends; attempt counts the
+    # datagrams sent and is the generation of the attempt timers. counters is
+    # the snapshot of the drop counters when the exchange began
+    # (TimeoutError.hint). The SNMPv3 fields hold what every attempt shares:
+    # keys are the user's keys for engine_id, used to protect the attempts and
+    # to verify the answers (None for noAuthNoPriv).
+    serial: int
+    handle: int
+    pdu_type: int
+    positions: list[int]
+    varbinds: list[VarBind]
+    non_repeaters: int
+    max_repetitions: int
+    opts: Options
+    request_id: int
+    ids: list[int]
+    sent_at: dict[int, float]
+    attempt: int
+    retries_used: int
+    first_sent: float
+    counters: list[int]
+    engine_id: bytes
+    level: int
+    user: bytes
+    context_engine_id: bytes
+    context_name: bytes
+    scoped: bytes
+    keys: ?LocalizedUser
+    time_window_drops: int
+
+    def __init__(self, serial: int, handle: int, pdu_type: int, positions: list[int], varbinds: list[VarBind],
+                 non_repeaters: int, max_repetitions: int, opts: Options, counters: list[int]):
+        self.serial = serial
+        self.handle = handle
+        self.pdu_type = pdu_type
+        self.positions = positions
+        self.varbinds = varbinds
+        self.non_repeaters = non_repeaters
+        self.max_repetitions = max_repetitions
+        self.opts = opts
+        self.request_id = 0
+        self.ids = []
+        self.sent_at = {}
+        self.attempt = 0
+        self.retries_used = 0
+        self.first_sent = 0.0
+        self.counters = counters
+        self.engine_id = b""
+        self.level = 0
+        self.user = b""
+        self.context_engine_id = b""
+        self.context_name = b""
+        self.scoped = b""
+        self.keys = None
+        self.time_window_drops = 0
+
+
+def _budget(o: Options) -> float:
+    # The seconds a request with Options o waits for an exchange in all: every attempt's timeout
+    return sum([o.attempt_timeout(i) for i in range(o.retries + 1)], 0.0)
+
+def _plan(kind: int, n: int, max_oids: int) -> list[list[int]]:
+    # The PDUs (lists of varbind positions) a request starts with
+    if (kind == pdu.GET or kind == pdu.GETNEXT) and max_oids > 0 and n > max_oids:
+        chunks: list[list[int]] = []
+        i = 0
+        while i < n:
+            end = i + max_oids
+            if end > n:
+                end = n
+            chunks.append(list(range(i, end)))
+            i = end
+        return chunks
+    return [list(range(n))]
+
+def _shape_problem(ex: _Exchange, p: Pdu, strict: bool) -> str:
+    # How an error-free response does not fit its request, "" if it does
+    n = len(ex.varbinds)
+    m = len(p.varbinds)
+    t = ex.pdu_type
+    if t == pdu.GETBULK:
+        nr = ex.non_repeaters if ex.non_repeaters < n else n
+        limit = nr + ex.max_repetitions * (n - nr)
+        if m > limit:
+            return "GETBULK response has %d varbinds, at most %d were asked for" % (m, limit)
+        return ""
+    if m != n:
+        return pdu.pdu_type_name(t) + " response has %d varbinds, the request %d" % (m, n)
+    if strict and t != pdu.GETNEXT:
+        for k in range(n):
+            got = p.varbinds[k].oid
+            want = ex.varbinds[k].oid
+            if got != want:
+                return ("varbind %d of the response is " % (k + 1) + got.dotted() + ", the request asked for "
+                        + want.dotted())
+    return ""
+
+def _hint(before: list[int], current: list[int], send_error: str, auth_priv: bool) -> ?str:
+    # TimeoutError.hint: what happened to the datagrams while a request was pending
+    d = [current[i] - before[i] for i in range(len(current))]
+    parts: list[str] = []
+    if d[_C_UNREACHABLE] > 0:
+        parts.append("ICMP port unreachable")
+    if d[_C_AUTH] > 0:
+        text = _plural(d[_C_AUTH], "datagram failed authentication", "datagrams failed authentication")
+        if d[_C_TIME_WINDOW] > 0:
+            text += " (%d outside the time window)" % d[_C_TIME_WINDOW]
+        parts.append(text)
+    if d[_C_SOURCE] > 0:
+        parts.append(_plural(d[_C_SOURCE], "datagram from another source", "datagrams from another source"))
+    if d[_C_DECODE] > 0:
+        parts.append(_plural(d[_C_DECODE], "undecodable datagram", "undecodable datagrams"))
+    if d[_C_VERSION] > 0:
+        parts.append(_plural(d[_C_VERSION], "datagram of another SNMP version", "datagrams of another SNMP version"))
+    if d[_C_UNKNOWN_ID] > 0:
+        parts.append(_plural(d[_C_UNKNOWN_ID], "datagram with an unknown id", "datagrams with an unknown id"))
+    if d[_C_PDU] > 0:
+        parts.append(_plural(d[_C_PDU], "datagram with an unexpected PDU", "datagrams with an unexpected PDU"))
+    if d[_C_SEND_ERRORS] > 0:
+        parts.append("send error: " + send_error)
+    if len(parts) > 0:
+        return "; ".join(parts)
+    if auth_priv:
+        return "with authPriv, a wrong privacy password or protocol also gives no response"
+    return None
+
+def _decode(data: bytes) -> (?CommunityMessage, ?V3Message, str):
+    # message.decode(), with the reason of a DecodeError instead of raising
+    try:
+        c, m = message.decode(data)
+        return (c, m, "")
+    except errors.DecodeError as e:
+        return (None, None, e.error_message)
+
+def _process(data: bytes, m: V3Message, keys: ?LocalizedUser, min_level: int, et: EngineTime,
+             now: float) -> (?ScopedPdu, ?EngineTime, str):
+    # usm.process_incoming(), with the counter name of a failure instead of raising
+    try:
+        r = usm.process_incoming(data, m, keys, min_level, et, now)
+        return (r.scoped, r.record, "")
+    except usm.UsmIncomingError as e:
+        return (None, None, e.kind)
+    except ValueError as e:
+        return (None, None, e.error_message)
+
+def _report_error(s: ScopedPdu) -> errors.ReportError:
+    # The ReportError for a Report-PDU: its first varbind names the counter
+    vbs = s.pdu.varbinds
+    if len(vbs) == 0:
+        return errors.ReportError([], "report without varbinds")
+    vb = vbs[0]
+    name = usm.report_name(vb.oid)
+    v = vb.value
+    value: ?int = v.value if isinstance(v, Counter32) else None
+    return errors.ReportError(vb.oid.arcs, name if name is not None else "unknown report", value)
+
+def _report_kind(s: ScopedPdu) -> str:
+    vbs = s.pdu.varbinds
+    if len(vbs) > 0:
+        name = usm.report_name(vbs[0].oid)
+        if name is not None:
+            return name
+    return ""
+
+def _as_usm(s: Security) -> ?Usm:
+    if isinstance(s, Usm):
+        return s
+    return None
+
+def _community_of(s: Security) -> bytes:
+    if isinstance(s, Community):
+        return s.community
+    return b""
+
+def _make_transport(cap: ?net.UDPConnectCap, address: str, port: int, supplied: ?Transport) -> ?Transport:
+    if supplied is not None:
+        return supplied
+    if cap is not None:
+        return udp_transport(cap, address, port)
+    return None
+
+def _is_ip(address: str) -> bool:
+    return net.is_ipv4(address) or net.is_ipv6(address)
+
+
+actor Client(cap: ?net.UDPConnectCap,
+             address: str,
+             security: Security,
+             log_handler: ?logging.Handler,
+             port: int=161,
+             opts: Options=Options(),
+             transport: ?Transport=None,
+             engine: ?EngineInfo=None,
+             local_engine_id: ?bytes=None,
+             local_engine_boots: int=1):
+    """An SNMP manager for the agent at address and port
+
+    cap is the capability for a UDP socket connected to address and port;
+    transport, when given, is used instead (cap may then be None). With
+    neither, every request fails with errors.TransportError. security is a
+    security.Community (SNMPv1/v2c) or security.Usm (SNMPv3). opts are the
+    default Options of every request. engine seeds the SNMPv3 engine
+    information (see EngineInfo), skipping discovery. local_engine_id is
+    our snmpEngineID for SNMPv3 traps, where the sender is authoritative
+    (5 to 32 octets; default: a random RFC 3411 format-5 ID), and
+    local_engine_boots our snmpEngineBoots (1..2^31-1); our time counts
+    from the Client's start. A receiver keeps a time record per sender
+    engine and drops traps that go back in time, so a sender with a fixed
+    engine ID (snmptrapd needs one: createUser -e) must persist its boots
+    and pass boots + 1 on every start (RFC 3414 section 2.2.2), as
+    ReceiverConfig.engine_boots does; with the default random engine ID
+    every Client is a new engine and boots 1 is fine.
+
+    The source of a response must be address and port. A connected UDP
+    socket made from cap already ensures this; with a given transport the
+    Client compares the source itself: the port always, the address when
+    address is an IP address (normalized, see transport.normalize_address).
+    """
+    _log = logging.Logger(log_handler)
+    _logging = log_handler is not None
+    _opts = opts
+    _start = _now()
+    _version = security.version
+    _usm: ?Usm = _as_usm(security)
+    _community = _community_of(security)
+    _local_engine_id = local_engine_id if local_engine_id is not None else _default_engine_id()
+    _check_port = transport is not None
+    _check_address = transport is not None and _is_ip(address)
+    _peer_address = normalize_address(address)
+    _salt = SaltCounter()
+
+    var _transport: ?Transport = None
+    var _fatal: ?str = None
+    var _closed = False
+    var _next_handle = 1
+    var _next_serial = 1
+    var _ops: dict[int, _Op] = {}
+    var _cbs: dict[int, action(Client, ?Response, ?errors.SnmpError) -> None] = {}
+    var _engine_cbs: list[action(Client, ?EngineInfo, ?errors.SnmpError) -> None] = []
+    var _queue: list[int] = []
+    var _queue_head = 0
+    var _pumping = False
+    var _active = 0
+    var _exchanges: dict[int, _Exchange] = {}
+    var _ids: dict[int, int] = {}
+
+    # SNMPv3 state: the agent's engine ID (None until discovered), the time
+    # records and localized keys per engine ID, the running discovery probe
+    # and the ops waiting for it
+    var _engine_id: ?bytes = None
+    var _times: dict[bytes, EngineTime] = {}
+    var _keys: dict[bytes, LocalizedUser] = {}
+    var _local_keys: ?LocalizedUser = None
+    var _disc_serial = 0
+    var _disc_waiters: list[int] = []
+    var _v3_timeouts = 0
+
+    # Counters (Stats) and the last non-fatal send error (TimeoutError.hint)
+    var _requests = 0
+    var _retries = 0
+    var _timeouts = 0
+    var _responses = 0
+    var _reports = 0
+    var _drops_decode = 0
+    var _drops_unknown_id = 0
+    var _drops_source = 0
+    var _drops_auth = 0
+    var _drops_version = 0
+    var _drops_pdu = 0
+    var _drops_time_window = 0
+    var _unreachable = 0
+    var _send_errors = 0
+    var _send_error = ""
+    var _rtt_last = 0.0
+    var _rtt_sum = 0.0
+
+    # Helpers #######################################################################################
+
+    proc def _counters() -> list[int]:
+        # The order of the _C_* indexes
+        return [_drops_decode, _drops_unknown_id, _drops_source, _drops_auth, _drops_version, _drops_pdu,
+                _unreachable, _send_errors, _drops_time_window]
+
+    proc def _mask(o: Options) -> int:
+        return _MASK15 if o.request_id_bits == 16 else _MASK31
+
+    proc def _new_id(mask: int) -> int:
+        # A random attempt id that no pending attempt uses
+        v = _random_id(mask)
+        while v in _ids:
+            v = _random_id(mask)
+        return v
+
+    proc def _uptime() -> int:
+        # Hundredths of a second since the Client started, as TimeTicks
+        return int((_now() - _start) * 100.0) % _TICKS_WRAP
+
+    proc def _from_peer(src_address: str, src_port: int) -> bool:
+        if _check_port and src_port != port:
+            return False
+        if _check_address and normalize_address(src_address) != _peer_address:
+            return False
+        return True
+
+    proc def _trace_on() -> bool:
+        return _log.output_level >= logging.TRACE
+
+    proc def _time_record(eid: bytes, now: float) -> EngineTime:
+        et = _times.get(eid)
+        if et is not None:
+            return et
+        return EngineTime(eid, 0, 0, 0, now)
+
+    proc def _clock_known(eid: bytes) -> bool:
+        # The engine's time record came from an authenticated message
+        et = _times.get(eid)
+        if et is not None:
+            return et.authenticated
+        return False
+
+    proc def _engine_info() -> ?EngineInfo:
+        eid = _engine_id
+        if eid is not None:
+            et = _times.get(eid)
+            if et is not None:
+                return EngineInfo(eid, et.boots, et.time, et.learned_at)
+            return EngineInfo(eid, 0, 0, _start)
+        return None
+
+    proc def _forget_engine(why: str) -> None:
+        # Forget the agent's engine ID and time record: the next request discovers them again
+        eid = _engine_id
+        if eid is not None:
+            _log.info("SNMPv3 engine state reset", {"engine_id": eid.hex(), "reason": why})
+            if eid in _times:
+                del _times[eid]
+        _engine_id = None
+        _v3_timeouts = 0
+
+    proc def _keys_for(u: Usm, eid: bytes) -> LocalizedUser:
+        # The user's keys localized to the agent's engine, derived once per engine ID. Keys are
+        # only derived for an engine we send to (discovered or seeded), never for an engine ID
+        # that an incoming message names: an answer is verified with the keys of the engine its
+        # request went to.
+        k = _keys.get(eid)
+        if k is not None:
+            return k
+        loc = u.localized(eid)
+        if len(_keys) >= 4:
+            _keys = {}
+        _keys[eid] = loc
+        return loc
+
+    # Completion ####################################################################################
+
+    proc def _end_exchange(ex: _Exchange) -> None:
+        # Unmap every attempt id; timers of the exchange find nothing afterwards
+        for i in ex.ids:
+            if i in _ids:
+                del _ids[i]
+        if ex.serial in _exchanges:
+            del _exchanges[ex.serial]
+
+    proc def _complete(op: _Op, r: ?Response, e: ?errors.SnmpError) -> None:
+        # Finish op and call its callback; a second completion finds nothing (exactly once)
+        h = op.handle
+        if h not in _ops:
+            return
+        del _ops[h]
+        ex = _exchanges.get(op.exchange)
+        if ex is not None:
+            _end_exchange(ex)
+        if op.active:
+            _active -= 1
+        # a queued op stays in _queue and a waiting one in _disc_waiters: both skip handles that
+        # are no longer in _ops, so completing many ops costs O(1) each
+        cb = _cbs.get(h)
+        if cb is not None:
+            del _cbs[h]
+            if e is not None:
+                _log.debug("request failed", {"handle": h, "error": e.error_message})
+            cb(self, r, e)
+        _pump()
+
+    proc def _fail_engine_cbs(e: errors.SnmpError) -> None:
+        cbs = _engine_cbs
+        _engine_cbs = []
+        for cb in cbs:
+            cb(self, None, e)
+
+    proc def _exchange_failed(ex: _Exchange, e: errors.SnmpError) -> None:
+        _end_exchange(ex)
+        if ex.handle == 0:
+            _discovery_failed(e)
+            return
+        op = _ops.get(ex.handle)
+        if op is not None:
+            _complete(op, None, e)
+
+    # Sending #######################################################################################
+
+    proc def _pump() -> None:
+        # Start queued ops while fewer than max_in_flight are active. Not reentrant: an op that
+        # completes at once (a failed transport) calls _pump again, which returns, and this loop
+        # goes on; so a long queue is drained iteratively, not by recursion. _queue_head is the
+        # next entry (popping the front of a list costs O(n)); the list is compacted now and then.
+        if _pumping:
+            return
+        _pumping = True
+        try:
+            while not _closed and _active < _opts.max_in_flight and _queue_head < len(_queue):
+                h = _queue[_queue_head]
+                _queue_head += 1
+                op = _ops.get(h)
+                if op is not None:
+                    op.active = True
+                    _active += 1
+                    _next_chunk(op)
+            if _queue_head >= len(_queue):
+                _queue = []
+                _queue_head = 0
+            elif _queue_head > 1024 and _queue_head * 2 > len(_queue):
+                _queue = _queue[_queue_head:]
+                _queue_head = 0
+        finally:
+            _pumping = False
+
+    proc def _next_chunk(op: _Op) -> None:
+        # Send the op's current chunk, or complete the op when none is left
+        if len(op.chunks) == 0:
+            vbs = op.bulk if op.kind == pdu.GETBULK and _version != message.SNMP_V1 else op.results
+            r = Response(pdu.RESPONSE, op.request_id, 0, 0, vbs, op.attempts, op.rtt, op.context_engine_id,
+                         op.context_name)
+            _complete(op, r, None)
+            return
+        fatal = _fatal
+        if fatal is not None:
+            _complete(op, None, errors.TransportError(fatal))
+            return
+        u = _usm
+        if u is not None:
+            if _engine_id is None:
+                if op.handle not in _disc_waiters:
+                    _disc_waiters.append(op.handle)
+                    # Each waiting request keeps its own budget: it fails when that has passed,
+                    # whoever started the probe (the probe runs as long as its longest waiter)
+                    op.wait_gen += 1
+                    gen = op.wait_gen
+                    after now _budget(op.opts): _discovery_wait_expired(op.handle, gen)
+                _start_discovery(op.opts)
+                return
+        try:
+            _start_exchange(op)
+        except errors.EncodeError as e:
+            _complete(op, None, e)
+        except ValueError as e:
+            _complete(op, None, errors.EncodeError(e.error_message))
+
+    proc def _start_exchange(op: _Op) -> None:
+        # Build the exchange of op.chunks[0] and send its first attempt
+        positions = op.chunks[0]
+        vbs = [op.varbinds[i] for i in positions]
+        wire = op.kind
+        nr = 0
+        mr = 0
+        if wire == pdu.GETBULK:
+            if _version == message.SNMP_V1:
+                wire = pdu.GETNEXT          # RFC 3584 section 4.2.1
+            else:
+                nr = op.non_repeaters
+                mr = op.max_repetitions
+        ex = _Exchange(_next_serial, op.handle, wire, positions, vbs, nr, mr, op.opts, _counters())
+        _next_serial += 1
+        u = _usm
+        eid = _engine_id
+        if u is not None and eid is not None:
+            ex.engine_id = eid
+            ex.level = u.level()
+            ex.user = u.user.encode()
+            ceid = u.context_engine_id
+            ex.context_engine_id = ceid if ceid is not None else eid
+            ex.context_name = u.context_name
+            ex.request_id = _random_id(_mask(op.opts))
+            p = Pdu(wire, ex.request_id, nr, mr, vbs)
+            ex.scoped = message.encode_scoped(ScopedPdu(ex.context_engine_id, ex.context_name, p))
+            if ex.level != 0:
+                ex.keys = _keys_for(u, eid)
+        _exchanges[ex.serial] = ex
+        op.exchange = ex.serial
+        _send(ex)
+
+    def _discovery_wait_expired(h: int, gen: int) -> None:
+        # A request waited for discovery as long as its Options allow: it times out, the probe goes on
+        op = _ops.get(h)
+        if op is not None and op.wait_gen == gen and h in _disc_waiters:
+            _disc_waiters = [w for w in _disc_waiters if w != h]
+            hint = "SNMPv3 engine discovery"
+            attempts = 0
+            probe = _exchanges.get(_disc_serial)
+            if probe is not None:
+                attempts = probe.attempt
+                more = _hint(probe.counters, _counters(), _send_error, False)
+                if more is not None:
+                    hint += "; " + more
+            _timeouts += 1
+            _complete(op, None, errors.TimeoutError(attempts, _budget(op.opts), hint))
+
+    proc def _start_discovery(o: Options) -> None:
+        # Send the RFC 3414 section 4 probe, unless one is running: a GET without varbinds,
+        # noAuthNoPriv and reportable, with empty engine ID, user and context. Its timeout and
+        # retries are those of o, the Options of the request that needs it (discover(): the
+        # Client's). A request that joins a running probe with a longer budget extends it to
+        # its Options; one with a shorter budget times out by itself (_discovery_wait_expired).
+        if _disc_serial != 0:
+            running = _exchanges.get(_disc_serial)
+            if running is not None and _budget(o) > _budget(running.opts):
+                running.opts = o
+            return
+        fatal = _fatal
+        if fatal is not None:
+            _discovery_failed(errors.TransportError(fatal))
+            return
+        ex = _Exchange(_next_serial, 0, pdu.GET, [], [], 0, 0, o, _counters())
+        _next_serial += 1
+        ex.request_id = _random_id(_mask(o))
+        ex.scoped = message.encode_scoped(ScopedPdu(b"", b"", Pdu(pdu.GET, ex.request_id)))
+        _exchanges[ex.serial] = ex
+        _disc_serial = ex.serial
+        _log.debug("discovering the SNMPv3 engine", {"address": address, "port": port})
+        _send(ex)
+
+    proc def _encode_attempt(ex: _Exchange, id: int, now: float) -> bytes:
+        u = _usm
+        if u is not None:
+            boots_time = (0, 0)
+            if ex.level != 0:
+                boots_time = _time_record(ex.engine_id, now).estimate(now)
+            hdr = V3Message(id, MAX_MSG_SIZE, ex.level | message.FLAG_REPORTABLE,
+                            UsmSecurityParameters(ex.engine_id, boots_time.0, boots_time.1, ex.user))
+            salt = _salt.next() if (ex.level & message.FLAG_PRIV) != 0 else u64(0)
+            return usm.protect(hdr, ex.scoped, ex.keys, salt)
+        ex.request_id = id
+        p = Pdu(ex.pdu_type, id, ex.non_repeaters, ex.max_repetitions, ex.varbinds)
+        return message.encode_community(CommunityMessage(_version, _community, p))
+
+    proc def _send(ex: _Exchange) -> None:
+        # Send one attempt of ex with a fresh id and arm its timer
+        tr = _transport
+        fatal = _fatal
+        if fatal is not None:
+            _exchange_failed(ex, errors.TransportError(fatal))
+            return
+        if tr is not None:
+            now = _now()
+            id = 0
+            if _usm is None and ex.pdu_type == pdu.INFORM and len(ex.ids) > 0:
+                # An SNMPv2c inform is retransmitted with its request-id, so that a receiver's
+                # duplicate suppression recognises it (SNMPv3 keeps the request-id anyway)
+                id = ex.ids[0]
+            else:
+                id = _new_id(_MASK31 if _usm is not None else _mask(ex.opts))
+            data = b""
+            failure: ?errors.SnmpError = None
+            try:
+                data = _encode_attempt(ex, id, now)
+            except errors.EncodeError as e:
+                failure = e
+            except ValueError as e:
+                failure = errors.EncodeError(e.error_message)
+            if failure is not None:
+                _exchange_failed(ex, failure)
+                return
+            if ex.attempt == 0:
+                ex.first_sent = now
+            if id not in ex.sent_at:
+                ex.ids.append(id)
+            ex.sent_at[id] = now
+            _ids[id] = ex.serial
+            ex.attempt += 1
+            op = _ops.get(ex.handle)
+            if op is not None:
+                op.attempts += 1
+            if _logging:
+                _log.debug("sending", {"handle": ex.handle, "pdu": pdu.pdu_type_name(ex.pdu_type), "id": id,
+                                       "attempt": ex.attempt})
+            tr.send(data)
+            after now ex.opts.attempt_timeout(ex.retries_used): _on_timer(ex.serial, ex.attempt)
+        else:
+            _exchange_failed(ex, errors.TransportError("no transport: neither cap nor transport was given"))
+
+    proc def _resend(ex: _Exchange) -> None:
+        # An extra attempt for a recovery (resynchronisation); it does not use up a retry
+        _send(ex)
+
+    def _on_timer(serial: int, attempt: int) -> None:
+        ex = _exchanges.get(serial)
+        if ex is not None:
+            if ex.attempt == attempt:
+                if ex.retries_used < ex.opts.retries:
+                    ex.retries_used += 1
+                    _retries += 1
+                    _send(ex)
+                else:
+                    _timed_out(ex)
+
+    proc def _timed_out(ex: _Exchange) -> None:
+        _timeouts += 1
+        now = _now()
+        current = _counters()
+        u = _usm
+        auth_priv = u is not None and ex.level == usm.LEVEL_AUTH_PRIV
+        hint = _hint(ex.counters, current, _send_error, auth_priv)
+        if ex.handle == 0:
+            hint = "SNMPv3 engine discovery" + ("; " + hint if hint is not None else "")
+        err = errors.TimeoutError(ex.attempt, now - ex.first_sent, hint)
+        if u is not None and ex.handle != 0:
+            # Only this exchange's own time-window drops, and only timeouts against the engine
+            # we still use, count towards a reset (a rediscovered engine starts afresh)
+            time_window = ex.time_window_drops > 0
+            eid = _engine_id
+            if eid is not None and eid == ex.engine_id:
+                _v3_timeouts += 1
+                if time_window:
+                    _forget_engine("responses outside the time window")
+                elif _v3_timeouts >= RESET_AFTER_TIMEOUTS:
+                    _forget_engine("%d consecutive timeouts" % _v3_timeouts)
+        _exchange_failed(ex, err)
+
+    # Discovery #####################################################################################
+
+    proc def _discovery_done(ex: _Exchange, eid: bytes, boots: int, etime: int, now: float) -> None:
+        _end_exchange(ex)
+        _disc_serial = 0
+        if len(eid) < usm.MIN_ENGINE_ID_LEN or len(eid) > usm.MAX_ENGINE_ID_LEN:
+            _discovery_failed(errors.InvalidResponseError("discovery gave an engine ID of %d octets, not 5 to 32"
+                                                          % len(eid)))
+            return
+        if not _clock_known(eid):
+            # An unauthenticated hint, only for outgoing messages
+            _times[eid] = EngineTime(eid, boots, etime, 0, now)
+        prev = _engine_id
+        if prev is not None and prev != eid:
+            _log.warning("SNMPv3 engine ID changed", {"old": prev.hex(), "new": eid.hex()})
+        _engine_id = eid
+        _log.debug("SNMPv3 engine discovered", {"engine_id": eid.hex(), "boots": boots, "time": etime})
+        info = _engine_info()
+        cbs = _engine_cbs
+        _engine_cbs = []
+        for cb in cbs:
+            cb(self, info, None)
+        waiters = _disc_waiters
+        _disc_waiters = []
+        for h in waiters:
+            op = _ops.get(h)
+            if op is not None:
+                _next_chunk(op)
+
+    proc def _discovery_failed(e: errors.SnmpError) -> None:
+        ex = _exchanges.get(_disc_serial)
+        if ex is not None:
+            _end_exchange(ex)
+        _disc_serial = 0
+        _log.debug("SNMPv3 discovery failed", {"error": e.error_message})
+        _fail_engine_cbs(e)
+        waiters = _disc_waiters
+        _disc_waiters = []
+        for h in waiters:
+            op = _ops.get(h)
+            if op is not None:
+                _complete(op, None, e)
+
+    # Receiving #####################################################################################
+
+    def _on_data(data: bytes, src_address: str, src_port: int) -> None:
+        if _closed:
+            return
+        try:
+            _receive(data, src_address, src_port)
+        except Exception as e:
+            _log.error("internal error while processing a datagram", {"error": str(e)})
+
+    def _on_transport_error(text: str, fatal: bool) -> None:
+        if _closed:
+            return
+        if fatal:
+            if _fatal is None:
+                _log.error("transport failed", {"error": text})
+            _fatal = text
+            err = errors.TransportError(text)
+            for h in list(_ops.keys()):
+                op = _ops.get(h)
+                if op is not None:
+                    _complete(op, None, err)
+            _discovery_failed(err)
+        elif is_unreachable(text):
+            _unreachable += 1
+            _log.debug("ICMP port unreachable", {"address": address, "port": port})
+        else:
+            _send_errors += 1
+            _send_error = text
+            _log.debug("transport error", {"error": text})
+
+    proc def _receive(data: bytes, src_address: str, src_port: int) -> None:
+        c, m, reason = _decode(data)
+        if c is not None:
+            _receive_community(c, src_address, src_port)
+        elif m is not None:
+            _receive_v3(data, m, src_address, src_port)
+        else:
+            _drops_decode += 1
+            _log.debug("undecodable datagram dropped", {"reason": reason})
+
+    proc def _receive_community(c: CommunityMessage, src_address: str, src_port: int) -> None:
+        if _trace_on():
+            _log.trace("received", {"from": src_address, "port": src_port, "message": repr(c)})
+        if _usm is not None or c.version != _version:
+            _drops_version += 1
+            return
+        p = c.pdu
+        if p is not None:
+            serial = _ids.get(p.request_id)
+            if serial is not None:
+                ex = _exchanges.get(serial)
+                if ex is not None:
+                    if not _from_peer(src_address, src_port):
+                        _drops_source += 1
+                        _log.debug("datagram from another source dropped", {"from": src_address, "port": src_port})
+                    elif ex.opts.check_community and c.community != _community:
+                        _drops_auth += 1
+                        _log.debug("response with another community dropped", {"id": p.request_id})
+                    elif p.pdu_type != pdu.RESPONSE:
+                        _drops_pdu += 1
+                    else:
+                        _answered(ex, p, p.request_id, b"", b"")
+                    return
+            _drops_unknown_id += 1
+            _log.debug("datagram with an unknown request-id dropped", {"id": p.request_id})
+        else:
+            _drops_pdu += 1           # an SNMPv1 Trap-PDU has no request-id
+
+    proc def _receive_v3(data: bytes, m: V3Message, src_address: str, src_port: int) -> None:
+        if _trace_on():
+            _log.trace("received", {"from": src_address, "port": src_port, "message": repr(m)})
+        u = _usm
+        if u is None:
+            _drops_version += 1
+            return
+        serial = _ids.get(m.msg_id)
+        if serial is not None:
+            ex = _exchanges.get(serial)
+            if ex is not None:
+                if not _from_peer(src_address, src_port):
+                    _drops_source += 1
+                    _log.debug("datagram from another source dropped", {"from": src_address, "port": src_port})
+                    return
+                s = m.scoped
+                if s is not None:
+                    if s.pdu.pdu_type == pdu.REPORT:
+                        _receive_report(data, m, s, ex)
+                        return
+                if ex.handle == 0:
+                    _probe_answered(m, ex)
+                else:
+                    _receive_response(data, m, ex)
+                return
+        _drops_unknown_id += 1
+        _log.debug("datagram with an unknown msgID dropped", {"id": m.msg_id})
+
+    proc def _probe_answered(m: V3Message, ex: _Exchange) -> None:
+        # Something other than a Report to the discovery probe. net-snmp fails discovery on a
+        # Response (SNMPERR_INVALID_MSG); anything else is dropped.
+        s = m.scoped
+        if s is not None:
+            if s.pdu.pdu_type == pdu.RESPONSE and s.pdu.request_id == ex.request_id:
+                _discovery_failed(errors.InvalidResponseError(
+                    "the agent answered the discovery probe with a Response instead of a Report"))
+                return
+        _drops_pdu += 1
+
+    proc def _drop_auth(kind: str, id: int) -> None:
+        _drops_auth += 1
+        if kind == usm.USM_STATS_NOT_IN_TIME_WINDOWS:
+            _drops_time_window += 1
+            serial = _ids.get(id)
+            if serial is not None:
+                ex = _exchanges.get(serial)
+                if ex is not None:
+                    ex.time_window_drops += 1
+        _log.debug("SNMPv3 message dropped", {"reason": kind, "id": id})
+
+    proc def _receive_response(data: bytes, m: V3Message, ex: _Exchange) -> None:
+        # RFC 3412 7.2 and RFC 3414 3.2 for a Response: engine ID, user and level of the request
+        # (step 12b), the USM checks with timeliness, then request-id and context (RFC 3413 3.1)
+        if m.usm.engine_id != ex.engine_id or m.usm.user != ex.user:
+            _drop_auth("engine ID or user differs from the request", m.msg_id)
+            return
+        if (m.flags & usm.LEVEL_AUTH_PRIV) != ex.level:
+            _drop_auth("security level differs from the request", m.msg_id)
+            return
+        now = _now()
+        scoped, record, kind = _process(data, m, ex.keys, ex.level, _time_record(ex.engine_id, now), now)
+        if scoped is not None and record is not None:
+            if (m.flags & message.FLAG_AUTH) != 0:
+                _times[ex.engine_id] = record
+            p = scoped.pdu
+            if p.pdu_type == pdu.REPORT:
+                # A Report at the request's level, encrypted (RFC 3412 7.2 step 11b allows it):
+                # engine ID, user and level were checked above, the MAC and time window by _process
+                _on_report(m, scoped, ex, _report_kind(scoped), (m.flags & message.FLAG_AUTH) != 0, now)
+            elif p.pdu_type != pdu.RESPONSE:
+                _drops_pdu += 1
+            elif p.request_id != ex.request_id:
+                _drops_pdu += 1
+                _log.debug("SNMPv3 response with another request-id dropped", {"id": p.request_id})
+            elif scoped.context_engine_id != ex.context_engine_id or scoped.context_name != ex.context_name:
+                _drops_pdu += 1
+                _log.debug("SNMPv3 response for another context dropped", {"id": m.msg_id})
+            else:
+                _answered(ex, p, m.msg_id, scoped.context_engine_id, scoped.context_name)
+        else:
+            _drop_auth(kind, m.msg_id)
+
+    proc def _receive_report(data: bytes, m: V3Message, s: ScopedPdu, ex: _Exchange) -> None:
+        # A Report is matched by msgID only; its level may be lower than the
+        # request's. It must echo the request's user, and name the request's engine unless it
+        # reports unknownEngineIDs. An authenticated Report (notInTimeWindows) is verified with
+        # the keys of the request's engine, never with keys derived for an engine it names.
+        kind = _report_kind(s)
+        eid = m.usm.engine_id
+        if m.usm.user != ex.user:
+            _drop_auth("report for another user", m.msg_id)
+            return
+        if ex.handle != 0 and eid != ex.engine_id and kind != usm.USM_STATS_UNKNOWN_ENGINE_IDS:
+            _drop_auth("report from another engine", m.msg_id)
+            return
+        now = _now()
+        authenticated = (m.flags & message.FLAG_AUTH) != 0
+        keys = ex.keys if authenticated and eid == ex.engine_id else None
+        scoped, record, failure = _process(data, m, keys, usm.LEVEL_NO_AUTH_NO_PRIV, _time_record(eid, now), now)
+        if scoped is not None and record is not None:
+            if authenticated:
+                _times[eid] = record
+            _on_report(m, s, ex, kind, authenticated, now)
+        else:
+            _drop_auth(failure, m.msg_id)
+
+    proc def _on_report(m: V3Message, s: ScopedPdu, ex: _Exchange, kind: str, authenticated: bool, now: float) -> None:
+        # Act on a Report that passed the checks
+        eid = m.usm.engine_id
+        _reports += 1
+        _log.debug("report received", {"report": kind, "id": m.msg_id, "authenticated": authenticated})
+        if ex.handle == 0:
+            if kind == usm.USM_STATS_UNKNOWN_ENGINE_IDS:
+                _discovery_done(ex, eid, m.usm.boots, m.usm.time, now)
+            else:
+                _discovery_failed(_report_error(s))
+            return
+        op = _ops.get(ex.handle)
+        if op is not None:
+            if kind == usm.USM_STATS_NOT_IN_TIME_WINDOWS:
+                if not authenticated:
+                    # Only a hint: it cannot move a clock learned from authenticated messages
+                    if not _clock_known(eid):
+                        _times[eid] = EngineTime(eid, m.usm.boots, m.usm.time, 0, now)
+                if op.resync_left > 0:
+                    op.resync_left -= 1
+                    _log.debug("resynchronised with the SNMPv3 engine, resending", {"handle": op.handle})
+                    _resend(ex)
+                    return
+                _end_exchange(ex)
+                cur = _engine_id
+                if cur is not None and cur == ex.engine_id:
+                    _forget_engine("repeated notInTimeWindows reports")
+                _complete(op, None, _report_error(s))
+                return
+            if kind == usm.USM_STATS_UNKNOWN_ENGINE_IDS and op.rediscover_left > 0:
+                op.rediscover_left -= 1
+                _end_exchange(ex)
+                op.exchange = 0
+                cur = _engine_id
+                if cur is not None and cur == ex.engine_id:
+                    _forget_engine("unknownEngineIDs report")
+                _next_chunk(op)
+                return
+            _end_exchange(ex)
+            _complete(op, None, _report_error(s))
+
+    proc def _answered(ex: _Exchange, p: Pdu, id: int, ceid: bytes, cname: bytes) -> None:
+        # A response that passed every check up to the PDU type
+        now = _now()
+        sent = ex.sent_at.get(id)
+        rtt = now - sent if sent is not None else 0.0
+        _responses += 1
+        _rtt_last = rtt
+        _rtt_sum += rtt
+        _end_exchange(ex)
+        if _usm is not None:
+            _v3_timeouts = 0
+        op = _ops.get(ex.handle)
+        if op is not None:
+            op.exchange = 0
+            op.request_id = p.request_id
+            op.rtt = rtt
+            op.context_engine_id = ceid
+            op.context_name = cname
+            _on_pdu(op, ex, p)
+
+    proc def _on_pdu(op: _Op, ex: _Exchange, p: Pdu) -> None:
+        # Error statuses that the engine handles itself (tooBig, SNMPv1 noSuchName), the shape
+        # check, then the next chunk
+        status = p.error_status
+        if status == pdu.TOO_BIG:
+            if (ex.pdu_type == pdu.GET or ex.pdu_type == pdu.GETNEXT) and len(ex.positions) > 1:
+                half = len(ex.positions) // 2
+                _log.debug("tooBig: splitting the request", {"handle": op.handle, "varbinds": len(ex.positions)})
+                op.chunks = [ex.positions[:half], ex.positions[half:]] + op.chunks[1:]
+                _next_chunk(op)
+                return
+            if ex.pdu_type == pdu.GETBULK and ex.max_repetitions > 1:
+                op.max_repetitions = ex.max_repetitions // 2
+                _log.debug("tooBig: halving max-repetitions", {"handle": op.handle, "max_repetitions": op.max_repetitions})
+                _next_chunk(op)
+                return
+        elif status == pdu.NO_SUCH_NAME and _version == message.SNMP_V1 and op.opts.v1_fix_errors:
+            i = p.error_index
+            if (ex.pdu_type == pdu.GET or ex.pdu_type == pdu.GETNEXT) and i >= 1 and i <= len(ex.positions):
+                pos = ex.positions[i - 1]
+                name = op.varbinds[pos].oid
+                if ex.pdu_type == pdu.GET:
+                    op.results[pos] = VarBind(name, NoSuchObject())
+                else:
+                    op.results[pos] = VarBind(name, EndOfMibView())
+                rest = ex.positions[:i - 1] + ex.positions[i:]
+                op.chunks = ([rest] if len(rest) > 0 else []) + op.chunks[1:]
+                _next_chunk(op)
+                return
+        if status != pdu.NO_ERROR:
+            _error_status(op, ex, p)
+            return
+        problem = _shape_problem(ex, p, op.opts.strict_response_oids)
+        if problem != "":
+            _complete(op, None, errors.InvalidResponseError(problem))
+            return
+        if ex.pdu_type == pdu.GETBULK:
+            op.bulk = p.varbinds
+        else:
+            for k in range(len(ex.positions)):
+                op.results[ex.positions[k]] = p.varbinds[k]
+        op.chunks = op.chunks[1:]
+        _next_chunk(op)
+
+    proc def _error_status(op: _Op, ex: _Exchange, p: Pdu) -> None:
+        # Complete op with an ErrorStatusError whose index refers to the caller's varbinds
+        idx = p.error_index
+        index = idx
+        if idx >= 1 and idx <= len(ex.positions):
+            index = ex.positions[idx - 1] + 1
+        elif not op.single(ex.positions):
+            # An index outside the PDU that was sent cannot be mapped to the caller's varbinds:
+            # naming one would blame a varbind of another (successful) PDU
+            if idx != 0:
+                _log.debug("error-index outside the request part", {"handle": op.handle, "error_index": idx})
+            index = 0
+        if op.single(ex.positions):
+            vbs = p.varbinds
+        else:
+            vbs = op.results.copy()
+            if len(p.varbinds) == len(ex.positions):
+                for k in range(len(ex.positions)):
+                    vbs[ex.positions[k]] = p.varbinds[k]
+        r = Response(p.pdu_type, p.request_id, p.error_status, index, vbs, op.attempts, op.rtt,
+                     op.context_engine_id, op.context_name)
+        arcs: ?list[int] = op.varbinds[index - 1].oid.arcs if index >= 1 and index <= len(op.varbinds) else None
+        _complete(op, None, errors.ErrorStatusError(p.error_status, index, arcs, pdu.error_status_text(p.error_status),
+                                                    response=r))
+
+    # Requests ######################################################################################
+
+    proc def _validate(kind: int, vbs: list[VarBind], non_repeaters: int, max_repetitions: int) -> str:
+        # What is wrong with a request, "" if nothing: encode it once as it would be sent
+        if len(vbs) == 0:
+            return "a request needs at least one OID"
+        if non_repeaters < 0:
+            return "non-repeaters must not be negative, got %d" % non_repeaters
+        if max_repetitions < 0:
+            return "max-repetitions must not be negative, got %d" % max_repetitions
+        wire = kind
+        nr = 0
+        mr = 0
+        if kind == pdu.GETBULK:
+            if _version == message.SNMP_V1:
+                wire = pdu.GETNEXT
+            else:
+                nr = non_repeaters
+                mr = max_repetitions
+        p = Pdu(wire, 1, nr, mr, vbs)
+        try:
+            if _usm is not None:
+                pdu.encode_pdu(p)
+            else:
+                message.encode_community(CommunityMessage(_version, _community, p))
+        except errors.EncodeError as e:
+            return e.error_message
+        return ""
+
+    proc def _submit(cb: action(Client, ?Response, ?errors.SnmpError) -> None, kind: int, vbs: list[VarBind],
+                     non_repeaters: int, max_repetitions: int, o: ?Options) -> int:
+        h = _next_handle
+        _next_handle += 1
+        if _closed:
+            cb(self, None, errors.CancelledError("client closed"))
+            return h
+        eff = o if o is not None else _opts
+        mr = max_repetitions if max_repetitions != -1 else eff.max_repetitions
+        problem = _validate(kind, vbs, non_repeaters, mr)
+        if problem != "":
+            cb(self, None, errors.EncodeError(problem))
+            return h
+        queued = len(_ops) - _active
+        if _opts.max_queued > 0 and queued >= _opts.max_queued:
+            cb(self, None, errors.QueueFullError("request queue full: %d requests queued" % queued))
+            return h
+        op = _Op(h, kind, eff, vbs, non_repeaters, mr, _plan(kind, len(vbs), eff.max_oids_per_request))
+        _ops[h] = op
+        _cbs[h] = cb
+        _queue.append(h)
+        _requests += 1
+        _pump()
+        return h
+
+    def get(cb: action(Client, ?Response, ?errors.SnmpError) -> None, oids: list[Oid], opts: ?Options=None) -> int:
+        """Send a GetRequest for oids; returns a handle for cancel()
+
+        The response varbinds are in the order of oids. More than
+        opts.max_oids_per_request OIDs, or a tooBig answer, split the
+        request into several PDUs, whose answers are merged.
+        """
+        return _submit(cb, pdu.GET, [VarBind(o) for o in oids], 0, 0, opts)
+
+    def get_next(cb: action(Client, ?Response, ?errors.SnmpError) -> None, oids: list[Oid],
+                 opts: ?Options=None) -> int:
+        """Send a GetNextRequest for oids; returns a handle for cancel()
+
+        Like get(). An SNMPv1 noSuchName answer becomes EndOfMibView for that
+        varbind (with Options.v1_fix_errors).
+        """
+        return _submit(cb, pdu.GETNEXT, [VarBind(o) for o in oids], 0, 0, opts)
+
+    def get_bulk(cb: action(Client, ?Response, ?errors.SnmpError) -> None, oids: list[Oid], non_repeaters: int=0,
+                 max_repetitions: int=-1, opts: ?Options=None) -> int:
+        """Send a GetBulkRequest for oids; returns a handle for cancel()
+
+        max_repetitions -1 takes opts.max_repetitions. The response may be
+        shorter than non_repeaters + max_repetitions * (the other OIDs): the
+        agent truncates as it likes, including mid-row. A tooBig answer
+        resends with half the max-repetitions. SNMPv1 has no GETBULK: the
+        request is sent as a GETNEXT of oids (RFC 3584 section 4.2.1), so
+        the response has one varbind per OID.
+        """
+        return _submit(cb, pdu.GETBULK, [VarBind(o) for o in oids], non_repeaters, max_repetitions, opts)
+
+    def set(cb: action(Client, ?Response, ?errors.SnmpError) -> None, varbinds: list[VarBind],
+            opts: ?Options=None) -> int:
+        """Send a SetRequest with varbinds; returns a handle for cancel()
+
+        Always one PDU, also above opts.max_oids_per_request: splitting a
+        SET would break its all-or-nothing semantics, so a tooBig answer is
+        reported as an ErrorStatusError. A retried SET may fail although an
+        earlier attempt succeeded at the agent; consider opts with retries=0.
+        """
+        return _submit(cb, pdu.SET, varbinds, 0, 0, opts)
+
+    def inform(cb: action(Client, ?Response, ?errors.SnmpError) -> None, trap_oid: Oid, varbinds: list[VarBind],
+               uptime: int=-1, opts: ?Options=None) -> int:
+        """Send an InformRequest (SNMPv2c or SNMPv3) to the receiver; returns a handle for cancel()
+
+        The varbinds sent are sysUpTime.0 = uptime (-1: hundredths of a
+        second since the Client started), snmpTrapOID.0 = trap_oid, then
+        varbinds. It is acknowledged and retried like a request; the
+        receiver's Response must echo the varbinds' OIDs (with
+        strict_response_oids). With SNMPv3 the receiver is the
+        authoritative engine and is discovered like an agent. SNMPv1 has no
+        InformRequest: the callback gets an EncodeError.
+        """
+        up = uptime if uptime != -1 else _uptime()
+        return _submit(cb, pdu.INFORM, notify.build_trap_v2(up, trap_oid, varbinds), 0, 0, opts)
+
+    def discover(cb: action(Client, ?EngineInfo, ?errors.SnmpError) -> None) -> None:
+        """Discover the agent's SNMPv3 engine now, and report what was learned
+
+        Sends the discovery probe (or joins the one that is running) even
+        when the engine is known. The boots and time in the EngineInfo come
+        from the agent's unauthenticated Report: the first authenticated
+        response confirms them. Requests discover lazily by themselves, so
+        this is only needed to check an agent or to learn its engine ID
+        early. The callback gets an EncodeError for SNMPv1/v2c.
+        """
+        if _closed:
+            cb(self, None, errors.CancelledError("client closed"))
+            return
+        if _usm is None:
+            cb(self, None, errors.EncodeError("discover() needs SNMPv3 (Usm) security"))
+            return
+        fatal = _fatal
+        if fatal is not None:
+            cb(self, None, errors.TransportError(fatal))
+            return
+        _engine_cbs.append(cb)
+        _start_discovery(_opts)
+
+    # Notifications #################################################################################
+
+    proc def _emit(cb: action(Client, ?errors.SnmpError) -> None, data: bytes) -> None:
+        # Hand an unacknowledged notification to the transport
+        tr = _transport
+        fatal = _fatal
+        if fatal is not None:
+            cb(self, errors.TransportError(fatal))
+        elif tr is not None:
+            tr.send(data)
+            cb(self, None)
+        else:
+            cb(self, errors.TransportError("no transport: neither cap nor transport was given"))
+
+    proc def _encode_trap_v3(u: Usm, p: Pdu) -> bytes:
+        # We are the authoritative engine of an SNMPv3 trap: our engine ID, boots and time
+        eid = _local_engine_id
+        if len(eid) < usm.MIN_ENGINE_ID_LEN or len(eid) > usm.MAX_ENGINE_ID_LEN:
+            raise errors.EncodeError("local_engine_id must be 5 to 32 octets, got %d" % len(eid))
+        level = u.level()
+        keys: ?LocalizedUser = None
+        if level != usm.LEVEL_NO_AUTH_NO_PRIV:
+            lk = _local_keys
+            if lk is not None:
+                keys = lk
+            else:
+                loc = u.localized(eid)
+                _local_keys = loc
+                keys = loc
+        if local_engine_boots < 1 or local_engine_boots > usm.MAX_BOOTS:
+            raise errors.EncodeError("local_engine_boots must be 1 to %d, got %d" % (usm.MAX_BOOTS, local_engine_boots))
+        etime = int(_now() - _start)
+        hdr = V3Message(_random_id(_MASK31), MAX_MSG_SIZE, level,
+                        UsmSecurityParameters(eid, local_engine_boots, etime, u.user.encode()))
+        ceid = u.context_engine_id
+        scoped = ScopedPdu(ceid if ceid is not None else eid, u.context_name, p)
+        salt = _salt.next() if (level & message.FLAG_PRIV) != 0 else u64(0)
+        return usm.protect(hdr, message.encode_scoped(scoped), keys, salt)
+
+    def trap(cb: action(Client, ?errors.SnmpError) -> None, trap_oid: Oid, varbinds: list[VarBind],
+             uptime: int=-1) -> None:
+        """Send an SNMPv2-Trap (SNMPv2c or SNMPv3); unacknowledged
+
+        The varbinds sent are sysUpTime.0 = uptime (-1: hundredths of a
+        second since the Client started), snmpTrapOID.0 = trap_oid, then
+        varbinds. cb(c, None) once the datagram is handed to the transport;
+        cb(c, error) for content that cannot be encoded (EncodeError), an
+        SNMPv1 Client (use trap_v1), or a failed transport. With SNMPv3 we
+        are the authoritative engine (local_engine_id, local_engine_boots,
+        time since the Client started): no discovery.
+        """
+        if _closed:
+            cb(self, errors.CancelledError("client closed"))
+            return
+        if _version == message.SNMP_V1:
+            cb(self, errors.EncodeError("an SNMPv2-Trap needs SNMPv2c or SNMPv3; use trap_v1() with SNMPv1"))
+            return
+        up = uptime if uptime != -1 else _uptime()
+        p = Pdu(pdu.TRAP_V2, _random_id(_mask(_opts)), 0, 0, notify.build_trap_v2(up, trap_oid, varbinds))
+        data = b""
+        failure: ?errors.SnmpError = None
+        try:
+            u = _usm
+            if u is not None:
+                data = _encode_trap_v3(u, p)
+            else:
+                data = message.encode_community(CommunityMessage(_version, _community, p))
+        except errors.EncodeError as e:
+            failure = e
+        except ValueError as e:
+            failure = errors.EncodeError(e.error_message)
+        if failure is not None:
+            cb(self, failure)
+            return
+        _log.debug("sending trap", {"trap_oid": trap_oid.dotted(), "id": p.request_id})
+        _emit(cb, data)
+
+    def trap_v1(cb: action(Client, ?errors.SnmpError) -> None, enterprise: Oid, agent_addr: bytes,
+                generic_trap: int, specific_trap: int, varbinds: list[VarBind], uptime: int=-1) -> None:
+        """Send an SNMPv1 Trap-PDU (SNMPv1 Client only); unacknowledged
+
+        agent_addr is the sender's IPv4 address (4 octets), generic_trap
+        0..6 and specific_trap the enterprise-specific code; uptime -1 is
+        the time since the Client started. cb as for trap(); an SNMPv2c or
+        SNMPv3 Client gets an EncodeError (use trap()).
+        """
+        if _closed:
+            cb(self, errors.CancelledError("client closed"))
+            return
+        if _version != message.SNMP_V1:
+            cb(self, errors.EncodeError("an SNMPv1 Trap-PDU needs an SNMPv1 Community; use trap()"))
+            return
+        up = uptime if uptime != -1 else _uptime()
+        t = TrapV1Pdu(enterprise, agent_addr, generic_trap, specific_trap, up, varbinds)
+        data = b""
+        failure: ?errors.SnmpError = None
+        try:
+            data = message.encode_community(CommunityMessage(message.SNMP_V1, _community, None, t))
+        except errors.EncodeError as e:
+            failure = e
+        if failure is not None:
+            cb(self, failure)
+            return
+        _log.debug("sending SNMPv1 trap", {"enterprise": enterprise.dotted(), "generic": generic_trap,
+                                           "specific": specific_trap})
+        _emit(cb, data)
+
+    # Control #######################################################################################
+
+    def cancel(handle: int) -> None:
+        """Cancel a request: its callback gets errors.CancelledError, unless it completed already
+
+        A late answer to it is dropped (Stats.drops_unknown_id).
+        """
+        op = _ops.get(handle)
+        if op is not None:
+            _complete(op, None, errors.CancelledError())
+
+    def engine_info() -> ?EngineInfo:
+        """Return what is known about the agent's SNMPv3 engine, None before discovery (and for SNMPv1/v2c)"""
+        return _engine_info()
+
+    def stats() -> Stats:
+        """Return a snapshot of the counters"""
+        avg = _rtt_sum / float(_responses) if _responses > 0 else 0.0
+        return Stats(_requests, _retries, _timeouts, _responses, _drops_decode, _drops_unknown_id, _drops_source,
+                     _drops_auth, _drops_version, _drops_pdu, _reports, _unreachable, _rtt_last, avg,
+                     len(_ops) - _active, _active)
+
+    def close() -> None:
+        """Cancel every pending and queued request and discovery (errors.CancelledError) and close the transport
+
+        Idempotent. Later requests get CancelledError("client closed").
+        """
+        if _closed:
+            return
+        _closed = True
+        _queue = []
+        _queue_head = 0
+        err = errors.CancelledError("client closed")
+        for h in list(_ops.keys()):
+            op = _ops.get(h)
+            if op is not None:
+                _complete(op, None, err)
+        ex = _exchanges.get(_disc_serial)
+        if ex is not None:
+            _end_exchange(ex)
+        _disc_serial = 0
+        _fail_engine_cbs(err)
+        tr = _transport
+        if tr is not None:
+            tr.close()
+
+    # Start #########################################################################################
+
+    _transport = _make_transport(cap, address, port, transport)
+    if _usm is not None:
+        seed = engine
+        if seed is not None:
+            n = len(seed.engine_id)
+            if n >= usm.MIN_ENGINE_ID_LEN and n <= usm.MAX_ENGINE_ID_LEN:
+                _engine_id = seed.engine_id
+                _times[seed.engine_id] = EngineTime(seed.engine_id, seed.boots, seed.time, 0, seed.learned_at)
+            else:
+                _log.warning("seeded engine ID ignored: not 5 to 32 octets", {"octets": n})
+    tr0 = _transport
+    if tr0 is not None:
+        tr0.set_receiver(_on_data, _on_transport_error)
+    else:
+        _fatal = "no transport: neither cap nor transport was given"

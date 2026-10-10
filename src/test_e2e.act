@@ -1,0 +1,1075 @@
+"""End-to-end tests: the real Client against the real Agent and NotificationReceiver, over MemNet
+
+Nothing here is scripted on the wire: a Client (client.act) talks to an
+Agent (agent.act) or a NotificationReceiver (receiver.act) through a
+transport.MemNet, so every byte is produced and checked by the library
+itself. Covered:
+
+  * SNMPv1 and SNMPv2c get, get_next, get_bulk and set, with the SET error
+    statuses (and their SNMPv1 mapping, RFC 3584 section 4.4), exceptions,
+    Counter64 hidden from SNMPv1 and atomic SETs;
+  * SNMPv3 with every authentication and privacy protocol the library has
+    (the users of interop/config/users.tsv, embedded below): engine
+    discovery from cold, time synchronisation, get, get_next, get_bulk,
+    set, and noAccess for the read-only user;
+  * the Agent's Faults (and NetFaults) seen through the real Client:
+    lost answers, wrong request-ids, duplicates, late answers, a forced
+    notInTimeWindows Report, tooBig with splitting and halving, truncated
+    GETBULK, injected error statuses, answers from another port, the wrong
+    version or community, trailing octets;
+  * Client.trap, trap_v1 and inform to a NotificationReceiver for SNMPv1,
+    SNMPv2c and SNMPv3 with every lab user, checked as fmt.canon_notification
+    blocks (the format of interop/expected/notify/).
+
+Requests of one Client complete in the order they were made
+(max_in_flight 1 queues them FIFO), so a Collector records the outcomes in
+order and the checks index them. Tests wait for causal events only; the
+watchdog timeouts are generous because the Reeder key extension
+(AES-192-C, AES-256-C, 3DES with a short hash) costs a password-to-key
+round per localization.
+"""
+
+import logging
+import testing
+import time
+
+import ber
+import errors
+import fmt
+import message
+import notify
+import pdu
+import security
+import usm
+from agent import Agent, AgentConfig, Faults
+from client import Client, EngineInfo, Options, Response, error_response
+from mibview import MibView, WriteRule
+from notify import Notification
+from oid import Oid
+from receiver import NotificationReceiver, ReceiverConfig
+from security import Community, Usm
+from transport import MemNet, NetFaults, ServerTransport
+from values import Counter32, Counter64, EndOfMibView, Gauge32, Integer, IpAddress, NoSuchInstance, NoSuchObject
+from values import ObjectIdentifier, OctetString, TimeTicks, Value, VarBind
+from testutil import h, outcome, report
+
+AGENT = "10.0.0.1"
+MANAGER = "10.0.0.2"
+RECEIVER = "10.0.0.9"
+AGENT_ENGINE = "80001f88806532652d6167656e74"
+RECEIVER_ENGINE = "80001f8880616374736e6d7072"
+AGENT_BOOTS = 5
+
+# Seconds to wait to see that nothing more arrives
+QUIET = 0.2
+
+# Every request waits up to 2 s (no retries) unless a test says otherwise; MemNet loses nothing
+OPTS = Options(timeout=2.0, retries=0)
+
+# A copy of interop/config/users.tsv (without its header): every authentication protocol with
+# every privacy protocol, u_noauth and the read-only u_ro_sha_aes
+USERS: list[str] = [
+    "u_noauth\tnoAuthNoPriv\t-\t-\t-\t-\t-\t-\tyes\tyes",
+    "u_md5\tauthNoPriv\tMD5\t-\tMD5\t-\tauthpass123\t-\tyes\tyes",
+    "u_sha\tauthNoPriv\tSHA\t-\tSHA\t-\tauthpass123\t-\tyes\tyes",
+    "u_sha224\tauthNoPriv\tSHA-224\t-\tSHA224\t-\tauthpass123\t-\tyes\tyes",
+    "u_sha256\tauthNoPriv\tSHA-256\t-\tSHA256\t-\tauthpass123\t-\tyes\tyes",
+    "u_sha384\tauthNoPriv\tSHA-384\t-\tSHA384\t-\tauthpass123\t-\tyes\tyes",
+    "u_sha512\tauthNoPriv\tSHA-512\t-\tSHA512\t-\tauthpass123\t-\tyes\tyes",
+    "u_md5_des\tauthPriv\tMD5\tDES\tMD5\tDES\tauthpass123\tprivpass123\tyes\tyes",
+    "u_md5_aes\tauthPriv\tMD5\tAES\tMD5\tAES\tauthpass123\tprivpass123\tyes\tyes",
+    "u_md5_aes192\tauthPriv\tMD5\tAES-192\tMD5\tAES192BLMT\tauthpass123\tprivpass123\tyes\tyes",
+    "u_md5_aes256\tauthPriv\tMD5\tAES-256\tMD5\tAES256BLMT\tauthpass123\tprivpass123\tyes\tyes",
+    "u_md5_aes192c\tauthPriv\tMD5\tAES-192-C\tMD5\tAES192\tauthpass123\tprivpass123\tyes\tyes",
+    "u_md5_aes256c\tauthPriv\tMD5\tAES-256-C\tMD5\tAES256\tauthpass123\tprivpass123\tyes\tyes",
+    "u_md5_3des\tauthPriv\tMD5\t-\tMD5\t3DES\tauthpass123\tprivpass123\tno\tyes",
+    "u_sha_des\tauthPriv\tSHA\tDES\tSHA\tDES\tauthpass123\tprivpass123\tyes\tyes",
+    "u_sha_aes\tauthPriv\tSHA\tAES\tSHA\tAES\tauthpass123\tprivpass123\tyes\tyes",
+    "u_sha_aes192\tauthPriv\tSHA\tAES-192\tSHA\tAES192BLMT\tauthpass123\tprivpass123\tyes\tyes",
+    "u_sha_aes256\tauthPriv\tSHA\tAES-256\tSHA\tAES256BLMT\tauthpass123\tprivpass123\tyes\tyes",
+    "u_sha_aes192c\tauthPriv\tSHA\tAES-192-C\tSHA\tAES192\tauthpass123\tprivpass123\tyes\tyes",
+    "u_sha_aes256c\tauthPriv\tSHA\tAES-256-C\tSHA\tAES256\tauthpass123\tprivpass123\tyes\tyes",
+    "u_sha_3des\tauthPriv\tSHA\t-\tSHA\t3DES\tauthpass123\tprivpass123\tno\tyes",
+    "u_sha224_des\tauthPriv\tSHA-224\tDES\tSHA224\tDES\tauthpass123\tprivpass123\tyes\tyes",
+    "u_sha224_aes\tauthPriv\tSHA-224\tAES\tSHA224\tAES\tauthpass123\tprivpass123\tyes\tyes",
+    "u_sha224_aes192\tauthPriv\tSHA-224\tAES-192\tSHA224\tAES192BLMT\tauthpass123\tprivpass123\tyes\tyes",
+    "u_sha224_aes256\tauthPriv\tSHA-224\tAES-256\tSHA224\tAES256BLMT\tauthpass123\tprivpass123\tyes\tyes",
+    "u_sha224_aes192c\tauthPriv\tSHA-224\tAES-192-C\tSHA224\tAES192\tauthpass123\tprivpass123\tyes\tyes",
+    "u_sha224_aes256c\tauthPriv\tSHA-224\tAES-256-C\tSHA224\tAES256\tauthpass123\tprivpass123\tyes\tyes",
+    "u_sha224_3des\tauthPriv\tSHA-224\t-\tSHA224\t3DES\tauthpass123\tprivpass123\tno\tyes",
+    "u_sha256_des\tauthPriv\tSHA-256\tDES\tSHA256\tDES\tauthpass123\tprivpass123\tyes\tyes",
+    "u_sha256_aes\tauthPriv\tSHA-256\tAES\tSHA256\tAES\tauthpass123\tprivpass123\tyes\tyes",
+    "u_sha256_aes192\tauthPriv\tSHA-256\tAES-192\tSHA256\tAES192BLMT\tauthpass123\tprivpass123\tyes\tyes",
+    "u_sha256_aes256\tauthPriv\tSHA-256\tAES-256\tSHA256\tAES256BLMT\tauthpass123\tprivpass123\tyes\tyes",
+    "u_sha256_aes192c\tauthPriv\tSHA-256\tAES-192-C\tSHA256\tAES192\tauthpass123\tprivpass123\tyes\tyes",
+    "u_sha256_aes256c\tauthPriv\tSHA-256\tAES-256-C\tSHA256\tAES256\tauthpass123\tprivpass123\tyes\tyes",
+    "u_sha256_3des\tauthPriv\tSHA-256\t-\tSHA256\t3DES\tauthpass123\tprivpass123\tno\tyes",
+    "u_sha384_des\tauthPriv\tSHA-384\tDES\tSHA384\tDES\tauthpass123\tprivpass123\tyes\tyes",
+    "u_sha384_aes\tauthPriv\tSHA-384\tAES\tSHA384\tAES\tauthpass123\tprivpass123\tyes\tyes",
+    "u_sha384_aes192\tauthPriv\tSHA-384\tAES-192\tSHA384\tAES192BLMT\tauthpass123\tprivpass123\tyes\tyes",
+    "u_sha384_aes256\tauthPriv\tSHA-384\tAES-256\tSHA384\tAES256BLMT\tauthpass123\tprivpass123\tyes\tyes",
+    "u_sha384_aes192c\tauthPriv\tSHA-384\tAES-192-C\tSHA384\tAES192\tauthpass123\tprivpass123\tyes\tyes",
+    "u_sha384_aes256c\tauthPriv\tSHA-384\tAES-256-C\tSHA384\tAES256\tauthpass123\tprivpass123\tyes\tyes",
+    "u_sha384_3des\tauthPriv\tSHA-384\t-\tSHA384\t3DES\tauthpass123\tprivpass123\tno\tyes",
+    "u_sha512_des\tauthPriv\tSHA-512\tDES\tSHA512\tDES\tauthpass123\tprivpass123\tyes\tyes",
+    "u_sha512_aes\tauthPriv\tSHA-512\tAES\tSHA512\tAES\tauthpass123\tprivpass123\tyes\tyes",
+    "u_sha512_aes192\tauthPriv\tSHA-512\tAES-192\tSHA512\tAES192BLMT\tauthpass123\tprivpass123\tyes\tyes",
+    "u_sha512_aes256\tauthPriv\tSHA-512\tAES-256\tSHA512\tAES256BLMT\tauthpass123\tprivpass123\tyes\tyes",
+    "u_sha512_aes192c\tauthPriv\tSHA-512\tAES-192-C\tSHA512\tAES192\tauthpass123\tprivpass123\tyes\tyes",
+    "u_sha512_aes256c\tauthPriv\tSHA-512\tAES-256-C\tSHA512\tAES256\tauthpass123\tprivpass123\tyes\tyes",
+    "u_sha512_3des\tauthPriv\tSHA-512\t-\tSHA512\t3DES\tauthpass123\tprivpass123\tno\tyes",
+    "u_ro_sha_aes\tauthPriv\tSHA\tAES\tSHA\tAES\tauthpass123\tprivpass123\tyes(read-only)\tno"
+]
+
+SYS_DESCR = Oid([1, 3, 6, 1, 2, 1, 1, 1, 0])
+ENTERPRISE = Oid([1, 3, 6, 1, 4, 1, 8072, 9999])
+DESCR = b"actsnmp end-to-end agent"
+
+
+def e(arcs: list[int]) -> Oid:
+    """An OID below the lab's enterprise subtree 1.3.6.1.4.1.8072.9999.1"""
+    return Oid([1, 3, 6, 1, 4, 1, 8072, 9999, 1] + arcs)
+
+def big(i: int) -> OctetString:
+    return OctetString(("%03d" % i).encode() * 33)
+
+def make_view() -> MibView:
+    """The agent's variables: scalars of every type, a 3-column table and 64 writable per-client integers"""
+    vbs = [VarBind(SYS_DESCR, OctetString(DESCR)),
+           VarBind(e([1, 1, 0]), Integer(42)),
+           VarBind(e([2, 1, 0]), OctetString(b"hello")),
+           VarBind(e([3, 1, 0]), Counter64(18446744073709551615)),
+           VarBind(e([4, 1, 0]), IpAddress(b"\xc0\x00\x02\x01")),
+           VarBind(e([5, 1, 0]), Counter32(7)),
+           VarBind(e([6, 1, 0]), Gauge32(8)),
+           VarBind(e([7, 1, 0]), TimeTicks(9)),
+           VarBind(e([8, 1, 0]), ObjectIdentifier(ENTERPRISE))]
+    for i in range(1, 9):
+        vbs.append(VarBind(e([9, i, 0]), big(i)))
+    for c in range(1, 4):
+        for i in range(1, 6):
+            vbs.append(VarBind(e([10, 1, c, i]), Integer(c * 100 + i)))
+    for i in range(1, 65):
+        vbs.append(VarBind(e([20, i, 0]), Integer(0)))
+    return MibView(vbs)
+
+def write_rules() -> list[WriteRule]:
+    return [WriteRule(e([1]), [ber.TAG_INTEGER], 0, 100), WriteRule(e([2]), [ber.TAG_OCTET_STRING], 0, 16),
+            WriteRule(e([20]), [ber.TAG_INTEGER], 0, 100000)]
+
+def agent_config(users: list[Usm]) -> AgentConfig:
+    return AgentConfig({"public": False, "private": True}, users, h(AGENT_ENGINE), AGENT_BOOTS, write_rules(),
+                       read_only_users=["u_ro_sha_aes"])
+
+def lab_users(auth: str) -> list[Usm]:
+    """The users of USERS whose net-snmp authentication column is auth; MD5 also gets u_noauth, SHA u_ro_sha_aes"""
+    rows: list[str] = []
+    for r in USERS:
+        a = r.split("\t")[2]
+        if a == auth or (auth == "MD5" and a == "-"):
+            rows.append(r)
+    return security.load_users_tsv("\n".join(rows)).users
+
+def table(c: int, i: int) -> VarBind:
+    return VarBind(e([10, 1, c, i]), Integer(c * 100 + i))
+
+
+# Outcomes ##########################################################################################
+
+class Outcome(object):
+    """What a request's callback got"""
+    r: ?Response
+    e: ?errors.SnmpError
+
+    def __init__(self, r: ?Response, e: ?errors.SnmpError):
+        self.r = r
+        self.e = e
+
+def describe(o: Outcome) -> str:
+    e = o.e
+    if e is not None:
+        return "error " + str(e)
+    r = o.r
+    if r is not None:
+        return repr(r)
+    return "nothing"
+
+def ok(o: Outcome, what: str) -> Response:
+    e = o.e
+    if e is not None:
+        raise AssertionError(what + ": unexpected error " + str(e))
+    r = o.r
+    if r is not None:
+        return r
+    raise AssertionError(what + ": no response")
+
+def vbs_of(o: Outcome, what: str) -> list[VarBind]:
+    return ok(o, what).varbinds
+
+def status_of(o: Outcome, what: str) -> (int, int):
+    e = o.e
+    if isinstance(e, errors.ErrorStatusError):
+        return (e.status, e.index)
+    raise AssertionError(what + ": expected an error-status, got " + describe(o))
+
+def timeout_hint(o: Outcome, what: str) -> str:
+    e = o.e
+    if isinstance(e, errors.TimeoutError):
+        hint = e.hint
+        return hint if hint is not None else ""
+    raise AssertionError(what + ": expected a TimeoutError, got " + describe(o))
+
+actor Collector(label: str, report: action(str, list[Outcome]) -> None):
+    """The callbacks of one Client's requests, in completion order; report(label, outcomes) once expect(n) are in"""
+    var got: list[Outcome] = []
+    var want = -1
+    var reported = False
+
+    proc def _check() -> None:
+        if not reported and want >= 0 and len(got) >= want:
+            reported = True
+            report(label, got)
+
+    def cb(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        got.append(Outcome(r, e))
+        _check()
+
+    def expect(n: int) -> None:
+        want = n
+        _check()
+
+    def count() -> int:
+        return len(got)
+
+def _client(mn: MemNet, sec: security.Security, port: int, opts: Options=OPTS, log: ?logging.Handler=None) -> Client:
+    return Client(None, AGENT, sec, log, opts=opts, transport=mn.client(MANAGER, port, AGENT, 161))
+
+
+# SNMPv2c and SNMPv1 ###############################################################################
+
+actor _test_v2c_ops(t: testing.AsyncT):
+    """SNMPv2c: get, get_next, get_bulk and set with every SET error status, through the real Client and Agent"""
+    t.timeout(30.0)
+    mn = MemNet()
+    agent = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), t.log_handler)
+    var results: dict[str, list[Outcome]] = {}
+
+    def check() -> None:
+        a = results["public"]
+        testing.assertEqual(vbs_of(a[0], "get"),
+                            [VarBind(SYS_DESCR, OctetString(DESCR)), VarBind(e([6, 1, 0]), Gauge32(8)),
+                             VarBind(e([3, 1, 0]), Counter64(18446744073709551615)),
+                             VarBind(e([4, 1, 0]), IpAddress(b"\xc0\x00\x02\x01")),
+                             VarBind(e([1, 1, 1]), NoSuchInstance()), VarBind(e([99, 0]), NoSuchObject())])
+        testing.assertEqual(vbs_of(a[1], "get_next"),
+                            [VarBind(e([2, 1, 0]), OctetString(b"hello")), table(1, 1),
+                             VarBind(Oid([2, 999]), EndOfMibView())])
+        testing.assertEqual(vbs_of(a[2], "get_bulk"),
+                            [VarBind(e([2, 1, 0]), OctetString(b"hello")), table(1, 1), table(2, 1), table(1, 2),
+                             table(2, 2), table(1, 3), table(2, 3)])
+        testing.assertEqual(status_of(a[3], "set with public"), (pdu.NO_ACCESS, 1))
+        testing.assertEqual(len(a), 4)
+        p = results["private"]
+        testing.assertEqual(vbs_of(p[0], "set"), [VarBind(e([1, 1, 0]), Integer(7))])
+        testing.assertEqual(vbs_of(p[1], "get after set"), [VarBind(e([1, 1, 0]), Integer(7))])
+        testing.assertEqual(status_of(p[2], "notWritable"), (pdu.NOT_WRITABLE, 1))
+        testing.assertEqual(status_of(p[3], "wrongType"), (pdu.WRONG_TYPE, 1))
+        testing.assertEqual(status_of(p[4], "wrongLength"), (pdu.WRONG_LENGTH, 1))
+        testing.assertEqual(status_of(p[5], "wrongValue"), (pdu.WRONG_VALUE, 1))
+        testing.assertEqual(status_of(p[6], "noCreation"), (pdu.NO_CREATION, 1))
+        testing.assertEqual(status_of(p[7], "second varbind wrongType"), (pdu.WRONG_TYPE, 2))
+        testing.assertEqual(vbs_of(p[8], "get after the failed SET"), [VarBind(e([1, 1, 0]), Integer(7))])
+        err = p[7].e
+        if isinstance(err, errors.ErrorStatusError):
+            testing.assertEqual(err.oid, e([2, 1, 0]).arcs)
+            r = error_response(err)
+            testing.assertTrue(r is not None, "the ErrorStatusError keeps its Response")
+
+    def reported(label: str, outs: list[Outcome]) -> None:
+        results[label] = outs
+        if len(results) == 2:
+            report(t, outcome(check))
+
+    pub = _client(mn, Community("public"), 40001, OPTS, t.log_handler)
+    cp = Collector("public", reported)
+    pub.get(cp.cb, [SYS_DESCR, e([6, 1, 0]), e([3, 1, 0]), e([4, 1, 0]), e([1, 1, 1]), e([99, 0])])
+    pub.get_next(cp.cb, [e([1, 1, 0]), e([10, 1, 1]), Oid([2, 999])])
+    pub.get_bulk(cp.cb, [e([1, 1, 0]), e([10, 1, 1]), e([10, 1, 2])], 1, 3)
+    pub.set(cp.cb, [VarBind(e([1, 1, 0]), Integer(1))])
+    cp.expect(4)
+
+    priv = _client(mn, Community("private"), 40002, OPTS, t.log_handler)
+    cq = Collector("private", reported)
+    priv.set(cq.cb, [VarBind(e([1, 1, 0]), Integer(7))])
+    priv.get(cq.cb, [e([1, 1, 0])])
+    priv.set(cq.cb, [VarBind(SYS_DESCR, OctetString(b"x"))])
+    priv.set(cq.cb, [VarBind(e([1, 1, 0]), OctetString(b"x"))])
+    priv.set(cq.cb, [VarBind(e([2, 1, 0]), OctetString(b"y" * 17))])
+    priv.set(cq.cb, [VarBind(e([1, 1, 0]), Integer(101))])
+    priv.set(cq.cb, [VarBind(e([1, 9, 0]), Integer(1))])
+    priv.set(cq.cb, [VarBind(e([1, 1, 0]), Integer(55)), VarBind(e([2, 1, 0]), Integer(1))])
+    priv.get(cq.cb, [e([1, 1, 0])])
+    cq.expect(9)
+
+actor _test_v1_ops(t: testing.AsyncT):
+    """SNMPv1: exceptions and Counter64 become noSuchName (fixed by the Client), GETBULK goes as GETNEXT, SET errors mapped"""
+    t.timeout(30.0)
+    mn = MemNet()
+    agent = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), t.log_handler)
+    var results: dict[str, list[Outcome]] = {}
+
+    def check() -> None:
+        a = results["public"]
+        testing.assertEqual(vbs_of(a[0], "get"), [VarBind(SYS_DESCR, OctetString(DESCR)),
+                                                  VarBind(e([3, 1, 0]), NoSuchObject()),
+                                                  VarBind(e([6, 1, 0]), Gauge32(8))])
+        testing.assertEqual(vbs_of(a[1], "get of a missing instance"), [VarBind(e([1, 1, 1]), NoSuchObject())])
+        testing.assertEqual(vbs_of(a[2], "get_next skips Counter64"),
+                            [VarBind(e([4, 1, 0]), IpAddress(b"\xc0\x00\x02\x01"))])
+        testing.assertEqual(vbs_of(a[3], "get_bulk as GETNEXT"), [table(1, 1)])
+        testing.assertEqual(vbs_of(a[4], "get_next past the end"), [VarBind(Oid([2, 999]), EndOfMibView())])
+        testing.assertEqual(status_of(a[5], "set with public"), (pdu.NO_SUCH_NAME, 1))
+        r6 = ok(a[6], "get with two missing")
+        testing.assertEqual(r6.varbinds, [VarBind(e([1, 1, 1]), NoSuchObject()), VarBind(SYS_DESCR, OctetString(DESCR)),
+                                          VarBind(e([99, 0]), NoSuchObject()), VarBind(e([6, 1, 0]), Gauge32(8))])
+        testing.assertEqual(r6.attempts, 3, "two noSuchName answers fixed, one resend each")
+        testing.assertEqual(vbs_of(a[7], "get_next with one past the end"),
+                            [VarBind(e([6, 1, 0]), Gauge32(8)), VarBind(Oid([2, 999]), EndOfMibView())])
+        p = results["private"]
+        testing.assertEqual(vbs_of(p[0], "set"), [VarBind(e([1, 1, 0]), Integer(9))])
+        testing.assertEqual(status_of(p[1], "notWritable"), (pdu.NO_SUCH_NAME, 1))
+        testing.assertEqual(status_of(p[2], "wrongType"), (pdu.BAD_VALUE, 1))
+        testing.assertEqual(status_of(p[3], "noCreation"), (pdu.NO_SUCH_NAME, 1))
+        testing.assertEqual(status_of(p[4], "wrongValue"), (pdu.BAD_VALUE, 1))
+        testing.assertEqual(vbs_of(p[5], "get after"), [VarBind(e([1, 1, 0]), Integer(9))])
+
+    def reported(label: str, outs: list[Outcome]) -> None:
+        results[label] = outs
+        if len(results) == 2:
+            report(t, outcome(check))
+
+    pub = _client(mn, Community("public", message.SNMP_V1), 40001, OPTS, t.log_handler)
+    cp = Collector("public", reported)
+    pub.get(cp.cb, [SYS_DESCR, e([3, 1, 0]), e([6, 1, 0])])
+    pub.get(cp.cb, [e([1, 1, 1])])
+    pub.get_next(cp.cb, [e([2, 1, 0])])
+    pub.get_bulk(cp.cb, [e([10, 1, 1])], 0, 5)
+    pub.get_next(cp.cb, [Oid([2, 999])])
+    pub.set(cp.cb, [VarBind(e([1, 1, 0]), Integer(1))])
+    pub.get(cp.cb, [e([1, 1, 1]), SYS_DESCR, e([99, 0]), e([6, 1, 0])])
+    pub.get_next(cp.cb, [e([5, 1, 0]), Oid([2, 999])])
+    cp.expect(8)
+
+    priv = _client(mn, Community("private", message.SNMP_V1), 40002, OPTS, t.log_handler)
+    cq = Collector("private", reported)
+    priv.set(cq.cb, [VarBind(e([1, 1, 0]), Integer(9))])
+    priv.set(cq.cb, [VarBind(SYS_DESCR, OctetString(b"x"))])
+    priv.set(cq.cb, [VarBind(e([1, 1, 0]), OctetString(b"x"))])
+    priv.set(cq.cb, [VarBind(e([1, 9, 0]), Integer(1))])
+    priv.set(cq.cb, [VarBind(e([1, 1, 0]), Integer(1000))])
+    priv.get(cq.cb, [e([1, 1, 0])])
+    cq.expect(6)
+
+
+# SNMPv3: every authentication and privacy protocol ###############################################
+
+actor _V3Group(t: testing.AsyncT, auth: str):
+    """Every lab user with authentication protocol auth, each with its own Client discovering the agent from cold"""
+    users = lab_users(auth)
+    mn = MemNet()
+    agent = Agent(mn.server(AGENT, 161), make_view(), agent_config(users), None)
+    var clients: dict[str, Client] = {}
+    var results: dict[str, list[Outcome]] = {}
+
+    def check() -> None:
+        for i in range(len(users)):
+            u = users[i]
+            name = u.user
+            a = results[name]
+            n = i + 1
+            what = name + ": "
+            testing.assertEqual(vbs_of(a[0], what + "get"),
+                                [VarBind(SYS_DESCR, OctetString(DESCR)), VarBind(e([20, n, 0]), Integer(0))])
+            if name == "u_ro_sha_aes":
+                testing.assertEqual(status_of(a[1], what + "set by a read-only user"), (pdu.NO_ACCESS, 1))
+                testing.assertEqual(vbs_of(a[2], what + "get after"), [VarBind(e([20, n, 0]), Integer(0))])
+            else:
+                testing.assertEqual(vbs_of(a[1], what + "set"), [VarBind(e([20, n, 0]), Integer(n * 7 + 1))])
+                testing.assertEqual(vbs_of(a[2], what + "get after"), [VarBind(e([20, n, 0]), Integer(n * 7 + 1))])
+            testing.assertEqual(vbs_of(a[3], what + "get_next"), [VarBind(e([2, 1, 0]), OctetString(b"hello"))])
+            testing.assertEqual(vbs_of(a[4], what + "get_bulk"), [table(1, 1), table(1, 2), table(1, 3)])
+            r = ok(a[0], what + "get")
+            testing.assertEqual((r.context_engine_id, r.context_name), (h(AGENT_ENGINE), b""), what + "context")
+            c = clients[name]
+            info = c.engine_info()
+            if info is not None:
+                testing.assertEqual((info.engine_id, info.boots), (h(AGENT_ENGINE), AGENT_BOOTS), what + "engine")
+            else:
+                raise AssertionError(what + "no engine info after discovery")
+            s = c.stats()
+            testing.assertTrue(s.reports >= 1, what + "the discovery Report: " + str(s))
+            testing.assertEqual((s.timeouts, s.drops_auth, s.drops_decode), (0, 0, 0), what + str(s))
+
+    def reported(label: str, outs: list[Outcome]) -> None:
+        results[label] = outs
+        if len(results) == len(users):
+            report(t, outcome(check))
+
+    for i in range(len(users)):
+        u = users[i]
+        n = i + 1
+        c = _client(mn, u, 41000 + n)
+        clients[u.user] = c
+        col = Collector(u.user, reported)
+        c.get(col.cb, [SYS_DESCR, e([20, n, 0])])
+        c.set(col.cb, [VarBind(e([20, n, 0]), Integer(n * 7 + 1))])
+        c.get(col.cb, [e([20, n, 0])])
+        c.get_next(col.cb, [e([1, 1, 0])])
+        c.get_bulk(col.cb, [e([10, 1, 1])], 0, 3)
+        col.expect(5)
+
+actor _test_v3_md5(t: testing.AsyncT):
+    """SNMPv3 with MD5 and every privacy protocol, and u_noauth"""
+    t.timeout(120.0)
+    g = _V3Group(t, "MD5")
+
+actor _test_v3_sha(t: testing.AsyncT):
+    """SNMPv3 with SHA and every privacy protocol, and the read-only u_ro_sha_aes"""
+    t.timeout(120.0)
+    g = _V3Group(t, "SHA")
+
+actor _test_v3_sha224(t: testing.AsyncT):
+    """SNMPv3 with SHA-224 and every privacy protocol"""
+    t.timeout(120.0)
+    g = _V3Group(t, "SHA-224")
+
+actor _test_v3_sha256(t: testing.AsyncT):
+    """SNMPv3 with SHA-256 and every privacy protocol"""
+    t.timeout(120.0)
+    g = _V3Group(t, "SHA-256")
+
+actor _test_v3_sha384(t: testing.AsyncT):
+    """SNMPv3 with SHA-384 and every privacy protocol"""
+    t.timeout(120.0)
+    g = _V3Group(t, "SHA-384")
+
+actor _test_v3_sha512(t: testing.AsyncT):
+    """SNMPv3 with SHA-512 and every privacy protocol"""
+    t.timeout(120.0)
+    g = _V3Group(t, "SHA-512")
+
+actor _test_v3_discover(t: testing.AsyncT):
+    """discover() from cold reports the agent's engine ID and boots; a request after it needs no second probe"""
+    t.timeout(30.0)
+    u = Usm.from_passwords("u_sha_aes", usm.AUTH_SHA1, "authpass123", usm.PRIV_AES128, "privpass123")
+    mn = MemNet()
+    agent = Agent(mn.server(AGENT, 161), make_view(), agent_config([u]), t.log_handler)
+    c = _client(mn, u, 40001, OPTS, t.log_handler)
+    var info: ?EngineInfo = None
+
+    def got(r: ?Response, err: ?errors.SnmpError) -> None:
+        s = c.stats()
+        def check() -> None:
+            testing.assertEqual(vbs_of(Outcome(r, err), "get"), [VarBind(SYS_DESCR, OctetString(DESCR))])
+            i = info
+            if i is not None:
+                testing.assertEqual((i.engine_id, i.boots), (h(AGENT_ENGINE), AGENT_BOOTS))
+            else:
+                raise AssertionError("no EngineInfo")
+            testing.assertEqual(s.reports, 1, "one discovery Report: " + str(s))
+        report(t, outcome(check))
+
+    def get_done(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+        got(r, err)
+
+    def discovered(cl: Client, i: ?EngineInfo, err: ?errors.SnmpError) -> None:
+        if err is not None:
+            t.failure(AssertionError("discovery failed: " + str(err)))
+            return
+        info = i
+        c.get(get_done, [SYS_DESCR])
+
+    c.discover(discovered)
+
+
+# Faults seen through the real Client ##############################################################
+
+actor _FaultRun(t: testing.AsyncT, faults: ?Faults, net_faults: ?NetFaults, sec: security.Security, opts: Options,
+                check: proc(list[Outcome], Client) -> None, other_port: int=0):
+    """An Agent with faults on a MemNet (net_faults on the answers to the manager), one Client, and requests"""
+    mn = MemNet(net_faults)
+    agent = Agent(mn.server(AGENT, 161), make_view(), agent_config([_sha_aes()]), t.log_handler, faults)
+    c = _client(mn, sec, 40001, opts, t.log_handler)
+
+    def reported(label: str, outs: list[Outcome]) -> None:
+        def run() -> None:
+            check(outs, c)
+        report(t, outcome(run))
+
+    col = Collector("faults", reported)
+
+    def client() -> Client:
+        return c
+
+    def callback() -> action(Client, ?Response, ?errors.SnmpError) -> None:
+        return col.cb
+
+    def expect(n: int) -> None:
+        col.expect(n)
+
+    def quietly(n: int) -> None:
+        # expect n outcomes, but report only after QUIET more seconds (to catch a second callback)
+        after now QUIET: col.expect(n)
+
+def _sha_aes() -> Usm:
+    return Usm.from_passwords("u_sha_aes", usm.AUTH_SHA1, "authpass123", usm.PRIV_AES128, "privpass123")
+
+actor _test_fault_drop_first_n(t: testing.AsyncT):
+    """drop_first_n: the lost answer is retried; the SET was applied once and its retry meets the same value"""
+    t.timeout(30.0)
+
+    def check(outs: list[Outcome], c: Client) -> None:
+        r = ok(outs[0], "get")
+        testing.assertEqual((r.varbinds, r.attempts), ([VarBind(SYS_DESCR, OctetString(DESCR))], 2))
+        testing.assertEqual(vbs_of(outs[1], "get"), [VarBind(e([1, 1, 0]), Integer(42))])
+        testing.assertEqual(c.stats().retries, 1)
+
+    run = _FaultRun(t, Faults(drop_first_n=1), None, Community("public"), Options(timeout=0.2, retries=2), check)
+    c = run.client()
+    cb = run.callback()
+    c.get(cb, [SYS_DESCR])
+    c.get(cb, [e([1, 1, 0])])
+    run.expect(2)
+
+actor _test_fault_wrong_request_id(t: testing.AsyncT):
+    """wrong_request_id: the copy with another request-id is dropped, the genuine Response taken"""
+    t.timeout(30.0)
+
+    def check(outs: list[Outcome], c: Client) -> None:
+        testing.assertEqual(vbs_of(outs[0], "get"), [VarBind(SYS_DESCR, OctetString(DESCR))])
+        testing.assertEqual(vbs_of(outs[1], "get_next"), [VarBind(e([2, 1, 0]), OctetString(b"hello"))])
+        s = c.stats()
+        testing.assertEqual((s.drops_unknown_id, s.responses), (2, 2), str(s))
+
+    run = _FaultRun(t, Faults(wrong_request_id=True), None, Community("public"), OPTS, check)
+    c = run.client()
+    cb = run.callback()
+    c.get(cb, [SYS_DESCR])
+    c.get_next(cb, [e([1, 1, 0])])
+    run.expect(2)
+
+actor _test_net_duplicate(t: testing.AsyncT):
+    """Every answer duplicated by the network: each callback exactly once, the copies dropped"""
+    t.timeout(30.0)
+
+    def check(outs: list[Outcome], c: Client) -> None:
+        testing.assertEqual(len(outs), 3, "exactly one callback per request")
+        for o in outs:
+            testing.assertEqual(vbs_of(o, "get"), [VarBind(SYS_DESCR, OctetString(DESCR))])
+        s = c.stats()
+        testing.assertEqual((s.responses, s.drops_unknown_id), (3, 3), str(s))
+
+    run = _FaultRun(t, None, NetFaults(duplicate=True, to_address=MANAGER), Community("public"), OPTS, check)
+    c = run.client()
+    cb = run.callback()
+    for _ in range(3):
+        c.get(cb, [SYS_DESCR])
+    run.quietly(3)
+
+actor _test_net_late(t: testing.AsyncT):
+    """Answers delayed beyond the timeout: the late answer to the first attempt completes the request"""
+    t.timeout(30.0)
+
+    def check(outs: list[Outcome], c: Client) -> None:
+        r = ok(outs[0], "get")
+        testing.assertEqual((r.varbinds, r.attempts), ([VarBind(SYS_DESCR, OctetString(DESCR))], 2))
+        testing.assertTrue(r.rtt >= 0.25, "the rtt of the first attempt: %f" % r.rtt)
+        s = c.stats()
+        testing.assertEqual((s.responses, s.retries, s.timeouts), (1, 1, 0), str(s))
+
+    run = _FaultRun(t, None, NetFaults(delay=0.3, to_address=MANAGER), Community("public"),
+                    Options(timeout=0.2, retries=2), check)
+    c = run.client()
+    c.get(run.callback(), [SYS_DESCR])
+    run.expect(1)
+
+actor _test_fault_not_in_time_window_once(t: testing.AsyncT):
+    """SNMPv3: a forced authenticated notInTimeWindows Report makes the Client resynchronise and resend once"""
+    t.timeout(30.0)
+
+    def check(outs: list[Outcome], c: Client) -> None:
+        testing.assertEqual(vbs_of(outs[0], "get"), [VarBind(SYS_DESCR, OctetString(DESCR))])
+        testing.assertEqual(vbs_of(outs[1], "get"), [VarBind(e([1, 1, 0]), Integer(42))])
+        s = c.stats()
+        testing.assertEqual((s.reports, s.timeouts), (2, 0), "discovery and notInTimeWindows: " + str(s))
+
+    run = _FaultRun(t, Faults(report_not_in_time_window_once=True), None, _sha_aes(), OPTS, check)
+    c = run.client()
+    cb = run.callback()
+    c.get(cb, [SYS_DESCR])
+    c.get(cb, [e([1, 1, 0])])
+    run.expect(2)
+
+actor _test_fault_too_big(t: testing.AsyncT):
+    """too_big_over: a GET is split until each part fits, a GETBULK halves max-repetitions, a SET reports tooBig"""
+    t.timeout(30.0)
+    oids = [e([9, i, 0]) for i in range(1, 9)]
+
+    def check(outs: list[Outcome], c: Client) -> None:
+        testing.assertEqual(vbs_of(outs[0], "split get"), [VarBind(e([9, i, 0]), big(i)) for i in range(1, 9)])
+        vbs = vbs_of(outs[1], "halved get_bulk")
+        testing.assertTrue(len(vbs) >= 1 and len(vbs) <= 4, "repetitions halved: %d varbinds" % len(vbs))
+        testing.assertEqual(vbs, [VarBind(e([9, i, 0]), big(i)) for i in range(2, 2 + len(vbs))])
+        testing.assertEqual(status_of(outs[2], "set"), (pdu.TOO_BIG, 0))
+
+    run = _FaultRun(t, Faults(too_big_over=300), None, Community("private"), OPTS, check)
+    c = run.client()
+    cb = run.callback()
+    c.get(cb, oids)
+    c.get_bulk(cb, [e([9, 1, 0])], 0, 8)
+    c.set(cb, [VarBind(e([20, i, 0]), Integer(i)) for i in range(1, 30)])
+    run.expect(3)
+
+actor _test_fault_truncate_bulk(t: testing.AsyncT):
+    """truncate_bulk: the Client returns the shortened GETBULK answer as it is"""
+    t.timeout(30.0)
+
+    def check(outs: list[Outcome], c: Client) -> None:
+        testing.assertEqual(vbs_of(outs[0], "get_bulk"), [table(1, 1), table(2, 1)])
+
+    run = _FaultRun(t, Faults(truncate_bulk=2), None, Community("public"), OPTS, check)
+    c = run.client()
+    c.get_bulk(run.callback(), [e([10, 1, 1]), e([10, 1, 2])], 0, 5)
+    run.expect(1)
+
+actor _test_fault_error_at(t: testing.AsyncT):
+    """error_at: the injected error-status reaches the caller with its index, OID and transient flag"""
+    t.timeout(30.0)
+
+    def check(outs: list[Outcome], c: Client) -> None:
+        testing.assertEqual(status_of(outs[0], "get"), (pdu.RESOURCE_UNAVAILABLE, 2))
+        err = outs[0].e
+        if isinstance(err, errors.ErrorStatusError):
+            testing.assertEqual(err.oid, e([5, 1, 0]).arcs)
+            testing.assertTrue(err.transient, "resourceUnavailable is transient")
+        testing.assertEqual(vbs_of(outs[1], "another OID"), [VarBind(e([6, 1, 0]), Gauge32(8))])
+
+    run = _FaultRun(t, Faults(error_at=e([5, 1, 0]), error_status=pdu.RESOURCE_UNAVAILABLE), None,
+                    Community("public"), OPTS, check)
+    c = run.client()
+    cb = run.callback()
+    c.get(cb, [e([1, 1, 0]), e([5, 1, 0])])
+    c.get(cb, [e([6, 1, 0])])
+    run.expect(2)
+
+actor _test_fault_wrong_source_version_community(t: testing.AsyncT):
+    """Answers from another port, in the wrong version or (checked) with the wrong community time out with a hint"""
+    t.timeout(30.0)
+    mn = MemNet()
+    other = mn.server(AGENT, 1161)
+    a1 = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), None,
+               Faults(respond_from_other_port=True, other_port=other))
+    a2 = Agent(mn.server(AGENT, 162), make_view(), agent_config([]), None, Faults(wrong_version=True))
+    a3 = Agent(mn.server(AGENT, 163), make_view(), agent_config([]), None, Faults(wrong_community=True))
+    quick = Options(timeout=0.2, retries=0)
+    c1 = Client(None, AGENT, Community("public"), None, opts=quick, transport=mn.client(MANAGER, 40001, AGENT, 161))
+    c2 = Client(None, AGENT, Community("public"), None, port=162, opts=quick,
+                transport=mn.client(MANAGER, 40002, AGENT, 162))
+    c3 = Client(None, AGENT, Community("public"), None, port=163, opts=quick.with_(check_community=True),
+                transport=mn.client(MANAGER, 40003, AGENT, 163))
+    c4 = Client(None, AGENT, Community("public"), None, port=163, opts=quick,
+                transport=mn.client(MANAGER, 40004, AGENT, 163))
+    var results: dict[str, list[Outcome]] = {}
+
+    def check() -> None:
+        testing.assertEqual(timeout_hint(results["port"][0], "other port"), "1 datagram from another source")
+        testing.assertEqual(timeout_hint(results["version"][0], "version"), "1 datagram of another SNMP version")
+        testing.assertEqual(timeout_hint(results["community"][0], "community"), "1 datagram failed authentication")
+        testing.assertEqual(vbs_of(results["unchecked"][0], "community not checked"),
+                            [VarBind(SYS_DESCR, OctetString(DESCR))])
+
+    def reported(label: str, outs: list[Outcome]) -> None:
+        results[label] = outs
+        if len(results) == 4:
+            report(t, outcome(check))
+
+    for c, label in [(c1, "port"), (c2, "version"), (c3, "community"), (c4, "unchecked")]:
+        col = Collector(label, reported)
+        c.get(col.cb, [SYS_DESCR])
+        col.expect(1)
+
+actor _test_fault_trailing_bytes(t: testing.AsyncT):
+    """Octets after the message: ignored in SNMPv2c, an undecodable message in SNMPv3 (dropped, the request times out)"""
+    t.timeout(30.0)
+    u = _sha_aes()
+    mn = MemNet()
+    a1 = Agent(mn.server(AGENT, 161), make_view(), agent_config([u]), None, Faults(trailing_bytes=b"\x00\x00"))
+    c1 = Client(None, AGENT, Community("public"), None, opts=OPTS, transport=mn.client(MANAGER, 40001, AGENT, 161))
+    c2 = Client(None, AGENT, u, None, opts=Options(timeout=0.3, retries=0),
+                transport=mn.client(MANAGER, 40002, AGENT, 161))
+    var results: dict[str, list[Outcome]] = {}
+
+    def check() -> None:
+        testing.assertEqual(vbs_of(results["v2c"][0], "v2c"), [VarBind(SYS_DESCR, OctetString(DESCR))])
+        hint = timeout_hint(results["v3"][0], "v3")
+        testing.assertTrue("undecodable" in hint, hint)
+
+    def reported(label: str, outs: list[Outcome]) -> None:
+        results[label] = outs
+        if len(results) == 2:
+            report(t, outcome(check))
+
+    k1 = Collector("v2c", reported)
+    c1.get(k1.cb, [SYS_DESCR])
+    k1.expect(1)
+    k2 = Collector("v3", reported)
+    c2.get(k2.cb, [SYS_DESCR])
+    k2.expect(1)
+
+
+# Notifications: Client.trap / trap_v1 / inform to the NotificationReceiver #######################
+
+def block(head: str, lines: list[str]) -> str:
+    return "\n".join([head] + lines + ["END"])
+
+actor _NotifyRun(t: testing.AsyncT, users: list[Usm], communities: list[str], want: int,
+                 check: proc(list[str], dict[str, int], dict[str, list[Outcome]]) -> None):
+    """A NotificationReceiver on RECEIVER:162; checks once want notifications and every expected callback are in"""
+    mn = MemNet()
+    var blocks: list[str] = []
+    var outcomes: dict[str, list[Outcome]] = {}
+    var expected = 0
+    var traps_done: list[str] = []
+    var finished = False
+    var rcv: ?NotificationReceiver = None
+
+    proc def _maybe_done() -> None:
+        if not finished and len(blocks) >= want and len(outcomes) >= expected:
+            finished = True
+            st: dict[str, int] = {}
+            r = rcv
+            if r is not None:
+                st = r.stats()
+            def run() -> None:
+                check(sorted(blocks), st, outcomes)
+            report(t, outcome(run))
+
+    def on_notification(r: NotificationReceiver, n: Notification) -> None:
+        blocks.append(fmt.canon_notification(n))
+        _maybe_done()
+
+    def reported(label: str, outs: list[Outcome]) -> None:
+        outcomes[label] = outs
+        _maybe_done()
+
+    def trap_done(c: Client, err: ?errors.SnmpError) -> None:
+        if err is not None:
+            t.failure(AssertionError("trap failed: " + str(err)))
+        traps_done.append("x")
+
+    def client(sec: security.Security, port: int) -> Client:
+        return Client(None, RECEIVER, sec, None, port=162, opts=OPTS, transport=mn.client(MANAGER, port, RECEIVER, 162))
+
+    def collector(label: str) -> Collector:
+        expected += 1
+        return Collector(label, reported)
+
+    def trap_cb() -> action(Client, ?errors.SnmpError) -> None:
+        return trap_done
+
+    rcv = NotificationReceiver(mn.server(RECEIVER, 162), ReceiverConfig(communities, users, [], h(RECEIVER_ENGINE), 1),
+                               on_notification, None)
+
+actor _test_notify_v1_v2c(t: testing.AsyncT):
+    """trap_v1, trap and inform over SNMPv1/v2c: delivered, informs acknowledged, canonical blocks as the lab's"""
+    t.timeout(30.0)
+
+    def check(blocks: list[str], st: dict[str, int], outcomes: dict[str, list[Outcome]]) -> None:
+        r = ok(outcomes["inform"][0], "inform")
+        testing.assertEqual(r.varbinds, notify.build_trap_v2(500, notify.TRAP_LINK_DOWN, [VarBind(e([1, 1, 0]), Integer(3))]))
+        want = [block('NOTIFICATION v1 TRAP community="public" enterprise=.1.3.6.1.4.1.8072.9999 agent=192.0.2.1 '
+                      + 'generic=6 specific=42 uptime=12345 trapoid=.1.3.6.1.4.1.8072.9999.0.42',
+                      [".1.3.6.1.4.1.8072.9999.1.1.1.0 = INTEGER: 0"]),
+                block('NOTIFICATION v2c INFORM community="public" uptime=500 trapoid=.1.3.6.1.6.3.1.1.5.3',
+                      [".1.3.6.1.4.1.8072.9999.1.1.1.0 = INTEGER: 3"]),
+                block('NOTIFICATION v2c TRAP2 community="public" uptime=12345 trapoid=.1.3.6.1.6.3.1.1.5.1',
+                      ['.1.3.6.1.4.1.8072.9999.1.2.1.0 = STRING: "Hello, SNMP!"'])]
+        testing.assertEqual(blocks, sorted(want))
+        testing.assertEqual((st["delivered"], st["acked"], st["dropped_community"]), (3, 1, 1), str(st))
+
+    run = _NotifyRun(t, [], ["public"], 3, check)
+    v1 = run.client(Community("public", message.SNMP_V1), 42001)
+    v2 = run.client(Community("public"), 42002)
+    bad = run.client(Community("secret"), 42003)
+    tcb = run.trap_cb()
+    v1.trap_v1(tcb, ENTERPRISE, b"\xc0\x00\x02\x01", 6, 42, [VarBind(e([1, 1, 0]), Integer(0))], 12345)
+    bad.trap(tcb, notify.TRAP_COLD_START, [], 1)
+    v2.trap(tcb, notify.TRAP_COLD_START, [VarBind(e([2, 1, 0]), OctetString(b"Hello, SNMP!"))], 12345)
+    col = run.collector("inform")
+    v2.inform(col.cb, notify.TRAP_LINK_DOWN, [VarBind(e([1, 1, 0]), Integer(3))], 500)
+    col.expect(1)
+
+actor _NotifyV3(t: testing.AsyncT, auth: str):
+    """Every lab user with authentication protocol auth sends an SNMPv3 trap and an inform to the receiver"""
+    users = lab_users(auth)
+
+    def check(blocks: list[str], st: dict[str, int], outcomes: dict[str, list[Outcome]]) -> None:
+        want: list[str] = []
+        for i in range(len(users)):
+            u = users[i]
+            head = 'user="' + u.user + '" level=' + usm.level_text(u.level()) + ' context=""'
+            line = [".1.3.6.1.4.1.8072.9999.1.1.1.0 = INTEGER: %d" % i]
+            want.append(block("NOTIFICATION v3 TRAP2 " + head + " uptime=%d trapoid=.1.3.6.1.6.3.1.1.5.4" % (1000 + i),
+                              line))
+            want.append(block("NOTIFICATION v3 INFORM " + head + " uptime=%d trapoid=.1.3.6.1.6.3.1.1.5.3" % (2000 + i),
+                              line))
+            ok(outcomes[u.user][0], u.user + ": inform")
+        testing.assertEqual(blocks, sorted(want))
+        testing.assertEqual((st["delivered"], st["acked"], st["internal_errors"]), (2 * len(users), len(users), 0),
+                            str(st))
+
+    run = _NotifyRun(t, users, [], 2 * len(users), check)
+    tcb = run.trap_cb()
+    for i in range(len(users)):
+        u = users[i]
+        c = run.client(u, 43000 + i)
+        c.trap(tcb, notify.TRAP_LINK_UP, [VarBind(e([1, 1, 0]), Integer(i))], 1000 + i)
+        col = run.collector(u.user)
+        c.inform(col.cb, notify.TRAP_LINK_DOWN, [VarBind(e([1, 1, 0]), Integer(i))], 2000 + i)
+        col.expect(1)
+
+actor _test_notify_v3_md5(t: testing.AsyncT):
+    """SNMPv3 traps and informs from u_noauth and the MD5 users"""
+    t.timeout(120.0)
+    g = _NotifyV3(t, "MD5")
+
+actor _test_notify_v3_sha(t: testing.AsyncT):
+    """SNMPv3 traps and informs from the SHA users"""
+    t.timeout(120.0)
+    g = _NotifyV3(t, "SHA")
+
+actor _test_notify_v3_sha224(t: testing.AsyncT):
+    """SNMPv3 traps and informs from the SHA-224 users"""
+    t.timeout(120.0)
+    g = _NotifyV3(t, "SHA-224")
+
+actor _test_notify_v3_sha256(t: testing.AsyncT):
+    """SNMPv3 traps and informs from the SHA-256 users"""
+    t.timeout(120.0)
+    g = _NotifyV3(t, "SHA-256")
+
+actor _test_notify_v3_sha384(t: testing.AsyncT):
+    """SNMPv3 traps and informs from the SHA-384 users"""
+    t.timeout(120.0)
+    g = _NotifyV3(t, "SHA-384")
+
+actor _test_notify_v3_sha512(t: testing.AsyncT):
+    """SNMPv3 traps and informs from the SHA-512 users"""
+    t.timeout(120.0)
+    g = _NotifyV3(t, "SHA-512")
+
+actor _test_v3_agent_reboot(t: testing.AsyncT):
+    """The agent reboots (boots + 1), then changes its engine ID: the Client resynchronises, then rediscovers"""
+    t.timeout(30.0)
+    u = _sha_aes()
+    mn = MemNet()
+    agent = Agent(mn.server(AGENT, 161), make_view(), agent_config([u]), t.log_handler)
+    c = _client(mn, u, 40001, OPTS, t.log_handler)
+    new_engine = h("80001f888001020304050607")
+    var step = 0
+
+    def fail(what: str, r: ?Response, err: ?errors.SnmpError) -> bool:
+        if err is not None:
+            t.failure(AssertionError(what + ": " + str(err)))
+            return True
+        return False
+
+    def third(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+        if fail("after the engine ID change", r, err):
+            return
+        info = c.engine_info()
+        s = c.stats()
+        def check() -> None:
+            testing.assertEqual(vbs_of(Outcome(r, err), "get"), [VarBind(SYS_DESCR, OctetString(DESCR))])
+            if info is not None:
+                testing.assertEqual((info.engine_id, info.boots), (new_engine, 1))
+            else:
+                raise AssertionError("no engine info")
+            # discovery, notInTimeWindows after the reboot, unknownEngineIDs, discovery again
+            testing.assertEqual((s.reports, s.timeouts), (4, 0), str(s))
+        report(t, outcome(check))
+
+    def second(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+        if fail("after the reboot", r, err):
+            return
+        boots = -1
+        info = c.engine_info()
+        if info is not None:
+            boots = info.boots
+        if boots != AGENT_BOOTS + 1:
+            t.failure(AssertionError("boots not learned after the reboot: %d" % boots))
+            return
+        agent.reboot(1, new_engine)
+        c.get(third, [SYS_DESCR])
+
+    def first(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+        if fail("first get", r, err):
+            return
+        agent.reboot()
+        c.get(second, [SYS_DESCR])
+
+    c.get(first, [SYS_DESCR])
+
+actor _test_fault_too_big_v3(t: testing.AsyncT):
+    """SNMPv3 authPriv with too_big_over: the GET is split into new exchanges and merged in order"""
+    t.timeout(30.0)
+
+    def check(outs: list[Outcome], c: Client) -> None:
+        testing.assertEqual(vbs_of(outs[0], "split get"), [VarBind(e([9, i, 0]), big(i)) for i in range(1, 9)])
+        testing.assertEqual(c.stats().timeouts, 0)
+
+    run = _FaultRun(t, Faults(too_big_over=500), None, _sha_aes(), OPTS, check)
+    c = run.client()
+    c.get(run.callback(), [e([9, i, 0]) for i in range(1, 9)])
+    run.expect(1)
+
+actor _test_inform_retransmission_dedup(t: testing.AsyncT):
+    """A v2c inform whose Response is lost is retransmitted; the receiver's dedup_window delivers it once"""
+    t.timeout(30.0)
+    mn = MemNet(NetFaults(drop_first_n=1, to_address=MANAGER))
+    var got: list[Notification] = []
+
+    def on_n(r: NotificationReceiver, n: Notification) -> None:
+        got.append(n)
+
+    rcv = NotificationReceiver(mn.server(RECEIVER, 162), ReceiverConfig(["public"], [], [], h(RECEIVER_ENGINE), 1, 60.0),
+                               on_n, t.log_handler)
+    c = Client(None, RECEIVER, Community("public"), t.log_handler, port=162, opts=Options(timeout=0.2, retries=2),
+               transport=mn.client(MANAGER, 42001, RECEIVER, 162))
+
+    def done(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+        st = rcv.stats()
+        def check() -> None:
+            resp = ok(Outcome(r, err), "inform")
+            testing.assertEqual(resp.attempts, 2)
+            testing.assertEqual(len(got), 1, "delivered once")
+            testing.assertEqual((st["delivered"], st["duplicates"], st["acked"]), (1, 1, 2), str(st))
+        report(t, outcome(check))
+
+    c.inform(done, notify.TRAP_LINK_DOWN, [VarBind(e([1, 1, 0]), Integer(3))], 500)
+
+actor _test_discovery_budgets(t: testing.AsyncT):
+    """Discovery keeps each request's own budget: a long one outlives a short Client default, a short one fails early"""
+    t.timeout(30.0)
+    u = _sha_aes()
+    mn = MemNet(NetFaults(delay=0.5, to_address=MANAGER))
+    agent = Agent(mn.server(AGENT, 161), make_view(), agent_config([u]), t.log_handler)
+    # the Client's default would give up after 0.05 s; the agent's answers take 0.5 s
+    c = _client(mn, u, 40001, Options(timeout=0.05, retries=0, max_in_flight=2), t.log_handler)
+    var log: list[str] = []
+    var short_elapsed = 0.0
+    var started = 0.0
+
+    def check() -> None:
+        testing.assertEqual(sorted(log), ["long:ok", "short:timeout"])
+        testing.assertTrue(short_elapsed < 0.45, "the short request failed after %.3f s" % short_elapsed)
+
+    def note(what: str) -> None:
+        log.append(what)
+        if len(log) == 2:
+            report(t, outcome(check))
+
+    def long_done(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+        note("long:" + ("ok" if err is None else str(err)))
+
+    def short_done(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+        short_elapsed = float(time.monotonic_ns()) / 1e9 - started
+        note("short:" + ("timeout" if isinstance(err, errors.TimeoutError) else describe(Outcome(r, err))))
+
+    started = float(time.monotonic_ns()) / 1e9
+    c.get(long_done, [SYS_DESCR], Options(timeout=3.0, retries=0))
+    c.get(short_done, [SYS_DESCR], Options(timeout=0.2, retries=0))
+
+
+# Logging ##########################################################################################
+
+actor _LogLines():
+    var texts: list[str] = []
+
+    def add(text: str) -> None:
+        texts.append(text)
+
+    def all() -> list[str]:
+        return texts
+
+class _CaptureSink(logging.Sink):
+    # Every formatted message, with its data, goes to a _LogLines actor
+    def __init__(self, lines: _LogLines):
+        logging.Sink.__init__(self)
+        self.lines = lines
+
+    def handle(self, m: logging.Message):
+        text = self.formatter.format(m)
+        if text is not None:
+            data = m.data
+            if data is not None:
+                text += " - " + str(data)
+            self.lines.add(text)
+
+actor _test_logs_never_show_secrets(t: testing.AsyncT):
+    """Client, Agent and NotificationReceiver logging at every level never show a community or a key"""
+    t.timeout(30.0)
+    secret = "s3cr3t-community"
+    lines = _LogLines()
+    handler = logging.Handler("e2e")
+    handler.add_sink(_CaptureSink(lines))
+    handler.set_output_level(logging.ALL)
+    u = _sha_aes()
+    mn = MemNet()
+    cfg = AgentConfig({secret: True}, [u], h(AGENT_ENGINE), AGENT_BOOTS, write_rules())
+    agent = Agent(mn.server(AGENT, 161), make_view(), cfg, handler)
+    var got = 0
+    var done_count = 0
+
+    def on_n(r: NotificationReceiver, n: Notification) -> None:
+        got += 1
+        maybe_done()
+
+    def check() -> None:
+        texts = lines.all()
+        testing.assertTrue(len(texts) > 10, "something was logged")
+        joined = "\n".join(texts)
+        for bad in [secret, secret.encode().hex(), u.auth_ku.hex(), u.priv_ku.hex(), "authpass123", "privpass123"]:
+            testing.assertFalse(bad in joined, "found " + bad)
+
+    def maybe_done() -> None:
+        if got == 4 and done_count == 4:
+            after now QUIET: report(t, outcome(check))
+
+    def req_done(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+        if err is not None:
+            t.failure(AssertionError(str(err)))
+            return
+        done_count += 1
+        maybe_done()
+
+    def trap_done(cl: Client, err: ?errors.SnmpError) -> None:
+        if err is not None:
+            t.failure(AssertionError(str(err)))
+
+    rcv = NotificationReceiver(mn.server(RECEIVER, 162), ReceiverConfig([secret], [u], [], h(RECEIVER_ENGINE), 1),
+                               on_n, handler)
+    c2 = _client(mn, Community(secret), 40001, OPTS, handler)
+    c2.get(req_done, [SYS_DESCR])
+    c2.set(req_done, [VarBind(e([1, 1, 0]), Integer(5))])
+    c3 = _client(mn, u, 40002, OPTS, handler)
+    c3.get(req_done, [SYS_DESCR])
+    n1 = Client(None, RECEIVER, Community(secret, message.SNMP_V1), handler, port=162, opts=OPTS,
+                transport=mn.client(MANAGER, 42001, RECEIVER, 162))
+    n1.trap_v1(trap_done, ENTERPRISE, b"\xc0\x00\x02\x01", 6, 1, [VarBind(e([1, 1, 0]), Integer(1))], 1)
+    n2 = Client(None, RECEIVER, Community(secret), handler, port=162, opts=OPTS,
+                transport=mn.client(MANAGER, 42002, RECEIVER, 162))
+    n2.trap(trap_done, notify.TRAP_COLD_START, [], 1)
+    n3 = Client(None, RECEIVER, u, handler, port=162, opts=OPTS, transport=mn.client(MANAGER, 42003, RECEIVER, 162))
+    n3.trap(trap_done, notify.TRAP_COLD_START, [], 1)
+    n3.inform(req_done, notify.TRAP_LINK_DOWN, [VarBind(e([1, 1, 0]), Integer(3))], 2)

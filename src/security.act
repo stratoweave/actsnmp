@@ -196,3 +196,106 @@ class Usm(Security):
 
     def __str__(self) -> str:
         return self.__repr__()
+
+
+# The interop lab's users file #######################################################################
+
+# pysnmp's privacy protocol names in interop/config/users.tsv; they differ from net-snmp's
+# (pysnmp's AES192 is net-snmp's AES-192-C)
+_PYSNMP_PRIV: dict[str, int] = {"DES": usm.PRIV_DES, "AES": usm.PRIV_AES128, "AES192BLMT": usm.PRIV_AES192,
+                                "AES256BLMT": usm.PRIV_AES256, "AES192": usm.PRIV_AES192C,
+                                "AES256": usm.PRIV_AES256C, "3DES": usm.PRIV_3DES}
+
+def _tsv_priv(netsnmp: str, pysnmp: str) -> int:
+    # The net-snmp name when there is one; 3DES has only a pysnmp name
+    if netsnmp != "-":
+        return usm.priv_from_name(netsnmp)
+    if pysnmp == "-":
+        return usm.PRIV_NONE
+    p = _PYSNMP_PRIV.get(pysnmp.upper())
+    if p is not None:
+        return p
+    raise ValueError("unknown pysnmp privacy protocol %r" % pysnmp)
+
+def _tsv_password(protocol: bool, password: str, what: str) -> None:
+    # A password must be given with its protocol and only then, and have at least 8 octets
+    if not protocol:
+        if password != "-":
+            raise ValueError(what + " password without an " + what + " protocol")
+        return
+    if password == "-":
+        raise ValueError(what + " password missing")
+    n = len(password.encode())
+    if n < MIN_PASSWORD_LEN:
+        raise ValueError("%s password must be at least %d octets, got %d" % (what, MIN_PASSWORD_LEN, n))
+
+def _tsv_ku(kus: dict[(int, str), bytes], auth: int, password: str) -> bytes:
+    # The master key (Ku) of password for auth, derived once per (auth, password): password-to-key
+    # hashes 1 MiB, and the lab's users share two passwords
+    k = kus.get((auth, password))
+    if k is not None:
+        return k
+    ku = usm.password_to_key(auth, password.encode())
+    kus[(auth, password)] = ku
+    return ku
+
+def _tsv_user(fields: list[str], kus: dict[(int, str), bytes]) -> Usm:
+    # One line of a users file; everything is checked before any password-to-key runs
+    if len(fields) < 8:
+        raise ValueError("%d fields, expected at least 8" % len(fields))
+    name = len(fields[0].encode())
+    if name == 0 or name > message.MAX_USER_NAME:
+        raise ValueError("user name must be 1 to %d octets, got %d" % (message.MAX_USER_NAME, name))
+    level = usm.level_from_name(fields[1])
+    auth = usm.AUTH_NONE if fields[2] == "-" else usm.auth_from_name(fields[2])
+    priv = _tsv_priv(fields[3], fields[5])
+    if usm.level_of(auth, priv) != level:
+        raise ValueError("level " + fields[1] + " does not match the protocols " + usm.auth_name(auth) + "/"
+                         + usm.priv_name(priv))
+    _tsv_password(auth != usm.AUTH_NONE, fields[6], "authentication")
+    _tsv_password(priv != usm.PRIV_NONE, fields[7], "privacy")
+    auth_ku = _tsv_ku(kus, auth, fields[6]) if auth != usm.AUTH_NONE else b""
+    priv_ku = _tsv_ku(kus, auth, fields[7]) if priv != usm.PRIV_NONE else b""
+    return Usm.from_keys(fields[0], auth, auth_ku, priv, priv_ku)
+
+def load_users_tsv(text: str) -> (users: list[Usm], read_only: list[str]):
+    """Return the SNMPv3 users of a users file in the format of interop/config/users.tsv, and the read-only ones
+
+    One user per line, tab-separated: user, level (net-snmp -l spelling),
+    authentication and privacy protocol (net-snmp -a/-x spellings), the
+    same two as pysnmp names them, authentication and privacy password,
+    then optional columns: the ninth (presence on the lab's snmpd) marks a
+    read-only user with "read-only" (yes(read-only)); further columns are
+    ignored. "-" stands for none. The pysnmp privacy name is used only when
+    net-snmp has none (3DES), with pysnmp's meaning (its AES192 and AES256
+    are the Reeder variants AES-192-C and AES-256-C). Blank lines and lines
+    starting with # are skipped; line ends may be CRLF. read_only holds
+    the names of the read-only users.
+
+    The agent (agent.load_users) and the receiver (receiver.load_users_tsv)
+    both read users files with this. Password-to-key (1 MiB of hashing)
+    runs once per authentication protocol and password, not per user: the
+    lab's 50 users share two passwords. Raises ValueError naming the line
+    ("users file line N: ...") for a line with fewer than 8 fields, a user
+    name that is empty or over 32 octets, an unknown protocol or level, a
+    level that does not match the protocols, a password missing, shorter
+    than 8 octets or given without its protocol; a line is checked
+    completely before its keys are derived.
+    """
+    users: list[Usm] = []
+    read_only: list[str] = []
+    kus: dict[(int, str), bytes] = {}
+    n = 0
+    for raw in text.split("\n"):
+        n += 1
+        line = raw[:-1] if raw.endswith("\r") else raw
+        if line.strip() == "" or line.startswith("#"):
+            continue
+        fields = line.split("\t")
+        try:
+            users.append(_tsv_user(fields, kus))
+        except ValueError as e:
+            raise ValueError("users file line %d: %s" % (n, e.error_message))
+        if len(fields) > 8 and "read-only" in fields[8]:
+            read_only.append(fields[0])
+    return (users=users, read_only=read_only)

@@ -1,0 +1,877 @@
+"""The command responder: an Agent actor that serves a MibView over SNMPv1, v2c and v3
+
+Agent answers GET, GETNEXT, GETBULK and SET requests from a MibView the
+way net-snmp's snmpd does. It exists for the library's own tests and for
+interop tests with other managers, not as a production agent.
+
+For SNMPv1/v2c the community selects read-only or read-write access.
+Unknown communities, malformed datagrams, unknown versions and PDU types
+an agent does not answer are dropped silently and counted. For SNMPv3 the
+agent is the authoritative engine (engine.AuthoritativeEngine), with
+discovery, Reports and Responses at the request's security level. Only the
+default context exists: a request for another context name is dropped, as
+snmpd does, and any contextEngineID is answered from the default context.
+
+GET answers noSuchObject or noSuchInstance for missing variables and
+GETNEXT answers endOfMibView past the end. GETBULK returns every
+non-repeater and at most AgentConfig.max_bulk_varbinds // R rows of the R
+repeaters, and ends after the first row that holds an endOfMibView, like
+snmpd. SET is all or nothing: every varbind is checked against
+AgentConfig.write_rules before any is applied, and a read-only community
+or user gets noAccess.
+
+A response over the size limit (AgentConfig.max_msg_size, and the
+request's msgMaxSize for SNMPv3) becomes tooBig (RFC 3416 section 4.2),
+except that a GETBULK response is shortened instead. A value that cannot
+be encoded gives genErr with its index. Error responses echo the request's
+varbinds, or their names with NULL values when the varbinds cannot be
+encoded again.
+
+SNMPv1 follows RFC 3584 sections 4.2.2.1 and 4.4: exception values become
+noSuchName, Counter64 objects are invisible, and SET errors are mapped
+with v1_error_status(). A GETBULK in an SNMPv1 message is answered with
+these rules, as snmpd does, and counted as v1_getbulk.
+
+The agent writes sysUpTime.0 (since start or reboot()) and snmpEngineID.0
+into the view, and replies from the port the request arrived on.
+
+Faults injects application-level misbehaviour for testing managers;
+packet-level faults are transport.NetFaults. load_users() and lab_config()
+build an AgentConfig from the interop lab's files.
+
+Nothing here logs a community, a password or a key.
+"""
+
+import logging
+import time
+
+import ber
+import errors
+import message
+import mibview
+import notify
+import pdu
+import security
+import transport as transport_mod
+import usm
+import values
+from engine import AuthoritativeEngine, Incoming
+from message import CommunityMessage, ScopedPdu, V3Message
+from mibview import MibView, WriteRule
+from oid import Oid
+from pdu import Pdu
+from security import Usm
+from transport import ServerTransport
+from values import Value, VarBind
+
+# The agent's default snmpEngineID: 0x80001f8880616374736e6d7061, net-snmp's enterprise
+# (8072) in RFC 3411 format with the octets "actsnmpa" (the sentinel of the lab dataset)
+DEFAULT_ENGINE_ID = ber.from_hex("80001f8880616374736e6d7061")
+
+# snmpd's maxGetbulkResponses: the most varbinds a GETBULK response carries
+DEFAULT_MAX_BULK_VARBINDS = 100
+
+# snmpEngineID.0 (SNMP-FRAMEWORK-MIB, RFC 3411); sysUpTime.0 is notify.SYS_UPTIME_0
+SNMP_ENGINE_ID_0 = Oid([1, 3, 6, 1, 6, 3, 10, 2, 1, 1, 0])
+
+# The counters of Agent.stats(), in order; the SNMPv3 engine's counters (engine.COUNTERS) follow them
+STATS: list[str] = [
+    "received",           # datagrams received
+    "requests",           # requests processed (GET, GETNEXT, GETBULK, SET), answered or not
+    "responses",          # Response datagrams sent (a Faults.wrong_request_id pair counts once)
+    "reports",            # SNMPv3 Report datagrams sent
+    "parse_errors",       # undecodable datagrams (snmpInASNParseErrs)
+    "bad_versions",       # an SNMP version other than 0, 1 and 3 (snmpInBadVersions)
+    "bad_communities",    # unknown communities (snmpInBadCommunityNames)
+    "unsupported_pdus",   # SNMPv1/v2c PDUs an agent does not answer: Response, Trap, Report, Inform
+    "v1_getbulk",         # GETBULK requests in SNMPv1 messages (answered, like snmpd)
+    "unknown_contexts",   # SNMPv3 requests for a context other than the default one (dropped)
+    "no_access",          # SETs from a read-only community or user (noAccess)
+    "too_big",            # tooBig responses
+    "truncated",          # GETBULK responses shortened to fit the size limit
+    "too_big_dropped",    # answers dropped because not even the tooBig response fit
+    "gen_errs",           # genErr responses for values that could not be encoded
+    "fault_drops"]        # answers held back by Faults.drop_first_n
+
+_REQUEST_TYPES: list[int] = [pdu.GET, pdu.GETNEXT, pdu.GETBULK, pdu.SET]
+_UINT32_MASK = 0xffffffff
+# Faults.wrong_request_id flips this bit of the request-id: the result stays an Integer32 of the same sign
+_WRONG_ID_BIT = 0x40000000
+
+
+def _now() -> float:
+    # Monotonic time in seconds, the clock of the SNMPv3 engine and of sysUpTime.0
+    return float(time.monotonic_ns()) / 1000000000.0
+
+
+def v1_error_status(status: int) -> int:
+    """Return the SNMPv1 error-status for an SNMPv2 error-status (RFC 3584 section 4.4)
+
+    noError, tooBig, noSuchName, badValue, readOnly and genErr stay as they
+    are; noAccess, noCreation, authorizationError, notWritable and
+    inconsistentName become noSuchName; wrongType, wrongLength,
+    wrongEncoding, wrongValue and inconsistentValue become badValue;
+    resourceUnavailable, commitFailed, undoFailed and anything unknown
+    become genErr.
+    """
+    if status >= pdu.NO_ERROR and status <= pdu.GEN_ERR:
+        return status
+    if (status == pdu.NO_ACCESS or status == pdu.NO_CREATION or status == pdu.AUTHORIZATION_ERROR
+            or status == pdu.NOT_WRITABLE or status == pdu.INCONSISTENT_NAME):
+        return pdu.NO_SUCH_NAME
+    if (status == pdu.WRONG_TYPE or status == pdu.WRONG_LENGTH or status == pdu.WRONG_ENCODING
+            or status == pdu.WRONG_VALUE or status == pdu.INCONSISTENT_VALUE):
+        return pdu.BAD_VALUE
+    return pdu.GEN_ERR
+
+
+# Configuration #####################################################################################
+
+class AgentConfig(object):
+    """What an Agent serves to whom
+
+    communities maps the SNMPv1/v2c communities the agent answers to
+    whether they may SET (True) or only read (False); requests with any
+    other community are dropped silently, as snmpd does. users are the
+    SNMPv3 users (security.Usm, with master keys from passwords or keys);
+    the agent localizes their keys to engine_id when first needed. A user
+    may only use the security level of its credentials. read_only_users
+    names users that may not SET (snmpd's rouser; the lab's u_ro_sha_aes).
+
+    engine_id is the agent's snmpEngineID (5 to 32 octets) and engine_boots
+    its snmpEngineBoots (1 to 2^31-1); persist boots and start the next run
+    with boots + 1 (RFC 3414 section 2.2.2).
+
+    write_rules decide which variables a SET may change and to what
+    (mibview.WriteRule, first match wins; no match is notWritable).
+
+    max_bulk_varbinds caps the repetitions of a GETBULK response at
+    max_bulk_varbinds // R rows; the non-repeaters come on top (snmpd: 100;
+    at least 1). max_msg_size is the largest datagram the agent sends
+    (484 to 65507 octets, transport.MAX_DATAGRAM); it is also the
+    msgMaxSize of its SNMPv3 messages. Larger responses become tooBig, or
+    are shortened for GETBULK.
+
+    Raises ValueError for values outside these ranges. repr() shows the
+    number of communities, never the communities themselves.
+    """
+    communities: dict[str, bool]
+    users: list[Usm]
+    engine_id: bytes
+    engine_boots: int
+    write_rules: list[WriteRule]
+    max_bulk_varbinds: int
+    max_msg_size: int
+    read_only_users: list[str]
+
+    def __init__(self, communities: dict[str, bool]={}, users: list[Usm]=[], engine_id: bytes=DEFAULT_ENGINE_ID,
+                 engine_boots: int=1, write_rules: list[WriteRule]=[],
+                 max_bulk_varbinds: int=DEFAULT_MAX_BULK_VARBINDS, max_msg_size: int=transport_mod.MAX_DATAGRAM,
+                 read_only_users: list[str]=[]):
+        if len(engine_id) < usm.MIN_ENGINE_ID_LEN or len(engine_id) > usm.MAX_ENGINE_ID_LEN:
+            raise ValueError("an engine ID has 5 to 32 octets, got %d" % len(engine_id))
+        if engine_boots < 1 or engine_boots > usm.MAX_BOOTS:
+            raise ValueError("snmpEngineBoots must be 1..2147483647, got %d" % engine_boots)
+        if max_bulk_varbinds < 1:
+            raise ValueError("max_bulk_varbinds must be at least 1, got %d" % max_bulk_varbinds)
+        if max_msg_size < message.MIN_MAX_SIZE or max_msg_size > transport_mod.MAX_DATAGRAM:
+            raise ValueError("max_msg_size must be 484..65507, got %d" % max_msg_size)
+        self.communities = communities
+        self.users = users
+        self.engine_id = engine_id
+        self.engine_boots = engine_boots
+        self.write_rules = write_rules
+        self.max_bulk_varbinds = max_bulk_varbinds
+        self.max_msg_size = max_msg_size
+        self.read_only_users = read_only_users
+
+    def __repr__(self) -> str:
+        return ("AgentConfig(communities=<%d>, users=" % len(self.communities) + repr([u.user for u in self.users])
+                + ", engine_id=" + self.engine_id.hex()
+                + ", engine_boots=%d, write_rules=%d, max_bulk_varbinds=%d, max_msg_size=%d"
+                % (self.engine_boots, len(self.write_rules), self.max_bulk_varbinds, self.max_msg_size)
+                + ", read_only_users=" + repr(self.read_only_users) + ")")
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
+
+def _check_faults(drop_first_n: int, too_big_over: int, truncate_bulk: int, error_status: int,
+                  respond_from_other_port: bool, other_port: ?ServerTransport) -> None:
+    # The validation of Faults.__init__
+    if drop_first_n < 0:
+        raise ValueError("drop_first_n must not be negative, got %d" % drop_first_n)
+    if too_big_over < 0:
+        raise ValueError("too_big_over must not be negative, got %d" % too_big_over)
+    if truncate_bulk < -1:
+        raise ValueError("truncate_bulk must be -1 (off) or a number of varbinds, got %d" % truncate_bulk)
+    if error_status < 0 or error_status > values.INTEGER32_MAX:
+        raise ValueError("error_status must be 0..2147483647, got %d" % error_status)
+    if respond_from_other_port and other_port is None:
+        raise ValueError("respond_from_other_port needs other_port, the transport to answer through")
+
+
+class Faults(object):
+    """Application-level misbehaviour of an Agent, for testing managers
+
+    Every knob is off by default and applies to every SNMP version unless
+    noted:
+
+    - drop_first_n: the first n answers (Responses and Reports) are not
+      sent. The requests are still processed, so a SET whose answer is lost
+      has been applied. Use NetFaults to lose the request itself.
+    - wrong_request_id: every Response is preceded by a copy with bit 30 of
+      the request-id flipped, which a manager must ignore.
+    - wrong_community (SNMPv1/v2c): Responses carry the request's community
+      with "-x" appended.
+    - wrong_version (SNMPv1/v2c): answers to SNMPv1 go out as SNMPv2c
+      messages and vice versa.
+    - trailing_bytes: appended to every datagram sent. SNMPv1/v2c managers
+      ignore them; an SNMPv3 message becomes undecodable.
+    - non_increasing_at: a GETNEXT or GETBULK step that would return the
+      variable at this OID returns the requested OID instead, so the OID
+      does not increase.
+    - too_big_over: answers longer than this many octets become tooBig,
+      GETBULK included (0 = off).
+    - truncate_bulk: GETBULK responses carry at most this many varbinds,
+      cut anywhere, mid-row included (-1 = off).
+    - error_at, error_status: a request that names error_at is answered
+      with error_status (genErr by default) and that varbind's index, sent
+      as it is, also in SNMPv1.
+    - report_not_in_time_window_once (SNMPv3): the first authenticated
+      request is answered with an authenticated usmStatsNotInTimeWindows
+      Report and not processed.
+    - respond_from_other_port, other_port: answers go out through
+      other_port, a ServerTransport on another port, which the agent never
+      closes.
+
+    Raises ValueError for negative counts, a truncate_bulk below -1, an
+    error_status outside 0..2^31-1, or respond_from_other_port without
+    other_port. Agent.set_faults() replaces the faults of a running agent
+    and restarts drop_first_n and report_not_in_time_window_once.
+    """
+    drop_first_n: int
+    wrong_request_id: bool
+    wrong_community: bool
+    wrong_version: bool
+    trailing_bytes: bytes
+    non_increasing_at: ?Oid
+    too_big_over: int
+    truncate_bulk: int
+    error_at: ?Oid
+    error_status: int
+    report_not_in_time_window_once: bool
+    respond_from_other_port: bool
+    other_port: ?ServerTransport
+
+    def __init__(self, drop_first_n: int=0, wrong_request_id: bool=False, wrong_community: bool=False,
+                 wrong_version: bool=False, trailing_bytes: bytes=b"", non_increasing_at: ?Oid=None,
+                 too_big_over: int=0, truncate_bulk: int=-1, error_at: ?Oid=None, error_status: int=pdu.GEN_ERR,
+                 report_not_in_time_window_once: bool=False, respond_from_other_port: bool=False,
+                 other_port: ?ServerTransport=None):
+        _check_faults(drop_first_n, too_big_over, truncate_bulk, error_status, respond_from_other_port, other_port)
+        self.drop_first_n = drop_first_n
+        self.wrong_request_id = wrong_request_id
+        self.wrong_community = wrong_community
+        self.wrong_version = wrong_version
+        self.trailing_bytes = trailing_bytes
+        self.non_increasing_at = non_increasing_at
+        self.too_big_over = too_big_over
+        self.truncate_bulk = truncate_bulk
+        self.error_at = error_at
+        self.error_status = error_status
+        self.report_not_in_time_window_once = report_not_in_time_window_once
+        self.respond_from_other_port = respond_from_other_port
+        self.other_port = other_port
+
+    def __repr__(self) -> str:
+        parts: list[str] = []
+        if self.drop_first_n > 0:
+            parts.append("drop_first_n=%d" % self.drop_first_n)
+        if self.wrong_request_id:
+            parts.append("wrong_request_id")
+        if self.wrong_community:
+            parts.append("wrong_community")
+        if self.wrong_version:
+            parts.append("wrong_version")
+        if len(self.trailing_bytes) > 0:
+            parts.append("trailing_bytes=" + self.trailing_bytes.hex())
+        at = self.non_increasing_at
+        if at is not None:
+            parts.append("non_increasing_at=" + str(at))
+        if self.too_big_over > 0:
+            parts.append("too_big_over=%d" % self.too_big_over)
+        if self.truncate_bulk >= 0:
+            parts.append("truncate_bulk=%d" % self.truncate_bulk)
+        err = self.error_at
+        if err is not None:
+            parts.append("error_at=" + str(err) + " error_status=" + pdu.error_status_name(self.error_status))
+        if self.report_not_in_time_window_once:
+            parts.append("report_not_in_time_window_once")
+        if self.respond_from_other_port:
+            parts.append("respond_from_other_port")
+        return "Faults(" + ", ".join(parts) + ")"
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
+
+# The lab's configuration files ######################################################################
+
+def load_users(text: str) -> (users: list[Usm], read_only: list[str]):
+    """Return the SNMPv3 users of the interop lab's users.tsv, and the names of the read-only ones
+
+    The format is that of security.load_users_tsv(); a user whose snmpd
+    field says yes(read-only) is read-only. Raises ValueError naming the
+    line.
+    """
+    r = security.load_users_tsv(text)
+    return (users=r.users, read_only=r.read_only)
+
+def lab_config(users_tsv: str, write_rules_tsv: str, engine_id: bytes=DEFAULT_ENGINE_ID,
+               engine_boots: int=1) -> AgentConfig:
+    """Return the configuration of an agent that serves the interop lab dataset
+
+    users_tsv is the text of interop/config/users.tsv (load_users()) and
+    write_rules_tsv that of interop/dataset/write-rules.tsv
+    (mibview.load_write_rules()). The communities are the lab's: public
+    reads, private reads and writes. The view to serve is
+    mibview.load_snmprec() of interop/dataset/actsnmp.snmprec; the agent
+    replaces its snmpEngineID.0 sentinel with engine_id. Raises ValueError
+    for invalid files or arguments.
+    """
+    u = load_users(users_tsv)
+    return AgentConfig({"public": False, "private": True}, u.users, engine_id, engine_boots,
+                       mibview.load_write_rules(write_rules_tsv), read_only_users=u.read_only)
+
+
+# Response building helpers ##########################################################################
+
+class _Answer(object):
+    # A response PDU and its datagram
+    pdu: Pdu
+    data: bytes
+
+    def __init__(self, p: Pdu, data: bytes):
+        self.pdu = p
+        self.data = data
+
+
+def _decode(data: bytes) -> (?CommunityMessage, ?V3Message, str):
+    # message.decode(), with the reason of a DecodeError as the third value ("" when it decoded)
+    try:
+        c, m = message.decode(data)
+        return (c, m, "")
+    except errors.DecodeError as e:
+        return (None, None, e.error_message)
+
+def _decode_failure(data: bytes) -> str:
+    # The counter of a datagram message.decode() rejected: bad_versions when it is a SEQUENCE starting
+    # with a version other than 0, 1 and 3, parse_errors for everything else
+    try:
+        start, stop = ber.expect_tlv(data, 0, len(data), ber.TAG_SEQUENCE)
+        vs, ve = ber.expect_tlv(data, start, stop, ber.TAG_INTEGER)
+        v = ber.dec_int(data, vs, ve)
+        if v != message.SNMP_V1 and v != message.SNMP_V2C and v != message.SNMP_V3:
+            return "bad_versions"
+    except errors.DecodeError:
+        pass
+    return "parse_errors"
+
+def _hidden_in_v1(v: Value) -> bool:
+    # What an SNMPv1 response cannot carry: the exception values and Counter64 (RFC 3584 section 4.2.2.1)
+    return values.is_exception(v) or isinstance(v, values.Counter64)
+
+def _error(p: Pdu, status: int, index: int) -> Pdu:
+    # An error Response: the request's varbinds echoed
+    return Pdu(pdu.RESPONSE, p.request_id, status, index, p.varbinds)
+
+def _request_index(p: Pdu, j: int) -> int:
+    # The 1-based index of the request varbind that position j (0-based) of p's response answers: the
+    # same position, except for GETBULK, whose repetitions cycle through the repeated varbinds
+    if p.pdu_type != pdu.GETBULK:
+        return j + 1
+    n, m = p.bulk_counts()
+    if j < n:
+        return j + 1
+    return n + (j - n) % (len(p.varbinds) - n) + 1
+
+def _unencodable_index(vbs: list[VarBind]) -> int:
+    # The 0-based position of the first varbind that cannot be encoded, -1 if there is none
+    for j in range(len(vbs)):
+        try:
+            values.encode_varbind(vbs[j])
+        except errors.EncodeError:
+            return j
+    return -1
+
+def _fallback(p: Pdu, resp: Pdu) -> Pdu:
+    # resp could not be encoded. An error response keeps its status and echoes the request's names
+    # with NULL values; a response with values becomes genErr at the first value without a BER form.
+    names = [VarBind(vb.oid) for vb in p.varbinds]
+    if resp.error_status != pdu.NO_ERROR:
+        return Pdu(pdu.RESPONSE, p.request_id, resp.error_status, resp.error_index, names)
+    j = _unencodable_index(resp.varbinds)
+    return Pdu(pdu.RESPONSE, p.request_id, pdu.GEN_ERR, _request_index(p, j) if j >= 0 else 0, names)
+
+def _encode_community(c: CommunityMessage, resp: Pdu, f: ?Faults) -> bytes:
+    # The SNMPv1/v2c datagram that answers c with resp, with the wrong_community and wrong_version faults
+    community = c.community
+    if f is not None:
+        if f.wrong_community:
+            community = community + b"-x"
+        if f.wrong_version:
+            other = message.SNMP_V2C if c.version == message.SNMP_V1 else message.SNMP_V1
+            # by hand: encode_community refuses SNMPv2 content in an SNMPv1 message
+            return ber.enc_sequence(ber.TAG_SEQUENCE, [ber.enc_integer(other),
+                                                       ber.enc_tlv(ber.TAG_OCTET_STRING, community),
+                                                       pdu.encode_pdu(resp)])
+    return message.encode_community(CommunityMessage(c.version, community, resp))
+
+def _community_table(communities: dict[str, bool]) -> dict[bytes, bool]:
+    # The communities as the wire carries them (UTF-8 octets)
+    return {k.encode(): w for k, w in communities.items()}
+
+def _name_set(names: list[str]) -> set[bytes]:
+    return {n.encode() for n in names}
+
+def _new_engine(config: AgentConfig, engine_id: bytes, boots: int, start: float) -> AuthoritativeEngine:
+    return AuthoritativeEngine(engine_id, boots, start, config.users, max_size=config.max_msg_size)
+
+
+# The agent ##########################################################################################
+
+actor Agent(transport: ServerTransport, view: MibView, config: AgentConfig, log_handler: ?logging.Handler,
+            faults: ?Faults=None):
+    """An SNMP agent (command responder) that serves view through transport
+
+    The agent registers as transport's receiver at once and owns view from
+    then on: it answers from it, applies SETs to it and keeps sysUpTime.0
+    and snmpEngineID.0 in it. It keeps no state per request, so a
+    retransmission is answered again. faults is None for a well-behaved
+    agent. log_handler gets debug messages for drops and Reports and trace
+    messages per request.
+
+    reboot() simulates a restart of the SNMPv3 engine, and close() releases
+    the transport.
+    """
+    _log = logging.Logger(log_handler)
+    _communities: dict[bytes, bool] = _community_table(config.communities)
+    _read_only: set[bytes] = _name_set(config.read_only_users)
+    _salts = usm.SaltCounter()
+    var _start: float = _now()
+    var _engine: AuthoritativeEngine = _new_engine(config, config.engine_id, config.engine_boots, _start)
+    var _faults: ?Faults = faults
+    var _answers = 0            # answers (Responses and Reports) since the faults were set
+    var _nitw_sent = False      # Faults.report_not_in_time_window_once has fired
+    var _closed = False
+    var _counts: dict[str, int] = {name: 0 for name in STATS}
+
+    proc def _count(name: str) -> None:
+        _counts[name] = _counts[name] + 1
+
+    proc def _set_uptime(now: float) -> None:
+        ticks = int((now - _start) * 100.0) & _UINT32_MASK
+        view.set_value(notify.SYS_UPTIME_0, values.TimeTicks(ticks))
+
+    proc def _too_big_over() -> int:
+        f = _faults
+        return f.too_big_over if f is not None else 0
+
+    proc def _truncate_bulk() -> int:
+        f = _faults
+        return f.truncate_bulk if f is not None else -1
+
+    # Sending ---------------------------------------------------------------------------------------
+
+    proc def _send(datagrams: list[bytes], address: str, port: int, counter: str) -> None:
+        # Send one answer (normally one datagram), applying the faults that concern every answer
+        _answers += 1
+        out = transport
+        tail = b""
+        f = _faults
+        if f is not None:
+            if _answers <= f.drop_first_n:
+                _count("fault_drops")
+                _log.debug("Answer dropped (fault)", {"to": address, "port": port, "answer": _answers})
+                return
+            tail = f.trailing_bytes
+            if f.respond_from_other_port:
+                o = f.other_port
+                if o is not None:
+                    out = o
+        for d in datagrams:
+            out.send_to(d + tail if len(tail) > 0 else d, address, port)
+        _count(counter)
+
+    proc def _try_encode(encode: proc(Pdu) -> bytes, resp: Pdu) -> ?bytes:
+        try:
+            return encode(resp)
+        except errors.EncodeError:
+            return None
+
+    proc def _send_response(a: _Answer, address: str, port: int, encode: proc(Pdu) -> bytes) -> None:
+        datagrams: list[bytes] = []
+        f = _faults
+        if f is not None:
+            if f.wrong_request_id:
+                r = a.pdu
+                wrong = _try_encode(encode, Pdu(pdu.RESPONSE, r.request_id ^ _WRONG_ID_BIT, r.error_status,
+                                                r.error_index, r.varbinds))
+                if wrong is not None:
+                    datagrams.append(wrong)
+        datagrams.append(a.data)
+        _send(datagrams, address, port, "responses")
+
+    # Size control ----------------------------------------------------------------------------------
+
+    proc def _too_big(p: Pdu, v1: bool, limit: int, encode: proc(Pdu) -> bytes) -> ?_Answer:
+        # RFC 3416 section 4.2: tooBig with an empty varbind list; SNMPv1 echoes the request's varbinds
+        _count("too_big")
+        resp = Pdu(pdu.RESPONSE, p.request_id, pdu.TOO_BIG, 0, p.varbinds if v1 else [])
+        d = _try_encode(encode, resp)
+        if d is None:
+            resp = _fallback(p, resp)
+            d = _try_encode(encode, resp)
+        if d is not None:
+            if len(d) <= limit:
+                return _Answer(resp, d)
+        _count("too_big_dropped")
+        _log.debug("Answer dropped: not even tooBig fits", {"limit": limit, "request_id": p.request_id})
+        return None
+
+    proc def _shorten(resp: Pdu, limit: int, encode: proc(Pdu) -> bytes) -> ?_Answer:
+        # The GETBULK response with the most leading varbinds of resp that fits limit (resp itself does not)
+        vbs = resp.varbinds
+        lo = 0
+        hi = len(vbs) - 1
+        best: ?_Answer = None
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            cut = Pdu(pdu.RESPONSE, resp.request_id, resp.error_status, resp.error_index, vbs[:mid])
+            fits = False
+            d = _try_encode(encode, cut)
+            if d is not None:
+                if len(d) <= limit:
+                    best = _Answer(cut, d)
+                    fits = True
+            if fits:
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        if best is not None:
+            _count("truncated")
+        else:
+            _count("too_big_dropped")
+            _log.debug("Answer dropped: no GETBULK response fits", {"limit": limit, "request_id": resp.request_id})
+        return best
+
+    proc def _fit(p: Pdu, resp: Pdu, data: bytes, v1: bool, limit: int, encode: proc(Pdu) -> bytes) -> ?_Answer:
+        over = _too_big_over()
+        if over > 0 and len(data) > over:
+            return _too_big(p, v1, limit, encode)
+        if len(data) <= limit:
+            return _Answer(resp, data)
+        if p.pdu_type == pdu.GETBULK:
+            return _shorten(resp, limit, encode)
+        return _too_big(p, v1, limit, encode)
+
+    proc def _deliver(p: Pdu, resp: Pdu, v1: bool, limit: int, encode: proc(Pdu) -> bytes) -> ?_Answer:
+        # Encode resp and apply the size rules; None when nothing can be sent
+        d = _try_encode(encode, resp)
+        if d is not None:
+            return _fit(p, resp, d, v1, limit, encode)
+        fixed = _fallback(p, resp)
+        if fixed.error_status == pdu.GEN_ERR and resp.error_status == pdu.NO_ERROR:
+            _count("gen_errs")
+            _log.debug("A value cannot be encoded: genErr", {"request_id": p.request_id, "index": fixed.error_index})
+        d2 = _try_encode(encode, fixed)
+        if d2 is not None:
+            return _fit(p, fixed, d2, v1, limit, encode)
+        _log.warning("A response cannot be encoded", {"request_id": p.request_id})
+        return None
+
+    # The operations --------------------------------------------------------------------------------
+
+    proc def _successor(o: Oid, v1: bool) -> VarBind:
+        # One GETNEXT step from o: SNMPv1 skips Counter64 objects; Faults.non_increasing_at applies
+        vb = view.get_next(o)
+        if v1:
+            while isinstance(vb.value, values.Counter64):
+                vb = view.get_next(vb.oid)
+        f = _faults
+        if f is not None:
+            at = f.non_increasing_at
+            if at is not None:
+                if vb.oid == at:
+                    return VarBind(o, vb.value)
+        return vb
+
+    proc def _get(p: Pdu, v1: bool) -> Pdu:
+        vbs = p.varbinds
+        out: list[VarBind] = []
+        for i in range(len(vbs)):
+            o = vbs[i].oid
+            v = view.get(o)
+            if v1:
+                if _hidden_in_v1(v):
+                    return _error(p, pdu.NO_SUCH_NAME, i + 1)
+            out.append(VarBind(o, v))
+        return Pdu(pdu.RESPONSE, p.request_id, pdu.NO_ERROR, 0, out)
+
+    proc def _get_next(p: Pdu, v1: bool) -> Pdu:
+        vbs = p.varbinds
+        out: list[VarBind] = []
+        for i in range(len(vbs)):
+            vb = _successor(vbs[i].oid, v1)
+            if v1:
+                if values.is_exception(vb.value):
+                    return _error(p, pdu.NO_SUCH_NAME, i + 1)
+            out.append(vb)
+        return Pdu(pdu.RESPONSE, p.request_id, pdu.NO_ERROR, 0, out)
+
+    proc def _get_bulk(p: Pdu, v1: bool) -> Pdu:
+        # RFC 3416 section 4.2.3 with snmpd's limits (snmp_agent.c, maxGetbulkResponses): every
+        # non-repeater, then at most max_bulk_varbinds // R rows of the R repeaters (none when R is
+        # above the limit), whole rows only, and no row after the first one that holds an
+        # endOfMibView. The size limit may shorten the answer further (_shorten).
+        n, m = p.bulk_counts()
+        vbs = p.varbinds
+        r = len(vbs) - n
+        cap = config.max_bulk_varbinds
+        out: list[VarBind] = []
+        for i in range(n):
+            out.append(_successor(vbs[i].oid, v1))
+        if r > 0:
+            rows = cap // r
+            if m < rows:
+                rows = m
+            cur: list[Oid] = [vb.oid for vb in vbs[n:]]
+            for _ in range(rows):
+                ended = False
+                for c in range(r):
+                    vb = _successor(cur[c], v1)
+                    out.append(vb)
+                    cur[c] = vb.oid
+                    if isinstance(vb.value, values.EndOfMibView):
+                        ended = True
+                if ended:
+                    break
+        tb = _truncate_bulk()
+        if tb >= 0 and tb < len(out):
+            out = out[:tb]
+        if v1:
+            for j in range(len(out)):
+                if values.is_exception(out[j].value):
+                    return _error(p, pdu.NO_SUCH_NAME, _request_index(p, j))
+        return Pdu(pdu.RESPONSE, p.request_id, pdu.NO_ERROR, 0, out)
+
+    proc def _set(p: Pdu, v1: bool, writable: bool, limit: int, encode: proc(Pdu) -> bytes) -> ?_Answer:
+        # Access, then MibView.check_set (nothing changes), then the size of the answer, then commit:
+        # a SET whose answer cannot be sent is not applied
+        vbs = p.varbinds
+        if not writable:
+            _count("no_access")
+            status = pdu.NO_SUCH_NAME if v1 else pdu.NO_ACCESS
+            return _deliver(p, _error(p, status, 1 if len(vbs) > 0 else 0), v1, limit, encode)
+        if v1:
+            for i in range(len(vbs)):
+                if isinstance(vbs[i].value, values.Counter64):
+                    return _deliver(p, _error(p, pdu.BAD_VALUE, i + 1), v1, limit, encode)
+        status, index = view.check_set(vbs, config.write_rules)
+        if status != pdu.NO_ERROR:
+            return _deliver(p, _error(p, v1_error_status(status) if v1 else status, index), v1, limit, encode)
+        resp = Pdu(pdu.RESPONSE, p.request_id, pdu.NO_ERROR, 0, vbs)
+        d = _try_encode(encode, resp)
+        if d is not None:
+            over = _too_big_over()
+            if len(d) <= limit and (over <= 0 or len(d) <= over):
+                view.apply_set(vbs, config.write_rules)
+                return _Answer(resp, d)
+            return _too_big(p, v1, limit, encode)
+        # check_set() refuses values that cannot be encoded, so this is not expected
+        return _deliver(p, _error(p, pdu.GEN_ERR, 0), v1, limit, encode)
+
+    proc def _injected_error(p: Pdu) -> ?Pdu:
+        # Faults.error_at
+        f = _faults
+        if f is not None:
+            at = f.error_at
+            if at is not None:
+                vbs = p.varbinds
+                for i in range(len(vbs)):
+                    if vbs[i].oid == at:
+                        return _error(p, f.error_status, i + 1)
+        return None
+
+    proc def _handle(p: Pdu, v1: bool, writable: bool, limit: int, encode: proc(Pdu) -> bytes) -> ?_Answer:
+        # The answer to a request PDU (GET, GETNEXT, GETBULK or SET) of any version
+        _count("requests")
+        injected = _injected_error(p)
+        if injected is not None:
+            return _deliver(p, injected, v1, limit, encode)
+        t = p.pdu_type
+        if t == pdu.SET:
+            return _set(p, v1, writable, limit, encode)
+        if t == pdu.GET:
+            resp = _get(p, v1)
+        elif t == pdu.GETNEXT:
+            resp = _get_next(p, v1)
+        else:
+            resp = _get_bulk(p, v1)
+        return _deliver(p, resp, v1, limit, encode)
+
+    # SNMPv1 and SNMPv2c ----------------------------------------------------------------------------
+
+    proc def _community_request(c: CommunityMessage, p: Pdu, address: str, port: int) -> None:
+        writable = _communities[c.community]
+        v1 = (c.version == message.SNMP_V1)
+        if v1 and p.pdu_type == pdu.GETBULK:
+            _count("v1_getbulk")
+        _log.trace("Request", {"from": address, "port": port, "version": c.version,
+                               "type": pdu.pdu_type_name(p.pdu_type), "request_id": p.request_id})
+        def encode(resp: Pdu) -> bytes:
+            return _encode_community(c, resp, _faults)
+        a = _handle(p, v1, writable, config.max_msg_size, encode)
+        if a is not None:
+            _send_response(a, address, port, encode)
+
+    proc def _community(c: CommunityMessage, address: str, port: int) -> None:
+        if c.community not in _communities:
+            _count("bad_communities")
+            _log.debug("Dropped a request with an unknown community", {"from": address, "port": port,
+                                                                      "version": c.version})
+            return
+        p = c.pdu
+        if p is not None:
+            if p.pdu_type in _REQUEST_TYPES:
+                _community_request(c, p, address, port)
+                return
+            what = pdu.pdu_type_name(p.pdu_type)
+        else:
+            what = "TRAP"
+        _count("unsupported_pdus")
+        _log.debug("Dropped a PDU an agent does not answer", {"from": address, "port": port, "type": what})
+
+    # SNMPv3 ----------------------------------------------------------------------------------------
+
+    proc def _nitw_report(m: V3Message, inc: Incoming, p: Pdu, now: float) -> bytes:
+        # A usmStatsNotInTimeWindows Report as the engine sends one (Faults.report_not_in_time_window_once):
+        # authNoPriv with the user's key, request-id 0 for an encrypted request (it was not decrypted)
+        name = usm.USM_STATS_NOT_IN_TIME_WINDOWS
+        n = _engine.stats[name] + 1
+        _engine.stats[name] = n
+        rid = p.request_id if inc.level == usm.LEVEL_AUTH_NO_PRIV else 0
+        report = Pdu(pdu.REPORT, rid, 0, 0, [VarBind(usm.report_oid(name), values.Counter32(n & _UINT32_MASK))])
+        hdr = V3Message(m.msg_id, m.max_size, message.FLAG_AUTH, m.usm)
+        return _engine.respond(hdr, inc.user, report, _engine.engine_id, b"", now, u64(0))
+
+    proc def _v3_request(m: V3Message, s: ScopedPdu, inc: Incoming, now: float, address: str, port: int) -> None:
+        if s.context_name != b"":
+            _count("unknown_contexts")
+            _log.debug("Dropped a request for an unknown context", {"from": address, "port": port})
+            return
+        p = s.pdu
+        f = _faults
+        if f is not None:
+            if f.report_not_in_time_window_once and not _nitw_sent and inc.level != usm.LEVEL_NO_AUTH_NO_PRIV:
+                _nitw_sent = True
+                _log.debug("Report (fault)", {"counter": usm.USM_STATS_NOT_IN_TIME_WINDOWS, "to": address,
+                                              "port": port})
+                _send([_nitw_report(m, inc, p, now)], address, port, "reports")
+                return
+        _log.trace("Request", {"from": address, "port": port, "version": message.SNMP_V3,
+                               "type": pdu.pdu_type_name(p.pdu_type), "request_id": p.request_id})
+        writable = m.usm.user not in _read_only
+        user = inc.user
+        def encode(resp: Pdu) -> bytes:
+            return _engine.respond(m, user, resp, s.context_engine_id, s.context_name, now, _salts.next())
+        limit = config.max_msg_size if config.max_msg_size < m.max_size else m.max_size
+        a = _handle(p, False, writable, limit, encode)
+        if a is not None:
+            _send_response(a, address, port, encode)
+
+    proc def _v3(data: bytes, m: V3Message, now: float, address: str, port: int) -> None:
+        inc = _engine.incoming(data, m, now)
+        s = inc.scoped
+        if s is not None:
+            _v3_request(m, s, inc, now, address, port)
+            return
+        rep = inc.report
+        if rep is not None:
+            _log.debug("Report", {"counter": inc.counter, "to": address, "port": port})
+            _send([rep], address, port, "reports")
+        else:
+            _log.debug("Dropped an SNMPv3 message", {"counter": inc.counter, "from": address, "port": port})
+
+    # Public ----------------------------------------------------------------------------------------
+
+    def _on_data(data: bytes, address: str, port: int) -> None:
+        # The transport's receiver: one datagram from address and port
+        if _closed:
+            return
+        _count("received")
+        c, m, error = _decode(data)
+        if error != "":
+            _count(_decode_failure(data))
+            _log.debug("Dropped an undecodable datagram", {"from": address, "port": port, "error": error})
+            return
+        now = _now()
+        _set_uptime(now)
+        if c is not None:
+            _community(c, address, port)
+        elif m is not None:
+            _v3(data, m, now, address, port)
+
+    def stats() -> dict[str, int]:
+        """Return a snapshot of the counters: STATS in order, then the SNMPv3 engine's (engine.COUNTERS)
+
+        The engine's counters (usmStatsUnknownUserNames, ...) restart at 0
+        on reboot(), like a real engine's.
+        """
+        out: dict[str, int] = {}
+        for name in STATS:
+            out[name] = _counts[name]
+        for name, n in _engine.stats.items():
+            out[name] = n
+        return out
+
+    def set_faults(faults: ?Faults) -> None:
+        """Replace the faults (None: behave); drop_first_n and report_not_in_time_window_once start over"""
+        _faults = faults
+        _answers = 0
+        _nitw_sent = False
+        _log.debug("Faults set", {"faults": repr(faults) if faults is not None else "None"})
+
+    def reboot(boots: ?int=None, engine_id: ?bytes=None) -> None:
+        """Simulate a restart of the agent: a new SNMPv3 engine, and sysUpTime.0 from 0
+
+        The engine gets boots (default: the current boots + 1, at most
+        2^31-1), engine_id (default: unchanged) and snmpEngineTime 0, as
+        after a restart that persisted boots (RFC 3414 section 2.2.2).
+        snmpEngineID.0 follows the engine ID. The engine's counters start
+        at 0; the view keeps its values (SETs survive). Raises ValueError
+        for an invalid engine ID or boots, before changing anything.
+        """
+        eid = engine_id if engine_id is not None else _engine.engine_id
+        old = _engine.boots
+        b = boots if boots is not None else (old + 1 if old < usm.MAX_BOOTS else old)
+        now = _now()
+        _engine = _new_engine(config, eid, b, now)
+        _start = now
+        view.set_value(SNMP_ENGINE_ID_0, values.OctetString(eid))
+        _set_uptime(now)
+        _log.info("Agent rebooted", {"engine_id": eid.hex(), "boots": b})
+
+    def close() -> None:
+        """Stop answering and close the transport (idempotent)"""
+        if not _closed:
+            _closed = True
+            transport.close()
+            _log.info("Agent closed", None)
+
+    view.set_value(SNMP_ENGINE_ID_0, values.OctetString(config.engine_id))
+    _set_uptime(_start)
+    transport.set_receiver(_on_data)
+    _log.info("Agent started", {"engine_id": config.engine_id.hex(), "boots": config.engine_boots,
+                                "variables": view.size(), "port": transport.local_port()})

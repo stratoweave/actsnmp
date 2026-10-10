@@ -7,6 +7,7 @@ vectors' passwords localized to engine 80001f88800102030405060708.
 import testing
 import message
 import pdu
+import security
 import usm
 from message import ScopedPdu, UsmSecurityParameters, V3Message
 from oid import Oid
@@ -244,3 +245,24 @@ def _test_localized_auth() -> None:
     s = Usm.from_passwords("shaonly", usm.AUTH_SHA1, "authpassword")
     testing.assertEqual(s.localized_auth(engine()).auth_key, s.localized(engine()).auth_key)
     testing.assertFalse(u.auth_ku.hex() in repr(a))
+
+
+def _test_load_users_tsv_pysnmp_names(t: testing.SyncT) -> None:
+    """The shared users-file loader: pysnmp privacy names with pysnmp's meaning, read-only users, CRLF"""
+    t.timeout(30.0)
+    text = ("# user\tlevel\n"
+            + "u_x\tauthPriv\tSHA\t-\tSHA\tAES192\tauthpass123\tprivpass123\tyes\tyes\r\n"
+            + "u_y\tauthPriv\tSHA\t-\tSHA\tAES256BLMT\tauthpass123\tprivpass123\tyes\tyes\n"
+            + "u_z\tauthPriv\tSHA\tAES\tSHA\tAES\tauthpass123\tprivpass123\tyes(read-only)\tno\n"
+            + "u_w\tnoAuthNoPriv\t-\t-\t-\t-\t-\t-\n")
+    r = security.load_users_tsv(text)
+    testing.assertEqual([(u.user, u.priv_protocol) for u in r.users],
+                        [("u_x", usm.PRIV_AES192C), ("u_y", usm.PRIV_AES256), ("u_z", usm.PRIV_AES128),
+                         ("u_w", usm.PRIV_NONE)])
+    testing.assertEqual(r.read_only, ["u_z"])
+    testing.assertEqual(r.users[0].auth_ku, r.users[2].auth_ku, "one Ku per (protocol, password)")
+    try:
+        security.load_users_tsv("u_v\tauthPriv\tSHA\t-\tSHA\tAES512\tauthpass123\tprivpass123")
+        testing.error("no ValueError for an unknown pysnmp privacy name")
+    except ValueError as e:
+        testing.assertTrue(e.error_message.startswith("users file line 1: "), e.error_message)

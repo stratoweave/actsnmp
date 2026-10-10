@@ -11,33 +11,13 @@ import time
 import transport
 from transport import Datagram, MemNet, NetFaults, NetStats, ServerTransport, Transport
 from transport import is_unreachable, mem_pair, normalize_address
-from testutil import pseudo_random, value_fails
+from testutil import pseudo_random, value_fails, outcome, report, report_env
 
 # Seconds a test waits to see that nothing (more) is delivered
 NOTHING_WAIT = 0.2
 
 # Watchdog for the UDP tests, below the timeout they ask the runner for
 UDP_WATCHDOG = 8.0
-
-proc def _outcome(check: proc() -> None) -> ?Exception:
-    # Run check; return what it raised, or None when it passed
-    try:
-        check()
-    except Exception as e:
-        return e
-    return None
-
-proc def _report(t: testing.AsyncT, error: ?Exception) -> None:
-    if error is not None:
-        t.failure(error)
-    else:
-        t.success()
-
-proc def _report_env(t: testing.EnvT, error: ?Exception) -> None:
-    if error is not None:
-        t.failure(error)
-    else:
-        t.success()
 
 def _numbered(n: int) -> list[bytes]:
     return [str(i).encode() for i in range(n)]
@@ -146,7 +126,7 @@ actor _test_mem_roundtrip(t: testing.AsyncT):
 
     def on_client(data: bytes, address: str, port: int) -> None:
         log.append((data, address, port))
-        _report(t, _outcome(check))
+        report(t, outcome(check))
 
     def on_error(message: str, fatal: bool) -> None:
         t.failure(AssertionError("unexpected error: " + message))
@@ -175,7 +155,7 @@ actor _test_mem_order(t: testing.AsyncT):
     def on_client(data: bytes, address: str, port: int) -> None:
         at_client.append(data)
         if len(at_client) == count:
-            _report(t, _outcome(check))
+            report(t, outcome(check))
 
     def on_error(message: str, fatal: bool) -> None:
         t.failure(AssertionError("unexpected error: " + message))
@@ -212,7 +192,7 @@ actor _test_mem_many_peers(t: testing.AsyncT):
         def on_client(data: bytes, address: str, port: int) -> None:
             at_clients.append((i, data, address, port))
             if len(at_clients) == 3:
-                _report(t, _outcome(check))
+                report(t, outcome(check))
         return on_client
 
     srv.set_receiver(on_server)
@@ -268,7 +248,7 @@ actor _test_mem_bind_rules(t: testing.AsyncT):
         testing.assertEqual(p.server.local_port(), 49155)
         testing.assertEqual(mn.stats().sent, 0)
 
-    _report(t, _outcome(check))
+    report(t, outcome(check))
 
 
 actor _test_mem_buffered_until_receiver(t: testing.AsyncT):
@@ -287,7 +267,7 @@ actor _test_mem_buffered_until_receiver(t: testing.AsyncT):
     def on_late(data: bytes, address: str, port: int) -> None:
         got.append(data)
         if data == b"after":
-            _report(t, _outcome(check))
+            report(t, outcome(check))
 
     def on_marker(data: bytes, address: str, port: int) -> None:
         # MemNet delivered every earlier datagram to late before this one
@@ -314,7 +294,7 @@ actor _test_mem_replace_receiver(t: testing.AsyncT):
 
     def second(data: bytes, address: str, port: int) -> None:
         log.append("second " + data.decode())
-        _report(t, _outcome(check))
+        report(t, outcome(check))
 
     def first(data: bytes, address: str, port: int) -> None:
         log.append("first " + data.decode())
@@ -343,7 +323,7 @@ actor _test_mem_inject_and_history(t: testing.AsyncT):
 
     def on_client(data: bytes, address: str, port: int) -> None:
         got.append((data, address, port))
-        _report(t, _outcome(check))
+        report(t, outcome(check))
 
     def on_error(message: str, fatal: bool) -> None:
         t.failure(AssertionError("unexpected error: " + message))
@@ -365,7 +345,7 @@ actor _test_mem_unroutable(t: testing.AsyncT):
 
     def on_late(data: bytes, address: str, port: int) -> None:
         if data == b"again":
-            _report(t, _outcome(check))
+            report(t, outcome(check))
 
     def on_error(message: str, fatal: bool) -> None:
         errors.append((message, fatal))
@@ -401,7 +381,7 @@ actor _test_mem_errors_and_data_in_order(t: testing.AsyncT):
     def on_data(data: bytes, address: str, port: int) -> None:
         log.append("data " + data.decode())
         if data == b"two":
-            _report(t, _outcome(check))
+            report(t, outcome(check))
 
     def on_error(message: str, fatal: bool) -> None:
         log.append("error " + message)
@@ -432,7 +412,7 @@ actor _test_mem_spoofed_copy_not_refused(t: testing.AsyncT):
         testing.assertEqual(repr(mn.stats()), _counts(sent=1, spoofed=1, unroutable=2))
 
     def conclude() -> None:
-        _report(t, _outcome(check))
+        report(t, outcome(check))
 
     def on_data(data: bytes, address: str, port: int) -> None:
         log.append("data")
@@ -461,7 +441,7 @@ actor _test_mem_oversize(t: testing.AsyncT):
         testing.assertEqual(repr(mn.stats()), _counts(sent=2, oversize=1, delivered=1))
 
     def on_server(data: bytes, address: str, port: int) -> None:
-        _report(t, _outcome(lambda: check(len(data))))
+        report(t, outcome(lambda: check(len(data))))
 
     def on_client(data: bytes, address: str, port: int) -> None:
         t.failure(AssertionError("unexpected datagram"))
@@ -487,7 +467,7 @@ actor _test_mem_close(t: testing.AsyncT):
         testing.assertEqual(mn.stats().sent, 2)
 
     def conclude() -> None:
-        _report(t, _outcome(check))
+        report(t, outcome(check))
 
     def on_server(data: bytes, address: str, port: int) -> None:
         log.append("server got " + data.decode())
@@ -536,7 +516,7 @@ actor _test_mem_wrapped_transport(t: testing.AsyncT):
 
     def on_client(data: bytes, address: str, port: int) -> None:
         wrapped.close()
-        _report(t, _outcome(check))
+        report(t, outcome(check))
 
     def on_error(message: str, fatal: bool) -> None:
         t.failure(AssertionError("unexpected error: " + message))
@@ -567,7 +547,7 @@ actor _fault_run(t: testing.AsyncT, faults: NetFaults, sends: list[bytes], expec
         testing.assertTrue(last_elapsed >= min_elapsed, "last datagram after %f s" % last_elapsed)
 
     def conclude() -> None:
-        _report(t, _outcome(check))
+        report(t, outcome(check))
 
     def on_server(data: bytes, address: str, port: int) -> None:
         got.append((data, port))
@@ -666,7 +646,7 @@ actor _test_fault_selector(t: testing.AsyncT):
         testing.assertEqual(repr(mn.stats()), _counts(sent=3, duplicated=1, delivered=4))
 
     def conclude() -> None:
-        _report(t, _outcome(check))
+        report(t, outcome(check))
 
     def on_server(data: bytes, address: str, port: int) -> None:
         at_server.append(data)
@@ -707,7 +687,7 @@ actor _test_fault_set_faults(t: testing.AsyncT):
             mn.set_faults(None)
             p.client.send(b"4")
         else:
-            _report(t, _outcome(check))
+            report(t, outcome(check))
 
     def on_error(message: str, fatal: bool) -> None:
         t.failure(AssertionError("unexpected error: " + message))
@@ -732,7 +712,7 @@ actor _test_fault_set_faults_releases_held(t: testing.AsyncT):
         testing.assertEqual(repr(mn.stats()), _counts(sent=3, reordered=1, delivered=3))
 
     def conclude() -> None:
-        _report(t, _outcome(check))
+        report(t, outcome(check))
 
     def on_server(data: bytes, address: str, port: int) -> None:
         got.append(data)
@@ -762,7 +742,7 @@ actor _test_fault_set_faults_releases_delayed(t: testing.AsyncT):
     def on_server(data: bytes, address: str, port: int) -> None:
         got.append(data)
         if len(got) == 4:
-            _report(t, _outcome(check))
+            report(t, outcome(check))
 
     srv.set_receiver(on_server)
     for d in _numbered(3):
@@ -796,7 +776,7 @@ actor _udp_roundtrip(t: testing.EnvT, listen_address: str, connect_address: str,
         if s is not None:
             s.close()
             s.close()
-        _report_env(t, error)
+        report_env(t, error)
 
     def on_client(data: bytes, address: str, port: int) -> None:
         def check() -> None:
@@ -804,7 +784,7 @@ actor _udp_roundtrip(t: testing.EnvT, listen_address: str, connect_address: str,
             testing.assertEqual(data, b"pong")
             testing.assertEqual(address, connect_address)
             testing.assertEqual(port, srv_port)
-        finish(_outcome(check))
+        finish(outcome(check))
 
     def on_client_error(message: str, fatal: bool) -> None:
         finish(AssertionError("client error: " + message))
@@ -878,7 +858,7 @@ actor _test_udp_unreachable_then_usable(t: testing.EnvT):
         s = srv
         if s is not None:
             s.close()
-        _report_env(t, error)
+        report_env(t, error)
 
     def on_client(data: bytes, address: str, rport: int) -> None:
         def check() -> None:
@@ -888,7 +868,7 @@ actor _test_udp_unreachable_then_usable(t: testing.EnvT):
             for e in errors:
                 testing.assertTrue(is_unreachable(e.0), "unexpected error " + e.0)
                 testing.assertFalse(e.1, "fatal error " + e.0)
-        finish(_outcome(check))
+        finish(outcome(check))
 
     def on_echo(data: bytes, address: str, rport: int) -> None:
         s = srv
@@ -967,7 +947,7 @@ actor _test_udp_hostname_queues_until_connected(t: testing.EnvT):
         s = srv
         if s is not None:
             s.close()
-        _report_env(t, error)
+        report_env(t, error)
 
     def on_server(data: bytes, address: str, port: int) -> None:
         got.append(data)
@@ -977,7 +957,7 @@ actor _test_udp_hostname_queues_until_connected(t: testing.EnvT):
                 testing.assertEqual(got, _numbered(20))
                 for a in sources:
                     testing.assertIn(a, ["127.0.0.1", "::1"])
-            finish(_outcome(check))
+            finish(outcome(check))
 
     def on_client(data: bytes, address: str, port: int) -> None:
         finish(AssertionError("unexpected datagram"))
@@ -1028,13 +1008,13 @@ actor _udp_setup_failure(t: testing.EnvT, address: str, port: int, expect: str):
             testing.assertFalse(is_unreachable(e.0))
 
     def conclude() -> None:
-        finish(_outcome(check))
+        finish(outcome(check))
 
     def finish(error: ?Exception) -> None:
         if not done:
             done = True
             c.close()
-            _report_env(t, error)
+            report_env(t, error)
 
     def on_data(data: bytes, address: str, port: int) -> None:
         finish(AssertionError("unexpected datagram"))
@@ -1082,7 +1062,7 @@ actor _test_udp_server_failures(t: testing.EnvT):
         f = first
         if f is not None:
             f.close()
-        _report_env(t, error)
+        report_env(t, error)
 
     def on_busy(s: ServerTransport, error: ?str) -> None:
         def check() -> None:
@@ -1094,7 +1074,7 @@ actor _test_udp_server_failures(t: testing.EnvT):
         s.send_to(b"ignored", "127.0.0.1", 9)
         s.close()
         s.close()
-        finish(_outcome(check))
+        finish(outcome(check))
 
     def on_first(s: ServerTransport, error: ?str) -> None:
         if error is not None:
@@ -1145,11 +1125,11 @@ actor _test_udp_close_idempotent(t: testing.EnvT):
         s = srv
         if s is not None:
             s.close()
-        _report_env(t, _outcome(check))
+        report_env(t, outcome(check))
 
     def on_ready(s: ServerTransport, error: ?str) -> None:
         if error is not None:
-            _report_env(t, AssertionError("listen: " + error))
+            report_env(t, AssertionError("listen: " + error))
             return
         srv = s
         s.set_receiver(on_server)

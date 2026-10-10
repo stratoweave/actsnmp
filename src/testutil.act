@@ -1,10 +1,4 @@
-"""Helpers shared by the test modules
-
-Not part of the library API: only the test_* modules import it. It holds the
-hex shorthand for vectors, the "must raise" checks, a deterministic
-pseudo-random generator and the file reader of the env tests, so that every
-test module uses the same ones.
-"""
+"""Helpers shared by the test modules; not part of the library API"""
 
 import file
 import testing
@@ -90,3 +84,26 @@ proc def read_text(t: testing.EnvT, path: str) -> str:
     data = f.read()
     f.close()
     return data.decode()
+
+
+proc def outcome(check: proc() -> None) -> ?Exception:
+    """Run check; return what it raised, or None when it passed (async tests report it with report())"""
+    try:
+        check()
+    except Exception as e:
+        return e
+    return None
+
+proc def report(t: testing.AsyncT, error: ?Exception) -> None:
+    """End an async test: t.failure(error), or t.success() when error is None"""
+    if error is not None:
+        t.failure(error)
+    else:
+        t.success()
+
+proc def report_env(t: testing.EnvT, error: ?Exception) -> None:
+    """End an env test: t.failure(error), or t.success() when error is None"""
+    if error is not None:
+        t.failure(error)
+    else:
+        t.success()

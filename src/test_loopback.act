@@ -1,0 +1,191 @@
+"""Loopback tests: Client, Agent and NotificationReceiver over real UDP on 127.0.0.1 and ::1
+
+The servers listen on ephemeral ports. The GET to a closed port relies on
+Linux sending ICMP port unreachable on loopback.
+"""
+
+import logging
+import net
+import testing
+
+import errors
+import fmt
+import notify
+import usm
+from agent import Agent, AgentConfig
+from client import Client, Options, Response
+from mibview import MibView
+from notify import Notification
+from oid import Oid
+from receiver import NotificationReceiver, ReceiverConfig
+from security import Community, Security, Usm
+from transport import ServerTransport, udp_server_transport
+from values import Integer, OctetString, VarBind
+from testutil import h, outcome, report_env
+
+SYS_DESCR = Oid([1, 3, 6, 1, 2, 1, 1, 1, 0])
+DESCR = b"actsnmp loopback agent"
+AGENT_ENGINE = "80001f88806c6f6f706261636b"
+RECEIVER_ENGINE = "80001f8880616374736e6d7072"
+OPTS = Options(timeout=1.0, retries=2)
+
+def sha_aes() -> Usm:
+    return Usm.from_passwords("u_sha_aes", usm.AUTH_SHA1, "authpass123", usm.PRIV_AES128, "privpass123")
+
+def view() -> MibView:
+    return MibView([VarBind(SYS_DESCR, OctetString(DESCR))])
+
+actor _AgentGet(t: testing.EnvT, address: str, sec: Security):
+    """An Agent on address (ephemeral port) over UDP; a Client from a UDPConnectCap GETs sysDescr.0"""
+    ucap = net.UDPCap(net.NetCap(t.env.cap))
+    var srv: ?ServerTransport = None
+    var agent: ?Agent = None
+
+    def done(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        c.close()
+        s = srv
+        if s is not None:
+            s.close()
+        def check() -> None:
+            if e is not None:
+                raise AssertionError("GET over UDP on " + address + " failed: " + str(e))
+            if r is not None:
+                testing.assertEqual(r.varbinds, [VarBind(SYS_DESCR, OctetString(DESCR))])
+        report_env(t, outcome(check))
+
+    def on_ready(st: ServerTransport, error: ?str) -> None:
+        if error is not None:
+            t.failure(AssertionError("listen on " + address + " failed: " + error))
+            return
+        srv = st
+        users: list[Usm] = []
+        if isinstance(sec, Usm):
+            users = [sec]
+        agent = Agent(st, view(), AgentConfig({"public": False}, users, h(AGENT_ENGINE)), t.log_handler)
+        c = Client(net.UDPConnectCap(ucap), address, sec, t.log_handler, port=st.local_port(), opts=OPTS)
+        c.get(done, [SYS_DESCR])
+
+    udp_server_transport(net.UDPListenCap(ucap), address, 0, on_ready, t.log_handler)
+
+actor _test_v2c_get_ipv4(t: testing.EnvT):
+    """SNMPv2c GET over UDP on 127.0.0.1"""
+    t.timeout(15.0)
+    a = _AgentGet(t, "127.0.0.1", Community("public"))
+
+actor _test_v2c_get_ipv6(t: testing.EnvT):
+    """SNMPv2c GET over UDP on ::1"""
+    t.timeout(15.0)
+    a = _AgentGet(t, "::1", Community("public"))
+
+actor _test_v3_auth_priv_get_ipv4(t: testing.EnvT):
+    """SNMPv3 authPriv (SHA/AES) GET with discovery over UDP on 127.0.0.1"""
+    t.timeout(15.0)
+    a = _AgentGet(t, "127.0.0.1", sha_aes())
+
+actor _test_v3_auth_priv_get_ipv6(t: testing.EnvT):
+    """SNMPv3 authPriv (SHA/AES) GET with discovery over UDP on ::1"""
+    t.timeout(15.0)
+    a = _AgentGet(t, "::1", sha_aes())
+
+
+actor _test_notifications_ipv4(t: testing.EnvT):
+    """An SNMPv2c trap, an SNMPv2c inform and an SNMPv3 authPriv inform to the NotificationReceiver over UDP"""
+    t.timeout(15.0)
+    ucap = net.UDPCap(net.NetCap(t.env.cap))
+    trap_oid = notify.TRAP_LINK_UP
+    payload = [VarBind(Oid([1, 3, 6, 1, 4, 1, 8072, 9999, 1, 1, 1, 0]), Integer(5))]
+    var srv: ?ServerTransport = None
+    var rcv: ?NotificationReceiver = None
+    var blocks: list[str] = []
+    var acks: list[str] = []
+    var clients: list[Client] = []
+    var finished = False
+
+    proc def _maybe_done() -> None:
+        if finished or len(blocks) < 3 or len(acks) < 2:
+            return
+        finished = True
+        for c in clients:
+            c.close()
+        r = rcv
+        if r is not None:
+            r.close()
+        line = ".1.3.6.1.4.1.8072.9999.1.1.1.0 = INTEGER: 5\nEND"
+        want = sorted(['NOTIFICATION v2c TRAP2 community="public" uptime=100 trapoid=.1.3.6.1.6.3.1.1.5.4\n' + line,
+                       'NOTIFICATION v2c INFORM community="public" uptime=200 trapoid=.1.3.6.1.6.3.1.1.5.4\n' + line,
+                       'NOTIFICATION v3 INFORM user="u_sha_aes" level=authPriv context="" uptime=300 '
+                       + 'trapoid=.1.3.6.1.6.3.1.1.5.4\n' + line])
+        got = sorted(blocks)
+        def check() -> None:
+            testing.assertEqual(sorted(acks), ["v2c", "v3"])
+            testing.assertEqual(got, want)
+        report_env(t, outcome(check))
+
+    def on_notification(r: NotificationReceiver, n: Notification) -> None:
+        blocks.append(fmt.canon_notification(n))
+        _maybe_done()
+
+    def trap_sent(c: Client, e: ?errors.SnmpError) -> None:
+        if e is not None:
+            t.failure(AssertionError("trap: " + str(e)))
+
+    def acked_v2c(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        if e is not None:
+            t.failure(AssertionError("v2c inform: " + str(e)))
+            return
+        acks.append("v2c")
+        _maybe_done()
+
+    def acked_v3(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        if e is not None:
+            t.failure(AssertionError("v3 inform: " + str(e)))
+            return
+        acks.append("v3")
+        _maybe_done()
+
+    def on_ready(st: ServerTransport, error: ?str) -> None:
+        if error is not None:
+            t.failure(AssertionError("listen failed: " + error))
+            return
+        srv = st
+        cfg = ReceiverConfig(["public"], [sha_aes()], [], h(RECEIVER_ENGINE), 1)
+        rcv = NotificationReceiver(st, cfg, on_notification, t.log_handler)
+        port = st.local_port()
+        c2 = Client(net.UDPConnectCap(ucap), "127.0.0.1", Community("public"), t.log_handler, port=port, opts=OPTS)
+        c3 = Client(net.UDPConnectCap(ucap), "127.0.0.1", sha_aes(), t.log_handler, port=port, opts=OPTS)
+        clients.append(c2)
+        clients.append(c3)
+        c2.trap(trap_sent, trap_oid, payload, 100)
+        c2.inform(acked_v2c, trap_oid, payload, 200)
+        c3.inform(acked_v3, trap_oid, payload, 300)
+
+    udp_server_transport(net.UDPListenCap(ucap), "127.0.0.1", 0, on_ready, t.log_handler)
+
+
+actor _test_icmp_unreachable(t: testing.EnvT):
+    """A GET to a closed UDP port times out with the hint "ICMP port unreachable\""""
+    t.timeout(15.0)
+    ucap = net.UDPCap(net.NetCap(t.env.cap))
+
+    def done(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        c.close()
+        def check() -> None:
+            if isinstance(e, errors.TimeoutError):
+                testing.assertEqual(e.hint, "ICMP port unreachable")
+                testing.assertTrue(c.stats().unreachable >= 1, "Stats.unreachable")
+            else:
+                raise AssertionError("expected a TimeoutError, got " + (str(e) if e is not None else "a response"))
+        report_env(t, outcome(check))
+
+    def on_ready(st: ServerTransport, error: ?str) -> None:
+        if error is not None:
+            t.failure(AssertionError("listen failed: " + error))
+            return
+        # bind, note the port, close: nothing listens there afterwards
+        port = st.local_port()
+        st.close()
+        c = Client(net.UDPConnectCap(ucap), "127.0.0.1", Community("public"), t.log_handler, port=port,
+                   opts=Options(timeout=0.3, retries=1))
+        c.get(done, [SYS_DESCR])
+
+    udp_server_transport(net.UDPListenCap(ucap), "127.0.0.1", 0, on_ready, t.log_handler)
