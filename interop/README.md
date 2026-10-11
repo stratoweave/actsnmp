@@ -1,6 +1,6 @@
 # actsnmp interop lab
 
-A Docker lab for testing actsnmp against independent SNMP implementations:
+A Docker lab that tests actsnmp against independent SNMP implementations:
 
 * net-snmp 5.9.4: the agent (`snmpd`), the trap receiver (`snmptrapd`) and
   the command line tools;
@@ -10,7 +10,8 @@ A Docker lab for testing actsnmp against independent SNMP implementations:
 
 Both agents serve the same generated dataset, so every walk of it has one
 expected answer. All containers use host networking and listen on loopback
-only.
+only. The MIB compiler has its own corpus and oracle setup in
+[`mibs/`](mibs/README.md).
 
 ## Quick start
 
@@ -23,6 +24,10 @@ interop/selftest.sh       # verify the lab itself (about 4 min, --quick about 2)
 interop/down.sh           # remove the containers, keep the image
 ```
 
+To run every check against actsnmp in one go (build, lab up, all phases,
+lab down), use `interop/run-interop.sh`; see
+[Running the checks](#running-the-checks).
+
 `up.sh` rebuilds the image when the lab sources changed (the image carries
 a hash of them) and recreates outdated containers. A recreated container
 starts from a clean file system, so writable objects are back at their
@@ -34,17 +39,17 @@ initial values and engineBoots restarts at 1.
 |---|---|---|---|
 | net-snmp agent | `actsnmp-snmpd` | udp/tcp `127.0.0.1:16161`, udp6 `[::1]:16161` | `0x80001f8880616374736e6d7064` ("actsnmpd") |
 | snmpsim agent | `actsnmp-snmpsim` | udp `127.0.0.1:16162`, udp6 `[::1]:16162` | `0x80004fb805616374736e6d7073696d` ("actsnmpsim") |
-| agent under test | host | udp `127.0.0.1:16163` | `0x80001f8880616374736e6d7061` ("actsnmpa") |
+| actsnmp agent (under test) | host | udp `127.0.0.1:16163`, `[::1]:16163` | `0x80001f8880616374736e6d7061` ("actsnmpa") |
 | net-snmp trap receiver | `actsnmp-snmptrapd` | udp `127.0.0.1:16164`, udp6 `[::1]:16164` | `0x80001f8880616374736e6d7074` ("actsnmpt") |
-| receiver under test | host | udp `127.0.0.1:16165` | `0x80001f8880616374736e6d7072` ("actsnmpr") |
+| actsnmp receiver (under test) | host | udp `127.0.0.1:16165` | `0x80001f8880616374736e6d7072` ("actsnmpr") |
+| closed port for timeout tests | | udp `127.0.0.1:16169` | |
 | tools | `actsnmp-tools` | | idle container for `docker exec` |
 
-16163 and 16165 are reserved for an agent and a notification receiver under
-test; nothing in the lab listens on them. `notifycheck.sh --selftest` runs a
-net-snmp snmptrapd stand-in with the receiver's engine ID on 16165.
+16163 and 16165 and the two engine IDs are the defaults of `actsnmp agent`
+and `actsnmp trapd`; nothing in the lab listens on them.
 
 SNMPv3 trap senders are authoritative and use fixed engine IDs:
-`0x8000000001020304` for net-snmp `snmptrap -e` and for a sender under test,
+`0x8000000001020304` for net-snmp `snmptrap -e` and for actsnmp,
 `0x8000000001020305` for `pysnmp_notify.py`. Both snmptrapd configurations
 know every user under both engine IDs.
 
@@ -116,14 +121,13 @@ whose GETNEXT answer does not increase. `expected/pathological-netsnmp.txt`
 records how net-snmp handles them.
 
 `dataset/actsnmp.snmprec`, `write-rules.tsv` and `pathological.snmprec` are
-the same data as plain files, for an agent under test. They end with
-`snmpEngineID.0` as a sentinel, because snmpsim answers endOfMibView at the
-end of a data file with the requested OID. Regenerate them with
-`dataset/regen.sh` (`--check` fails on drift, `--verify` also serves the file
-with snmpsim and compares walks). The files use a subset of the snmprec
-format: one sorted `OID|TAG|VALUE` record per line, numeric OIDs without a
-leading dot, and the suffix `x` on the tag for hex values (always used for
-OCTET STRING).
+the same data for the actsnmp test agent. They end with `snmpEngineID.0` as a
+sentinel, because snmpsim answers endOfMibView at the end of a data file with
+the requested OID. Regenerate them with `dataset/regen.sh` (`--check` fails
+on drift, `--verify` also serves the file with snmpsim and compares walks).
+The files use a subset of the snmprec format: one sorted `OID|TAG|VALUE`
+record per line, numeric OIDs without a leading dot, and the suffix `x` on
+the tag for hex values (always used for OCTET STRING).
 
 ## Canonical output
 
@@ -143,13 +147,14 @@ per line:
 ```
 
 A value is a STRING when every byte is printable ASCII (with `\"` and `\\`
-escaped), otherwise Hex-STRING. `pysnmp_client.py` and
-`actsnmp_dataset.canon_line()` print this format; `tools/netsnmp2canon.py`
-converts net-snmp output made with `-On -Oe -Ox --hexOutputLength=0`.
+escaped), otherwise Hex-STRING. `pysnmp_client.py`, `fmt.canon_varbind` in
+the library and `actsnmp_dataset.canon_line()` print this format;
+`tools/netsnmp2canon.py` converts net-snmp output made with `-On -Oe -Ox
+--hexOutputLength=0`.
 
-Notifications use blocks of a header line, the payload varbinds (without
-sysUpTime.0 and snmpTrapOID.0) and `END`. The v1 trap OID is derived as in
-RFC 3584 section 3.1.
+Notifications use blocks in the format of `actsnmp trapd --canon`: a header
+line, the payload varbinds (without sysUpTime.0 and snmpTrapOID.0) and `END`.
+The v1 trap OID is derived as in RFC 3584 section 3.1.
 
 ```
 NOTIFICATION v1 TRAP community="public" enterprise=.1.3.6.1.4.1.8072.9999 agent=192.0.2.1 generic=6 specific=42 uptime=12345 trapoid=.1.3.6.1.4.1.8072.9999.0.42
@@ -163,16 +168,44 @@ NOTIFICATION v3 INFORM user="u_sha_aes192" level=authPriv context="" uptime=3001
 
 ## Running the checks
 
-With the lab up, these scripts check an agent, a notification receiver or a
-notification sender under test:
+`run-interop.sh` runs every phase, writes each phase's output to
+`results/<phase>.log` and a summary to `results/LATEST.md`, and exits 0 only
+when every phase passed. Each phase takes its own hold of the bench lock
+(`--no-lock` when the caller holds it) and is bounded to 14 minutes.
 
 ```
-interop/agentcheck.sh [--quick] 'acton=127.0.0.1:16163,udp6:[::1]:16163'
-interop/notifycheck.sh [--quick|--all-users] --log FILE      # FILE: the receiver's canonical output
-interop/notifycheck.sh --selftest [--quick|--all-users]
-interop/trapdcheck.sh start; ...; interop/trapdcheck.sh check EXPECTED
-interop/trapdcheck.sh cli [--quick|--all-users] CMD...
+interop/run-interop.sh
+interop/run-interop.sh --quick --keep-lab     # smaller variants, leave the lab running
+interop/run-interop.sh --phases cli,agent     # some phases, with an existing build
 ```
+
+| Phase | What runs |
+|---|---|
+| `build` | `acton build`, then `up.sh` |
+| `library` | `src/test_interop.act`: the library against the lab over real UDP |
+| `cli` | `clicheck.sh`: the actsnmp CLI side by side with net-snmp's tools |
+| `agent` | `actsnmp agent` on 16163 (IPv4 and IPv6), checked with `agentcheck.sh` |
+| `notify` | `actsnmp trapd --canon` on 16165, fed by `notifycheck.sh` |
+| `trapd` | `trapdcheck.sh cli`: actsnmp sends, the lab snmptrapd receives |
+
+Each check can also be run on its own with the lab up:
+
+```
+acton test --tag interop --no-cache --min-iter 1 --max-iter 1 --max-time 120000 --jobs 1 --module test_interop
+interop/clicheck.sh [--quick] [--section dataset,set] [--filter REGEX] [-v]
+interop/agentcheck.sh [--quick] 'acton=127.0.0.1:16163,udp6:[::1]:16163'
+interop/notifycheck.sh [--quick|--all-users] --log FILE      # FILE: output of actsnmp trapd --canon
+interop/trapdcheck.sh start; ...; interop/trapdcheck.sh check EXPECTED
+interop/trapdcheck.sh cli [--quick|--all-users] out/bin/actsnmp
+```
+
+The tests in `test_interop` skip themselves when the lab does not answer.
+
+`clicheck.sh` runs each case through net-snmp's tool in the tools container
+and through `out/bin/actsnmp` on the host, and compares stdout, stderr and the
+exit code byte for byte. A difference is a FAIL unless the case is marked as
+a known difference with its reason; those are reported as KNOWN, and as
+FIXED? once the outputs agree.
 
 `agentcheck.sh` runs the agent-generic part of `tools/selftest.py`
 (communities, the v3 matrix, negative USM cases, GET/GETNEXT/GETBULK, walks,
@@ -187,9 +220,7 @@ engine ID above, community `public` and the users of `config/users.tsv`.
 `--selftest` runs the same matrix against a net-snmp snmptrapd stand-in to
 validate the senders and the expected files. `trapdcheck.sh` covers the
 other direction: it restarts the lab snmptrapd, and `log` or `check` print
-or compare what it received. `cli` sends the net-snmp half of the matrix
-with a command that takes snmptrap and snmpinform arguments (`CMD trap ...`,
-`CMD inform ...`). Restart snmptrapd before each run, since it remembers
+or compare what it received. Restart it before each run, since it remembers
 boots and time per sender engine.
 
 ## Helper commands
@@ -200,9 +231,9 @@ boots and time per sender engine.
 | `pysnmp.sh OP ARGS...` | run `pysnmp_client.py`: `get getnext getbulk walk bulkwalk set`, net-snmp style options |
 | `pysnmp-notify.sh trap\|inform ARGS...` | run `pysnmp_notify.py`, with snmptrap style arguments |
 | `selftest.sh [--quick] [--record]` | restart the lab and verify it; `--record` rewrites `expected/` |
-| `dataset/regen.sh [--check\|--verify]` | regenerate the plain dataset files |
+| `dataset/regen.sh [--check\|--verify]` | regenerate the dataset files for the actsnmp agent |
 
-For example, to walk an agent under test with both independent managers:
+For example, to walk the actsnmp agent with both independent managers:
 
 ```
 interop/nsnmp.sh snmpbulkwalk -v2c -c public -On -Oe -Ox --hexOutputLength=0 127.0.0.1:16163 .1.3.6.1.4.1.8072.9999.1 \
@@ -216,6 +247,10 @@ Packet capture:
 
 ## Adding cases
 
+* CLI: add a `case(section, name, tool, args, ...)` call to the section's
+  function in `clicheck.py`. A known difference gets `known="reason"`;
+  `cmp="first-line"` and `cmp="sorted"` relax the comparison. SET cases must
+  leave the `B.20` objects at their initial values.
 * Agent behaviour: add checks to `tools/selftest.py`. Generic checks run in
   both lab mode and agent mode; run `selftest.sh` against the lab first.
 * Notifications: extend the matrix in `tools/notifycheck.py`, then run
@@ -225,6 +260,8 @@ Packet capture:
   `selftest.sh --record` once all checks pass. The recorded files are
   deterministic, so a re-record without a dataset change must not change
   them.
+* Library tests: add an env test to `src/test_interop.act`, gated with
+  `t.require("interop")`.
 
 ## Agent differences worth knowing
 
@@ -232,14 +269,25 @@ Packet capture:
 * With SNMPv1, Counter64 objects give `noSuchName` on GET and are skipped by
   GETNEXT.
 * A security level below the user's: snmpd answers `authorizationError`,
-  snmpsim sends an `unsupportedSecLevels` report.
+  snmpsim sends an `unsupportedSecLevels` report. Above the user's: snmpd
+  sends that report, snmpsim does not answer.
 * Decryption failures: snmpd drops the request, snmpsim sends a
   `decryptionErrors` report.
+* A request with a stale engine ID: snmpd sends `unknownEngineIDs`, snmpsim
+  an unauthenticated `unknownUserNames` report naming its own engine. The
+  Client rediscovers on the first. It drops the second, forgets the engine
+  after two timeouts, and the next request rediscovers.
 * GETBULK returns at most 100 varbinds on snmpd and 64 on snmpsim.
+  Max-repetitions 0 gives an empty response on snmpd and no answer on
+  snmpsim.
 * Responses above 65507 octets are dropped in v1 and v2c; in v3 snmpd answers
   `tooBig` and snmpsim drops them.
 * snmpsim has no access control, and a SET of the wrong type "succeeds" with a
   `noSuchInstance` value instead of an error-status.
+* `docker restart actsnmp-snmpd` resets engineBoots to 1 and engineTime to 0,
+  so a long-lived manager gets `notInTimeWindows` reports that fail RFC 3414
+  section 3.2 step 7b. The Client drops them: its first request after the
+  restart times out, the next one rediscovers.
 * net-snmp `snmptrap` sends the host uptime in hundredths of a second as
   engineTime and cannot send a raw Opaque; snmptrapd drops v3 notifications
   below the user's level without a trace.
@@ -252,7 +300,9 @@ Packet capture:
 | `lib.sh` | shared shell settings: image, container names, ports, source hash |
 | `container/` | entry points inside the image |
 | `config/` | generated by `tools/gen_config.py`: agent and receiver configurations, `users.tsv` |
-| `dataset/` | the dataset, its snmpd backend, the snmpsim generator and the plain dataset files |
+| `dataset/` | the dataset, its snmpd backend, the snmpsim generator and the files for the actsnmp agent |
 | `snmpsim/variation/` | snmpsim module for non-increasing GETNEXT answers |
 | `tools/` | canonical converters, the notification matrix, the lab self test, `gen_usm_vectors.py` (SNMPv3 test vectors checked with pysnmp) |
 | `expected/` | reference outputs: canonical walks, raw net-snmp output, notification matrices, the per-user v3 matrix |
+| `results/` | output of `run-interop.sh` (not committed) |
+| `mibs/` | MIB corpus, oracles and golden set for the MIB compiler |

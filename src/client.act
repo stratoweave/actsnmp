@@ -42,7 +42,9 @@ The request engine:
     varbinds are sent in parts, and a tooBig answer to one with more than
     one varbind splits it in half, recursively. A SET is never split (that
     would not be atomic): it reports tooBig. A tooBig GETBULK is resent
-    with half the max-repetitions.
+    with half the max-repetitions. Options.split_too_big=False turns both
+    off: tooBig is then reported like any error-status (the CLI does that,
+    as net-snmp's tools do).
   * SNMPv1: GETBULK is sent as GETNEXT; with Options.v1_fix_errors a
     noSuchName answer to a GET drops that varbind, resends the rest and
     reports NoSuchObject for it (EndOfMibView for a GETNEXT).
@@ -174,6 +176,10 @@ class Options(object):
     max_oids_per_request splits GET and GETNEXT requests with more varbinds
     into several PDUs (0: never). A SET is never split, because a split
     SET is not atomic. max_repetitions is the GETBULK default.
+    split_too_big: a tooBig answer to a GET or GETNEXT of several varbinds
+    splits it in half (recursively), and one to a GETBULK halves its
+    max-repetitions; without it tooBig fails the request like any other
+    error-status (errors.ErrorStatusError), as net-snmp's tools report it.
 
     use_bulk, adaptive_bulk, check_increasing, get_root_if_empty and
     max_walk_varbinds control walks and tables:
@@ -221,13 +227,14 @@ class Options(object):
     check_community: bool
     request_id_bits: int
     max_queued: int
+    split_too_big: bool
 
     def __init__(self, timeout: float=1.0, retries: int=3, backoff: float=1.0, max_timeout: float=8.0,
                  max_in_flight: int=1, max_oids_per_request: int=32, max_repetitions: int=25,
                  use_bulk: bool=True, adaptive_bulk: bool=True, check_increasing: bool=True,
                  get_root_if_empty: bool=True, max_walk_varbinds: int=1000000, v1_fix_errors: bool=True,
                  strict_response_oids: bool=True, check_community: bool=False, request_id_bits: int=31,
-                 max_queued: int=0):
+                 max_queued: int=0, split_too_big: bool=True):
         if not _finite_positive(timeout):
             raise ValueError("Options.timeout must be a positive number of seconds up to 86400")
         if not _finite_positive(backoff):
@@ -265,13 +272,14 @@ class Options(object):
         self.check_community = check_community
         self.request_id_bits = request_id_bits
         self.max_queued = max_queued
+        self.split_too_big = split_too_big
 
     def with_(self, timeout: ?float=None, retries: ?int=None, backoff: ?float=None, max_timeout: ?float=None,
               max_in_flight: ?int=None, max_oids_per_request: ?int=None, max_repetitions: ?int=None,
               use_bulk: ?bool=None, adaptive_bulk: ?bool=None, check_increasing: ?bool=None,
               get_root_if_empty: ?bool=None, max_walk_varbinds: ?int=None, v1_fix_errors: ?bool=None,
               strict_response_oids: ?bool=None, check_community: ?bool=None,
-              request_id_bits: ?int=None, max_queued: ?int=None) -> Options:
+              request_id_bits: ?int=None, max_queued: ?int=None, split_too_big: ?bool=None) -> Options:
         """Return a copy with the given fields replaced; raises ValueError like the constructor"""
         return Options(timeout if timeout is not None else self.timeout,
                        retries if retries is not None else self.retries,
@@ -289,7 +297,8 @@ class Options(object):
                        strict_response_oids if strict_response_oids is not None else self.strict_response_oids,
                        check_community if check_community is not None else self.check_community,
                        request_id_bits if request_id_bits is not None else self.request_id_bits,
-                       max_queued if max_queued is not None else self.max_queued)
+                       max_queued if max_queued is not None else self.max_queued,
+                       split_too_big if split_too_big is not None else self.split_too_big)
 
     def attempt_timeout(self, n: int) -> float:
         """Return the seconds attempt n (0 = the first) waits: timeout * backoff^n, capped as described above"""
@@ -311,7 +320,8 @@ class Options(object):
                 + str(self.get_root_if_empty) + ", max_walk_varbinds=%d, " % self.max_walk_varbinds
                 + "v1_fix_errors=" + str(self.v1_fix_errors) + ", strict_response_oids="
                 + str(self.strict_response_oids) + ", check_community=" + str(self.check_community)
-                + ", request_id_bits=%d, max_queued=%d)" % (self.request_id_bits, self.max_queued))
+                + ", request_id_bits=%d, max_queued=%d" % (self.request_id_bits, self.max_queued)
+                + ", split_too_big=" + str(self.split_too_big) + ")")
 
     def __str__(self) -> str:
         return self.__repr__()
@@ -1631,7 +1641,7 @@ actor Client(cap: ?net.UDPConnectCap,
         # Error statuses that the engine handles itself (tooBig, SNMPv1 noSuchName), the shape
         # check, then the next chunk
         status = p.error_status
-        if status == pdu.TOO_BIG:
+        if status == pdu.TOO_BIG and op.opts.split_too_big:
             if (ex.pdu_type == pdu.GET or ex.pdu_type == pdu.GETNEXT) and len(ex.positions) > 1:
                 half = len(ex.positions) // 2
                 _log.debug("tooBig: splitting the request", {"handle": op.handle, "varbinds": len(ex.positions)})

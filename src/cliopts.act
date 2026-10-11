@@ -15,21 +15,25 @@ snmptrap, ... work unchanged with `actsnmp get`, `actsnmp walk`, ...:
     negative INTEGER needs no `--`. `--` ends the options.
   * Common options: -v 1|2c|3, -c COMMUNITY, -u USER, -l LEVEL, -a PROTO,
     -A PASS, -x PROTO, -X PASS, -n CONTEXT, -e ENGINEID, -E CTXENGINEID,
-    -Z BOOTS[,TIME], -t SECONDS, -r RETRIES, -O FLAGS, -C FLAGS,
+    -Z BOOTS,TIME, -t SECONDS, -r RETRIES, -O FLAGS, -C FLAGS,
     --hexOutputLength=N, --canon, -h, -V; net-snmp's -m, -M, -I and -d
-    are accepted and ignored (there are no MIBs and no packet dumps).
+    are accepted and ignored (there are no MIBs and no packet dumps), an
+    unknown --NAME gets net-snmp's "Unknown token" warning.
   * -O letters go to fmt.OutputOptions.with_flags, in order (so repeated
     letters toggle as in net-snmp); --canon selects fmt.canon_varbind.
   * -C letters depend on the command, as in net-snmp: get/getnext -Cf;
-    bulkget -Cn<N> -Cr<N>; walk -Cc -Ci -CI -Cp -Ct -CE<OID>; bulkwalk -Cc
-    -Ci -CI -Cp -Ct -Cn<N> -Cr<N>; set -Cq; table -Cr<N> -Cc; trap -Ci
-    (send an inform).
+    bulkget -Cn<N> -Cr<N>; walk -Cc -Ci -CI -Cp -Ct -CE (the end OID is the
+    next argument); bulkwalk -Cc -Ci -Cp -Cn<N> -Cr<N>; set -Cq; table
+    -Cr<N> -Cc; trap and inform -Ci (send an inform). Numbers are C numbers
+    (0x hex, leading 0 octal) and other letters may follow them.
   * AGENT is [udp:|udp6:]HOST[:PORT], with IPv6 literals in brackets when a
     port follows ([::1]:161, udp6:[::1]:161) or bare (udp6:::1).
-  * OIDs are numeric only (no MIBs), with or without the leading dot.
+  * OIDs are numeric only (no MIBs), read as net-snmp's read_objid reads
+    them: an optional leading dot, sub-identifiers in C notation.
   * set, trap and inform take OID TYPE VALUE triples with net-snmp's type
-    letters (parse_value): i u c C t a o n s x d b, and the Opaque forms q
-    F D I U.
+    letters, read as snmp_add_var reads them (parse_value): i u c 3 C t a o
+    n s x d b, and the Opaque forms F D I U; actsnmp adds q (raw Opaque),
+    and set also takes c, C and q, which snmpset refuses.
   * trap/inform use snmptrap/snmpinform's positional syntax: SNMPv2c/v3
     `AGENT UPTIME TRAPOID [OID TYPE VALUE]...`, SNMPv1 `AGENT ENTERPRISE
     AGENT-ADDR GENERIC SPECIFIC UPTIME [OID TYPE VALUE]...`; an empty
@@ -38,9 +42,12 @@ snmptrap, ... work unchanged with `actsnmp get`, `actsnmp walk`, ...:
     --port and --bind (long options in `--name=value` or `--name value`
     form) and -c (repeatable); agent also -w (read-write community).
 
-Every problem raises CliError with net-snmp's message where net-snmp has
-one ("No hostname specified.", "Missing object name", "Bad object type:
-c", ...); CliError.usage says whether the usage text should follow.
+Every problem raises CliError with net-snmp's message, in net-snmp's order
+of checks ("No hostname specified.", "Missing object name", "<OID>: Unknown
+Object Identifier (<detail>)", "<OID>: Bad object type: c", "Unknown flag
+passed to -C: x", ...); CliError.usage says whether the usage text should
+follow. Where net-snmp sends a value that does not fit its type (it
+truncates or wraps it), actsnmp refuses it: its encoders are strict.
 """
 
 import math
@@ -51,7 +58,7 @@ import values
 import ber
 from oid import Oid
 from values import Value, VarBind, Integer, OctetString, Null, ObjectIdentifier, IpAddress, Counter32, Gauge32
-from values import TimeTicks, Opaque, Counter64
+from values import TimeTicks, Opaque, Counter64, UnknownValue
 
 # The commands, in the order of the usage text
 COMMANDS: list[str] = ["get", "getnext", "bulkget", "walk", "bulkwalk", "set", "table", "trap", "inform", "agent",
@@ -106,38 +113,16 @@ class CliError(Exception):
 
 
 class CliOptions(object):
-    """The parsed command line of one actsnmp command (see parse)
+    """The parsed command line of one actsnmp command
 
-    command is one of COMMANDS. peer is the agent (or receiver) argument as
-    given, which net-snmp's messages quote ("Timeout: No Response from
-    <peer>."), address and port the target parsed from it and
-    transport_domain "udp" or "udp6".
-
-    Security: version (message.SNMP_V1/V2C/V3), community (the last -c),
-    communities (every -c, for agent and trapd), user, level (msgFlags
-    bits; level_given says whether -l was used), auth_protocol and
-    auth_password, priv_protocol and priv_password (usm.AUTH_*/PRIV_*;
-    net-snmp's defaults MD5 and DES when only the password is given),
-    context, engine_id (-e: the security engine ID, the sender's engine ID
-    for v3 traps), context_engine_id (-E) and boots (-Z).
-
-    Timing and output: timeout, retries, output (fmt.OutputOptions from -O
-    and --hexOutputLength), canon (--canon).
-
-    Command specific: oids (OIDs to get, the walk root or table columns),
-    varbinds (set, trap and inform payload), non_repeaters and
-    max_repetitions (-Cn/-Cr), the walk flags dont_check (-Cc),
-    include_requested (-Ci), dont_get_requested (-CI), print_count (-Cp),
-    print_time (-Ct) and end_oid (-CE), dont_fix (-Cf), quiet (-Cq), and for
-    trap/inform: inform (inform, or trap -Ci), uptime (-1: the sender's),
-    trap_oid, enterprise, agent_addr (4 octets), generic and specific.
-
-    agent/trapd: snmprec, write_rules and users are file names
-    (users_given: --users was used), server_engine_id, listen_port,
-    bind_address and rw_communities (agent -w).
-
-    help (-h, --help) and show_version (-V) ask for the usage text or the
-    version instead of running the command.
+    Most attributes hold one option each. peer is the agent argument as
+    given, for messages; address, port and transport_domain are parsed from
+    it. engine_id (-e) is the peer's engine ID, except for an SNMPv3 trap
+    where it is our own. uptime -1 means the sender's uptime. warnings are
+    lines to print on stderr before the command runs. session_error is the
+    error net-snmp reports when it opens an SNMPv3 session (no user, or no
+    pass phrase for the level); the command then only runs the engine
+    discovery before printing it.
     """
     command: str
     peer: str
@@ -191,6 +176,9 @@ class CliOptions(object):
     bind_address: str
     help: bool
     show_version: bool
+    warnings: list[str]
+    session_error: str
+    end_oid_text: ?str
 
     def __init__(self, command: str):
         self.command = command
@@ -245,6 +233,9 @@ class CliOptions(object):
         self.bind_address = DEFAULT_BIND
         self.help = False
         self.show_version = False
+        self.warnings = []
+        self.session_error = ""
+        self.end_oid_text = None
 
     def is_server(self) -> bool:
         """True for agent and trapd, which listen instead of talking to a peer"""
@@ -259,89 +250,314 @@ class CliOptions(object):
         return self.__repr__()
 
 
+# C number scanning (strtoul, strtol, strtod), as net-snmp's parsers use it ##########################
+
+_C_SPACE = " \t\n\v\f\r"
+_U64_MAX = u64(18446744073709551615)
+
+def _digit(c: str) -> int:
+    """The value of an ASCII digit or letter as a digit (0-9, then a/A = 10 .. z/Z = 35), 99 for anything else"""
+    o = ord(c)
+    if o >= 48 and o <= 57:
+        return o - 48
+    if o >= 97 and o <= 122:
+        return o - 87
+    if o >= 65 and o <= 90:
+        return o - 55
+    return 99
+
+def _is_digit(c: str) -> bool:
+    return _digit(c) < 10
+
+class CNumber(object):
+    """What C's strtoul (or strtol) makes of the start of a string
+
+    neg is True for a minus sign, mag the magnitude (2^64-1 when it did not
+    fit, overflow is True then) and end the index after the number: 0 when
+    nothing was converted (C's end pointer is then the start of the string).
+    """
+    neg: bool
+    mag: u64
+    overflow: bool
+    end: int
+
+    def __init__(self, neg: bool, mag: u64, overflow: bool, end: int):
+        self.neg = neg
+        self.mag = mag
+        self.overflow = overflow
+        self.end = end
+
+def c_number(s: str, base: int) -> CNumber:
+    """C's strtoul(s, &end, base) scanning, which strtol shares
+
+    Leading white space, an optional sign, then the digits of the base.
+    Base 0 reads hexadecimal after "0x" or "0X" when a hex digit follows,
+    octal after a leading 0 and decimal otherwise.
+    """
+    n = len(s)
+    i = 0
+    while i < n and s[i] in _C_SPACE:
+        i += 1
+    neg = False
+    if i < n and (s[i] == "+" or s[i] == "-"):
+        neg = s[i] == "-"
+        i += 1
+    b = base
+    if ((b == 0 or b == 16) and i + 2 < n and s[i] == "0" and (s[i + 1] == "x" or s[i + 1] == "X")
+            and _digit(s[i + 2]) < 16):
+        b = 16
+        i += 2
+    elif b == 0:
+        b = 8 if i < n and s[i] == "0" else 10
+    start = i
+    mag = u64(0)
+    over = False
+    ub = u64(b)
+    while i < n and _digit(s[i]) < b:
+        d = u64(_digit(s[i]))
+        if not over:
+            if mag > (_U64_MAX - d) // ub:
+                over = True
+                mag = _U64_MAX
+            else:
+                mag = mag * ub + d
+        i += 1
+    if i == start:
+        return CNumber(False, u64(0), False, 0)
+    return CNumber(neg, mag, over, i)
+
+def _int32_of(r: CNumber) -> int:
+    """C's (int)strtol(...): the low 32 bits of the saturated long, as a signed number"""
+    m = 9223372036854775807 if (r.overflow or r.mag > u64(9223372036854775807)) else int(r.mag)
+    if r.neg:
+        m = (4294967296 - (m & 0xffffffff)) & 0xffffffff
+    else:
+        m = m & 0xffffffff
+    return m - 4294967296 if m >= 2147483648 else m
+
+class CFloat(object):
+    """What C's strtod makes of the start of a string
+
+    end is the index after the number (0: nothing converted); neg the sign;
+    kind 0 for a finite number (magnitude value, which overflows to inf),
+    1 for infinity and 2 for NaN.
+    """
+    end: int
+    neg: bool
+    kind: int
+    value: float
+
+    def __init__(self, end: int, neg: bool, kind: int, value: float):
+        self.end = end
+        self.neg = neg
+        self.kind = kind
+        self.value = value
+
+def _word_at(s: str, i: int, word: str) -> bool:
+    return s[i:i + len(word)].lower() == word
+
+def c_float(s: str) -> CFloat:
+    """C's strtod(s, &end) scanning
+
+    White space, a sign, then infinity, inf, nan or nan(...) in any case, a
+    hexadecimal number (0x, hex digits with an optional point, an optional
+    binary exponent p) or a decimal one (digits with an optional point,
+    an optional exponent e). An exponent without digits is not part of it.
+    """
+    n = len(s)
+    i = 0
+    while i < n and s[i] in _C_SPACE:
+        i += 1
+    neg = False
+    if i < n and (s[i] == "+" or s[i] == "-"):
+        neg = s[i] == "-"
+        i += 1
+    if _word_at(s, i, "infinity"):
+        return CFloat(i + 8, neg, 1, 0.0)
+    if _word_at(s, i, "inf"):
+        return CFloat(i + 3, neg, 1, 0.0)
+    if _word_at(s, i, "nan"):
+        j = i + 3
+        if j < n and s[j] == "(":
+            k = j + 1
+            while k < n and (_digit(s[k]) < 36 or s[k] == "_"):
+                k += 1
+            if k < n and s[k] == ")":
+                j = k + 1
+        return CFloat(j, neg, 2, 0.0)
+    if (i + 2 < n and s[i] == "0" and (s[i + 1] == "x" or s[i + 1] == "X")
+            and (_digit(s[i + 2]) < 16 or (s[i + 2] == "." and i + 3 < n and _digit(s[i + 3]) < 16))):
+        j = i + 2
+        m = 0.0
+        e = 0
+        digits = 0
+        point = False
+        while j < n and (_digit(s[j]) < 16 or (s[j] == "." and not point)):
+            if s[j] == ".":
+                point = True
+            else:
+                if digits < 14:
+                    m = m * 16.0 + float(_digit(s[j]))
+                    digits += 1 if (digits > 0 or _digit(s[j]) > 0) else 0
+                    if point:
+                        e -= 4
+                elif not point:
+                    e += 4
+            j += 1
+        if j < n and (s[j] == "p" or s[j] == "P"):
+            k = j + 1
+            esign = 1
+            if k < n and (s[k] == "+" or s[k] == "-"):
+                esign = -1 if s[k] == "-" else 1
+                k += 1
+            if k < n and _is_digit(s[k]):
+                x = 0
+                while k < n and _is_digit(s[k]):
+                    if x < 100000:
+                        x = x * 10 + _digit(s[k])
+                    k += 1
+                e += esign * x
+                j = k
+        return CFloat(j, neg, 0, math.ldexp(m, e) if m != 0.0 else 0.0)
+    j = i
+    digits = 0
+    while j < n and _is_digit(s[j]):
+        j += 1
+        digits += 1
+    if j < n and s[j] == ".":
+        j += 1
+        while j < n and _is_digit(s[j]):
+            j += 1
+            digits += 1
+    if digits == 0:
+        return CFloat(0, False, 0, 0.0)
+    if j < n and (s[j] == "e" or s[j] == "E"):
+        k = j + 1
+        if k < n and (s[k] == "+" or s[k] == "-"):
+            k += 1
+        if k < n and _is_digit(s[k]):
+            while k < n and _is_digit(s[k]):
+                k += 1
+            j = k
+    return CFloat(j, neg, 0, float(s[i:j]))
+
+
 # Value parsing (net-snmp's snmp_add_var type letters) ###############################################
 
-def _magnitude(digits: str, text: str) -> u64:
-    # The value of a string of ASCII decimal digits; ValueError with net-snmp's text for anything else
-    if digits == "" or not (digits.isascii() and digits.isdecimal()):
-        raise ValueError("Bad value notation (%s)" % text)
-    if len(digits) > 20:
-        raise ValueError("Value out of range (%s)" % text)
-    v = u64(0)
-    limit = u64(18446744073709551615)
-    for c in digits:
-        d = u64(ord(c) - 48)
-        if v > (limit - d) // u64(10):
-            raise ValueError("Value out of range (%s)" % text)
-        v = v * u64(10) + d
-    return v
+# The type letters snmpset accepts (its check before snmp_add_var), plus actsnmp's c, C and q
+SET_LETTERS = "iu3tcCaosxdbnqIUFD="
 
-def _signed(text: str, lo: int, hi: int) -> int:
-    # A signed decimal integer in lo..hi (both within the int64 range)
+def _read64(text: str) -> u64:
+    """net-snmp's read64(): an optional minus, then decimal digits up to the first other character
+
+    The value wraps modulo 2^64 (a minus negates it in two's complement).
+    Raises ValueError "Bad value notation" when no digit follows.
+    """
+    i = 0
     neg = text.startswith("-")
-    m = _magnitude(text[1:] if neg or text.startswith("+") else text, text)
     if neg:
-        if m > u64(9223372036854775808):
-            raise ValueError("Value out of range (%s)" % text)
-        v = -9223372036854775807 - 1 if m == u64(9223372036854775808) else -int(m)
-    else:
-        if m > u64(9223372036854775807):
-            raise ValueError("Value out of range (%s)" % text)
-        v = int(m)
-    if v < lo or v > hi:
-        raise ValueError("Value out of range (%s)" % text)
-    return v
-
-def _unsigned(text: str, hi: int) -> int:
-    # An unsigned decimal integer in 0..hi (hi within the int64 range)
-    m = _magnitude(text[1:] if text.startswith("+") else text, text)
-    if m > u64(hi):
-        raise ValueError("Value out of range (%s)" % text)
-    return int(m)
-
-def _u64(text: str) -> u64:
-    return _magnitude(text[1:] if text.startswith("+") else text, text)
-
-def _hex_octets(text: str) -> bytes:
-    # net-snmp's hex input: an optional 0x, then hex digits; blanks between octets are ignored
-    t = text.strip()
-    if t.startswith("0x") or t.startswith("0X"):
-        t = t[2:]
-    t = t.replace(" ", "").replace("\t", "").replace(":", "")
-    if len(t) % 2 != 0:
+        i = 1
+    hi = 0
+    lo = 0
+    ok = False
+    while i < len(text) and _is_digit(text[i]):
+        ok = True
+        lo = lo * 10 + _digit(text[i])
+        hi = (hi * 10 + (lo >> 32)) & 0xffffffff
+        lo = lo & 0xffffffff
+        i += 1
+    if not ok:
         raise ValueError("Bad value notation (%s)" % text)
-    for c in t:
-        if c not in "0123456789abcdefABCDEF":
-            raise ValueError("Bad value notation (%s)" % text)
-    return bytes.from_hex(t)
+    if neg:
+        hi = (~hi) & 0xffffffff
+        lo = ((~lo) & 0xffffffff) + 1
+        hi = (hi + (lo >> 32)) & 0xffffffff
+        lo = lo & 0xffffffff
+    return u64(hi) * u64(4294967296) + u64(lo)
 
-def _separated(text: str) -> list[str]:
-    # The words of text separated by dots, commas or blanks (decimal strings and BITS)
-    words: list[str] = []
-    cur = ""
-    for c in text:
-        if c in ". ,\t":
-            if cur != "":
-                words.append(cur)
-            cur = ""
+def _unsigned32(text: str) -> int:
+    """u, t, c and 3: strtoul in base 10 with nothing after the number; actsnmp refuses what does not fit 32 bits"""
+    if text == "":
+        raise ValueError("Bad value notation ()")
+    r = c_number(text, 10)
+    if r.end == 0 or r.end != len(text):
+        raise ValueError("Bad value notation (%s)" % text)
+    if r.overflow or r.mag > u64(4294967295) or (r.neg and r.mag != u64(0)):
+        raise ValueError("Value out of range (%s)" % text)
+    return int(r.mag)
+
+def _integer32(text: str) -> int:
+    """i: strtol in base 10 with nothing after the number (net-snmp: "Value out of range" otherwise)"""
+    if text == "":
+        raise ValueError("Bad value notation ()")
+    r = c_number(text, 10)
+    if r.end == 0 or r.end != len(text):
+        raise ValueError("Value out of range (%s)" % text)
+    if r.overflow or r.mag > (u64(2147483648) if r.neg else u64(2147483647)):
+        raise ValueError("Value out of range (%s)" % text)
+    v = int(r.mag)
+    return -v if r.neg else v
+
+def netsnmp_hex(text: str) -> ?bytes:
+    """net-snmp's hex input (netsnmp_hex_to_binary with blank as the delimiter), or None
+
+    An optional 0x or 0X at the start, then pairs of hex digits; blanks
+    between the pairs are skipped. Anything else (an odd digit, a tab, a
+    colon) makes it invalid.
+    """
+    n = len(text)
+    i = 2 if n >= 2 and text[0] == "0" and (text[1] == "x" or text[1] == "X") else 0
+    out: list[int] = []
+    while i < n:
+        if i + 1 < n and _digit(text[i]) < 16 and _digit(text[i + 1]) < 16:
+            out.append(_digit(text[i]) * 16 + _digit(text[i + 1]))
+            i += 2
+        elif text[i] == " ":
+            i += 1
         else:
-            cur += c
-    if cur != "":
-        words.append(cur)
-    return words
+            return None
+    return bytes(out)
+
+def _hex_value(text: str) -> bytes:
+    b = netsnmp_hex(text)
+    if b is None:
+        raise ValueError("Bad value notation (%s)" % text)
+    return b!
 
 def _decimal_octets(text: str) -> bytes:
-    # net-snmp's 'd': decimal octet values separated by dots or blanks ("1.2.3.4")
+    """d: net-snmp's ascii_to_binary: decimal octets separated by white space or dots"""
     out: list[int] = []
-    for w in _separated(text):
-        out.append(_unsigned(w, 255))
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c in _C_SPACE or c == ".":
+            i += 1
+            continue
+        if not _is_digit(c):
+            raise ValueError("Bad value notation (%s)" % text)
+        j = i
+        v = 0
+        while j < n and _is_digit(text[j]):
+            if v <= 255:
+                v = v * 10 + _digit(text[j])
+            j += 1
+        if v > 255:
+            raise ValueError("Bad value notation (%s)" % text)
+        out.append(v)
+        i = j
     return bytes(out)
 
 def _bits(text: str) -> bytes:
-    # net-snmp's 'b': the numbers of the bits that are set; bit 0 is the top bit of the first octet
+    """b: bit numbers (strtol base 0) separated by blanks, commas or tabs; bit 0 is the top bit of the first octet"""
     nums: list[int] = []
-    for w in _separated(text):
-        nums.append(_unsigned(w, 65535 * 8 - 1))
+    for word in text.replace(",", " ").replace("\t", " ").split(" "):
+        if word == "":
+            continue
+        r = c_number(word, 0)
+        if r.end == 0 or r.end != len(word) or r.overflow or (r.neg and r.mag != u64(0)) or r.mag > u64(524279):
+            raise ValueError("Value out of range (%s)" % word)
+        nums.append(int(r.mag))
     n = 0
     for b in nums:
         if b // 8 + 1 > n:
@@ -351,49 +567,51 @@ def _bits(text: str) -> bytes:
         out[b // 8] = out[b // 8] | (0x80 >> (b % 8))
     return bytes(out)
 
-def parse_ip(text: str) -> bytes:
-    """Return the 4 octets of a dotted-quad IPv4 address; raises ValueError otherwise"""
-    parts = text.split(".")
-    if len(parts) != 4:
-        raise ValueError("Bad value notation (%s)" % text)
-    out: list[int] = []
-    for p in parts:
-        if p == "" or len(p) > 3 or not (p.isascii() and p.isdecimal()):
-            raise ValueError("Bad value notation (%s)" % text)
-        v = int(p)
-        if v > 255:
-            raise ValueError("Bad value notation (%s)" % text)
-        out.append(v)
-    return bytes(out)
+def inet_aton(text: str) -> ?bytes:
+    """glibc's inet_addr(): the 4 octets of a.b.c.d, a.b.c, a.b or a, or None
 
-def _is_float_text(t: str) -> bool:
-    # [+-]digits[.digits][(e|E)[+-]digits], with at least one digit before the exponent
+    Each part is a C number (0x hex, leading 0 octal); in the short forms
+    the last part fills the remaining octets. White space and anything
+    after it end the address. As with inet_addr, the all-ones address must
+    be written 255.255.255.255.
+    """
+    parts: list[int] = []
+    n = len(text)
     i = 0
-    n = len(t)
-    if i < n and (t[i] == "+" or t[i] == "-"):
-        i += 1
-    digits = 0
-    while i < n and t[i].isascii() and t[i].isdecimal():
-        i += 1
-        digits += 1
-    if i < n and t[i] == ".":
-        i += 1
-        while i < n and t[i].isascii() and t[i].isdecimal():
+    val = 0
+    while True:
+        if i >= n or not _is_digit(text[i]):
+            return None
+        r = c_number(text[i:], 0)
+        if r.overflow or r.mag > u64(4294967295):
+            return None
+        val = int(r.mag)
+        i += r.end
+        if i < n and text[i] == ".":
+            if len(parts) > 2 or val > 255:
+                return None
+            parts.append(val)
             i += 1
-            digits += 1
-    if digits == 0:
-        return False
-    if i < n and (t[i] == "e" or t[i] == "E"):
-        i += 1
-        if i < n and (t[i] == "+" or t[i] == "-"):
-            i += 1
-        exp_digits = 0
-        while i < n and t[i].isascii() and t[i].isdecimal():
-            i += 1
-            exp_digits += 1
-        if exp_digits == 0:
-            return False
-    return i == n
+        else:
+            break
+    if i < n and not (text[i] in _C_SPACE):
+        return None
+    limits = [4294967295, 16777215, 65535, 255]
+    if val > limits[len(parts)]:
+        return None
+    word = val
+    for k in range(len(parts)):
+        word = word | (parts[k] << (24 - 8 * k))
+    if word == 0xffffffff and text != "255.255.255.255":
+        return None
+    return bytes([(word >> 24) & 255, (word >> 16) & 255, (word >> 8) & 255, word & 255])
+
+def parse_ip(text: str) -> bytes:
+    """The 4 octets of an IPv4 address as inet_addr() reads it (inet_aton); raises ValueError otherwise"""
+    b = inet_aton(text)
+    if b is None:
+        raise ValueError("Bad value notation (%s)" % text)
+    return b!
 
 def _round_even(s: float) -> int:
     # s >= 0, rounded to the nearest integer, ties to even
@@ -403,30 +621,15 @@ def _round_even(s: float) -> int:
         f += 1
     return f
 
-def ieee_bits(text: str, exp_bits: int, frac_bits: int) -> int:
-    """Return the IEEE 754 bits of the decimal number text, rounded to nearest even
-
-    binary32 for exp_bits 8 and frac_bits 23, binary64 for 11 and 52. Accepts
-    what C's strtod accepts for net-snmp's F and D: decimal and exponent
-    forms, and inf, infinity and nan (any case, optionally signed). The text
-    is converted to a double first, then rounded once more to binary32 (net-
-    snmp converts directly; the two differ only for decimal inputs within
-    half a binary64 unit of a binary32 tie). Raises ValueError for anything
-    else.
-    """
-    t = text.strip()
-    neg = t.startswith("-")
-    body = t[1:] if neg or t.startswith("+") else t
+def _float_bits(neg: bool, kind: int, magnitude: float, exp_bits: int, frac_bits: int) -> int:
+    # The IEEE 754 bits of a C float result (see c_float), rounded to nearest even
     sign = (1 << (exp_bits + frac_bits)) if neg else 0
     exp_all = (1 << exp_bits) - 1
-    low = body.lower()
-    if low == "inf" or low == "infinity":
+    if kind == 1:
         return sign | (exp_all << frac_bits)
-    if low == "nan":
+    if kind == 2:
         return sign | (exp_all << frac_bits) | (1 << (frac_bits - 1))
-    if not _is_float_text(body):
-        raise ValueError("Bad value notation (%s)" % text)
-    m = float(body)
+    m = magnitude
     if m == 0.0:
         return sign
     bias = (1 << (exp_bits - 1)) - 1
@@ -449,6 +652,27 @@ def ieee_bits(text: str, exp_bits: int, frac_bits: int) -> int:
         return sign | (exp_all << frac_bits)
     return sign | bits
 
+def ieee_bits(text: str, exp_bits: int, frac_bits: int) -> int:
+    """The IEEE 754 bits of the number in text, rounded to nearest even
+
+    exp_bits 8 and frac_bits 23 give binary32, 11 and 52 binary64. text is
+    anything C's strtod reads, with blanks around it. Raises ValueError
+    otherwise. A binary32 is rounded twice, via a double; net-snmp's strtof
+    rounds once, which differs only for inputs very close to a tie.
+    """
+    t = text.strip()
+    c = c_float(t)
+    if c.end == 0 or c.end != len(t):
+        raise ValueError("Bad value notation (%s)" % text)
+    return _float_bits(c.neg, c.kind, c.value, exp_bits, frac_bits)
+
+def _float_value(text: str, exp_bits: int, frac_bits: int) -> int:
+    # F and D: the bits of the number strtod reads at the start of text (net-snmp ignores what follows)
+    c = c_float(text)
+    if c.end == 0:
+        raise ValueError("Bad value notation (%s)" % text)
+    return _float_bits(c.neg, c.kind, c.value, exp_bits, frac_bits)
+
 def _be(v: int, n: int) -> bytes:
     # v (non-negative) as n big-endian octets
     out: list[int] = []
@@ -458,78 +682,123 @@ def _be(v: int, n: int) -> bytes:
 
 def opaque_float(text: str) -> Opaque:
     """net-snmp's F: an Opaque-wrapped binary32 float (9f 78 04 + 4 octets)"""
-    return Opaque(b"\x9f\x78\x04" + _be(ieee_bits(text, 8, 23), 4))
+    return Opaque(b"\x9f\x78\x04" + _be(_float_value(text, 8, 23), 4))
 
 def opaque_double(text: str) -> Opaque:
     """net-snmp's D: an Opaque-wrapped binary64 double (9f 79 08 + 8 octets)"""
-    bits = ieee_bits(text, 11, 52)
+    bits = _float_value(text, 11, 52)
     return Opaque(b"\x9f\x79\x08" + _be(bits >> 32, 4) + _be(bits & 0xffffffff, 4))
 
 def parse_value(letter: str, text: str) -> Value:
-    """Return the value of a net-snmp `TYPE VALUE` pair (snmpset, snmptrap)
+    """The value of a `TYPE VALUE` pair, as net-snmp's snmp_add_var reads it without MIBs
 
-    i INTEGER (Integer32), u Gauge32 (Unsigned32), c Counter32, C Counter64,
-    t TimeTicks, a IpAddress (dotted quad), o OBJECT IDENTIFIER (numeric),
-    n NULL (the value is ignored), s OCTET STRING (UTF-8 text), x OCTET
-    STRING from hex (optional 0x, blanks allowed), d OCTET STRING from
-    decimal octets ("1.2.3.4"), b BITS (bit numbers separated by blanks or
-    commas), q raw Opaque (hex), and net-snmp's Opaque-wrapped specials F
-    (float), D (double), I (Int64) and U (UInt64). Raises ValueError with
-    net-snmp's text: "Bad object type: <letter>" for an unknown letter
-    (also '=', which needs MIBs), "Bad value notation (<value>)" or
-    "Value out of range (<value>)" for a bad value.
+    The letters are snmpset's: i u c 3 t C a o n s x d b, and the
+    Opaque-wrapped F D I U. q (a raw Opaque in hex) is our own. Numbers are
+    read with the same C library functions net-snmp uses, so odd forms such
+    as hex or octal INTEGERs are accepted where net-snmp accepts them.
+
+    Raises ValueError with net-snmp's text. A value that does not fit its
+    type, which net-snmp would send truncated, is refused with "Value out
+    of range".
     """
     if letter == "i":
-        return Integer(_signed(text, _INT32_MIN, _INT32_MAX))
+        return Integer(_integer32(text))
     if letter == "u":
-        return Gauge32(_unsigned(text, _UINT32_MAX))
+        return Gauge32(_unsigned32(text))
     if letter == "c":
-        return Counter32(_unsigned(text, _UINT32_MAX))
+        return Counter32(_unsigned32(text))
+    if letter == "3":
+        return UnknownValue(ber.TAG_UINTEGER32, ber.enc_uint_content(_unsigned32(text)))
     if letter == "C":
-        return Counter64(_u64(text))
+        return Counter64(_read64(text))
     if letter == "t":
-        return TimeTicks(_unsigned(text, _UINT32_MAX))
+        return TimeTicks(_unsigned32(text))
     if letter == "a":
         return IpAddress(parse_ip(text))
     if letter == "o":
-        try:
-            return ObjectIdentifier(Oid.parse(text))
-        except ValueError:
-            raise ValueError("Bad value notation (%s)" % text)
+        r = read_objid(text)
+        if r.detail != "" or len(r.arcs) == 0:
+            raise ValueError("Unknown Object Identifier (" + r.detail + ")")
+        return ObjectIdentifier(Oid(r.arcs))
     if letter == "n":
         return Null()
     if letter == "s":
         return OctetString(text.encode())
     if letter == "x":
-        return OctetString(_hex_octets(text))
+        return OctetString(_hex_value(text))
     if letter == "d":
         return OctetString(_decimal_octets(text))
     if letter == "b":
         return OctetString(_bits(text))
     if letter == "q":
-        return Opaque(_hex_octets(text))
+        return Opaque(_hex_value(text))
     if letter == "F":
         return opaque_float(text)
     if letter == "D":
         return opaque_double(text)
     if letter == "I":
-        v = _signed(text, -9223372036854775807 - 1, 9223372036854775807)
+        u = _read64(text)
+        v = int(u) if u <= u64(9223372036854775807) else -int(_U64_MAX - u) - 1
         c = ber.enc_int_content(v)
         return Opaque(b"\x9f\x7a" + bytes([len(c)]) + c)
     if letter == "U":
-        c = ber.enc_u64_content(_u64(text))
+        c = ber.enc_u64_content(_read64(text))
         return Opaque(b"\x9f\x7b" + bytes([len(c)]) + c)
-    raise ValueError("Bad object type: " + (letter if letter != "" else "''"))
+    raise ValueError("Bad variable type (\"" + letter + "\")")
+
+
+# OIDs (net-snmp's read_objid without MIBs) ##########################################################
+
+class ObjidResult(object):
+    """What read_objid made of a text: the arcs, or the detail of its "Unknown Object Identifier" error"""
+    arcs: list[int]
+    detail: str
+
+    def __init__(self, arcs: list[int], detail: str):
+        self.arcs = arcs
+        self.detail = detail
+
+def read_objid(text: str) -> ObjidResult:
+    """Read a numeric OID as net-snmp's read_objid does with no MIBs loaded
+
+    One leading dot is allowed and each sub-identifier is a C number. On
+    failure the result has net-snmp's detail text. Unlike net-snmp, a
+    sub-identifier above 2^32-1 and the OID "." are refused instead of
+    being truncated or read as empty.
+    """
+    s = text[1:] if text.startswith(".") else text
+    n = len(s)
+    arcs: list[int] = []
+    dot = s.find(".")
+    piece = s if dot < 0 else s[:dot]
+    if piece == "" or not _is_digit(piece[0]):
+        return ObjidResult([], "Sub-id not found: (top) -> " + piece)
+    r = c_number(piece, 0)
+    if r.end != len(piece):
+        return ObjidResult([], "Sub-id not found: (top) -> " + piece)
+    if r.overflow or r.mag > u64(4294967295):
+        return ObjidResult([], piece)
+    arcs.append(int(r.mag))
+    pos = dot + 1 if dot >= 0 else n + 1
+    while pos <= n:
+        rest = s[pos:]
+        if rest == "" or not _is_digit(rest[0]):
+            return ObjidResult([], rest)
+        dot = rest.find(".")
+        piece = rest if dot < 0 else rest[:dot]
+        r = c_number(piece, 0)
+        if r.end != len(piece) or len(arcs) >= ber.MAX_OID_ARCS or r.overflow or r.mag > u64(4294967295):
+            return ObjidResult([], piece)
+        arcs.append(int(r.mag))
+        pos = pos + dot + 1 if dot >= 0 else n + 1
+    return ObjidResult(arcs, "")
 
 def parse_oid(text: str) -> Oid:
-    """A numeric OID with or without the leading dot; CliError "<text>: Unknown Object Identifier" otherwise"""
-    try:
-        o = Oid.parse(text)
-    except ValueError:
-        raise CliError(text + ": Unknown Object Identifier")
-    if len(o.arcs) > ber.MAX_OID_ARCS:
-        raise CliError(text + ": Unknown Object Identifier (too many sub-identifiers)")
-    return o
+    """A numeric OID as read_objid reads it; CliError "<text>: Unknown Object Identifier (<detail>)" otherwise"""
+    r = read_objid(text)
+    if r.detail != "" or len(r.arcs) == 0:
+        raise CliError(text + ": Unknown Object Identifier (" + r.detail + ")")
+    return Oid(r.arcs)
 
 
 # Agent specification #################################################################################
@@ -585,23 +854,45 @@ def parse_agent(spec: str, default_port: int) -> (domain: str, host: str, port: 
     return (domain=domain, host=host, port=port)
 
 def parse_engine_id(text: str, flag: str) -> bytes:
-    """An engine ID in hex (optional 0x), 5 to 32 octets; CliError "Bad engine ID value after -<flag> flag." otherwise"""
-    t = text[2:] if text.startswith("0x") or text.startswith("0X") else text
-    ok = len(t) % 2 == 0 and len(t) >= 2 * usm.MIN_ENGINE_ID_LEN and len(t) <= 2 * usm.MAX_ENGINE_ID_LEN
-    if ok:
-        for c in t:
-            if c not in "0123456789abcdefABCDEF":
-                ok = False
-    if not ok:
+    """An engine ID of 5 to 32 octets, in hex as net-snmp reads it
+
+    flag is the option it came from, for the CliError message.
+    """
+    b = netsnmp_hex(text)
+    ok_len = b is not None and len(b!) >= usm.MIN_ENGINE_ID_LEN and len(b!) <= usm.MAX_ENGINE_ID_LEN
+    if flag == "-e" or flag == "-E":
+        if b is None:
+            raise CliError("Bad engine ID value after -3" + flag[1:] + " flag.", True)
+        if not ok_len:
+            raise CliError("Invalid engine ID value after " + flag + " flag.", True)
+        return b!
+    if b is None or not ok_len:
         raise CliError("Bad engine ID value after " + flag + " flag.")
-    return bytes.from_hex(t)
+    return b!
 
 
 # The scanner ##########################################################################################
 
+def tool_of(command: str) -> str:
+    """The net-snmp tool a client command imitates ("snmpget", "snmptrap", ...); "actsnmp <command>" otherwise"""
+    if command == "agent" or command == "trapd" or command == "":
+        return "actsnmp " + command if command != "" else "actsnmp"
+    return "snmp" + command
+
+class _Opt(object):
+    # One short option: its letter, its value ("" for flags) and, for walk's -CE, the end OIDs it took
+    letter: str
+    value: str
+    extra: list[str]
+
+    def __init__(self, letter: str, value: str, extra: list[str]):
+        self.letter = letter
+        self.value = value
+        self.extra = extra
+
 class _Raw(object):
     # The options and positional arguments of a command line, before interpretation
-    shorts: list[(str, str)]        # (letter, value) in order; value "" for flags
+    shorts: list[_Opt]
     longs: list[(str, str)]         # (name, value) in order
     positional: list[str]
 
@@ -615,8 +906,10 @@ def _long_takes_value(name: str) -> bool:
 
 def _scan(args: list[str], command: str) -> _Raw:
     # Split args into options and positional arguments like GNU getopt with permutation. snmpwalk's
-    # -CE takes the end OID from the next argument (-CE OID); -CE<OID> works as well
+    # -CE takes the end OID from the next argument, for every E of the -C argument (-CEp OID works,
+    # -CE.1.3 does not: the dot is the next -C letter)
     raw = _Raw()
+    tool = tool_of(command)
     i = 0
     n = len(args)
     while i < n:
@@ -640,7 +933,7 @@ def _scan(args: list[str], command: str) -> _Raw:
             else:
                 raw.longs.append((body, ""))
             continue
-        if len(a) < 2 or not a.startswith("-") or (a[1].isascii() and a[1].isdecimal()):
+        if len(a) < 2 or not a.startswith("-") or _is_digit(a[1]):
             raw.positional.append(a)
             continue
         j = 1
@@ -648,25 +941,34 @@ def _scan(args: list[str], command: str) -> _Raw:
             c = a[j]
             j += 1
             if c in _FLAG_LETTERS:
-                raw.shorts.append((c, ""))
+                raw.shorts.append(_Opt(c, "", []))
             elif c in _VALUE_LETTERS:
                 value = a[j:]
                 if value == "":
                     if i >= n:
-                        raise CliError("option requires an argument -- '" + c + "'", True)
+                        raise CliError(tool + ": option requires an argument -- '" + c + "'", True)
                     value = args[i]
                     i += 1
-                if c == "C" and command == "walk" and value.endswith("E") and i < n:
-                    value += args[i]
-                    i += 1
-                raw.shorts.append((c, value))
+                extra: list[str] = []
+                if c == "C" and command == "walk":
+                    for k in range(value.count("E")):
+                        if i < n:
+                            extra.append(args[i])
+                            i += 1
+                raw.shorts.append(_Opt(c, value, extra))
                 break
             else:
-                raise CliError("invalid option -- '" + c + "'", True)
+                raise CliError(tool + ": invalid option -- '" + c + "'", True)
     return raw
 
 
 # Option interpretation ###############################################################################
+
+# The -C letters of each command, as net-snmp's tools take them (table is actsnmp's own)
+_C_LETTERS: dict[str, str] = {
+    "get": "f", "getnext": "f", "bulkget": "nr", "walk": "ciIptE", "bulkwalk": "cinrp", "set": "q",
+    "table": "rc", "trap": "i", "inform": "i",
+}
 
 def _version(text: str) -> int:
     if text == "1":
@@ -675,7 +977,7 @@ def _version(text: str) -> int:
         return message.SNMP_V2C
     if text == "3":
         return message.SNMP_V3
-    raise CliError("Invalid version specified after -v flag: " + text)
+    raise CliError("Invalid version specified after -v flag: " + text, True)
 
 def _int_option(text: str, what: str, lo: int, hi: int) -> int:
     t = text[1:] if text.startswith("-") else text
@@ -687,71 +989,86 @@ def _int_option(text: str, what: str, lo: int, hi: int) -> int:
     return v
 
 def _timeout(text: str) -> float:
-    if not _is_float_text(text) or text.startswith("-"):
-        raise CliError("Invalid timeout in seconds after -t flag.")
-    v = float(text)
-    if v <= 0.0 or v > 86400.0:
-        raise CliError("Invalid timeout in seconds after -t flag.")
+    # net-snmp: atof(TEXT) * 1000000 as a long must be positive; what follows the number is ignored
+    c = c_float(text)
+    v = c.value if c.end > 0 and c.kind == 0 and not c.neg else 0.0
+    if v * 1000000.0 < 1.0 or v > 86400.0:
+        raise CliError("Invalid timeout in seconds after -t flag.", True)
+    return float(int(v * 1000000.0)) / 1000000.0
+
+def _retries(text: str) -> int:
+    # net-snmp: the text must start with a digit, and atoi() of it must not be negative
+    if text == "" or not _is_digit(text[0]):
+        raise CliError("Invalid number of retries after -r flag.", True)
+    v = _int32_of(c_number(text, 10))
+    if v < 0:
+        raise CliError("Invalid number of retries after -r flag.", True)
     return v
 
-def _c_number(flags: str, i: int, letter: str) -> (int, int):
-    # The number after -C<letter> (strtol base 0: decimal, 0x hex); returns (value, next index)
-    j = i
-    if j < len(flags) and (flags[j] == "-" or flags[j] == "+"):
-        j += 1
-    base = 10
-    if j + 1 < len(flags) and flags[j] == "0" and (flags[j + 1] == "x" or flags[j + 1] == "X"):
-        base = 16
-        j += 2
-    start = j
-    while j < len(flags) and ((base == 10 and flags[j] in "0123456789") or
-                              (base == 16 and flags[j] in "0123456789abcdefABCDEF")):
-        j += 1
-    if j == start or j - start > 9:
-        raise CliError("No number given with -C" + letter, True)
-    v = int(flags[start:j], base)
-    if flags[i] == "-":
-        v = -v
-    return (v, j)
+def _boots(text: str) -> int:
+    # -Z BOOTS,TIME as net-snmp reads it (strtoul for both); the time is not used
+    r = c_number(text, 10)
+    if r.end == 0:
+        raise CliError("Need engine boots value after -3Z flag.", True)
+    rest = text[r.end:]
+    if not rest.startswith(","):
+        raise CliError("Need engine time after \"-Z engineBoot\".", True)
+    if c_number(rest[1:], 10).end == 0:
+        raise CliError("Need engine time after \"-3Z engineBoot,\".", True)
+    if r.neg or r.overflow or r.mag < u64(1) or r.mag > u64(2147483647):
+        raise CliError("Invalid engine boots after -Z flag.", True)
+    return int(r.mag)
 
-def _apply_c(o: CliOptions, flags: str) -> None:
-    # The -C letters of one -C argument, per command as in net-snmp's tools
+def _apply_c(o: CliOptions, flags: str, extra: list[str]) -> None:
+    # The -C letters of one -C argument, per command as in net-snmp's tools: "Unknown flag passed to -C"
+    # without the usage text, the usage text alone for a missing number, "Bad value for" a negative one
     cmd = o.command
+    letters = _C_LETTERS.get(cmd)
+    allowed = letters if letters is not None else ""
+    tool = tool_of(cmd)
     i = 0
+    e_used = 0
     while i < len(flags):
         c = flags[i]
         i += 1
-        if c == "f" and (cmd == "get" or cmd == "getnext"):
+        if c not in allowed:
+            raise CliError("Unknown flag passed to -C: " + c)
+        if c == "f":
             o.dont_fix = not o.dont_fix
-        elif (c == "n" or c == "r") and (cmd == "bulkget" or cmd == "bulkwalk" or (cmd == "table" and c == "r")):
-            v, i = _c_number(flags, i, c)
+        elif c == "n" or c == "r":
+            r = c_number(flags[i:], 0)
+            if r.end == 0:
+                raise CliError("", True)
+            v = _int32_of(r)
+            if v < 0:
+                raise CliError(tool + ": Bad value for " + ("non-repeaters" if c == "n" else "max-repetitions"))
             if c == "n":
                 o.non_repeaters = v
             else:
                 o.max_repetitions = v
-        elif c == "c" and (cmd == "walk" or cmd == "bulkwalk" or cmd == "table"):
+            i += r.end
+        elif c == "c":
             o.dont_check = not o.dont_check
-        elif c == "i" and (cmd == "walk" or cmd == "bulkwalk"):
-            o.include_requested = not o.include_requested
-        elif c == "I" and (cmd == "walk" or cmd == "bulkwalk"):
-            o.dont_get_requested = not o.dont_get_requested
-        elif c == "p" and (cmd == "walk" or cmd == "bulkwalk"):
-            o.print_count = not o.print_count
-        elif c == "t" and (cmd == "walk" or cmd == "bulkwalk"):
-            o.print_time = not o.print_time
-        elif c == "E" and cmd == "walk":
-            if i >= len(flags):
-                raise CliError("No end OID given with -CE", True)
-            o.end_oid = parse_oid(flags[i:])
-            return
-        elif c == "q" and cmd == "set":
-            o.quiet = not o.quiet
-        elif c == "i" and cmd == "trap":
+        elif c == "i" and (cmd == "trap" or cmd == "inform"):
             o.inform = True
-        else:
-            raise CliError("Unknown flag passed to -C: " + c, True)
+        elif c == "i":
+            o.include_requested = not o.include_requested
+        elif c == "I":
+            o.dont_get_requested = not o.dont_get_requested
+        elif c == "p":
+            o.print_count = not o.print_count
+        elif c == "t":
+            o.print_time = not o.print_time
+        elif c == "E":
+            # the OID is read after the options (parse), as snmpwalk does
+            if e_used >= len(extra):
+                raise CliError("No end OID given with -CE", True)
+            o.end_oid_text = extra[e_used]
+            e_used += 1
+        elif c == "q":
+            o.quiet = not o.quiet
 
-def _apply_short(o: CliOptions, letter: str, value: str) -> None:
+def _apply_short(o: CliOptions, letter: str, value: str, extra: list[str]) -> None:
     if letter == "h":
         o.help = True
     elif letter == "H":
@@ -771,20 +1088,20 @@ def _apply_short(o: CliOptions, letter: str, value: str) -> None:
         try:
             o.level = usm.level_from_name(value)
         except ValueError:
-            raise CliError("Invalid security level specified after -l flag: " + value)
+            raise CliError("Invalid security level specified after -3l flag: " + value, True)
         o.level_given = True
     elif letter == "a":
         try:
             o.auth_protocol = usm.auth_from_name(value)
         except ValueError:
-            raise CliError("Invalid authentication protocol specified after -a flag: " + value)
+            raise CliError("Invalid authentication protocol specified after -3a flag: " + value, True)
     elif letter == "A":
         o.auth_password = value
     elif letter == "x":
         try:
             o.priv_protocol = usm.priv_from_name(value)
         except ValueError:
-            raise CliError("Invalid privacy protocol specified after -x flag: " + value)
+            raise CliError("Invalid privacy protocol specified after -3x flag: " + value, True)
     elif letter == "X":
         o.priv_password = value
     elif letter == "n":
@@ -794,28 +1111,26 @@ def _apply_short(o: CliOptions, letter: str, value: str) -> None:
     elif letter == "E":
         o.context_engine_id = parse_engine_id(value, "-E")
     elif letter == "Z":
-        comma = value.find(",")
-        o.boots = _int_option(value[:comma] if comma >= 0 else value, "Invalid engine boots after -Z flag.", 1,
-                              2147483647)
+        o.boots = _boots(value)
     elif letter == "t":
         o.timeout = _timeout(value)
     elif letter == "r":
-        o.retries = _int_option(value, "Invalid number of retries after -r flag.", 0, 1000000)
+        o.retries = _retries(value)
     elif letter == "O":
         try:
             o.output = o.output.with_flags(value)
         except ValueError:
             bad = ""
             for c in value:
-                if bad == "" and c not in "qQvxaTtneUbEX":
+                if bad == "" and c not in "qQvxaTtneUbEX0":
                     bad = c
             raise CliError("Unknown output option passed to -O: " + bad + ".", True)
     elif letter == "C":
-        _apply_c(o, value)
+        _apply_c(o, value, extra)
     elif letter in "mMId":
         pass            # MIB, input and debug options: nothing to do without MIBs
     else:
-        raise CliError("invalid option -- '" + letter + "'", True)
+        raise CliError(tool_of(o.command) + ": invalid option -- '" + letter + "'", True)
 
 def _apply_long(o: CliOptions, name: str, value: str) -> None:
     if name == "help":
@@ -843,91 +1158,171 @@ def _apply_long(o: CliOptions, name: str, value: str) -> None:
         if value == "":
             raise CliError("Invalid address after --bind", True)
         o.bind_address = value
-    else:
+    elif o.is_server():
         raise CliError("unrecognized option '--" + name + "'", True)
+    else:
+        # net-snmp reads --NAME=VALUE as a configuration line and warns about unknown ones
+        o.warnings.append("(null): line 0: Warning: Unknown token: " + name + ".")
+
+def _c_int(text: str) -> int:
+    # C's atol(): the number at the start of text, 0 if there is none
+    r = c_number(text, 10)
+    if r.end == 0:
+        return 0
+    if r.overflow or r.mag > u64(9223372036854775807):
+        return -9223372036854775807 - 1 if r.neg else 9223372036854775807
+    return -int(r.mag) if r.neg else int(r.mag)
 
 def _trap_positional(o: CliOptions, args: list[str]) -> list[str]:
-    # snmptrap/snmpinform positional arguments after the agent; returns the OID TYPE VALUE words
+    # snmptrap/snmpinform positional arguments after the agent, with snmptrap's messages; returns the
+    # OID TYPE VALUE words. GENERIC, SPECIFIC and UPTIME (v1) are read like atoi/atol, but must fit the
+    # Trap-PDU (net-snmp sends whatever atoi made of them)
     if o.version == message.SNMP_V1:
         if o.inform:
             raise CliError("Cannot send INFORM as SNMPv1 PDU")
-        if len(args) < 5:
-            raise CliError("Missing argument: v1 traps need ENTERPRISE AGENT-ADDR GENERIC SPECIFIC UPTIME", True)
+        if len(args) < 1:
+            raise CliError("No enterprise oid", True)
         o.enterprise = parse_oid(args[0] if args[0] != "" else DEFAULT_ENTERPRISE)
-        if args[1] != "":
-            try:
-                o.agent_addr = parse_ip(args[1])
-            except ValueError:
-                raise CliError(args[1] + ": Unknown host")
-        o.generic = _int_option(args[2], "Invalid generic trap type: " + args[2], 0, 6)
-        o.specific = _int_option(args[3], "Invalid specific trap type: " + args[3], 0, _UINT32_MAX)
-        uptime = args[4]
-        rest = args[5:]
-    else:
         if len(args) < 2:
-            raise CliError("Missing argument: traps and informs need UPTIME TRAPOID", True)
-        uptime = args[0]
-        o.trap_oid = parse_oid(args[1])
-        rest = args[2:]
-    if uptime != "":
+            raise CliError("Missing agent parameter", True)
+        if args[1] != "":
+            addr = inet_aton(args[1])
+            if addr is None:
+                raise CliError("unknown host: " + args[1])
+            o.agent_addr = addr!
+        if len(args) < 3:
+            raise CliError("Missing generic-trap parameter", True)
+        o.generic = _c_int(args[2])
+        if o.generic < 0 or o.generic > 6:
+            raise CliError("Invalid generic trap type: " + args[2])
+        if len(args) < 4:
+            raise CliError("Missing specific-trap parameter", True)
+        o.specific = _c_int(args[3])
+        if o.specific < _INT32_MIN or o.specific > _UINT32_MAX:
+            raise CliError("Invalid specific trap type: " + args[3])
+        if len(args) < 5:
+            raise CliError("Missing uptime parameter", True)
+        if args[4] != "":
+            o.uptime = _c_int(args[4])
+            if o.uptime < 0 or o.uptime > _UINT32_MAX:
+                raise CliError("Invalid uptime: " + args[4])
+        return args[5:]
+    if len(args) < 1:
+        raise CliError("Missing up-time parameter", True)
+    if len(args) < 2:
+        raise CliError("Missing trap-oid parameter", True)
+    if args[0] != "":
         try:
-            o.uptime = _unsigned(uptime, _UINT32_MAX)
+            o.uptime = _unsigned32(args[0])
         except ValueError:
-            raise CliError("Invalid uptime: " + uptime)
-    return rest
+            raise CliError("Invalid uptime: " + args[0])
+    o.trap_oid = parse_oid(args[1])
+    return args[2:]
 
-def _triples(words: list[str], need_values: bool) -> list[VarBind]:
-    # OID TYPE VALUE triples, with snmpset's messages
+def _trap_varbinds(words: list[str]) -> list[VarBind]:
+    # snmptrap's OID TYPE VALUE triples: the first problem ends the command
     vbs: list[VarBind] = []
+    i = 0
+    while i < len(words):
+        name = words[i]
+        if i + 3 > len(words):
+            raise CliError(name + ": Missing type/value for variable")
+        oid = parse_oid(name)
+        t = words[i + 1]
+        try:
+            v = parse_value(t[0] if t != "" else "\x00", words[i + 2])
+        except ValueError as e:
+            raise CliError(name + ": " + e.error_message)
+        vbs.append(VarBind(oid, v))
+        i += 3
+    return vbs
+
+def _set_varbinds(o: CliOptions, words: list[str]) -> list[VarBind]:
+    # snmpset's OID TYPE VALUE triples: first the syntax and the type letters of all of them (the first
+    # problem ends the command), then every OID and value, all problems reported together. Value errors
+    # come after net-snmp opened the session, so a session error (session_error) hides them
     i = 0
     while i < len(words):
         name = words[i]
         if i + 1 >= len(words):
             raise CliError(name + ": Needs type and value")
-        letter = words[i + 1]
+        t = words[i + 1]
+        letter = t[0] if t != "" else "\x00"
+        if letter not in SET_LETTERS:
+            raise CliError(name + ": Bad object type: " + letter)
         if i + 2 >= len(words):
             raise CliError(name + ": Needs value")
-        oid = parse_oid(name)
-        if len(letter) != 1:
-            raise CliError(name + ": Bad object type: " + (letter[0] if letter != "" else "''"))
-        try:
-            v = parse_value(letter, words[i + 2])
-        except ValueError as e:
-            raise CliError(name + ": " + e.error_message)
-        vbs.append(VarBind(oid, v))
         i += 3
-    if need_values and len(vbs) == 0:
-        raise CliError("Missing object name", True)
+    vbs: list[VarBind] = []
+    problems: list[str] = []
+    i = 0
+    while i < len(words):
+        name = words[i]
+        r = read_objid(name)
+        if r.detail != "" or len(r.arcs) == 0:
+            problems.append(name + ": Unknown Object Identifier (" + r.detail + ")")
+        else:
+            try:
+                vbs.append(VarBind(Oid(r.arcs), parse_value(words[i + 1][0], words[i + 2])))
+            except ValueError as e:
+                problems.append(name + ": " + e.error_message)
+        i += 3
+    if len(problems) > 0 and o.session_error == "":
+        raise CliError("\n".join(problems))
     return vbs
 
+def _oid_list(texts: list[str], all_problems: bool) -> list[Oid]:
+    # The OIDs of get, getnext, bulkget and table: snmpget and snmpgetnext report every bad one,
+    # snmpbulkget only the first
+    oids: list[Oid] = []
+    problems: list[str] = []
+    for t in texts:
+        r = read_objid(t)
+        if r.detail != "" or len(r.arcs) == 0:
+            problems.append(t + ": Unknown Object Identifier (" + r.detail + ")")
+            if not all_problems:
+                break
+        else:
+            oids.append(Oid(r.arcs))
+    if len(problems) > 0:
+        raise CliError("\n".join(problems))
+    return oids
+
+def _key_problem(o: CliOptions, password: str, what: str) -> None:
+    # net-snmp derives Ku from every pass phrase given, whatever the level, and stops at a short one
+    if password != "" and len(password.encode()) < 8:
+        raise CliError("Error: passphrase chosen is below the length requirements of the USM (min=8).\n"
+                       + tool_of(o.command) + ":  (The supplied password length is too short.)\n"
+                       + "Error generating a key (Ku) from the supplied " + what + " pass phrase. ")
+
 def _check_v3(o: CliOptions) -> None:
-    # The -l level against the protocols and passwords, with net-snmp's defaults (MD5, DES)
+    # The -l level against the protocols and passwords, with net-snmp's defaults (MD5, DES). What
+    # net-snmp reports when it opens the session goes to session_error
     if o.version != message.SNMP_V3:
         return
-    if o.user == "":
-        raise CliError("No security name specified (-u).")
     if not o.level_given:
         o.level = usm.LEVEL_NO_AUTH_NO_PRIV
+    tool = tool_of(o.command)
+    problem = ""
+    if o.user == "":
+        problem = tool + ": No securityName specified"
     if (o.level & message.FLAG_AUTH) != 0:
         if o.auth_protocol == usm.AUTH_NONE:
             o.auth_protocol = usm.AUTH_MD5
-        if o.auth_password == "":
-            raise CliError("Error: authentication pass phrase must be given with -A for -l "
-                           + usm.level_name(o.level))
+        if o.auth_password == "" and problem == "":
+            problem = tool + ": USM authentication failure (incorrect password or key)"
     else:
         o.auth_protocol = usm.AUTH_NONE
         o.auth_password = ""
     if (o.level & message.FLAG_PRIV) != 0:
         if o.priv_protocol == usm.PRIV_NONE:
             o.priv_protocol = usm.PRIV_DES
-        if o.priv_password == "":
-            raise CliError("Error: privacy pass phrase must be given with -X for -l authPriv")
+        if o.priv_password == "" and problem == "":
+            problem = tool + ": USM generic error"
     else:
         o.priv_protocol = usm.PRIV_NONE
         o.priv_password = ""
-    for p in [o.auth_password, o.priv_password]:
-        if p != "" and len(p.encode()) < 8:
-            raise CliError("Error: passphrase chosen is below the length requirements of the USM (min=8).")
+    o.session_error = problem
 
 def parse(argv: list[str]) -> CliOptions:
     """Parse `actsnmp <command> [OPTIONS] ...` (argv[0] is the program name)
@@ -935,11 +1330,18 @@ def parse(argv: list[str]) -> CliOptions:
     Returns the CliOptions of the command. `actsnmp -h`, `actsnmp --help`
     and a missing command give a CliOptions with command "" and help set;
     `actsnmp -V` one with show_version set. With -h or -V anywhere the
-    positional arguments are not checked. Raises CliError for an unknown
-    command, an unknown option or -C letter, a missing or bad option value,
-    a missing agent ("No hostname specified."), missing or bad OIDs,
-    TYPE/VALUE problems, v3 options that do not fit the level, and
-    arguments a command does not take.
+    positional arguments are not checked.
+
+    The checks and their messages follow net-snmp's tools, in their order:
+    the options (getopt's "snmpget: invalid option -- 'k'", the value of
+    each option, the -C letters per command), the pass phrases (net-snmp
+    derives the keys of every pass phrase given), the agent ("No hostname
+    specified.") and community, then the command's arguments (missing or
+    bad OIDs, the snmpset type letters, then every bad OID and value,
+    snmptrap's positional parameters). The SNMPv3 problems net-snmp only
+    finds when it opens the session (no user, no pass phrase for the
+    level) do not raise: they are left in session_error. Raises CliError
+    otherwise; its usage says whether the usage text follows.
     """
     if len(argv) < 2:
         o = CliOptions("")
@@ -959,9 +1361,9 @@ def parse(argv: list[str]) -> CliOptions:
     o = CliOptions(command)
     raw = _scan(argv[2:], command)
     for s in raw.shorts:
-        if s.0 == "w" and command != "agent":
-            raise CliError("invalid option -- 'w'", True)
-        _apply_short(o, s.0, s.1)
+        if s.letter == "w" and command != "agent":
+            raise CliError(tool_of(command) + ": invalid option -- 'w'", True)
+        _apply_short(o, s.letter, s.value, s.extra)
     for l in raw.longs:
         _apply_long(o, l.0, l.1)
     if o.help or o.show_version:
@@ -975,6 +1377,9 @@ def parse(argv: list[str]) -> CliOptions:
         if o.command == "trapd" and o.engine_id is not None:
             o.server_engine_id = o.engine_id!
         return o
+    if o.version == message.SNMP_V3:
+        _key_problem(o, o.auth_password, "authentication")
+        _key_problem(o, o.priv_password, "privacy")
     if len(pos) == 0:
         raise CliError("No hostname specified.", True)
     o.peer = pos[0]
@@ -992,26 +1397,24 @@ def parse(argv: list[str]) -> CliOptions:
         if len(args) > MAX_CMDLINE_OIDS:
             raise CliError("Too many object identifiers specified. Only %d allowed in one request."
                            % MAX_CMDLINE_OIDS, True)
-        o.oids = [parse_oid(a) for a in args]
+        o.oids = _oid_list(args, command != "bulkget")
     elif command == "walk" or command == "bulkwalk":
-        if len(args) > 1:
-            raise CliError("Unexpected argument: " + args[1] + " (one root OID only)", True)
-        o.oids = [parse_oid(args[0] if len(args) == 1 else DEFAULT_WALK_ROOT)]
+        end = o.end_oid_text
+        if end is not None:
+            o.end_oid = parse_oid(end)
+        # like snmpwalk, only the first argument is used
+        o.oids = [parse_oid(args[0] if len(args) > 0 else DEFAULT_WALK_ROOT)]
     elif command == "set":
         if len(args) == 0:
             raise CliError("Missing object name", True)
         if len(args) > 3 * MAX_CMDLINE_OIDS:
             raise CliError("Too many assignments specified. Only %d allowed in one request." % MAX_CMDLINE_OIDS,
                            True)
-        o.varbinds = _triples(args, True)
+        o.varbinds = _set_varbinds(o, args)
     else:
         if o.command == "trap" and o.inform and o.version == message.SNMP_V1:
             raise CliError("Cannot send INFORM as SNMPv1 PDU")
-        o.varbinds = _triples(_trap_positional(o, args), False)
-    if o.non_repeaters < 0:
-        o.non_repeaters = 0
-    if o.max_repetitions < 0:
-        o.max_repetitions = 0
+        o.varbinds = _trap_varbinds(_trap_positional(o, args))
     return o
 
 
@@ -1032,7 +1435,7 @@ _COMMON = """  -h, --help            print this text
   -E ENGINE-ID          context engine ID (hex)
   -t TIMEOUT            seconds per attempt (default 1)
   -r RETRIES            retries (default 5)
-  -O FLAGS              output options: q Q v x a T t (n e U b E X accepted)
+  -O FLAGS              output options: q Q v x a T t (n e U b E X 0 accepted)
   --hexOutputLength=N   octets per Hex-STRING line (0: no line breaks)
   --canon               the interop lab's canonical output format"""
 
@@ -1046,14 +1449,12 @@ _C_TEXT: dict[str, str] = {
              + "  -Ct                   print the time the walk took\n  -CE OID               end the walk at OID"),
     "bulkwalk": ("  -Cc                   do not check that OIDs increase\n"
                  + "  -Ci                   include the root (GET it first)\n"
-                 + "  -CI                   no GET of the root when the subtree is empty\n"
                  + "  -Cp                   print the number of variables found\n"
-                 + "  -Ct                   print the time the walk took\n"
                  + "  -Cn<N>                non-repeaters (default 0)\n  -Cr<N>                max-repetitions (default 10)"),
     "set": "  -Cq                   do not print the result",
     "table": "  -Cr<N>                max-repetitions (default 10)\n  -Cc                   do not check that OIDs increase",
     "trap": "  -Ci                   send an INFORM instead of a TRAP",
-    "inform": "",
+    "inform": "  -Ci                   send an INFORM (the default of inform)",
 }
 
 _SYNOPSIS: dict[str, str] = {
@@ -1098,7 +1499,7 @@ def usage(command: str) -> str:
                  % (TRAP_PORT if command == "trap" or command == "inform" else SNMP_PORT))
         types = ""
         if command == "set" or command == "trap" or command == "inform":
-            types = ("\n  TYPE                  i u c C t a o n s x d b, q (Opaque hex), F D I U (Opaque float,\n"
+            types = ("\n  TYPE                  i u c 3 C t a o n s x d b, q (Opaque hex), F D I U (Opaque float,\n"
                      + "                        double, Int64, UInt64)")
         return ("USAGE: actsnmp " + syn + agent + "\nOPTIONS:\n" + _COMMON
                 + ("\n" + c if c != "" else "") + types)

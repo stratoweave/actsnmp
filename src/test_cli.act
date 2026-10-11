@@ -144,7 +144,8 @@ proc def run_cli(mn: MemNet, port: int, args: list[str], report: action(Result) 
         c = actsnmp.new_client(None, o, sec, mn.client(MANAGER, port, o.address, o.port))
         Command(o, c, cap.out, cap.err, cap.done)
     except cliopts.CliError as x:
-        cap.err(x.error_message + "\n")
+        if x.error_message != "":
+            cap.err(x.error_message + "\n")
         cap.done(1)
     except ValueError as x:
         cap.err(x.error_message + "\n")
@@ -305,12 +306,13 @@ def walk_steps() -> list[Step]:
         Step(["walk", "-CI"] + pub + [EP + ".15"], "", "", 0),
         Step(["walk"] + pub + [EP + ".1.1.0"], EP + ".1.1.0 = INTEGER: 42\n", "", 0),
         Step(["bulkwalk"] + pub + [EP + ".1.1.0"], EP + ".1.1.0 = INTEGER: 42\n", "", 0),
-        Step(["walk", "-Cp"] + pub + [EP + ".15"], EP + ".15" + NO_SUCH_OBJECT + "Variables found: 0\n", "", 0),
+        # snmpwalk counts what the GET of the root printed
+        Step(["walk", "-Cp"] + pub + [EP + ".15"], EP + ".15" + NO_SUCH_OBJECT + "Variables found: 1\n", "", 0),
         # -Ci: GET the root first; -CE: end OID
         Step(["walk", "-Ci"] + pub + [EP + ".4"], EP + ".4" + NO_SUCH_OBJECT + EP + ".4.1.0 = IpAddress: 192.0.2.1\n",
              "", 0),
         Step(["walk", "-CE", EP + ".10.1.1.3"] + pub + [EP + ".10"], table_lines([1], [1, 2], False), "", 0),
-        Step(["walk", "-CpE" + EP + ".10.1.2"] + pub + [EP + ".10"], table_lines([1], [1, 2, 3], False)
+        Step(["walk", "-CpE", EP + ".10.1.2"] + pub + [EP + ".10"], table_lines([1], [1, 2, 3], False)
              + "Variables found: 3\n", "", 0),
         Step(["walk", "-Cp", "--canon"] + pub + [EP + ".4"], EP + ".4.1.0 = IpAddress: 192.0.2.1\nVariables found: 1\n",
              "", 0),
@@ -369,6 +371,107 @@ actor _test_walk_faults(t: testing.AsyncT):
         finish(t, failures)
 
     Script(mn, steps, 43000, done)
+
+
+# net-snmp parity ####################################################################################
+
+TOO_BIG_TEXT = "Reason: (tooBig) Response message would have been too large.\n"
+BUILD_FAILURE = "snmp_build: unknown failure\n"
+
+def parity_steps() -> list[Step]:
+    pub = ["-v2c", "-c", "public", AGENT]
+    big = ["-v2c", "-c", "public", "10.0.0.3"]
+    nsn = ["-v2c", "-c", "public", "10.0.0.4"]
+    md5 = ["-v3", "-l", "authNoPriv", "-u", "u_md5", "-A", "authpass123"]
+    return [
+        # tooBig: snmpgetnext's exit code is 2 only for an error-index; get and bulkget are neither split nor halved
+        Step(["getnext"] + big + [EP + ".1.1.0"], "", "Error in packet.\n" + TOO_BIG_TEXT, 0),
+        Step(["get"] + big + [EP + ".1.1.0", EP + ".2.1.0"], "", "Error in packet\n" + TOO_BIG_TEXT, 2),
+        Step(["bulkget", "-Cr5"] + big + [EP + ".10"], "", "Error in packet.\n" + TOO_BIG_TEXT, 2),
+        Step(["walk"] + big + [EP + ".10"], "", "Error in packet.\n" + TOO_BIG_TEXT, 2),
+        # snmpbulkget takes noSuchName for the end of the MIB
+        Step(["bulkget"] + nsn + [EP + ".10"], "End of MIB.\n", "", 0),
+        # what -Ci printed counts (and makes the GET of an empty subtree unnecessary)
+        Step(["walk", "-Cpi"] + pub + [EP + ".4"], EP + ".4" + NO_SUCH_OBJECT + EP + ".4.1.0 = IpAddress: 192.0.2.1\n"
+             + "Variables found: 2\n", "", 0),
+        Step(["bulkwalk", "-C", "p", "-C", "i"] + pub + [EP + ".15"], EP + ".15" + NO_SUCH_OBJECT + "Variables found: 1\n",
+             "", 0),
+        # SNMPv3: a discovery that times out is "<tool>: Timeout" (net-snmp discovers when it opens the session)
+        Step(["get"] + md5 + ["-t", "0.2", "-r", "0", "10.0.0.5", EP + ".1.1.0"], "", "snmpget: Timeout\n", 1),
+        Step(["walk"] + md5 + ["-t", "0.2", "-r", "0", "10.0.0.5", EP], "", "snmpwalk: Timeout\n", 1),
+        Step(["get", "-e", AGENT_ENGINE] + md5 + ["-t", "0.2", "-r", "0", "10.0.0.5", EP + ".1.1.0"], "",
+             TIMEOUT_V2 + "10.0.0.5.\n", 1),
+        # the session errors come after a successful discovery
+        Step(["get", "-v3", "-l", "authNoPriv", "-A", "authpass123", AGENT, EP + ".1.1.0"], "",
+             "snmpget: No securityName specified\n", 1),
+        Step(["set", "-v3", "-l", "authNoPriv", "-u", "u_md5", AGENT, EP + ".20.1.0", "i", "x"], "",
+             "snmpset: USM authentication failure (incorrect password or key)\n", 1),
+        Step(["walk", "-v3", "-l", "authPriv", "-u", "u_sha_aes", "-A", "authpass123", AGENT, EP], "",
+             "snmpwalk: USM generic error\n", 1),
+        Step(["get", "-v3", "-l", "authNoPriv", "-u", "u_md5", "-t", "0.2", "-r", "0", "10.0.0.5", EP + ".1.1.0"], "",
+             "snmpget: Timeout\n", 1),
+        Step(["get", "-v3", "-e", AGENT_ENGINE, "-l", "authNoPriv", "-u", "u_md5", "10.0.0.5", EP + ".1.1.0"], "",
+             "snmpget: USM authentication failure (incorrect password or key)\n", 1),
+        # OIDs net-snmp cannot encode (a first sub-identifier above 2)
+        Step(["get"] + pub + [EP + ".1.1.0", "3.1"], "",
+             BUILD_FAILURE + "snmpget: Error building ASN.1 representation (Can't build OID for variable)\n", 1),
+        Step(["set", "-v2c", "-c", "private", AGENT, EP + ".20.1.0", "o", "5.1"], "",
+             BUILD_FAILURE + "snmpset: Error building ASN.1 representation (build objid: bad first subidentifier)\n", 1),
+        Step(["trap", "-v2c", "-c", "public", RECEIVER, "1", "3.1"], "",
+             BUILD_FAILURE + "snmptrap: Error building ASN.1 representation (build objid: bad first subidentifier)\n", 1),
+        # an unknown --NAME is a configuration-token warning; the command runs
+        Step(["get", "--nosuch=1"] + pub + [EP + ".1.1.0"], EP + ".1.1.0 = INTEGER: 42\n",
+             "(null): line 0: Warning: Unknown token: nosuch.\n", 0),
+        # usage errors: a missing -Cr number prints only the usage text (not captured here)
+        Step(["bulkget", "-Cr"] + pub + [EP + ".10"], "", "", 1),
+        Step(["walk", "-Cx"] + pub + [EP + ".10"], "", "Unknown flag passed to -C: x\n", 1),
+        Step(["set", "-v2c", "-c", "private", AGENT, EP + ".20.1.0", "i", "x", EP + ".20.2.0", "x", "0g"], "",
+             EP + ".20.1.0: Value out of range (x)\n" + EP + ".20.2.0: Bad value notation (0g)\n", 1),
+    ]
+
+actor _test_parity(t: testing.AsyncT):
+    """Command lines checked against net-snmp's output (interop/clicheck.sh): exact stdout, stderr, exit code"""
+    t.timeout(60.0)
+    mn = MemNet()
+    ag = Agent(mn.server(AGENT, 161), make_view(), make_config(), None)
+    big = Agent(mn.server("10.0.0.3", 161), make_view(), make_config(), None, Faults(too_big_over=40))
+    nsn = Agent(mn.server("10.0.0.4", 161), make_view(), make_config(), None,
+                Faults(error_at=e([10]), error_status=pdu.NO_SUCH_NAME))
+
+    def done(failures: list[str]) -> None:
+        finish(t, failures)
+
+    Script(mn, parity_steps(), 46000, done)
+
+def _test_failure_texts() -> None:
+    """A DNS failure of the agent's name is net-snmp's Unknown host, a discovery timeout is "<tool>: Timeout" """
+    o = cliopts.parse(["actsnmp", "get", "-c", "public", "udp:nosuch.invalid:161", "1.3"])
+    dns = errors.TransportError("UDP setup for nosuch.invalid:161 failed: DNS lookup error: unknown node or service")
+    testing.assertEqual(actsnmp.failure_text(o, dns, True), "snmpget: Unknown host (udp:nosuch.invalid:161)\n")
+    other = errors.TransportError("UDP setup for x:161 failed: no route")
+    testing.assertEqual(actsnmp.failure_text(o, other, True),
+                        "snmpget: UDP setup for x:161 failed: no route\n")
+    disc = errors.TimeoutError(2, 2.0, actsnmp.DISCOVERY_HINT + "; ICMP port unreachable")
+    testing.assertEqual(actsnmp.failure_text(o, disc, True), "snmpget: Timeout\n")
+    plain = errors.TimeoutError(2, 2.0, "ICMP port unreachable")
+    testing.assertEqual(actsnmp.failure_text(o, plain, True), "Timeout: No Response from udp:nosuch.invalid:161.\n")
+
+def bp(args: list[str]) -> str:
+    """actsnmp.build_problem of a command line"""
+    return actsnmp.build_problem(cliopts.parse(["actsnmp"] + args))
+
+def _test_build_problem() -> None:
+    """build_problem checks the varbind names before their values, the trap OID and enterprise first"""
+    testing.assertEqual(bp(["get", "-c", "x", "h", "1.3", "2.999"]), "")
+    name = "Error building ASN.1 representation (Can't build OID for variable)\n"
+    value = "Error building ASN.1 representation (build objid: bad first subidentifier)\n"
+    testing.assertEqual(bp(["walk", "-c", "x", "h", "3.1"]), BUILD_FAILURE + "snmpwalk: " + name)
+    testing.assertEqual(bp(["set", "-c", "x", "h", "1.3", "o", "3.1", "4.1", "i", "1"]), BUILD_FAILURE + "snmpset: " + value)
+    testing.assertEqual(bp(["set", "-c", "x", "h", "4.1", "o", "3.1"]), BUILD_FAILURE + "snmpset: " + name)
+    testing.assertEqual(bp(["trap", "-v1", "-c", "x", "h", "3.1", "", "6", "1", "1", "4.1", "i", "1"]),
+                        BUILD_FAILURE + "snmptrap: " + value)
+    testing.assertEqual(bp(["trap", "-Ci", "-c", "x", "h", "1", "1.3", "4.1", "i", "1"]),
+                        BUILD_FAILURE + "snmpinform: " + name)
 
 
 # Notifications ######################################################################################

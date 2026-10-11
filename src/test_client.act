@@ -929,6 +929,51 @@ actor _test_bulk_too_big_halves(t: testing.AsyncT):
     c.get_bulk(done, _oids(1), 0, 9)
 
 
+actor _test_too_big_no_split(t: testing.AsyncT):
+    """Options.split_too_big=False: tooBig fails a 5-varbind GET and a GETBULK at once, nothing is split or halved
+
+    The CLI uses it, so its get and bulkget report tooBig as net-snmp's tools do.
+    """
+    mn = MemNet()
+    p = mem_pair(mn)
+    opts = SLOW.with_(split_too_big=False)
+    c = Client(None, AGENT, Community("public"), t.log_handler, opts=opts, transport=p.client)
+    var sizes: list[int] = []
+    var reps: list[int] = []
+    var statuses: list[(int, int)] = []
+
+    def on_request(data: bytes, address: str, port: int) -> None:
+        req = _cm(data)
+        q = _pdu(req)
+        sizes.append(len(q.varbinds))
+        if q.pdu_type == pdu.GETBULK:
+            reps.append(q.max_repetitions())
+        p.server.send_to(_reply(req, [], pdu.TOO_BIG, 0), address, port)
+
+    def status_of(e: ?errors.SnmpError) -> (int, int):
+        if isinstance(e, errors.ErrorStatusError):
+            return (e.status, e.index)
+        return (-1, -1)
+
+    def check() -> None:
+        testing.assertEqual(statuses, [(pdu.TOO_BIG, 0), (pdu.TOO_BIG, 0)])
+        testing.assertEqual(sizes, [5, 1])
+        testing.assertEqual(reps, [9])
+        testing.assertTrue(Options().split_too_big)
+        testing.assertFalse(opts.with_(retries=2).split_too_big)
+
+    def bulk_done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        statuses.append(status_of(e))
+        _finish(t, check)
+
+    def get_done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        statuses.append(status_of(e))
+        c.get_bulk(bulk_done, _oids(1), 0, 9)
+
+    p.server.set_receiver(on_request)
+    c.get(get_done, _oids(5))
+
+
 # SNMPv1 normalisation ##############################################################################
 
 actor _test_v1_bulk_as_getnext(t: testing.AsyncT):
@@ -2847,7 +2892,7 @@ def _test_rv_options_repr_complete() -> None:
     for name in ["timeout", "retries", "backoff", "max_timeout", "max_in_flight", "max_oids_per_request",
                  "max_repetitions", "use_bulk", "adaptive_bulk", "check_increasing", "get_root_if_empty",
                  "max_walk_varbinds", "v1_fix_errors", "strict_response_oids", "check_community", "request_id_bits",
-                 "max_queued"]:
+                 "max_queued", "split_too_big"]:
         testing.assertTrue(name + "=" in r, name + " missing in " + r)
 
 actor _test_rv_max_queued(t: testing.AsyncT):

@@ -69,7 +69,9 @@ wait_snmp() {  # name port
 wait_trapd() {
     local i
     for i in $(seq 1 60); do
-        if docker logs "$C_SNMPTRAPD" 2>&1 | grep -q "NET-SNMP version"; then
+        # grep reads the whole log: "grep -q" would exit at the first match and docker logs would
+        # get SIGPIPE, which pipefail turns into a failure once the log is large
+        if docker logs "$C_SNMPTRAPD" 2>&1 | grep "NET-SNMP version" >/dev/null; then
             log "$C_SNMPTRAPD ready on udp/127.0.0.1:$SNMPTRAPD_PORT"
             return 0
         fi

@@ -136,13 +136,21 @@ agents, managers and trap receivers. It serves a shared deterministic
 dataset and has SNMPv3 users for every supported protocol combination.
 
 ```bash
-interop/up.sh
+interop/run-interop.sh
 ```
 
-`interop/up.sh` builds the lab image when needed and starts the agents and
-the trap receiver on loopback ports. With the lab up, these scripts test
-actsnmp against it:
+`interop/run-interop.sh` builds the lab, runs the library and the command-line
+tool against the reference implementations in both directions, compares
+output with net-snmp's, and writes a summary to
+`interop/results/LATEST.md`.
 
+Each check can also be run on its own while the lab is up (`interop/up.sh`
+starts it, `interop/down.sh` stops it):
+
+- `src/test_interop.act`, the tests tagged `interop`, runs the library
+  against snmpd, snmpsim and snmptrapd;
+- `interop/clicheck.sh` runs `actsnmp` and net-snmp's tools side by side
+  and compares their output;
 - `interop/agentcheck.sh` runs net-snmp's and pysnmp's managers against
   `actsnmp agent`;
 - `interop/notifycheck.sh` sends traps and informs from net-snmp and pysnmp
@@ -150,8 +158,7 @@ actsnmp against it:
 - `interop/trapdcheck.sh` checks what net-snmp's snmptrapd received from
   actsnmp as the sender.
 
-`interop/down.sh` stops the lab. See `interop/README.md` for ports, users
-and options.
+See `interop/README.md` for ports, users and options.
 
 `interop/mibs/` holds a MIB corpus and oracle setup for testing the MIB
 compiler against pysmi, net-snmp and libsmi; see `interop/mibs/README.md`.

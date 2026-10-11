@@ -60,7 +60,9 @@ class OutputOptions(object):
     second flag that -OQ sets: it keeps ` = ` while quick is on.
     bare_value (-Ov): the value without the OID. string_format: one of
     STRING_GUESS, STRING_HEX (-Ox) and STRING_ASCII (-Oa). hex_text (-OT):
-    each hex line followed by its printable characters. numeric_timeticks
+    each hex line followed by its text, the printable and white-space octets
+    as they are (net-snmp's isprint() or isspace(), so a tab or a line break
+    is copied too) and the others as ".". numeric_timeticks
     (-Ot): Timeticks as a bare number of hundredths. hex_line_length
     (--hexOutputLength): octets per hex line; 0 or less means no line
     breaks.
@@ -93,8 +95,9 @@ class OutputOptions(object):
         The letters act as in net-snmp: q, Q, v, T and t toggle (so -Oqq is
         the same as no -Oq; Q toggles both quick_equals and quick), x and a
         set string_format. n (numeric OIDs, always the case here), e (numeric
-        enums), U (no units), b, E and X (index formatting) are accepted and
-        change nothing, since without MIBs they have no effect. Raises
+        enums), U (no units), b, E and X (index formatting) and 0 (leading
+        zeros in display hints) are accepted and change nothing, since
+        without MIBs they have no effect. Raises
         ValueError for any other letter, including the f, s, S and u OID
         styles, which this module does not produce.
         """
@@ -116,7 +119,7 @@ class OutputOptions(object):
                 o.hex_text = not o.hex_text
             elif c == "t":
                 o.numeric_timeticks = not o.numeric_timeticks
-            elif c not in "neUbEX":
+            elif c not in "neUbEX0":
                 raise ValueError("unsupported output option -O" + c)
         return o
 
@@ -201,7 +204,8 @@ def _all_netsnmp_text(b: bytes) -> bool:
 def _hex_line(b: bytes, start: int, stop: int, text: bool) -> str:
     line = "".join([_HEX[b[i]] + " " for i in range(start, stop)])
     if text:
-        line += "  [" + "".join([chr(b[i]) if _is_printable(b[i]) else "." for i in range(start, stop)]) + "]"
+        # net-snmp copies isprint() and isspace() octets (also tab and line breaks) and shows the rest as "."
+        line += "  [" + "".join([chr(b[i]) if _is_netsnmp_text(b[i]) else "." for i in range(start, stop)]) + "]"
     return line
 
 def _hex_lines(b: bytes, opts: OutputOptions) -> str:

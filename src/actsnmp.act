@@ -1,51 +1,31 @@
-"""actsnmp: the net-snmp-compatible SNMP command line tool
+"""actsnmp: a command line SNMP tool compatible with net-snmp's
 
     actsnmp get|getnext|bulkget|walk|bulkwalk|set|table [OPTIONS] AGENT ...
     actsnmp trap|inform [OPTIONS] AGENT ...
     actsnmp agent|trapd [OPTIONS]
+    actsnmp translate|mib2yang|mibmeta|miblint [OPTIONS] ...
 
-The client commands behave like net-snmp's snmpget, snmpgetnext,
-snmpbulkget, snmpwalk, snmpbulkwalk, snmpset, snmptrap and snmpinform run
-with `-m '' -On` (no MIBs, numeric OIDs): the same options (cliopts), the
-same stdout and stderr text and the same exit codes:
+The client commands mimic snmpget, snmpgetnext, snmpbulkget, snmpwalk,
+snmpbulkwalk, snmpset, snmptrap and snmpinform: same options (see
+cliopts), same stdout and stderr text, same exit codes. Without MIBs the
+output is that of net-snmp run with `-m '' -On`. The exit code is 0 on
+success (exception values and "End of MIB" included), 1 for a timeout, a
+non-increasing OID or a local error, and 2 when the agent answers with an
+error-status. interop/clicheck.sh runs the same command lines through
+both tools and compares the output.
 
-  * 0: success, including exception values in the output and snmpwalk's
-    "End of MIB";
-  * 1: a timeout ("Timeout: No Response from AGENT." for get and getnext,
-    without the period for the others), "Error: OID not increasing", a
-    local error (bad arguments, a transport or SNMPv3 failure, printed as
-    "<net-snmp tool>: <reason>");
-  * 2: an error-status in a response, printed on stderr as "Error in
-    packet" (get) or "Error in packet." (the others), "Reason: <net-snmp's
-    text>" and "Failed object: <OID>" plus an empty line when the
-    error-index names a varbind.
+Like net-snmp, get and getnext drop the failed varbind and retry after an
+error-status unless -Cf is given. walk and bulkwalk write their output per
+response, so large walks are not buffered. With -Cc, where net-snmp would
+loop forever, a repeated OID ends the walk with an error. table fetches
+the columns with Client.get_table and prints the rows in index order.
 
-get and getnext drop the failed varbind and ask again after an
-error-status, as net-snmp does (-Cf turns that off). walk follows snmpwalk
-(GETNEXT; prints the exception value that ends the walk; "End of MIB" for
-SNMPv1's noSuchName; a GET of the root when the subtree printed nothing,
-unless -CI; -Ci, -Cp, -Ct, -CE, -Cc) and bulkwalk snmpbulkwalk (GETBULK
--Cn/-Cr, default 0/10; the subtree is a prefix test; the increasing check
-compares with the last OID of the previous response, so a looping agent
-gives one error line per varbind, as net-snmp prints them). Walk output is
-written per response, so huge walks are not buffered. With -Cc, where
-net-snmp would loop forever, a repeated OID ends the walk with an error.
-table fetches its column OIDs with Client.get_table (lock-step GETBULK,
-GETNEXT on SNMPv1; -Cr max-repetitions, -Cc no increasing check) and
-prints the rows in index order, each row's varbinds in column order.
+agent serves an snmprec file (the lab dataset by default) until SIGTERM or
+SIGINT. trapd prints each notification it receives, canonically with
+--canon or otherwise in net-snmp style. The MIB commands are in mibcli.
 
-Output is fmt.netsnmp_varbind with the -O options and --hexOutputLength,
-or fmt.canon_varbind with --canon.
-
-agent serves an snmprec file (the lab dataset by default) with the
-lab's write rules and users until SIGTERM or SIGINT; trapd prints every
-notification it receives as a block: fmt.canon_notification with
---canon (the format of interop/expected/notify/), otherwise the same
-header with the source address and the varbinds in net-snmp style.
-
-The command logic is in actors that take the parsed options, a Client and
-output callbacks (Command, TrapPrinter, AgentServer, TrapdServer), so the
-tests (test_cli) run it in-process over transport.MemNet.
+The commands are actors that take the parsed options, a Client and output
+callbacks, so test_cli can run them in-process over transport.MemNet.
 """
 
 import file
@@ -59,6 +39,7 @@ import message
 import mibview
 import pdu
 import security
+import usm
 from agent import Agent, AgentConfig
 from client import Client, EngineInfo, Options, Response, Table, error_response
 from cliopts import CliError, CliOptions
@@ -68,12 +49,15 @@ from oid import Oid
 from receiver import NotificationReceiver, ReceiverConfig
 from security import Community, Security, Usm
 from transport import ServerTransport, Transport, udp_server_transport
-from values import VarBind, is_exception
+from values import ObjectIdentifier, VarBind, is_exception
 
 VERSION = "0.1.0-dev"
 
 # Seconds a trap command waits after handing its datagram to the transport before it exits
 TRAP_LINGER = 0.3
+
+# How the Client's TimeoutError.hint starts when the SNMPv3 engine discovery timed out
+DISCOVERY_HINT = "SNMPv3 engine discovery"
 
 # net-snmp's texts for the SNMPv3 Reports that end a request (snmp_api_errstring)
 _REPORT_TEXTS: dict[str, str] = {
@@ -110,15 +94,14 @@ def lines_text(o: CliOptions, vbs: list[VarBind]) -> str:
     return "".join([varbind_text(o, vb) + "\n" for vb in vbs])
 
 def request_options(o: CliOptions) -> Options:
-    """Client Options for net-snmp behaviour: -t/-r, a fixed timeout per attempt, nothing split or fixed by the Client
+    """Client Options that behave like net-snmp: -t/-r, a fixed timeout per attempt, nothing split or fixed
 
-    max_oids_per_request 0 sends every OID in one PDU, as net-snmp does, and
-    v1_fix_errors False leaves SNMPv1's noSuchName to the command (net-snmp's
-    PDU fixing in get/getnext, "End of MIB" in walks).
+    Every OID goes in one PDU, tooBig is reported like any other
+    error-status, and SNMPv1's noSuchName is left to the command.
     """
     return Options(timeout=o.timeout, retries=o.retries, backoff=1.0,
                    max_timeout=o.timeout, max_oids_per_request=0,
-                   max_repetitions=o.max_repetitions, v1_fix_errors=False)
+                   max_repetitions=o.max_repetitions, v1_fix_errors=False, split_too_big=False)
 
 def security_of(o: CliOptions) -> Security:
     """The Community or Usm of the command line
@@ -127,6 +110,10 @@ def security_of(o: CliOptions) -> Security:
     ValueError for credentials the library rejects.
     """
     if o.version == message.SNMP_V3:
+        if o.session_error != "":
+            # only the engine discovery runs (Command): a noAuthNoPriv user that needs no pass phrase
+            return Usm.from_passwords(o.user if o.user != "" else "-", usm.AUTH_NONE, "", usm.PRIV_NONE, "",
+                                      o.context, o.context_engine_id)
         return Usm.from_passwords(o.user, o.auth_protocol, o.auth_password, o.priv_protocol, o.priv_password,
                                   o.context, o.context_engine_id)
     community = o.community
@@ -159,16 +146,51 @@ def failure_text(o: CliOptions, e: errors.SnmpError, period: bool) -> str:
     """The stderr text of a request that failed without an error-status (with the final newline)
 
     A timeout is net-snmp's "Timeout: No Response from <agent>." (period:
-    snmpget and snmpgetnext), anything else "<tool>: <reason>", with
-    net-snmp's texts for SNMPv3 Reports.
+    snmpget and snmpgetnext), but "<tool>: Timeout" when the SNMPv3 engine
+    discovery timed out (net-snmp discovers when it opens the session); an
+    agent whose name does not resolve is "<tool>: Unknown host (<agent>)";
+    anything else "<tool>: <reason>", with net-snmp's texts for SNMPv3
+    Reports.
     """
     if isinstance(e, errors.TimeoutError):
+        hint = e.hint
+        if hint is not None and hint.startswith(DISCOVERY_HINT):
+            return tool_name(o) + ": Timeout\n"
         return "Timeout: No Response from " + o.peer + ("." if period else "") + "\n"
+    if isinstance(e, errors.TransportError) and "DNS lookup" in e.error_message:
+        return tool_name(o) + ": Unknown host (" + o.peer + ")\n"
     if isinstance(e, errors.ReportError):
         t = _REPORT_TEXTS.get(e.name)
         if t is not None:
             return tool_name(o) + ": " + t + "\n"
     return tool_name(o) + ": " + e.error_message + "\n"
+
+def build_problem(o: CliOptions) -> str:
+    """net-snmp's error for an OID it cannot encode, a first sub-identifier above 2 ("" if none)
+
+    The text (with the final newline) is what snmp_build and the tool print:
+    "Can't build OID for variable" for a varbind name, "build objid: bad
+    first subidentifier" for an OID value (also the trap OID and the SNMPv1
+    enterprise). actsnmp's encoder refuses such OIDs as well; this gives the
+    refusal net-snmp's words, before anything is sent.
+    """
+    head = "snmp_build: unknown failure\n" + tool_name(o) + ": Error building ASN.1 representation ("
+    bad_name = head + "Can't build OID for variable)\n"
+    bad_value = head + "build objid: bad first subidentifier)\n"
+    if o.command == "trap" or o.command == "inform":
+        first = o.enterprise if o.version == message.SNMP_V1 else o.trap_oid
+        if len(first.arcs) > 0 and first.arcs[0] > 2:
+            return bad_value
+    for n in o.oids:
+        if len(n.arcs) > 0 and n.arcs[0] > 2:
+            return bad_name
+    for vb in o.varbinds:
+        v = vb.value
+        if len(vb.oid.arcs) > 0 and vb.oid.arcs[0] > 2:
+            return bad_name
+        if isinstance(v, ObjectIdentifier) and len(v.value.arcs) > 0 and v.value.arcs[0] > 2:
+            return bad_value
+    return ""
 
 def oid_not_increasing(previous: Oid, received: Oid) -> str:
     """net-snmp's walk error for a received OID that is not greater than the previous one"""
@@ -243,8 +265,11 @@ def table_text(o: CliOptions, t: Table) -> str:
     return "".join(out)
 
 def table_options(o: CliOptions) -> Options:
-    """request_options for Client.get_table: -Cr is its max-repetitions, -Cc turns the increasing check off"""
-    return request_options(o).with_(check_increasing=not o.dont_check)
+    """request_options for Client.get_table: -Cr is its max-repetitions, -Cc turns the increasing check off
+
+    table has no net-snmp counterpart to imitate, so a tooBig answer halves the GETBULK as in any table walk.
+    """
+    return request_options(o).with_(check_increasing=not o.dont_check, split_too_big=True)
 
 
 # The client commands ################################################################################
@@ -290,13 +315,15 @@ actor Command(o: CliOptions, c: Client, out: action(str) -> None, err: action(st
         if e is not None:
             if isinstance(e, errors.ErrorStatusError):
                 err(error_status_text(o.command != "get", e))
-                _exit = 2
+                # snmpgetnext sets its exit code 2 only for an error that names a varbind
+                if o.command == "get" or e.index != 0:
+                    _exit = 2
                 # net-snmp's snmp_fix_pdu: drop the failed varbind and ask again for the rest
                 if not o.dont_fix and e.index >= 1 and e.index <= len(_oids) and len(_oids) > 1:
                     _oids = _oids[:e.index - 1] + _oids[e.index:]
                     _send_get()
                 else:
-                    _finish(2)
+                    _finish(_exit)
             else:
                 _fail(e, True)
             return
@@ -309,6 +336,11 @@ actor Command(o: CliOptions, c: Client, out: action(str) -> None, err: action(st
     def _on_simple(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         if e is not None:
             if isinstance(e, errors.ErrorStatusError):
+                if o.command == "bulkget" and e.status == pdu.NO_SUCH_NAME:
+                    # snmpbulkget takes noSuchName for the end of the MIB
+                    out("End of MIB.\n")
+                    _finish(0)
+                    return
                 err(error_status_text(True, e))
                 _finish(2)
             else:
@@ -328,9 +360,10 @@ actor Command(o: CliOptions, c: Client, out: action(str) -> None, err: action(st
         _finish(_exit)
 
     def _on_fallback(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-        # snmp_get_and_print: prints the varbinds of a successful answer and ignores everything else
+        # snmp_get_and_print: prints (and counts) the varbinds of a successful answer, ignores everything else
         if e is None and r is not None:
             out(lines_text(o, r.varbinds))
+            _count += len(r.varbinds)
         _walk_report()
 
     proc def _walk_done(success: bool) -> None:
@@ -420,8 +453,10 @@ actor Command(o: CliOptions, c: Client, out: action(str) -> None, err: action(st
                 _walk_done(True)
 
     def _on_include(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        # -Ci: snmp_get_and_print of the root; what it prints counts, so the GET of an empty subtree is skipped
         if e is None and r is not None:
             out(lines_text(o, r.varbinds))
+            _count += len(r.varbinds)
         _walk_next()
 
     # table -------------------------------------------------------------------------------------------
@@ -465,7 +500,32 @@ actor Command(o: CliOptions, c: Client, out: action(str) -> None, err: action(st
 
     # dispatch ----------------------------------------------------------------------------------------
 
+    def _on_session_discovery(cl: Client, info: ?EngineInfo, e: ?errors.SnmpError) -> None:
+        # net-snmp reports o.session_error when it opens the session, after a successful discovery
+        if e is not None:
+            _fail(e, False)
+        else:
+            err(o.session_error + "\n")
+            _finish(1)
+
     proc def _run() -> None:
+        for w in o.warnings:
+            err(w + "\n")
+        if o.session_error != "":
+            if o.engine_id is None:
+                c.discover(_on_session_discovery)
+            else:
+                err(o.session_error + "\n")
+                _finish(1)
+            return
+        problem = build_problem(o)
+        if problem != "":
+            err(problem)
+            _finish(1)
+            return
+        _dispatch()
+
+    proc def _dispatch() -> None:
         cmd = o.command
         v1 = o.version == message.SNMP_V1
         if cmd == "get" or cmd == "getnext":
