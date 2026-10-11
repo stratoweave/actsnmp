@@ -1,0 +1,266 @@
+"""Compile RFC 6643 YANG modules with acton-yang and check them against mibmeta.
+
+    yangcheck [--keep-going] FILE... [--meta FILE.mibmeta.json...]
+
+Every `.yang` file is compiled in one `yang.compile` call (the closure must be complete:
+ietf-yang-smiv2, ietf-yang-types and ietf-inet-types included). Every `.mibmeta.json` file
+(actsnmp-mibmeta/1, `mib.meta.to_json`) is checked against the compiled schema:
+
+1. every data node (not inside a notification) with `smiv2:oid` has a mibmeta node at its
+   schema path (`/<prefix>:<name>/...`, each segment with its module's prefix), with that OID
+   (a `nodes` entry, or a `containers` entry for a container standing for a foreign node);
+2. every notification with `smiv2:oid` likewise;
+3. every mibmeta node with a `yang` path resolves to a schema node;
+4. every list's keys equal the `key` names of its row's mibmeta index (in order).
+
+Prints a summary and every problem; exits with 1 on a compile error or a problem.
+"""
+
+import file
+import json
+import yang
+import yang.parser
+import yang.schema as ys
+
+
+def oid_ext(n: ys.DNode) -> ?str:
+    for e in n.exts:
+        if e.name == "oid" and e.module == "ietf-yang-smiv2":
+            return e.arg
+    return None
+
+
+class Walk(object):
+    paths: dict[str, ?str]        # schema path -> smiv2:oid (None when none)
+    in_notif: set[str]
+    notifs: set[str]
+    lists: dict[str, list[str]]
+    containers: int
+    leafs: int
+
+    def __init__(self):
+        self.paths = {}
+        self.in_notif = set()
+        self.notifs = set()
+        self.lists = {}
+        self.containers = 0
+        self.leafs = 0
+
+
+def walk(w: Walk, n: ys.DNode, path: str, notif: bool) -> None:
+    p = path + "/" + n.prefix + ":" + n.name
+    w.paths[p] = oid_ext(n)
+    if notif:
+        w.in_notif.add(p)
+    sub_notif = notif
+    if isinstance(n, ys.DNotification):
+        w.notifs.add(p)
+        sub_notif = True
+    if isinstance(n, ys.DList):
+        w.lists[p] = n.key
+    if isinstance(n, ys.DContainer):
+        w.containers += 1
+    if isinstance(n, ys.DLeaf):
+        w.leafs += 1
+    if isinstance(n, ys.DNodeInner):
+        for c in n.children:
+            walk(w, c, p, sub_notif)
+
+
+def jstr(d: dict[str, ?value], k: str) -> str:
+    if k in d:
+        v = d[k]
+        if isinstance(v, str):
+            return v
+    return ""
+
+
+def jlist(d: dict[str, ?value], k: str) -> list[?value]:
+    if k in d:
+        v = d[k]
+        if isinstance(v, list):
+            lst: list[?value] = v
+            return lst
+    return []
+
+
+def check(w: Walk, metas: list[dict[str, ?value]]) -> list[str]:
+    probs: list[str] = []
+    by_path: dict[str, (str, str, list[str])] = {}   # path -> (qname, oid, keys)
+    for m in metas:
+        mod = jstr(m, "module")
+        for nv in jlist(m, "nodes") + jlist(m, "containers"):
+            if isinstance(nv, dict):
+                nd: dict[str, ?value] = nv
+                yp = jstr(nd, "yang")
+                if yp == "":
+                    continue
+                keys: list[str] = []
+                for pv in jlist(nd, "index"):
+                    if isinstance(pv, dict):
+                        pd: dict[str, ?value] = pv
+                        keys.append(jstr(pd, "key"))
+                q = mod + "::" + jstr(nd, "name")
+                if yp in by_path:
+                    probs.append("mibmeta: " + q + " and " + by_path[yp].0 + " share the path " + yp)
+                    continue
+                by_path[yp] = (q, jstr(nd, "oid"), keys)
+                if yp not in w.paths:
+                    probs.append("mibmeta: the path " + yp + " of " + q + " is not in the schema")
+    for p, o in w.paths.items():
+        if o is not None:
+            if p in w.in_notif:
+                continue
+            e = by_path.get(p)
+            if e is not None:
+                if e.1 != o:
+                    probs.append("schema: " + p + " has smiv2:oid " + o + ", mibmeta " + e.0 + " has " + e.1)
+            else:
+                probs.append("schema: " + p + " (smiv2:oid " + o + ") has no mibmeta node")
+    for p, k in w.lists.items():
+        f = by_path.get(p)
+        if f is not None:
+            if f.2 != k:
+                probs.append("schema: list " + p + " has keys " + " ".join(k) + ", mibmeta " + f.0 + " has " + " ".join(f.2))
+    return probs
+
+
+def module_name(text: str) -> str:
+    """The name of the module (or submodule) a YANG text defines ("" when not found)."""
+    for ln in text.split("\n"):
+        t = ln.strip()
+        if t.startswith("module ") or t.startswith("submodule "):
+            w = t.split(" ")
+            if len(w) >= 2:
+                return w[1].strip().rstrip("{{").strip()
+    return ""
+
+
+def imports_of(text: str) -> list[str]:
+    out: list[str] = []
+    for ln in text.split("\n"):
+        t = ln.strip()
+        if t.startswith("import "):
+            w = t.split(" ")
+            if len(w) >= 2:
+                out.append(w[1].strip().rstrip("{{").strip())
+    return out
+
+
+def culprit(msg: str, names: list[str], srcs: dict[str, str]) -> str:
+    """The module a compile error is about: the name acton-yang puts before " - ", else the
+    first module that does not parse on its own ("" when none is found)."""
+    k = msg.find(" - ")
+    if k > 0:
+        nm = msg[:k].strip()
+        if nm in srcs:
+            return nm
+    # a schema path in the message: its top container is named after the module
+    cur: list[str] = []
+    for ch in msg + " ":
+        if ch.isalnum() or ch == "-" or ch == "_" or ch == ".":
+            cur.append(ch)
+        else:
+            if len(cur) > 0:
+                tok = "".join(cur)
+                if tok in srcs and not tok.startswith("ietf-"):
+                    return tok
+                cur = []
+    for nm in names:
+        try:
+            yang.parser.parse(srcs[nm])
+        except Exception:
+            return nm
+    return ""
+
+
+actor main(env):
+    """`yangcheck [--keep-going] FILE... [--meta FILE.mibmeta.json...]`; an argument `@LIST`
+    reads file names from LIST (one per line). With `--keep-going` a module that fails to
+    compile is reported (`FAILED <module>: <error>`), dropped together with the modules that
+    import it (`BLOCKED <module>: imports <module>`), and the rest is compiled again."""
+    fc = file.FileCap(env.cap)
+    rfc = file.ReadFileCap(fc)
+    paths: list[str] = []
+    keep_going = False
+    for a in env.argv[1:]:
+        if a == "--meta":
+            continue
+        if a == "--keep-going":
+            keep_going = True
+            continue
+        if a.startswith("@"):
+            lf = file.ReadFile(rfc, a[1:])
+            for ln in lf.read().decode().split("\n"):
+                if ln.strip() != "":
+                    paths.append(ln.strip())
+            lf.close()
+        else:
+            paths.append(a)
+    srcs: dict[str, str] = {}
+    names: list[str] = []
+    metas: list[dict[str, ?value]] = []
+    for path in paths:
+        rf = file.ReadFile(rfc, path)
+        text = rf.read().decode()
+        rf.close()
+        if path.endswith(".json"):
+            metas.append(json.decode(text))
+        else:
+            nm = module_name(text)
+            if nm == "":
+                nm = path
+            if nm not in srcs:
+                names.append(nm)
+            srcs[nm] = text
+    failed: list[str] = []
+    gone: set[str] = set()
+    while True:
+        live = [nm for nm in names if nm not in gone]
+        try:
+            root = yang.compile([srcs[nm] for nm in live])
+            w = Walk()
+            for c in root.children:
+                walk(w, c, "", False)
+            noid = len([p for p, o in w.paths.items() if o is not None and p not in w.in_notif])
+            print("compiled " + str(len(live)) + " modules: " + str(len(w.paths)) + " schema nodes, " + str(w.containers) +
+                  " containers, " + str(len(w.lists)) + " lists, " + str(w.leafs) + " leafs, " + str(len(w.notifs)) +
+                  " notifications, " + str(noid) + " nodes with smiv2:oid outside notifications, " + str(len(root.identities)) + " identities" +
+                  (", " + str(len(gone)) + " modules dropped" if len(gone) > 0 else ""))
+            for f in failed:
+                print(f)
+            rc = 1 if len(failed) > 0 else 0
+            if len(metas) > 0:
+                ms = [m for m in metas if jstr(m, "module") not in gone]
+                probs = check(w, ms)
+                print("mibmeta: " + str(len(ms)) + " modules checked, " + str(len(probs)) + " problems")
+                for p in probs:
+                    print("PROBLEM " + p)
+                if len(probs) > 0:
+                    rc = 1
+            env.exit(rc)
+            break
+        except Exception as e:
+            msg = str(e)
+            if not keep_going:
+                print("COMPILE ERROR: " + msg)
+                env.exit(1)
+                break
+            bad = culprit(msg, live, srcs)
+            if bad == "":
+                print("COMPILE ERROR (no culprit found): " + msg)
+                env.exit(1)
+                break
+            failed.append("FAILED " + bad + ": " + msg.replace("\n", " ")[:400])
+            gone.add(bad)
+            changed = True
+            while changed:
+                changed = False
+                for nm in live:
+                    if nm not in gone:
+                        for im in imports_of(srcs[nm]):
+                            if im in gone:
+                                gone.add(nm)
+                                failed.append("BLOCKED " + nm + ": imports " + im)
+                                changed = True
+                                break

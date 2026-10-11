@@ -1,0 +1,1337 @@
+"""Tests of `mib.yang`, the RFC 6643 emitter, and of mibmeta's YANG paths.
+
+The golden tests emit the reference MIBs and the golden modules; checking their output with
+libsmi, pyang and acton-yang is `interop/mibs/compare/yang_check.sh`."""
+
+import file
+import testing
+import mib.diag
+import mib.meta
+import mib.model
+import mib.resolver
+import mib.source
+import mib.yang
+
+T_MIB = r"""T-MIB DEFINITIONS ::= BEGIN
+IMPORTS
+    MODULE-IDENTITY, OBJECT-TYPE, OBJECT-IDENTITY, NOTIFICATION-TYPE, Integer32, Unsigned32,
+    Gauge32, Counter32, Counter64, TimeTicks, IpAddress, Opaque, enterprises
+        FROM SNMPv2-SMI
+    TEXTUAL-CONVENTION, DisplayString, PhysAddress, MacAddress, TruthValue, TimeStamp, RowStatus,
+    AutonomousType
+        FROM SNMPv2-TC
+    OBJECT-GROUP, MODULE-COMPLIANCE
+        FROM SNMPv2-CONF;
+tMIB MODULE-IDENTITY
+    LAST-UPDATED "201001010000Z"
+    ORGANIZATION "Org"
+    CONTACT-INFO "  Name
+                    Street 1
+                      indented"
+    DESCRIPTION  "Module text with a \ backslash."
+    REVISION     "200901010000Z"
+    DESCRIPTION  "first"
+    REVISION     "200901010000Z"
+    DESCRIPTION  "dup"
+    REVISION     "9901010000Z"
+    DESCRIPTION  "old"
+    ::= { enterprises 99998 }
+
+Pct ::= TEXTUAL-CONVENTION DISPLAY-HINT "d-2" STATUS current DESCRIPTION "p" REFERENCE "r"
+    SYNTAX Integer32 (0..10000)
+Name ::= TEXTUAL-CONVENTION DISPLAY-HINT "64a" STATUS deprecated DESCRIPTION "n"
+    SYNTAX OCTET STRING (SIZE (4..32))
+Hex ::= TEXTUAL-CONVENTION DISPLAY-HINT "1x:" STATUS current DESCRIPTION "h"
+    SYNTAX OCTET STRING (SIZE (0..16))
+Raw ::= TEXTUAL-CONVENTION STATUS current DESCRIPTION "raw" SYNTAX OCTET STRING (SIZE (0..8))
+Color ::= TEXTUAL-CONVENTION STATUS current DESCRIPTION "c"
+    SYNTAX INTEGER { red(1), green(2), blue(3), crimson(1) }
+Big ::= TEXTUAL-CONVENTION STATUS current DESCRIPTION "b" SYNTAX INTEGER { small(1), huge(4294967296) }
+SubPct ::= TEXTUAL-CONVENTION STATUS current DESCRIPTION "sub" SYNTAX Pct (0..100)
+
+tObjects OBJECT IDENTIFIER ::= { tMIB 1 }
+tScalars OBJECT IDENTIFIER ::= { tObjects 1 }
+tInt OBJECT-TYPE SYNTAX Integer32 (10 | -5..5) MAX-ACCESS read-write STATUS current DESCRIPTION "i"
+    DEFVAL { 3 } ::= { tScalars 1 }
+tWide OBJECT-TYPE SYNTAX INTEGER (0..4294967295) MAX-ACCESS read-only STATUS current DESCRIPTION "w" ::= { tScalars 2 }
+tGauge OBJECT-TYPE SYNTAX Gauge32 (1..100) UNITS "seconds" MAX-ACCESS read-only STATUS current DESCRIPTION "g" ::= { tScalars 3 }
+tCount OBJECT-TYPE SYNTAX Counter32 (0..100) MAX-ACCESS read-only STATUS current DESCRIPTION "c" ::= { tScalars 4 }
+tTicks OBJECT-TYPE SYNTAX TimeTicks MAX-ACCESS read-only STATUS current DESCRIPTION "t" ::= { tScalars 5 }
+tC64 OBJECT-TYPE SYNTAX Counter64 MAX-ACCESS read-only STATUS current DESCRIPTION "c" ::= { tScalars 6 }
+tIp OBJECT-TYPE SYNTAX IpAddress MAX-ACCESS read-only STATUS current DESCRIPTION "a" ::= { tScalars 7 }
+tAuto OBJECT-TYPE SYNTAX AutonomousType MAX-ACCESS read-only STATUS current DESCRIPTION "o" ::= { tScalars 8 }
+tOpaque OBJECT-TYPE SYNTAX Opaque MAX-ACCESS read-only STATUS current DESCRIPTION "o" ::= { tScalars 9 }
+tStr OBJECT-TYPE SYNTAX OCTET STRING (SIZE (0..10)) MAX-ACCESS read-only STATUS current DESCRIPTION "s"
+    DEFVAL { 'ABCD'H } ::= { tScalars 10 }
+tDisp OBJECT-TYPE SYNTAX DisplayString (SIZE (0..32)) MAX-ACCESS read-write STATUS current DESCRIPTION "d"
+    DEFVAL { "hi" } ::= { tScalars 11 }
+tTruth OBJECT-TYPE SYNTAX TruthValue MAX-ACCESS read-write STATUS current DESCRIPTION "t" DEFVAL { true } ::= { tScalars 12 }
+tStamp OBJECT-TYPE SYNTAX TimeStamp MAX-ACCESS read-only STATUS current DESCRIPTION "t" ::= { tScalars 13 }
+tMac OBJECT-TYPE SYNTAX MacAddress MAX-ACCESS read-only STATUS current DESCRIPTION "m" ::= { tScalars 14 }
+tPhys OBJECT-TYPE SYNTAX PhysAddress MAX-ACCESS read-only STATUS current DESCRIPTION "p" ::= { tScalars 15 }
+tColor OBJECT-TYPE SYNTAX Color MAX-ACCESS read-write STATUS current DESCRIPTION "c" DEFVAL { green } ::= { tScalars 16 }
+tColorSub OBJECT-TYPE SYNTAX Color { red(1), blue(3) } MAX-ACCESS read-write STATUS current DESCRIPTION "c" ::= { tScalars 17 }
+tBits OBJECT-TYPE SYNTAX BITS { x(0), y(5) } MAX-ACCESS read-write STATUS current DESCRIPTION "b" DEFVAL { { x } } ::= { tScalars 18 }
+tNA OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS not-accessible STATUS current DESCRIPTION "na" ::= { tScalars 19 }
+tNotify OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS accessible-for-notify STATUS current DESCRIPTION "n" ::= { tScalars 20 }
+tDep OBJECT-TYPE SYNTAX Name MAX-ACCESS read-only STATUS deprecated DESCRIPTION "d" ::= { tScalars 21 }
+tSub OBJECT-TYPE SYNTAX SubPct MAX-ACCESS read-only STATUS current DESCRIPTION "s" ::= { tScalars 22 }
+tBig OBJECT-TYPE SYNTAX Big MAX-ACCESS read-only STATUS current DESCRIPTION "b" ::= { tScalars 23 }
+tHex OBJECT-TYPE SYNTAX Hex (SIZE (6)) MAX-ACCESS read-only STATUS current DESCRIPTION "h" ::= { tScalars 24 }
+tRaw OBJECT-TYPE SYNTAX Raw (SIZE (2..4)) MAX-ACCESS read-only STATUS current DESCRIPTION "r" ::= { tScalars 25 }
+3comThing OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current DESCRIPTION "digit" ::= { tScalars 26 }
+tLoose OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current DESCRIPTION "no parent name" ::= { tMIB 7 3 }
+
+tTable OBJECT-TYPE SYNTAX SEQUENCE OF TEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "t" ::= { tObjects 2 }
+tEntry OBJECT-TYPE SYNTAX TEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "e"
+    INDEX { tIdx, IMPLIED tName } ::= { tTable 1 }
+TEntry ::= SEQUENCE { tIdx Integer32, tName Name, tVal Unsigned32, tStatus RowStatus, tHidden Integer32 }
+tIdx OBJECT-TYPE SYNTAX Integer32 (1..100) MAX-ACCESS not-accessible STATUS current DESCRIPTION "i" ::= { tEntry 1 }
+tName OBJECT-TYPE SYNTAX Name (SIZE (1..8)) MAX-ACCESS not-accessible STATUS current DESCRIPTION "n" ::= { tEntry 2 }
+tVal OBJECT-TYPE SYNTAX Unsigned32 MAX-ACCESS read-create STATUS current DESCRIPTION "v" ::= { tEntry 3 }
+tStatus OBJECT-TYPE SYNTAX RowStatus MAX-ACCESS read-create STATUS current DESCRIPTION "s" ::= { tEntry 4 }
+tHidden OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS accessible-for-notify STATUS current DESCRIPTION "h" ::= { tEntry 5 }
+
+tDupTable OBJECT-TYPE SYNTAX SEQUENCE OF TDupEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "d" ::= { tObjects 3 }
+tDupEntry OBJECT-TYPE SYNTAX TDupEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "d"
+    INDEX { tIdx, tDupA, tDupA } ::= { tDupTable 1 }
+TDupEntry ::= SEQUENCE { tDupA Integer32, tDupVal Integer32 }
+tDupA OBJECT-TYPE SYNTAX Integer32 (0..9) MAX-ACCESS not-accessible STATUS current DESCRIPTION "a" ::= { tDupEntry 1 }
+tDupVal OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current DESCRIPTION "v" ::= { tDupEntry 2 }
+
+tSTable OBJECT-TYPE SYNTAX SEQUENCE OF TSEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "s" ::= { tObjects 4 }
+tSEntry OBJECT-TYPE SYNTAX TSEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "s" INDEX { tInt } ::= { tSTable 1 }
+TSEntry ::= SEQUENCE { tSVal Integer32 }
+tSVal OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current DESCRIPTION "v" ::= { tSEntry 1 }
+
+tKTable OBJECT-TYPE SYNTAX SEQUENCE OF TKEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "k" ::= { tObjects 5 }
+tKEntry OBJECT-TYPE SYNTAX TKEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "k" ::= { tKTable 1 }
+TKEntry ::= SEQUENCE { tKVal Integer32 }
+tKVal OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current DESCRIPTION "v" ::= { tKEntry 1 }
+
+tAugTable OBJECT-TYPE SYNTAX SEQUENCE OF TAugEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "aug table" ::= { tObjects 6 }
+tAugEntry OBJECT-TYPE SYNTAX TAugEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "aug row"
+    AUGMENTS { tEntry } ::= { tAugTable 1 }
+TAugEntry ::= SEQUENCE { tAugX Integer32 }
+tAugX OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current DESCRIPTION "x" ::= { tAugEntry 1 }
+
+tIdent OBJECT-IDENTITY STATUS current DESCRIPTION "an identity" ::= { tMIB 3 }
+
+tTrap NOTIFICATION-TYPE OBJECTS { tVal, tIdx, tNotify, tDupVal, tInt } STATUS current DESCRIPTION "trap" ::= { tMIB 0 1 }
+
+tConformance OBJECT IDENTIFIER ::= { tMIB 2 }
+tGroup OBJECT-GROUP OBJECTS { tInt } STATUS current DESCRIPTION "g" ::= { tConformance 1 }
+END
+"""
+
+# a module augmenting T-MIB's tEntry from outside; its Appendix B prefix collides with T-MIB's
+T_EXT = r"""T-MIB-EXT DEFINITIONS ::= BEGIN
+IMPORTS
+    MODULE-IDENTITY, OBJECT-TYPE, Integer32, enterprises FROM SNMPv2-SMI
+    tEntry, tIdx FROM T-MIB;
+tExt MODULE-IDENTITY LAST-UPDATED "201001010000Z" ORGANIZATION "o" CONTACT-INFO "c" DESCRIPTION "d"
+    ::= { enterprises 99995 }
+tXTable OBJECT-TYPE SYNTAX SEQUENCE OF TXEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "x" ::= { tExt 1 }
+tXEntry OBJECT-TYPE SYNTAX TXEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "x" AUGMENTS { tEntry } ::= { tXTable 1 }
+TXEntry ::= SEQUENCE { tXVal Integer32 }
+tXVal OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current DESCRIPTION "v" ::= { tXEntry 1 }
+tYTable OBJECT-TYPE SYNTAX SEQUENCE OF TYEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "y" ::= { tExt 2 }
+tYEntry OBJECT-TYPE SYNTAX TYEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "y" INDEX { tIdx, tYId } ::= { tYTable 1 }
+TYEntry ::= SEQUENCE { tYId Integer32 }
+tYId OBJECT-TYPE SYNTAX Integer32 (1..9) MAX-ACCESS read-only STATUS current DESCRIPTION "i" ::= { tYEntry 1 }
+END
+"""
+
+# SMIv1: informal DisplayString, INDEX { INTEGER }, TRAP-TYPE, a deprecated object
+V1_MIB = r"""V1-MIB DEFINITIONS ::= BEGIN
+IMPORTS enterprises, Counter FROM RFC1155-SMI
+        OBJECT-TYPE FROM RFC-1212
+        TRAP-TYPE FROM RFC-1215;
+DisplayString ::= OCTET STRING
+v1 OBJECT IDENTIFIER ::= { enterprises 99996 }
+v1Name OBJECT-TYPE SYNTAX DisplayString (SIZE (0..32)) ACCESS read-only STATUS mandatory DESCRIPTION "n" ::= { v1 1 }
+v1Count OBJECT-TYPE SYNTAX Counter ACCESS read-only STATUS deprecated DESCRIPTION "c" ::= { v1 2 }
+v1Table OBJECT-TYPE SYNTAX SEQUENCE OF V1Entry ACCESS not-accessible STATUS mandatory DESCRIPTION "t" ::= { v1 3 }
+v1Entry OBJECT-TYPE SYNTAX V1Entry ACCESS not-accessible STATUS mandatory DESCRIPTION "e" INDEX { INTEGER } ::= { v1Table 1 }
+V1Entry ::= SEQUENCE { v1Val INTEGER }
+v1Val OBJECT-TYPE SYNTAX INTEGER ACCESS read-write STATUS mandatory DESCRIPTION "v" ::= { v1Entry 1 }
+v1Trap TRAP-TYPE ENTERPRISE v1 VARIABLES { v1Name } DESCRIPTION "trap" ::= 3
+END
+"""
+
+# two descriptors for one scalar parent OID: the translation must fail
+A_MIB = r"""A-MIB DEFINITIONS ::= BEGIN
+IMPORTS enterprises FROM SNMPv2-SMI;
+aNode OBJECT IDENTIFIER ::= { enterprises 99994 }
+END
+"""
+B_MIB = r"""B-MIB DEFINITIONS ::= BEGIN
+IMPORTS OBJECT-TYPE, Integer32, enterprises FROM SNMPv2-SMI
+        aNode FROM A-MIB;
+bNode OBJECT IDENTIFIER ::= { enterprises 99994 }
+bScalar OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current DESCRIPTION "s" ::= { bNode 1 }
+END
+"""
+
+
+def tr(texts: list[str]) -> mib.yang.Translator:
+    return mib.yang.Translator(mib.resolver.resolve_texts(texts))
+
+
+def emit(texts: list[str], name: str) -> mib.yang.YangModule:
+    r = tr(texts).module(name)
+    if r is not None:
+        return r
+    raise ValueError(name + " not translated")
+
+
+def tmib() -> str:
+    return emit([T_MIB], "T-MIB").text
+
+
+def block(text: str, head: str) -> str:
+    """The statement whose first line is `head` (after indentation), through its closing brace,
+    re-indented to column 0 ("" when there is none)."""
+    lines = text.split("\n")
+    for i, ln in enumerate(lines):
+        if ln.strip() == head:
+            ind = len(ln) - len(ln.lstrip())
+            out = [ln[ind:]]
+            if not head.endswith("{{"):
+                return out[0]
+            for j in range(i + 1, len(lines)):
+                l2 = lines[j]
+                out.append(l2[ind:] if len(l2) >= ind else l2.strip())
+                if l2 == " " * ind + "}}":
+                    return "\n".join(out)
+            return "\n".join(out)
+    return ""
+
+
+def codes(r: mib.yang.YangModule) -> list[str]:
+    return sorted([d.code for d in r.diags if d.code.startswith("yang.")])
+
+
+# --- helpers -------------------------------------------------------------------------------------
+
+def _test_identifiers() -> None:
+    """Identifiers YANG cannot express: validity checks and rewriting."""
+    testing.assertTrue(mib.yang.valid_identifier("ifIndex"))
+    testing.assertTrue(mib.yang.valid_identifier("mib-2"))
+    testing.assertTrue(mib.yang.valid_identifier("a_b.c"))
+    testing.assertFalse(mib.yang.valid_identifier("3com"))
+    testing.assertFalse(mib.yang.valid_identifier("xmlThing"))
+    testing.assertFalse(mib.yang.valid_identifier("a/b"))
+    testing.assertEqual(mib.yang.rewrite_identifier("3com"), "_3com")
+    testing.assertEqual(mib.yang.rewrite_identifier("packet/attack"), "packet_attack")
+    testing.assertEqual(mib.yang.rewrite_identifier("XMLfoo"), "_XMLfoo")
+    testing.assertEqual(mib.yang.rewrite_identifier("ok-name"), "ok-name")
+    testing.assertEqual(mib.yang.typedef_identifier("string"), "_string")
+    n = mib.yang.Namer()
+    testing.assertEqual([n.take("a"), n.take("a"), n.take("a_2"), n.take("a")], ["a", "a_2", "a_2_2", "a_3"])
+
+
+def _test_prefixes() -> None:
+    """Appendix B prefixes: two leading tokens, unique; the fixed IETF prefixes; own module last."""
+    testing.assertEqual(mib.yang.module_prefix("IF-MIB"), "if-mib")
+    testing.assertEqual(mib.yang.module_prefix("SNMP-FRAMEWORK-MIB"), "snmp-framework")
+    testing.assertEqual(mib.yang.module_prefix("P-BRIDGE-MIB"), "p-bridge")
+    testing.assertEqual(mib.yang.module_prefix("IANAifType-MIB"), "ianaiftype-mib")
+    testing.assertEqual(mib.yang.module_prefix("RFC1213-MIB"), "rfc1213-mib")
+    testing.assertEqual(mib.yang.module_prefix("ietf-yang-types"), "yang")
+    pm = mib.yang.allocate_prefixes("NET-SNMP-TC", ["NET-SNMP-MIB", "ietf-yang-smiv2"])
+    testing.assertEqual(pm["NET-SNMP-MIB"], "net-snmp")
+    testing.assertEqual(pm["NET-SNMP-TC"], "net-snmp-tc")
+    testing.assertEqual(pm["ietf-yang-smiv2"], "smiv2")
+    # unique across a set: fewer tokens first, then byte order
+    sp = mib.yang.set_prefix_map(["CISCO-IF-EXTENSION-MIB", "CISCO-IF-MIB", "NET-SNMP-TC", "NET-SNMP-MIB", "IF-MIB"])
+    testing.assertEqual([sp["CISCO-IF-MIB"], sp["CISCO-IF-EXTENSION-MIB"], sp["NET-SNMP-MIB"], sp["NET-SNMP-TC"], sp["IF-MIB"]],
+                        ["cisco-if", "cisco-if-extension", "net-snmp", "net-snmp-tc", "if-mib"])
+
+
+def _test_set_prefixes() -> None:
+    """Two modules with the same Appendix B prefix in one set get different prefixes (option
+    set_prefixes, the default); per module they would both be `aa-bb`."""
+    a = r"""AA-BB-ONE-MIB DEFINITIONS ::= BEGIN
+IMPORTS enterprises FROM SNMPv2-SMI;
+one OBJECT IDENTIFIER ::= { enterprises 99980 }
+END
+"""
+    b = r"""AA-BB-TWO-MIB DEFINITIONS ::= BEGIN
+IMPORTS enterprises FROM SNMPv2-SMI;
+two OBJECT IDENTIFIER ::= { enterprises 99981 }
+END
+"""
+    t = tr([a, b])
+    testing.assertEqual([r.prefix for r in [t.module("AA-BB-ONE-MIB"), t.module("AA-BB-TWO-MIB")] if r is not None], ["aa-bb", "aa-bb-two"])
+    o = mib.yang.Options()
+    o.set_prefixes = False
+    t2 = mib.yang.Translator(mib.resolver.resolve_texts([a, b]), o)
+    testing.assertEqual([r.prefix for r in [t2.module("AA-BB-ONE-MIB"), t2.module("AA-BB-TWO-MIB")] if r is not None], ["aa-bb", "aa-bb"])
+
+
+def _test_oid_ok() -> None:
+    """smiv2:oid syntax: two arcs at least, first arc 0..2, second <= 39 below 0 and 1."""
+    testing.assertTrue(mib.yang.oid_ok([1, 3, 6, 1]))
+    testing.assertTrue(mib.yang.oid_ok([0, 0]))
+    testing.assertTrue(mib.yang.oid_ok([2, 999]))
+    testing.assertFalse(mib.yang.oid_ok([1]))
+    testing.assertFalse(mib.yang.oid_ok([3400]))
+    testing.assertFalse(mib.yang.oid_ok([1, 40]))
+    roots = r"""ROOTS-MIB DEFINITIONS ::= BEGIN
+IMPORTS enterprises FROM SNMPv2-SMI;
+ccitt OBJECT IDENTIFIER ::= { 0 }
+rNode OBJECT IDENTIFIER ::= { enterprises 99979 }
+END
+"""
+    r = emit([roots], "ROOTS-MIB")
+    testing.assertNotIn("smiv2:alias \"ccitt\"", r.text)
+    testing.assertIn("smiv2:alias \"rNode\"", r.text)
+    testing.assertIn("yang.oid-invalid", codes(r))
+
+
+def _test_text_lines() -> None:
+    """Description text: line ends, tab expansion, common indent, trailing white space."""
+    testing.assertEqual(mib.yang.text_lines("one"), ["one"])
+    testing.assertEqual(mib.yang.text_lines("a\r\n        b\r\n          c  \n        d\n   "), ["a", "b", "  c", "d"])
+    testing.assertEqual(mib.yang.text_lines("  lead\n\tx\n\t  y"), ["  lead", "x", "  y"])
+    testing.assertEqual(mib.yang.text_lines("a\n\n    b"), ["a", "", "b"])
+    testing.assertEqual(mib.yang.text_lines("ctl\x0cchar"), ["ctl char"])
+    testing.assertEqual(mib.yang.escape("a \\ \"q\""), "a \\\\ \\\"q\\\"")
+
+
+def rng(lo: int, hi: int) -> mib.model.Range:
+    return mib.model.Range(bigint(lo), bigint(hi))
+
+
+def _test_ranges() -> None:
+    rs = mib.yang.norm_ranges([rng(10, 10), rng(-5, 5), rng(3, 7)])
+    testing.assertEqual(mib.yang.ranges_text(rs), "-5..7|10")
+    testing.assertEqual(mib.yang.ranges_text(mib.yang.norm_ranges([rng(1, 4094), rng(4095, 4095)])), "1..4095")
+    sl = mib.yang.string_length([rng(4, 32)], "64a")
+    testing.assertEqual(mib.yang.ranges_text(sl) if sl is not None else "none", "1..32")
+    sl2 = mib.yang.string_length([rng(6, 6)], "1x:")
+    testing.assertEqual(mib.yang.ranges_text(sl2) if sl2 is not None else "none", "none")
+    sl3 = mib.yang.string_length([rng(0, 300)], "255a")
+    testing.assertEqual(mib.yang.ranges_text(sl3) if sl3 is not None else "none", "none")
+
+
+# --- module header and imports -------------------------------------------------------------------
+
+def _test_t1_t2_t3_header() -> None:
+    y = tmib()
+    testing.assertIn("module T-MIB {{\n\n  namespace \"urn:ietf:params:xml:ns:yang:smiv2:T-MIB\";\n  prefix \"t-mib\";\n", y)
+
+
+def _test_t3_prefix_collision() -> None:
+    """T-MIB-EXT imports T-MIB (prefix t-mib), so its own prefix is the next longer run."""
+    r = emit([T_MIB, T_EXT], "T-MIB-EXT")
+    testing.assertEqual(r.prefix, "t-mib-ext")
+    testing.assertIn("  import T-MIB {{\n    prefix \"t-mib\";\n  }}", r.text)
+
+
+def _test_t4_meta_and_revisions() -> None:
+    """ORGANIZATION/CONTACT-INFO/DESCRIPTION; revisions newest first, the LAST-UPDATED date
+    added (no description), duplicate dates merged, a 2-digit year read as 19YY."""
+    r = emit([T_MIB], "T-MIB")
+    y = r.text
+    testing.assertIn("  organization\n   \"Org\";\n", y)
+    testing.assertIn("  contact\n   \"  Name\n    Street 1\n      indented\";\n", y)
+    testing.assertIn("  description\n   \"Module text with a \\\\ backslash.\";\n", y)
+    testing.assertIn("  revision 2010-01-01;\n\n  revision 2009-01-01 {{\n    description\n     \"first\n\n      dup\";\n  }}\n\n  revision 1999-01-01 {{", y)
+    testing.assertEqual(r.revision, "2010-01-01")
+
+
+def _test_t4_dates() -> None:
+    """SMI dates, plus what YANG cannot take: impossible days, years outside
+    1900..2099 (a 12-digit `YYMMDDHHMMSS` date reads as year 0009)."""
+    testing.assertEqual(mib.yang.date_of("200006140000Z"), "2000-06-14")
+    testing.assertEqual(mib.yang.date_of("9311082355Z"), "1993-11-08")
+    testing.assertEqual(mib.yang.date_of("0801010000Z"), "2008-01-01")
+    testing.assertEqual(mib.yang.date_of("200002290000Z"), "2000-02-29")
+    testing.assertEqual(mib.yang.date_of("190002290000Z"), "")
+    testing.assertEqual(mib.yang.date_of("201209310000Z"), "")
+    testing.assertEqual(mib.yang.date_of("000907140000Z"), "")
+    testing.assertEqual(mib.yang.date_of("TBD"), "")
+
+
+def _test_t4_no_identity() -> None:
+    """SMIv1 modules have no MODULE-IDENTITY: no organization, contact, description, revision."""
+    y = emit([V1_MIB], "V1-MIB").text
+    testing.assertNotIn("organization", y)
+    testing.assertNotIn("revision", y)
+
+
+def _test_t5_container_skipped() -> None:
+    """A TC-only module has no top-level container."""
+    tc = r"""TC-ONLY DEFINITIONS ::= BEGIN
+IMPORTS TEXTUAL-CONVENTION FROM SNMPv2-TC;
+Foo ::= TEXTUAL-CONVENTION STATUS current DESCRIPTION "f" SYNTAX INTEGER (0..7)
+END
+"""
+    y = emit([tc], "TC-ONLY").text
+    testing.assertNotIn("container", y)
+    testing.assertIn("  typedef Foo {{\n    type int32 {{\n      range \"0..7\";\n    }}\n", y)
+
+
+def _test_t6_t14_aliases() -> None:
+    """OID assignments and the MODULE-IDENTITY become aliases (the latter without text), in OID
+    order, at the end; implicit and identity nodes do not."""
+    y = tmib()
+    testing.assertEqual(block(y, "smiv2:alias \"tMIB\" {{"), "smiv2:alias \"tMIB\" {{\n  smiv2:oid \"1.3.6.1.4.1.99998\";\n}}")
+    i1 = y.find("smiv2:alias \"tMIB\"")
+    i2 = y.find("smiv2:alias \"tObjects\"")
+    i3 = y.find("smiv2:alias \"tScalars\"")
+    i4 = y.find("smiv2:alias \"tConformance\"")
+    testing.assertTrue(i1 > 0 and i1 < i2 and i2 < i3 and i3 < i4)
+    testing.assertNotIn("smiv2:alias \"tIdent\"", y)
+    testing.assertNotIn("tGroup", y)
+
+
+def _test_t7_imports() -> None:
+    """Only modules the statements refer to, byte order, ietf-yang-smiv2 always; never
+    SNMPv2-SMI/SNMPv2-CONF; no SNMPv2-TC import for well-known types alone."""
+    y = tmib()
+    imps = [ln.strip() for ln in y.split("\n") if ln.startswith("  import ")]
+    testing.assertEqual(imps, ["import SNMPv2-TC {{", "import ietf-inet-types {{", "import ietf-yang-smiv2 {{", "import ietf-yang-types {{"])
+    v1 = emit([V1_MIB], "V1-MIB").text
+    testing.assertEqual([ln.strip() for ln in v1.split("\n") if ln.startswith("  import ")],
+                        ["import ietf-yang-smiv2 {{", "import ietf-yang-types {{"])
+    a = emit([A_MIB], "A-MIB").text
+    testing.assertEqual([ln.strip() for ln in a.split("\n") if ln.startswith("  import ")], ["import ietf-yang-smiv2 {{"])
+
+
+# --- types ---------------------------------------------------------------------------------------
+
+def _test_t8_typedefs() -> None:
+    y = tmib()
+    testing.assertEqual(block(y, "typedef Pct {{"), r"""typedef Pct {
+  type int32 {
+    range "0..10000";
+  }
+  description
+   "p";
+  reference
+   "r";
+  smiv2:display-hint "d-2";
+}""")
+    # TC on TC: the parent typedef with the refinement
+    testing.assertEqual(block(y, "typedef SubPct {{"), r"""typedef SubPct {
+  type t-mib:Pct {
+    range "0..100";
+  }
+  description
+   "sub";
+}""")
+    # status, hinted string with a convertible length
+    testing.assertEqual(block(y, "typedef Name {{"), r"""typedef Name {
+  type string {
+    length "1..32";
+  }
+  status deprecated;
+  description
+   "n";
+  smiv2:display-hint "64a";
+}""")
+    testing.assertEqual(block(y, "typedef Raw {{"), r"""typedef Raw {
+  type binary {
+    length "0..8";
+  }
+  description
+   "raw";
+}""")
+
+
+def _test_t9_smiv1_display_string() -> None:
+    y = emit([V1_MIB], "V1-MIB").text
+    testing.assertEqual(block(y, "typedef DisplayString {{"), "typedef DisplayString {{\n  type string;\n  smiv2:display-hint \"255a\";\n}}")
+    testing.assertIn("  type v1-mib:DisplayString {{\n    length \"0..32\";\n  }}", block(y, "leaf v1Name {{"))
+    o = mib.yang.Options()
+    o.smiv1_hints = False
+    r = mib.yang.Translator(mib.resolver.resolve_texts([V1_MIB]), o).module("V1-MIB")
+    y2 = r.text if r is not None else ""
+    testing.assertEqual(block(y2, "typedef DisplayString {{"), "typedef DisplayString {{\n  type binary;\n}}")
+
+
+def _test_t10_well_known() -> None:
+    y = tmib()
+    testing.assertIn("  type boolean;\n", block(y, "leaf tTruth {{"))
+    testing.assertIn("  type yang:timestamp;\n", block(y, "leaf tStamp {{"))
+    testing.assertIn("  type yang:mac-address;\n", block(y, "leaf tMac {{"))
+    testing.assertIn("  type yang:phys-address;\n", block(y, "leaf tPhys {{"))
+    testing.assertIn("  type snmpv2-tc:DisplayString {{\n    length \"0..32\";\n  }}", block(y, "leaf tDisp {{"))
+    testing.assertIn("  type snmpv2-tc:AutonomousType;\n", block(y, "leaf tAuto {{"))
+
+
+def _test_t11_base_types() -> None:
+    y = tmib()
+    for x in [("tWide", "type int64 {{\n    range \"0..4294967295\";\n  }}"), ("tGauge", "type yang:gauge32 {{\n    range \"1..100\";\n  }}"),
+              ("tTicks", "type yang:timeticks;"), ("tC64", "type yang:counter64;"), ("tIp", "type inet:ipv4-address;"),
+              ("tOpaque", "type smiv2:opaque;"), ("tStr", "type binary {{\n    length \"0..10\";\n  }}"), ("tVal", "type uint32;"),
+              ("tKVal", "type int32;")]:
+        testing.assertIn("  " + x.1 + "\n", block(y, "leaf " + x.0 + " {{"), x.0)
+
+
+def _test_t12_ranges_enums_bits() -> None:
+    r = emit([T_MIB], "T-MIB")
+    y = r.text
+    # sorted and merged ranges; Counter32 ranges dropped
+    testing.assertIn("  type int32 {{\n    range \"-5..5|10\";\n  }}", block(y, "leaf tInt {{"))
+    testing.assertIn("  type yang:counter32;\n", block(y, "leaf tCount {{"))
+    testing.assertIn("yang.range-dropped", codes(r))
+    testing.assertIn("yang.range-int64", codes(r))
+    # an enumeration typedef: the duplicate value keeps the first label
+    testing.assertEqual(block(y, "typedef Color {{"), r"""typedef Color {
+  type enumeration {
+    enum "red" {
+      value "1";
+    }
+    enum "green" {
+      value "2";
+    }
+    enum "blue" {
+      value "3";
+    }
+  }
+  description
+   "c";
+}""")
+    testing.assertIn("yang.enum-duplicate-value", codes(r))
+    # a refined enumeration is an inline enumeration
+    testing.assertIn("  type enumeration {{\n    enum \"red\" {{\n      value \"1\";\n    }}\n    enum \"blue\" {{\n      value \"3\";\n    }}\n  }}", block(y, "leaf tColorSub {{"))
+    testing.assertIn("  type t-mib:Color;\n", block(y, "leaf tColor {{"))
+    testing.assertIn("  type bits {{\n    bit x {{\n      position \"0\";\n    }}\n    bit y {{\n      position \"5\";\n    }}\n  }}", block(y, "leaf tBits {{"))
+
+
+def _test_t12_enum_fallback() -> None:
+    """A value outside int32 makes the type int64; the labels go into the description,
+    and mibmeta converts it as `int` to match."""
+    r = emit([T_MIB], "T-MIB")
+    testing.assertEqual(block(r.text, "typedef Big {{"), "typedef Big {{\n  type int64;\n  description\n   \"b\n\n    Enumeration (not expressible in YANG): small(1), huge(4294967296).\";\n}}")
+    testing.assertIn("yang.enum-fallback", codes(r))
+    mm = mib.meta.module_meta(mib.resolver.resolve_texts([T_MIB]), "T-MIB")
+    convs: list[str] = []
+    if mm is not None:
+        for n in mm.nodes:
+            sx = n.syntax
+            if n.name == "tBig" and sx is not None:
+                convs.append(sx.conv)
+    testing.assertEqual(convs, ["int"])
+
+
+def _test_t13_string_lengths() -> None:
+    y = tmib()
+    # a 1x: string: no length on the leaf refinement; an Na string: lower bound ceil(lo/4)
+    testing.assertIn("  type t-mib:Hex;\n", block(y, "leaf tHex {{"))
+    testing.assertIn("  type t-mib:Name {{\n    length \"1..8\";\n  }}", block(y, "leaf tName {{"))
+    testing.assertIn("  type t-mib:Raw {{\n    length \"2..4\";\n  }}", block(y, "leaf tRaw {{"))
+
+
+# --- identities, scalars, tables, leafs ----------------------------------------------------------
+
+def _test_t15_identity() -> None:
+    testing.assertEqual(block(tmib(), "identity tIdent {{"), r"""identity tIdent {
+  base smiv2:object-identity;
+  description
+   "an identity";
+  smiv2:oid "1.3.6.1.4.1.99998.3";
+}""")
+
+
+def _test_t16_scalars() -> None:
+    """Scalar group containers carry the parent's OID; not-accessible scalars get a leaf,
+    accessible-for-notify ones do not; a scalar without a named parent goes to the top."""
+    y = tmib()
+    c = block(y, "container tScalars {{")
+    testing.assertTrue(c.startswith("container tScalars {{\n  smiv2:oid \"1.3.6.1.4.1.99998.1.1\";\n\n  leaf tInt {{"))
+    testing.assertIn("leaf tNA {{", c)
+    testing.assertIn("  smiv2:max-access \"not-accessible\";\n", block(y, "leaf tNA {{"))
+    testing.assertNotIn("leaf tNotify", c)
+    testing.assertIn("  leaf tLoose {{", block(y, "container T-MIB {{"))
+    testing.assertIn("yang.scalar-parent-unnamed", codes(emit([T_MIB], "T-MIB")))
+
+
+def _test_t16_ambiguous_parent() -> None:
+    """Several descriptors at a scalar's parent OID: the translation fails, unless an option
+    picks the name."""
+    r = emit([A_MIB, B_MIB], "B-MIB")
+    testing.assertFalse(r.ok)
+    testing.assertIn("yang.scalar-parent-ambiguous", codes(r))
+    ms = mib.resolver.resolve_texts([A_MIB, B_MIB])
+    try:
+        mib.yang.emit_module(ms, "B-MIB")
+        testing.error("emit_module accepted an ambiguous scalar parent")
+    except mib.yang.YangError as e:
+        testing.assertIn("several descriptors", e.error_message)
+    o = mib.yang.Options()
+    o.scalar_parent_names["1.3.6.1.4.1.99994"] = "aNode"
+    y = mib.yang.emit_module(ms, "B-MIB", o)
+    testing.assertIn("    container aNode {{\n      smiv2:oid \"1.3.6.1.4.1.99994\";\n", y)
+
+
+def _test_t17_t18_table() -> None:
+    y = tmib()
+    testing.assertTrue(block(y, "container tTable {{").startswith(r"""container tTable {
+  description
+   "t";
+  smiv2:oid "1.3.6.1.4.1.99998.1.2";
+
+  list tEntry {
+    key "tIdx tName";
+    smiv2:implied "tName";
+    description
+     "e";
+    smiv2:oid "1.3.6.1.4.1.99998.1.2.1";
+
+    leaf tIdx {"""))
+
+
+def _test_t18_duplicate_index() -> None:
+    """`_n` for repeated INDEX objects; the copy carries no smiv2:oid (one OID per data node)."""
+    y = tmib()
+    l = block(y, "list tDupEntry {{")
+    testing.assertIn("  key \"tIdx tDupA tDupA_2\";\n", l)
+    testing.assertIn("  leaf tDupA {{", l)
+    testing.assertEqual(block(l, "leaf tDupA_2 {{"), r"""leaf tDupA_2 {
+  type int32 {
+    range "0..9";
+  }
+  description
+   "a";
+  smiv2:max-access "not-accessible";
+}""")
+
+
+def _test_t19_columns() -> None:
+    """Index columns always get leafs; a non-index accessible-for-notify column does not."""
+    l = block(tmib(), "list tEntry {{")
+    testing.assertIn("  smiv2:max-access \"not-accessible\";\n", block(l, "leaf tIdx {{"))
+    testing.assertNotIn("tHidden", l)
+
+
+def _test_t20_foreign_index() -> None:
+    """A foreign INDEX object is a leafref leaf without oid/max-access, before the columns; a
+    scalar INDEX object too."""
+    y = tmib()
+    l = block(y, "list tDupEntry {{")
+    testing.assertEqual(block(l, "leaf tIdx {{"), r"""leaf tIdx {
+  type leafref {
+    path "/t-mib:T-MIB/t-mib:tTable/t-mib:tEntry/t-mib:tIdx";
+  }
+  description
+   "See the definition of the leaf the leafref path points to.
+    [This leaf has been added by the SMIv2 to YANG conversion.]";
+}""")
+    testing.assertTrue(l.find("leaf tIdx {{") < l.find("leaf tDupA {{"))
+    testing.assertIn("    path \"/t-mib:T-MIB/t-mib:tScalars/t-mib:tInt\";\n", block(block(y, "list tSEntry {{"), "leaf tInt {{"))
+    x = emit([T_MIB, T_EXT], "T-MIB-EXT").text
+    testing.assertIn("    path \"/t-mib:T-MIB/t-mib:tTable/t-mib:tEntry/t-mib:tIdx\";\n", block(block(x, "list tYEntry {{"), "leaf tIdx {{"))
+
+
+def _test_t21_leaf_order() -> None:
+    """type, units, status, description, reference, defval, max-access (read-create kept), oid."""
+    y = tmib()
+    testing.assertEqual(block(y, "leaf tGauge {{"), r"""leaf tGauge {
+  type yang:gauge32 {
+    range "1..100";
+  }
+  units "seconds";
+  description
+   "g";
+  smiv2:max-access "read-only";
+  smiv2:oid "1.3.6.1.4.1.99998.1.1.3";
+}""")
+    testing.assertIn("  smiv2:max-access \"read-create\";\n", block(y, "leaf tVal {{"))
+    testing.assertIn("  status deprecated;\n", block(y, "leaf tDep {{"))
+
+
+def _test_t22_defval() -> None:
+    y = tmib()
+    for x in [("tInt", "3"), ("tStr", "'abcd'H"), ("tDisp", "hi"), ("tTruth", "true"), ("tColor", "green"), ("tBits", "{{x}}")]:
+        testing.assertIn("  smiv2:defval \"" + x.1 + "\";\n", block(y, "leaf " + x.0 + " {{"), x.0)
+
+
+# --- augments, keyless rows, notifications -------------------------------------------------------
+
+def _test_t23_augment() -> None:
+    y = tmib()
+    testing.assertIn(r"""  smiv2:alias "tAugTable" {
+    description
+     "aug table";
+    smiv2:oid "1.3.6.1.4.1.99998.1.6";
+  }
+
+  smiv2:alias "tAugEntry" {
+    description
+     "aug row";
+    smiv2:oid "1.3.6.1.4.1.99998.1.6.1";
+  }
+
+  augment "/t-mib:T-MIB/t-mib:tTable/t-mib:tEntry" {
+    description
+     "aug row";
+    smiv2:oid "1.3.6.1.4.1.99998.1.6.1";
+
+    leaf tAugX {""", y)
+    testing.assertNotIn("container tAugTable", y)
+
+
+def _test_t23_cross_module_augment() -> None:
+    x = emit([T_MIB, T_EXT], "T-MIB-EXT").text
+    testing.assertIn("  augment \"/t-mib:T-MIB/t-mib:tTable/t-mib:tEntry\" {{\n", x)
+    testing.assertIn("    leaf tXVal {{", x)
+
+
+def _test_t24_keyless() -> None:
+    """A row without INDEX/AUGMENTS is a list without key."""
+    l = block(tmib(), "list tKEntry {{")
+    testing.assertTrue(l.startswith("list tKEntry {{\n  description\n   \"k\";\n  smiv2:oid"))
+    testing.assertNotIn("key", l)
+
+
+def _test_t25_notification() -> None:
+    """object-<k> containers: index leafrefs of the object's row except the object itself
+    (erratum 4786), then a leafref for readable objects or a full leaf; `_n` for repeated
+    INDEX objects."""
+    y = tmib()
+    n = block(y, "notification tTrap {{")
+    o1 = block(n, "container object-1 {{")
+    testing.assertEqual([ln.strip() for ln in o1.split("\n") if ln.strip().startswith("leaf ") or ln.strip().startswith("path ")],
+                        ["leaf tIdx {{", "path \"/t-mib:T-MIB/t-mib:tTable/t-mib:tEntry/t-mib:tIdx\";",
+                         "leaf tName {{", "path \"/t-mib:T-MIB/t-mib:tTable/t-mib:tEntry/t-mib:tName\";",
+                         "leaf tVal {{", "path \"/t-mib:T-MIB/t-mib:tTable/t-mib:tEntry/t-mib:tVal\";"])
+    o2 = block(n, "container object-2 {{")
+    testing.assertEqual([ln.strip() for ln in o2.split("\n") if ln.strip().startswith("leaf ")], ["leaf tName {{", "leaf tIdx {{"])
+    testing.assertIn("smiv2:oid \"1.3.6.1.4.1.99998.1.2.1.1\";", block(o2, "leaf tIdx {{"))
+    o3 = block(n, "container object-3 {{")
+    testing.assertIn("    smiv2:max-access \"accessible-for-notify\";\n    smiv2:oid \"1.3.6.1.4.1.99998.1.1.20\";\n", o3)
+    o4 = block(n, "container object-4 {{")
+    testing.assertEqual([ln.strip() for ln in o4.split("\n") if ln.strip().startswith("leaf ")],
+                        ["leaf tIdx {{", "leaf tDupA {{", "leaf tDupA_2 {{", "leaf tDupVal {{"])
+    testing.assertIn("    path \"/t-mib:T-MIB/t-mib:tScalars/t-mib:tInt\";\n", block(n, "container object-5 {{"))
+    testing.assertTrue(n.startswith("notification tTrap {{\n  description\n   \"trap\";\n  smiv2:oid \"1.3.6.1.4.1.99998.0.1\";\n"))
+
+
+def _test_smiv1() -> None:
+    """RFC 3584: SMIv1 objects, a TRAP-TYPE notification at enterprise.0.N, `INDEX { INTEGER }`
+    as a synthetic key leaf without OID, STATUS deprecated kept."""
+    r = emit([V1_MIB], "V1-MIB")
+    y = r.text
+    testing.assertIn("  notification v1Trap {{\n", y)
+    testing.assertIn("smiv2:oid \"1.3.6.1.4.1.99996.0.3\";", block(y, "notification v1Trap {{"))
+    l = block(y, "list v1Entry {{")
+    testing.assertIn("  key \"v1EntryIndex1\";\n", l)
+    testing.assertEqual(block(l, "leaf v1EntryIndex1 {{"), r"""leaf v1EntryIndex1 {
+  type int32;
+  description
+   "Index component 1 of v1Entry (an SMIv1 INDEX item of type INTEGER).
+    [This leaf has been added by the SMIv2 to YANG conversion.]";
+}""")
+    testing.assertIn("  type yang:counter32;\n  status deprecated;\n", block(y, "leaf v1Count {{"))
+    testing.assertIn("  smiv2:max-access \"read-write\";\n", block(y, "leaf v1Val {{"))
+
+
+def _test_identifier_rewrite() -> None:
+    """A digit-initial descriptor is rewritten, with a level-4 diagnostic."""
+    r = emit([T_MIB], "T-MIB")
+    testing.assertIn("    leaf _3comThing {{\n", r.text)
+    testing.assertIn("yang.identifier-rewritten", codes(r))
+
+
+def _test_self_check_and_determinism() -> None:
+    """No emitter diagnostic above level 3 for T-MIB, and the output is deterministic."""
+    r = emit([T_MIB], "T-MIB")
+    testing.assertEqual([str(d) for d in r.diags if d.level <= 2], [])
+    testing.assertTrue(r.ok)
+    testing.assertEqual(tmib(), r.text)
+    testing.assertTrue(r.text.endswith("\n}}\n"))
+
+
+def _test_api() -> None:
+    ms = mib.resolver.resolve_texts([T_MIB, T_EXT])
+    testing.assertNone(mib.yang.translate(ms, "NO-SUCH-MIB"))
+    try:
+        mib.yang.emit_module(ms, "NO-SUCH-MIB")
+        testing.error("emit_module accepted an unknown module")
+    except mib.yang.YangError:
+        pass
+    rs = mib.yang.emit_set(ms, ["T-MIB-EXT", "T-MIB", "NO-SUCH-MIB"])
+    testing.assertEqual([r.name for r in rs], ["T-MIB-EXT", "T-MIB"])
+    testing.assertEqual(rs[1].text, mib.yang.emit_module(ms, "T-MIB"))
+    testing.assertEqual(rs[0].imports, ["T-MIB", "ietf-yang-smiv2"])
+    o = mib.yang.Options()
+    o.header = False
+    testing.assertTrue(mib.yang.emit_module(ms, "T-MIB", o).startswith("module T-MIB {{"))
+
+
+def _test_import_cycle() -> None:
+    """SMI modules that import each other: YANG forbids the import cycle, so the byte-order
+    larger module inlines its references (typedefs as base types, leafrefs as typed leafs)."""
+    c1 = r"""C1-MIB DEFINITIONS ::= BEGIN
+IMPORTS OBJECT-TYPE, Integer32, enterprises FROM SNMPv2-SMI
+        TEXTUAL-CONVENTION FROM SNMPv2-TC
+        c2Index FROM C2-MIB;
+C1Type ::= TEXTUAL-CONVENTION STATUS current DESCRIPTION "t" SYNTAX Integer32 (0..9)
+c1 OBJECT IDENTIFIER ::= { enterprises 99990 }
+c1Table OBJECT-TYPE SYNTAX SEQUENCE OF C1Entry MAX-ACCESS not-accessible STATUS current DESCRIPTION "t" ::= { c1 1 }
+c1Entry OBJECT-TYPE SYNTAX C1Entry MAX-ACCESS not-accessible STATUS current DESCRIPTION "e" INDEX { c2Index } ::= { c1Table 1 }
+C1Entry ::= SEQUENCE { c1Val Integer32 }
+c1Val OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current DESCRIPTION "v" ::= { c1Entry 1 }
+END
+"""
+    c2 = r"""C2-MIB DEFINITIONS ::= BEGIN
+IMPORTS OBJECT-TYPE, Integer32, enterprises FROM SNMPv2-SMI
+        C1Type FROM C1-MIB;
+c2 OBJECT IDENTIFIER ::= { enterprises 99991 }
+c2Table OBJECT-TYPE SYNTAX SEQUENCE OF C2Entry MAX-ACCESS not-accessible STATUS current DESCRIPTION "t" ::= { c2 1 }
+c2Entry OBJECT-TYPE SYNTAX C2Entry MAX-ACCESS not-accessible STATUS current DESCRIPTION "e" INDEX { c2Index } ::= { c2Table 1 }
+C2Entry ::= SEQUENCE { c2Index Integer32, c2Val C1Type }
+c2Index OBJECT-TYPE SYNTAX Integer32 (1..5) MAX-ACCESS not-accessible STATUS current DESCRIPTION "i" ::= { c2Entry 1 }
+c2Val OBJECT-TYPE SYNTAX C1Type MAX-ACCESS read-only STATUS current DESCRIPTION "v" ::= { c2Entry 2 }
+END
+"""
+    t = tr([c1, c2])
+    r1 = t.module("C1-MIB")
+    r2 = t.module("C2-MIB")
+    if r1 is not None and r2 is not None:
+        testing.assertEqual(r1.imports, ["C2-MIB", "ietf-yang-smiv2"])
+        testing.assertEqual(r2.imports, ["ietf-yang-smiv2"])
+        testing.assertIn("  type int32 {{\n    range \"0..9\";\n  }}", block(r2.text, "leaf c2Val {{"))
+        testing.assertIn("yang.import-cycle", codes(r2))
+        testing.assertIn("    path \"/c2-mib:C2-MIB/c2-mib:c2Table/c2-mib:c2Entry/c2-mib:c2Index\";\n", block(r1.text, "leaf c2Index {{"))
+    else:
+        testing.error("not translated")
+
+
+DUP_MIB = r"""DUP-MIB DEFINITIONS ::= BEGIN
+IMPORTS OBJECT-TYPE, Integer32, enterprises FROM SNMPv2-SMI;
+d OBJECT IDENTIFIER ::= { enterprises 99989 }
+dATable OBJECT-TYPE SYNTAX SEQUENCE OF DAEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "a" ::= { d 1 }
+dAEntry OBJECT-TYPE SYNTAX DAEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "a" INDEX { dAIdx } ::= { dATable 1 }
+DAEntry ::= SEQUENCE { dAIdx Integer32 }
+dAIdx OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current DESCRIPTION "a" ::= { dAEntry 1 }
+dBTable OBJECT-TYPE SYNTAX SEQUENCE OF DBEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "b" ::= { d 1 }
+dBEntry OBJECT-TYPE SYNTAX DBEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "b" INDEX { dBIdx } ::= { dBTable 1 }
+DBEntry ::= SEQUENCE { dBIdx Integer32 }
+dBIdx OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current DESCRIPTION "b" ::= { dBEntry 2 }
+dS OBJECT IDENTIFIER ::= { d 2 }
+dScalar OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current DESCRIPTION "s" ::= { dS 5 }
+dSEntry OBJECT-TYPE SYNTAX DSEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "r" INDEX { dSIdx } ::= { dS 1 }
+DSEntry ::= SEQUENCE { dSIdx Integer32 }
+dSIdx OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current DESCRIPTION "i" ::= { dSEntry 1 }
+dTwice OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current DESCRIPTION "first" ::= { dS 6 }
+dTwice OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current DESCRIPTION "second" ::= { dS 7 }
+END
+"""
+
+
+def _test_two_rows_one_oid() -> None:
+    """A MIB registering two tables and rows at one OID: each column belongs to the row whose
+    SEQUENCE lists it, each row to the table whose SEQUENCE OF names its type; the shared OID
+    is reported (yang.oid-duplicate), nothing is emitted twice."""
+    r = emit([DUP_MIB], "DUP-MIB")
+    y = r.text
+    la = block(y, "list dAEntry {{")
+    lb = block(y, "list dBEntry {{")
+    testing.assertIn("leaf dAIdx {{", la)
+    testing.assertNotIn("dBIdx", la)
+    testing.assertIn("leaf dBIdx {{", lb)
+    testing.assertNotIn("dAIdx", lb)
+    testing.assertIn("list dAEntry {{", block(y, "container dATable {{"))
+    testing.assertIn("list dBEntry {{", block(y, "container dBTable {{"))
+    testing.assertIn("yang.oid-duplicate", codes(r))
+    testing.assertEqual([d.code for d in r.diags if d.level == 0], [])
+
+
+def _test_misplaced_and_twice_defined() -> None:
+    """A scalar and a row below one node share its container; a name defined twice with
+    different OIDs (both kept by the resolver) is two leafs, the second renamed."""
+    y = emit([DUP_MIB], "DUP-MIB").text
+    c = block(y, "container dS {{")
+    testing.assertEqual([ln.strip() for ln in c.split("\n") if ln.startswith("  leaf ") or ln.startswith("  list ")],
+                        ["leaf dScalar {{", "leaf dTwice {{", "leaf dTwice_2 {{", "list dSEntry {{"])
+    testing.assertIn("smiv2:oid \"1.3.6.1.4.1.99989.2.7\";", block(c, "leaf dTwice_2 {{"))
+    testing.assertEqual(len([ln for ln in y.split("\n") if ln.strip() == "container dS {{"]), 1)
+
+
+# scalar parent conflicts seen in the corpus: an implicit `name(n)` label on the defined arc
+# (RARITANSX-MIB), a notification registered at a scalar group's OID (PowerNet-MIB), scalars
+# registered below a scalar (NV-ATKK-MIB), an OBJECT-GROUP at the parent OID (MSTP-MIB's
+# dot1sStp is BRIDGE-MIB's dot1dBaseBridgeGroup)
+P_MIB = r"""P-MIB DEFINITIONS ::= BEGIN
+IMPORTS OBJECT-TYPE, NOTIFICATION-TYPE, Integer32, enterprises FROM SNMPv2-SMI
+        OBJECT-GROUP FROM SNMPv2-CONF;
+pLabeled OBJECT IDENTIFIER ::= { enterprises pVendor(99988) pSub(2) }
+pS1 OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current DESCRIPTION "s" ::= { pLabeled 1 }
+pMgr OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current DESCRIPTION "m" ::= { pLabeled 6 }
+pRcvr1 OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current DESCRIPTION "r" ::= { pMgr 1 }
+pTraps OBJECT IDENTIFIER ::= { pLabeled 8 }
+pInfo OBJECT IDENTIFIER ::= { pTraps 1 }
+pCode OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current DESCRIPTION "c" ::= { pInfo 9 }
+pCritical NOTIFICATION-TYPE OBJECTS { pCode } STATUS current DESCRIPTION "n" ::= { pTraps 1 }
+pGroups OBJECT IDENTIFIER ::= { pLabeled 9 }
+pGroup OBJECT-GROUP OBJECTS { pS1 } STATUS current DESCRIPTION "g" ::= { pGroups 1 }
+pStp OBJECT IDENTIFIER ::= { pGroups 1 }
+pStpName OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current DESCRIPTION "n" ::= { pStp 1 }
+END
+"""
+
+# two OID assignments at one OID (aliases, USR-DEFINITIONS-MIB); the scalar module writes qB
+Q_DEFS = r"""Q-DEFS DEFINITIONS ::= BEGIN
+IMPORTS enterprises FROM SNMPv2-SMI;
+qA OBJECT IDENTIFIER ::= { enterprises 99987 }
+qB OBJECT IDENTIFIER ::= { enterprises 99987 }
+END
+"""
+Q_MIB = r"""Q-MIB DEFINITIONS ::= BEGIN
+IMPORTS OBJECT-TYPE, Integer32 FROM SNMPv2-SMI
+        qB FROM Q-DEFS;
+qS OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current DESCRIPTION "s" ::= { qB 1 }
+END
+"""
+
+# a scalar below another module's node
+C_MIB = r"""C-MIB DEFINITIONS ::= BEGIN
+IMPORTS OBJECT-TYPE, Integer32 FROM SNMPv2-SMI
+        aNode FROM A-MIB;
+cScalar OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current DESCRIPTION "s" ::= { aNode 1 }
+END
+"""
+
+
+def _test_t16_parent_conflicts() -> None:
+    """Only OID assignments, identities, tables and rows name a scalar's parent: an implicit
+    label of the same arc does not count, and a scalar, column or notification registered at
+    the parent OID is a MIB error (`yang.scalar-parent-conflict`, level 2) that leaves the
+    container to the OID assignment."""
+    r = emit([P_MIB], "P-MIB")
+    testing.assertTrue(r.ok)
+    testing.assertEqual([c for c in codes(r) if c.startswith("yang.scalar")],
+                        ["yang.scalar-parent-conflict", "yang.scalar-parent-conflict", "yang.scalar-parent-conflict"])
+    y = r.text
+    testing.assertIn("    container pStp {{\n", y)
+    testing.assertIn("    container pLabeled {{\n      smiv2:oid \"1.3.6.1.4.1.99988.2\";\n", y)
+    testing.assertIn("    container pInfo {{\n      smiv2:oid \"1.3.6.1.4.1.99988.2.8.1\";\n", y)
+    testing.assertIn("    container pMgr {{\n      description\n       \"m\";\n      smiv2:oid \"1.3.6.1.4.1.99988.2.6\";\n", y)
+    testing.assertIn("leaf pMgr {{", block(y, "container pLabeled {{"))
+    # the scalar keeps its leaf path; the container below it is listed in mibmeta's containers
+    ms = mib.resolver.resolve_texts([P_MIB])
+    mm = mib.meta.module_meta(ms, "P-MIB")
+    if mm is not None:
+        ix = mib.meta.MetaIndex(mib.meta.MibBundle([mm]))
+        n = ix.find("P-MIB::pMgr")
+        testing.assertEqual(n.yang if n is not None else "", "/p-mib:P-MIB/p-mib:pLabeled/p-mib:pMgr")
+        testing.assertEqual([(c.name, mib.model.oid_str(c.oid), c.kind, c.yang) for c in mm.containers],
+                            [("pMgr", "1.3.6.1.4.1.99988.2.6", "container", "/p-mib:P-MIB/p-mib:pMgr")])
+        c = ix.find_path("/p-mib:P-MIB/p-mib:pMgr")
+        testing.assertEqual(c.kind if c is not None else "", "container")
+        back = mib.meta.from_json(mib.meta.to_json(mm))
+        testing.assertEqual([c.yang for c in back.containers], ["/p-mib:P-MIB/p-mib:pMgr"])
+    else:
+        testing.error("no mibmeta")
+
+
+def _test_t16_written_parent() -> None:
+    """Aliases at a scalar's parent OID still fail the translation (RFC 6643 section 7.1), but the
+    text uses the descriptor the module's own OID value names (`{ qB 1 }`)."""
+    r = emit([Q_DEFS, Q_MIB], "Q-MIB")
+    testing.assertFalse(r.ok)
+    testing.assertIn("yang.scalar-parent-ambiguous", codes(r))
+    testing.assertIn("    container qB {{\n", r.text)
+
+
+def _test_meta_foreign_container() -> None:
+    """A scalar group container standing for another module's node is in `containers`."""
+    ms = mib.resolver.resolve_texts([A_MIB, C_MIB])
+    mm = mib.meta.module_meta(ms, "C-MIB")
+    if mm is not None:
+        testing.assertEqual([(c.name, mib.model.oid_str(c.oid), c.yang) for c in mm.containers],
+                            [("aNode", "1.3.6.1.4.1.99994", "/c-mib:C-MIB/c-mib:aNode")])
+        testing.assertIn("\"containers\":[\n {{\"name\":\"aNode\",\"oid\":\"1.3.6.1.4.1.99994\",\"kind\":\"container\"", mib.meta.to_json(mm))
+    else:
+        testing.error("no mibmeta")
+    a = mib.meta.module_meta(ms, "A-MIB")
+    testing.assertEqual(len(a.containers) if a is not None else -1, 0)
+
+
+H_MIB = r"""H-MIB DEFINITIONS ::= BEGIN
+IMPORTS OBJECT-TYPE, Gauge32, Integer32, enterprises FROM SNMPv2-SMI
+        TEXTUAL-CONVENTION, TruthValue FROM SNMPv2-TC;
+hRoot OBJECT IDENTIFIER ::= { enterprises 99986 }
+hTv OBJECT-TYPE SYNTAX TruthValue (0) MAX-ACCESS read-only STATUS current DESCRIPTION "t" ::= { hRoot 2 }
+HexBytes ::= TEXTUAL-CONVENTION DISPLAY-HINT "1x " STATUS current DESCRIPTION "h" SYNTAX OCTET STRING (SIZE (0..8))
+DecTrim ::= TEXTUAL-CONVENTION DISPLAY-HINT "d   " STATUS current DESCRIPTION "d" SYNTAX Integer32
+END
+"""
+# SMIv1 named numbers on Gauge (CONEL-STATUS-MIB); `Gauge32 {..}` is read as INTEGER by the
+# parser (parse.enum-on-non-integer), the SMIv1 name is not
+H1_MIB = r"""H1-MIB DEFINITIONS ::= BEGIN
+IMPORTS enterprises, Gauge FROM RFC1155-SMI
+        OBJECT-TYPE FROM RFC-1212;
+h1Root OBJECT IDENTIFIER ::= { enterprises 99984 }
+hFlag OBJECT-TYPE SYNTAX Gauge { no(0), yes(1) } ACCESS read-only STATUS mandatory DESCRIPTION "f" ::= { h1Root 1 }
+END
+"""
+
+
+def _test_hint_separator_and_named_gauge() -> None:
+    """A blank after the last octet spec of a DISPLAY-HINT is its separator (`"1x "`, RFC 2579
+    section 3.1) and is kept; trailing blanks of an integer hint are trimmed. Named numbers on a
+    non-INTEGER base keep the wire type and go into the description, and a range on an
+    enumeration is dropped (`yang.restriction-dropped` both)."""
+    r = emit([H_MIB], "H-MIB")
+    testing.assertIn("  smiv2:display-hint \"1x \";\n", block(r.text, "typedef HexBytes {{"))
+    testing.assertIn("  smiv2:display-hint \"d\";\n", block(r.text, "typedef DecTrim {{"))
+    # a range on an enumeration (ANUE-MIB `TruthValue (0)`) is dropped with a diagnostic
+    testing.assertIn("leaf hTv {{\n  type boolean;\n", block(r.text, "leaf hTv {{"))
+    testing.assertIn("yang.restriction-dropped", codes(r))
+    r1 = emit([H1_MIB], "H1-MIB")
+    testing.assertEqual(block(r1.text, "leaf hFlag {{"), "leaf hFlag {{\n  type yang:gauge32;\n  description\n   \"f\n\n    Named numbers (not expressible in YANG on Gauge32): no(0), yes(1).\";\n  smiv2:max-access \"read-only\";\n  smiv2:oid \"1.3.6.1.4.1.99984.1\";\n}}")
+    testing.assertIn("yang.restriction-dropped", codes(r1))
+
+
+S_MIB = r"""S-MIB DEFINITIONS ::= BEGIN
+IMPORTS OBJECT-TYPE, Integer32, enterprises FROM SNMPv2-SMI
+        TEXTUAL-CONVENTION FROM SNMPv2-TC;
+sRoot OBJECT IDENTIFIER ::= { enterprises 99985 }
+OldTc ::= TEXTUAL-CONVENTION STATUS obsolete DESCRIPTION "o" SYNTAX Integer32 (0..9)
+NewTc ::= TEXTUAL-CONVENTION STATUS current DESCRIPTION "n" SYNTAX OldTc
+sTable OBJECT-TYPE SYNTAX SEQUENCE OF SEntry MAX-ACCESS not-accessible STATUS obsolete DESCRIPTION "t" ::= { sRoot 1 }
+sEntry OBJECT-TYPE SYNTAX SEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "e" INDEX { sIdx } ::= { sTable 1 }
+SEntry ::= SEQUENCE { sIdx Integer32, sVal NewTc }
+sIdx OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS not-accessible STATUS obsolete DESCRIPTION "i" ::= { sEntry 1 }
+sVal OBJECT-TYPE SYNTAX NewTc MAX-ACCESS read-only STATUS current DESCRIPTION "v" ::= { sEntry 2 }
+END
+"""
+
+
+def _test_consistent_status() -> None:
+    """By default a current row keyed by an obsolete column (a table made obsolete with its
+    entry left current, frequent in TIMETRA-*) keeps its status and `yang.status-reference`
+    warns; `Options.consistent_status` gives the list, the leaf and the typedef the worst status
+    they refer to within the module."""
+    ms = mib.resolver.resolve_texts([S_MIB])
+    r = mib.yang.Translator(ms).module("S-MIB")
+    if r is not None:
+        testing.assertIn("yang.status-reference", codes(r))
+        testing.assertNotIn("status", block(r.text, "list sEntry {{").split("\n")[2])
+    o = mib.yang.Options()
+    o.consistent_status = True
+    y = mib.yang.emit_module(ms, "S-MIB", o)
+    testing.assertIn("\n  status obsolete;\n", block(y, "list sEntry {{"))
+    testing.assertIn("\n  status obsolete;\n", block(y, "leaf sVal {{"))
+    testing.assertIn("\n  status obsolete;\n", block(y, "typedef NewTc {{"))
+
+
+U_MIB = r"""U-MIB DEFINITIONS ::= BEGIN
+IMPORTS OBJECT-TYPE, NOTIFICATION-TYPE, Integer32, enterprises FROM SNMPv2-SMI;
+uRoot OBJECT IDENTIFIER ::= { enterprises 99983 }
+uTable OBJECT-TYPE SYNTAX SEQUENCE OF UEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "t" ::= { uRoot 1 }
+uEntry OBJECT-TYPE SYNTAX UEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "e" INDEX { uMissing } ::= { uTable 1 }
+UEntry ::= SEQUENCE { uVal Integer32 }
+uVal OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current DESCRIPTION "v" ::= { uEntry 2 }
+uTrap NOTIFICATION-TYPE OBJECTS { uVal } STATUS current DESCRIPTION "n" ::= { uRoot 2 }
+END
+"""
+
+
+def _test_t25_unresolved_index_object() -> None:
+    """An INDEX object that does not resolve has a string key leaf in its list
+    (`yang.index-unresolved`); a notification that carries a column of that row refers to that
+    key leaf (as libsmi does) instead of repeating a string leaf."""
+    r = emit([U_MIB], "U-MIB")
+    testing.assertIn("yang.index-unresolved", codes(r))
+    n = block(r.text, "notification uTrap {{")
+    testing.assertIn("    leaf uMissing {{\n      type leafref {{\n        path \"/u-mib:U-MIB/u-mib:uTable/u-mib:uEntry/u-mib:uMissing\";\n", n)
+
+
+# --- mibmeta YANG paths --------------------------------------------------------------------------
+
+def _test_meta_paths() -> None:
+    """NodeMeta.yang, IndexPart.key and the by-path lookup agree with the emitted YANG."""
+    ms = mib.resolver.resolve_texts([T_MIB, T_EXT])
+    b = mib.meta.bundle(ms, ["T-MIB", "T-MIB-EXT"])
+    ix = mib.meta.MetaIndex(b)
+    want = [("T-MIB::tScalars", "/t-mib:T-MIB/t-mib:tScalars"),
+            ("T-MIB::tInt", "/t-mib:T-MIB/t-mib:tScalars/t-mib:tInt"),
+            ("T-MIB::3comThing", "/t-mib:T-MIB/t-mib:tScalars/t-mib:_3comThing"),
+            ("T-MIB::tLoose", "/t-mib:T-MIB/t-mib:tLoose"),
+            ("T-MIB::tTable", "/t-mib:T-MIB/t-mib:tTable"),
+            ("T-MIB::tEntry", "/t-mib:T-MIB/t-mib:tTable/t-mib:tEntry"),
+            ("T-MIB::tName", "/t-mib:T-MIB/t-mib:tTable/t-mib:tEntry/t-mib:tName"),
+            ("T-MIB::tAugX", "/t-mib:T-MIB/t-mib:tTable/t-mib:tEntry/t-mib:tAugX"),
+            ("T-MIB-EXT::tXVal", "/t-mib:T-MIB/t-mib:tTable/t-mib:tEntry/t-mib-ext:tXVal"),
+            ("T-MIB::tTrap", "/t-mib:tTrap"),
+            ("T-MIB::tNotify", ""), ("T-MIB::tHidden", ""), ("T-MIB::tAugEntry", ""), ("T-MIB::tAugTable", ""),
+            ("T-MIB::tIdent", ""), ("T-MIB::tConformance", ""), ("T-MIB::tGroup", "")]
+    for w in want:
+        n = ix.find(w.0)
+        testing.assertEqual(n.yang if n is not None else "<missing>", w.1, w.0)
+        if w.1 != "":
+            p = ix.find_path(w.1)
+            testing.assertEqual(p.qname() if p is not None else "<none>", w.0)
+    d = ix.find("T-MIB::tDupEntry")
+    testing.assertEqual([p.key for p in d.index] if d is not None else [], ["tIdx", "tDupA", "tDupA_2"])
+    testing.assertEqual(b.modules[1].yang_prefix, "t-mib-ext")
+    testing.assertEqual(b.modules[0].revision, "2010-01-01")
+
+
+# --- golden sets ---------------------------------------------------------------------------------
+
+REF_DIR = "interop/mibs/yang-examples/mibs"
+REF_MODULES = ["BRIDGE-MIB", "IANAifType-MIB", "IF-MIB", "INET-ADDRESS-MIB", "IP-MIB", "SNMP-FRAMEWORK-MIB",
+               "SNMP-TARGET-MIB", "SNMPv2-MIB", "SNMPv2-TC"]
+GOLDEN_DIR = "interop/mibs/golden/mibs"
+
+
+VENDOR_DIR = "interop/mibs/cache/golden-vendor"
+CACHE_YANG = "interop/mibs/cache/yang"
+
+
+proc def write_text(fc: file.FileCap, path: str, text: str) -> None:
+    wf = file.WriteFile(file.WriteFileCap(fc), path)
+    wf.write(text.encode())
+    wf.close()
+
+
+proc def mkdirs(fc: file.FileCap, path: str) -> None:
+    """Create `path` and its missing parents."""
+    fs = file.FS(fc)
+    parts = path.split("/")
+    for i in range(1, len(parts) + 1):
+        p = "/".join(parts[:i])
+        if p != "" and p != ".":
+            fs.mkdir(p)
+
+
+proc def write_module(fc: file.FileCap, out: str, ms: mib.model.MibSet, tr: mib.yang.Translator, r: mib.yang.YangModule, meta: bool) -> None:
+    """Write `<out>/<MOD>.yang` and `<out>/<MOD>.diags`, and with `meta` `<out>/<MOD>.mibmeta.json`."""
+    write_text(fc, out + "/" + r.name + ".yang", r.text)
+    write_text(fc, out + "/" + r.name + ".diags", "\n".join([str(x) for x in r.diags]) + "\n")
+    if meta:
+        mm = mib.meta.module_meta(ms, r.name, tr)
+        if mm is not None:
+            write_text(fc, out + "/" + r.name + ".mibmeta.json", mib.meta.to_json(mm))
+
+
+proc def emit_dir(fc: file.FileCap, d: str, names: list[str], out: str, pins: dict[str, str] = {}) -> list[mib.yang.YangModule]:
+    """Resolve `names` (all modules of `d` when empty) over `d` and emit them, writing the
+    files of `write_module` when `out` is set. `pins` maps module names to files, to use a
+    file's text instead of a built-in base module."""
+    mp = mib.source.MibPath([d], True, True)
+    for k, v in pins.items():
+        mp.pin(k, v)
+    dg = mib.diag.Diagnostics()
+    mib.source.index_path(mp, fc, dg)
+    mods = names if len(names) > 0 else sorted(list(mp.entries.keys()))
+    ms = mib.resolver.resolve_path(fc, mp, mods)
+    tr = mib.yang.Translator(ms)
+    res: list[mib.yang.YangModule] = []
+    for nm in mods:
+        r = tr.module(nm)
+        if r is not None:
+            res.append(r)
+            if out != "":
+                write_module(fc, out, ms, tr, r, True)
+    return res
+
+
+actor _test_yang_golden(t: testing.EnvT):
+    """The 9 reference MIBs (REF_DIR) and the 43 golden modules translate without diagnostics
+    of level 0-2. With `MIBYANG_OUT=<dir>` the YANG goes to `<dir>/ref/` and `<dir>/golden/`
+    for `interop/mibs/compare/yang_check.sh`."""
+    t.timeout(600.0)
+    fc = file.FileCap(t.env.cap)
+    out = ""
+    eo = t.env.getenv("MIBYANG_OUT")
+    if eo is not None:
+        out = eo
+    # the reference SNMPv2-TC text differs from the built-in copy in blank lines
+    ref = emit_dir(fc, REF_DIR, REF_MODULES, out + "/ref" if out != "" else "", {"SNMPv2-TC": REF_DIR + "/SNMPv2-TC.txt"})
+    gold = emit_dir(fc, GOLDEN_DIR, [], out + "/golden" if out != "" else "")
+    bad: list[str] = []
+    for r in ref + gold:
+        if not r.ok:
+            bad.append(r.name + " failed")
+        for d in r.diags:
+            if d.level <= 2:
+                bad.append(str(d))
+    print("ref=" + str(len(ref)) + " golden=" + str(len(gold)) + " problems=" + str(len(bad)))
+    for b in bad[:40]:
+        print(b)
+    testing.assertEqual(len(ref), 9)
+    testing.assertEqual(len(gold), 43)
+    testing.assertEqual(bad, [])
+    t.success()
+
+
+actor _test_yang_golden_vendor(t: testing.EnvT):
+    """Emit the IETF golden modules together with the IEEE and vendor ones, resolved as one set,
+    for `yang_check.sh golden-all`.
+
+    The vendor texts are staged from the local corpus by `meta_vs_oracles.py --stage-vendor`
+    into VENDOR_DIR (or `MIBGOLDEN_VENDOR`). Output goes to `MIBYANG_OUT`, by default
+    `interop/mibs/cache/yang/golden-all`. Fails only on internal (level-0) diagnostics;
+    translation failures and level-1/2 diagnostics are printed."""
+    t.require("mibcorpus")
+    t.timeout(600.0)
+    fc = file.FileCap(t.env.cap)
+    vdir = VENDOR_DIR
+    ev = t.env.getenv("MIBGOLDEN_VENDOR")
+    if ev is not None and ev != "":
+        vdir = ev
+    out = CACHE_YANG + "/golden-all"
+    eo = t.env.getenv("MIBYANG_OUT")
+    if eo is not None and eo != "":
+        out = eo
+    mkdirs(fc, out)
+    mp = mib.source.MibPath([GOLDEN_DIR, vdir], True, True)
+    dg = mib.diag.Diagnostics()
+    mib.source.index_path(mp, fc, dg)
+    names = sorted(list(mp.entries.keys()))
+    ms = mib.resolver.resolve_path(fc, mp, names)
+    tr = mib.yang.Translator(ms)
+    failed: list[str] = []
+    serious: list[str] = []
+    internal: list[str] = []
+    n = 0
+    vendor = 0
+    for nm in ms.order:
+        r = tr.module(nm)
+        if r is not None:
+            n += 1
+            write_module(fc, out, ms, tr, r, True)
+            for e in mp.entries.get_def(nm, []):
+                if e.dir_index == 1:
+                    vendor += 1
+                    break
+            if not r.ok:
+                failed.append(nm)
+            for d in r.diags:
+                if d.level == 0:
+                    internal.append(str(d))
+                elif d.level <= 2:
+                    serious.append(str(d))
+    print("modules " + str(n) + " (vendor/IEEE " + str(vendor) + "), failed " + str(len(failed)) + ", level-1/2 " + str(len(serious)) +
+          ", internal " + str(len(internal)) + " -> " + out)
+    for x in failed:
+        print("FAILED " + x)
+    for x in serious[:40]:
+        print("DIAG " + x)
+    for x in internal[:20]:
+        print("INTERNAL " + x)
+    testing.assertTrue(vendor > 0)
+    testing.assertEqual(internal, [])
+    t.success()
+
+
+def corpus_chunk(spec: str, n: int) -> (int, int):
+    """`[lo, hi)` of the k-th of m slices for `k/m` (all for an empty or bad spec)."""
+    parts = spec.split("/")
+    if len(parts) == 2:
+        try:
+            k = int(parts[0].strip())
+            m = int(parts[1].strip())
+            if m >= 1 and k >= 1 and k <= m:
+                return ((k - 1) * n // m, k * n // m)
+        except ValueError:
+            pass
+    return (0, n)
+
+
+actor _test_yang_corpus(t: testing.EnvT):
+    """Emit YANG for the corpus, or a slice of it, with each module's import closure.
+
+        acton test --fast --tag mibcorpus --no-cache --module mib.test_yang --name yang_corpus
+
+    The slice is `MIBCORPUS_CHUNK=k/n` (the k-th of n slices of the sorted names),
+    `MIBCORPUS_ONLY=A,B` or `MIBCORPUS_LIST=<file>` (one name per line). `MIBCORPUS_DIR`
+    overrides the corpus directory and `MIBYANG_OUT` the output directory. `MIBYANG_META=1`
+    also writes mibmeta, and `MIBYANG_CONSISTENT_STATUS=1` sets `Options.consistent_status`.
+
+    Besides the YANG files, the slice's emitter and resolver diagnostics and a per-module
+    result TSV are written. Prefixes are allocated over every name in the corpus, so a
+    module's YANG does not depend on the slice and chunks can share one output directory.
+    Fails only on internal (level-0) diagnostics.
+    """
+    t.require("mibcorpus")
+    t.timeout(1800.0)
+    fc = file.FileCap(t.env.cap)
+    cdir = "interop/mibs/corpus/flat"
+    ed = t.env.getenv("MIBCORPUS_DIR")
+    if ed is not None and ed != "":
+        cdir = ed
+    out = CACHE_YANG + "/corpus"
+    eo = t.env.getenv("MIBYANG_OUT")
+    if eo is not None and eo != "":
+        out = eo
+    mkdirs(fc, out)
+    meta = False
+    em = t.env.getenv("MIBYANG_META")
+    if em is not None and em.strip() == "1":
+        meta = True
+    spec = ""
+    ec = t.env.getenv("MIBCORPUS_CHUNK")
+    if ec is not None:
+        spec = ec.strip()
+    mp = mib.source.MibPath([cdir], True, False)
+    dg = mib.diag.Diagnostics()
+    mib.source.index_path(mp, fc, dg)
+    allnames = sorted(list(mp.entries.keys()))
+    lo, hi = corpus_chunk(spec, len(allnames))
+    names = allnames[lo:hi]
+    sfx = "" if spec == "" else "." + spec.replace("/", "of")
+    eon = t.env.getenv("MIBCORPUS_ONLY")
+    if eon is not None and eon.strip() != "":
+        names = [x.strip() for x in eon.split(",") if x.strip() != ""]
+        sfx = ".only"
+    el = t.env.getenv("MIBCORPUS_LIST")
+    if el is not None and el.strip() != "":
+        rf = file.ReadFile(file.ReadFileCap(fc), el.strip())
+        names = [x.strip() for x in rf.read().decode().split("\n") if x.strip() != "" and not x.startswith("#")]
+        rf.close()
+        sfx = ".list"
+    ms = mib.resolver.resolve_path(fc, mp, names)
+    opts = mib.yang.Options()
+    opts.prefix_names = allnames
+    ecs = t.env.getenv("MIBYANG_CONSISTENT_STATUS")
+    if ecs is not None and ecs.strip() == "1":
+        opts.consistent_status = True
+    tr = mib.yang.Translator(ms, opts)
+    diags: list[str] = []
+    failed: list[str] = []
+    internal: list[str] = []
+    rows: list[str] = []
+    want = set(names)
+    for nm in ms.order:
+        r = tr.module(nm)
+        if r is not None:
+            write_text(fc, out + "/" + nm + ".yang", r.text)
+            if meta:
+                mm = mib.meta.module_meta(ms, nm, tr)
+                if mm is not None:
+                    write_text(fc, out + "/" + nm + ".mibmeta.json", mib.meta.to_json(mm))
+            if nm in want:
+                rows.append(nm + "\t" + ("ok" if r.ok else "failed"))
+                if not r.ok:
+                    failed.append(nm)
+                for d in r.diags:
+                    diags.append(str(d))
+                    if d.level == 0:
+                        internal.append(str(d))
+    for nm in names:
+        if nm not in ms.modules:
+            rows.append(nm + "\tnot-loaded")
+    write_text(fc, out + "/yang-diags" + sfx + ".txt", "\n".join(diags) + "\n")
+    # the resolver's level-1/2 diagnostics of the slice (to classify MIB defects)
+    rdiags = [str(d) for d in ms.diags if d.level >= 1 and d.level <= 2 and d.module in want]
+    write_text(fc, out + "/resolve-diags" + sfx + ".txt", "\n".join(rdiags) + "\n")
+    write_text(fc, out + "/yang-modules" + sfx + ".tsv", "\n".join(rows) + "\n")
+    print("modules " + str(len(names)) + " (closure " + str(len(ms.order)) + "), failed " + str(len(failed)) +
+          ", diagnostics " + str(len(diags)) + ", internal " + str(len(internal)) + " -> " + out)
+    for x in failed[:20]:
+        print("FAILED " + x)
+    for x in internal[:20]:
+        print("INTERNAL " + x)
+    testing.assertEqual(internal, [])
+    t.success()

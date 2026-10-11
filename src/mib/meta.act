@@ -4,20 +4,35 @@
   (`NodeMeta.keyless` marks a row without a usable INDEX or AUGMENTS). Optional strings are
   "" when absent (written as missing keys in JSON).
 - `module_meta(ms, name)` / `bundle(ms, names)` derive them from a resolved
-  `mib.model.MibSet`.
+  `mib.model.MibSet`, together with the YANG emitter (`mib.yang.Translator`), so the module
+  prefix, the revision, `NodeMeta.yang` data node paths and `IndexPart.key` names are the ones
+  the emitted YANG uses.
 - `to_json(m)` / `bundle_to_json(b)` write the `actsnmp-mibmeta/1` JSON format, with a
   fixed key order so the output is diffable; `from_json(text)` / `bundle_from_json(text)`
   read it back (`MetaError` on malformed input).
 - `MetaIndex`: an OID trie with longest-prefix match (`lookup(oid)` gives the node and
-  the instance suffix) and by-name lookup (`find("ifIndex")`, `find("IF-MIB::ifIndex")`).
+  the instance suffix), by-name lookup (`find("ifIndex")`, `find("IF-MIB::ifIndex")`) and
+  by YANG path (`find_path("/if-mib:IF-MIB/if-mib:ifTable/if-mib:ifEntry/if-mib:ifIndex")`).
 
-Not yet derived: `NodeMeta.yang` data node paths stay empty, and the module prefix is the
-RFC 6643 Appendix B prefix of `prefix_of`, without collision handling against import prefixes.
+YANG paths: every segment carries the own prefix of the module that defines
+it (the prefix in that module's YANG file), e.g. an augmenting column of Q-BRIDGE-MIB is
+`/bridge-mib:BRIDGE-MIB/.../bridge-mib:dot1dBasePortEntry/q-bridge:dot1qPvid`. Nodes without a
+data node have none: accessible-for-notify objects (non-index), OID assignments, identities,
+groups, compliances, augmenting rows and their tables. A scalar group container gets the path
+of its parent node when that node is defined in the same module; notifications get
+`/<prefix>:<name>`. A container whose OID node is defined in another module (a vendor scalar
+below SNMPv2-MIB's `system`), or is a scalar, column or notification (a MIB error), is listed
+in `ModuleMeta.containers` (JSON `containers`) as a `NodeMeta` of kind "container" with the
+container's YANG name, its OID and path; `MetaIndex.find_path` finds those too, so every data
+node with `smiv2:oid` has an entry. Value conversion (`conv`, `hint`) follows the emitter:
+SMIv1 informal DisplayString/PhysAddress carry the SNMPv2-TC hints, and enumerations YANG
+cannot express (values outside int32) convert as `int`, like their int64 YANG leaf.
 """
 
 import json
 import mib.model
 import mib.source
+import mib.yang
 
 FORMAT = "actsnmp-mibmeta/1"
 
@@ -135,6 +150,7 @@ class ModuleMeta(object):
     source_sha256: str
     types: list[TypeMeta]
     nodes: list[NodeMeta]
+    containers: list[NodeMeta]
 
     def __init__(self, name: str, smi: str):
         self.name = name
@@ -145,6 +161,7 @@ class ModuleMeta(object):
         self.source_sha256 = ""
         self.types = []
         self.nodes = []
+        self.containers = []
 
 
 class MibBundle(object):
@@ -159,12 +176,10 @@ class MibBundle(object):
 # --- derivation from the model ----------------------------------------------------------------
 
 def prefix_of(name: str) -> str:
-    """RFC 6643 Appendix B prefix without collision handling: the first two `-` tokens of the
-    lowercased name (the whole name when it has one token)."""
-    toks = name.lower().split("-")
-    if len(toks) < 2:
-        return name.lower()
-    return toks[0] + "-" + toks[1]
+    """RFC 6643 Appendix B prefix when no other prefix is taken: the first two `-` tokens of the
+    lowercased name (the whole name when it has one token). `module_meta` uses the prefix of
+    the emitted YANG, which also avoids collisions with the module's import prefixes."""
+    return mib.yang.module_prefix(name)
 
 
 def revision_date(m: mib.model.MibModule) -> str:
@@ -177,21 +192,30 @@ def revision_date(m: mib.model.MibModule) -> str:
     return k[0:4] + "-" + k[4:6] + "-" + k[6:8]
 
 
-def conv_of(s: mib.model.Syntax) -> str:
-    """The value conversion kind of a resolved syntax."""
+def conv_of(s: mib.model.Syntax, ms: ?mib.model.MibSet = None) -> str:
+    """The value conversion kind of a resolved syntax. With `ms` the hint is the YANG
+    emitter's (SMIv1 informal hints); enumerations YANG cannot express (int64 leaf) convert
+    as `int`."""
     b = s.base
+    hint = s.hint
+    if ms is not None:
+        hint = mib.yang.effective_hint(ms, s)
     if b == "INTEGER":
         if len(s.enums) > 0:
             if s.tc_name == "TruthValue" and s.tc_module == "SNMPv2-TC":
                 return "truthvalue"
-            return "enum"
-        if s.hint.startswith("d-"):
+            if mib.yang.enum_expressible(s.enums):
+                return "enum"
+            return "int"
+        if hint.startswith("d-"):
             return "int-hint"
         return "int"
     if b == "Unsigned32" or b == "Gauge32" or b == "Counter32" or b == "TimeTicks" or b == "Counter64":
         return "uint"
     if b == "BITS":
-        return "bits"
+        if len(s.bits) == 0 or mib.yang.bits_expressible(s.bits):
+            return "bits"
+        return "binary"
     if b == "IpAddress":
         return "ipv4"
     if b == "OBJECT IDENTIFIER":
@@ -204,14 +228,14 @@ def conv_of(s: mib.model.Syntax) -> str:
                 return "phys-address"
             if c == "SNMPv2-TC::MacAddress":
                 return "mac-address"
-        if s.hint != "":
+        if hint != "":
             return "string-hint"
         return "binary"
     return ""
 
 
-def syntax_meta(s: mib.model.Syntax) -> SyntaxMeta:
-    sm = SyntaxMeta(s.base, s.tc(), conv_of(s), s.hint)
+def syntax_meta(s: mib.model.Syntax, ms: ?mib.model.MibSet = None) -> SyntaxMeta:
+    sm = SyntaxMeta(s.base, s.tc(), conv_of(s, ms), mib.yang.effective_hint(ms, s) if ms is not None else s.hint)
     sm.ranges = [(r.lo, r.hi) for r in s.ranges]
     sm.sizes = [(r.lo, r.hi) for r in s.sizes]
     sm.enums = [(e.label, e.value) for e in s.enums]
@@ -219,14 +243,14 @@ def syntax_meta(s: mib.model.Syntax) -> SyntaxMeta:
     return sm
 
 
-def _opt_syntax(s: ?mib.model.Syntax) -> ?SyntaxMeta:
+def _opt_syntax(s: ?mib.model.Syntax, ms: ?mib.model.MibSet = None) -> ?SyntaxMeta:
     if s is not None:
         if s.unresolved == "" and s.base != "" and s.base != "SEQUENCE" and s.base != "SEQUENCE OF" and s.base != "CHOICE":
-            return syntax_meta(s)
+            return syntax_meta(s, ms)
     return None
 
 
-def node_meta(n: mib.model.MibNode) -> NodeMeta:
+def node_meta(n: mib.model.MibNode, ms: ?mib.model.MibSet = None) -> NodeMeta:
     nm = NodeMeta(n.name, n.module, n.oid, n.kind)
     nm.access = n.access
     nm.status = n.status
@@ -234,11 +258,11 @@ def node_meta(n: mib.model.MibNode) -> NodeMeta:
     dv = n.defval
     if dv is not None:
         nm.defval = dv.smi
-    nm.syntax = _opt_syntax(n.syntax)
+    nm.syntax = _opt_syntax(n.syntax, ms)
     if n.kind == "row":
         if n.augments == "":
             # an augmenting row has no index of its own: the base row's applies
-            nm.index = [IndexPart(p.object(), p.key, p.enc, p.size, _opt_syntax(p.syntax)) for p in n.index]
+            nm.index = [IndexPart(p.object(), p.key, p.enc, p.size, _opt_syntax(p.syntax, ms)) for p in n.index]
         nm.implied = n.implied
         nm.keyless = n.keyless
         nm.augments = n.augments
@@ -248,28 +272,49 @@ def node_meta(n: mib.model.MibNode) -> NodeMeta:
     return nm
 
 
-def module_meta(ms: mib.model.MibSet, name: str) -> ?ModuleMeta:
+def module_meta(ms: mib.model.MibSet, name: str, tr: ?mib.yang.Translator = None) -> ?ModuleMeta:
     """The mibmeta of module `name` of a resolved set (None when it is not loaded). Nodes are
-    sorted by OID; unlinked nodes are left out."""
+    sorted by OID; unlinked nodes are left out. The YANG facts (prefix, revision, data node
+    paths, key leaf names) come from `tr` (a new `mib.yang.Translator` by default; pass one to
+    share its work across modules)."""
     m = ms.module(name)
     if m is not None:
+        t = tr if tr is not None else mib.yang.Translator(ms)
         mm = ModuleMeta(m.name, m.smi)
         mm.revision = revision_date(m)
+        yr = t.module(name)
+        if yr is not None:
+            mm.yang_prefix = yr.prefix
+            mm.revision = yr.revision
+        paths = t.paths(name)
         mm.source_sha256 = m.sha256
-        for t in m.types:
-            if t.kind == "tc" or t.kind == "type":
-                mm.types.append(TypeMeta(t.name, t.parent, t.status, _opt_syntax(t.syntax)))
+        for ty in m.types:
+            if ty.kind == "tc" or ty.kind == "type":
+                mm.types.append(TypeMeta(ty.name, ty.parent, ty.status, _opt_syntax(ty.syntax, ms)))
         keyed = [(n.oid, i) for i, n in enumerate(m.nodes) if n.linked]
         for k in sorted(keyed):
-            mm.nodes.append(node_meta(m.nodes[k.1]))
+            n = m.nodes[k.1]
+            nm = node_meta(n, ms)
+            nm.yang = paths.get_def(mib.yang.node_key(n), "")
+            if n.kind == "row" and n.augments == "":
+                keys = t.row_keys(n)
+                if len(keys) == len(nm.index):
+                    for i, p in enumerate(nm.index):
+                        p.key = keys[i]
+            mm.nodes.append(nm)
+        for c in t.containers(name):
+            cm = NodeMeta(c.0, m.name, c.1, "container")
+            cm.yang = c.2
+            mm.containers.append(cm)
         return mm
     return None
 
 
 def bundle(ms: mib.model.MibSet, names: list[str]) -> MibBundle:
     out: list[ModuleMeta] = []
+    tr = mib.yang.Translator(ms)
     for nm in names:
-        mm = module_meta(ms, nm)
+        mm = module_meta(ms, nm, tr)
         if mm is not None:
             out.append(mm)
     return MibBundle(out)
@@ -391,6 +436,8 @@ def module_json(m: ModuleMeta) -> str:
         f.append("\"source_sha256\":" + jq(m.source_sha256))
     f.append("\"types\":[\n " + ",\n ".join([_type_json(t) for t in m.types]) + "]" if len(m.types) > 0 else "\"types\":[]")
     f.append("\"nodes\":[\n " + ",\n ".join([node_json(n) for n in m.nodes]) + "]" if len(m.nodes) > 0 else "\"nodes\":[]")
+    if len(m.containers) > 0:
+        f.append("\"containers\":[\n " + ",\n ".join([node_json(n) for n in m.containers]) + "]")
     return "{{" + ",\n".join(f) + "}}"
 
 
@@ -546,6 +593,12 @@ def _module(d: dict[str, ?value]) -> ModuleMeta:
             n.index.append(IndexPart(_str(pd, "object"), _str(pd, "key"), _str(pd, "enc"), _int(sz) if sz is not None else 0,
                                      _syntax(_get(pd, "syntax"))))
         m.nodes.append(n)
+    for cv in _list(d, "containers"):
+        cd = _dict(cv)
+        c = NodeMeta(_str(cd, "name"), name, parse_oid(_str(cd, "oid")), _str(cd, "kind"))
+        c.status = _str(cd, "status")
+        c.yang = _str(cd, "yang")
+        m.containers.append(c)
     return m
 
 
@@ -578,21 +631,28 @@ class TrieNode(object):
 
 
 class MetaIndex(object):
-    """Runtime lookup over a bundle: an OID trie (longest-prefix match) and names.
+    """Runtime lookup over a bundle: an OID trie (longest-prefix match), names and YANG data
+    node paths.
 
     At an OID with several names the first one added wins for `lookup` (bundle order, then
-    module order); a registration is preferred over a plain OID assignment."""
+    module order); a registration is preferred over a plain OID assignment. A YANG path maps
+    to the first node added with that path."""
     root: TrieNode
     by_qname: dict[str, NodeMeta]
     by_name: dict[str, list[NodeMeta]]
+    by_yang_path: dict[str, NodeMeta]
 
     def __init__(self, b: MibBundle):
         self.root = TrieNode()
         self.by_qname = {}
         self.by_name = {}
+        self.by_yang_path = {}
         for m in b.modules:
             for n in m.nodes:
                 self.add(n)
+            for c in m.containers:
+                if c.yang != "" and c.yang not in self.by_yang_path:
+                    self.by_yang_path[c.yang] = c
 
     def add(self, n: NodeMeta) -> None:
         cur = self.root
@@ -611,6 +671,8 @@ class MetaIndex(object):
         q = n.qname()
         if q not in self.by_qname:
             self.by_qname[q] = n
+        if n.yang != "" and n.yang not in self.by_yang_path:
+            self.by_yang_path[n.yang] = n
         lst = self.by_name.get(n.name)
         if lst is not None:
             lst.append(n)
@@ -645,6 +707,10 @@ class MetaIndex(object):
             else:
                 return []
         return cur.nodes
+
+    def find_path(self, path: str) -> ?NodeMeta:
+        """The node whose YANG data node (schema) path is `path`."""
+        return self.by_yang_path.get(path)
 
     def find(self, name: str) -> ?NodeMeta:
         """By `MOD::name` (also `MOD.name`) or bare name (the first module that defines it)."""

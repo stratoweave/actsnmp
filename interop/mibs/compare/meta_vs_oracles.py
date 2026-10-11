@@ -40,7 +40,10 @@ net-snmp: ``oid``, ``type`` (kind: the leaf's base type or the macro), ``tc``, `
 
 Normalisation before comparing (the RFC 3584 mapping we apply on purpose): SMIv1 status
 mandatory/optional -> current, write-only -> read-write, Integer32 -> INTEGER, Counter ->
-Counter32, Gauge -> Gauge32, NetworkAddress -> IpAddress, Bits -> BITS.
+Counter32, Gauge -> Gauge32, NetworkAddress -> IpAddress, Bits -> BITS. Our ``hint`` of an
+object whose type chain reaches an SMIv1 informal ``DisplayString``/``PhysAddress`` type
+assignment (not SNMPv2-TC's) is the SNMPv2-TC hint the YANG emitter gives it; it is compared
+as "" with net-snmp, which has no hint there.
 
 Output: a Markdown report with the agreement rate per oracle and field, missing names
 (oracle knows the name, we do not) and with ``--show N`` the first N disagreements per
@@ -315,6 +318,28 @@ def check_oid(st, oracle, mod, name, theirs, n, oids):
     st.check(oracle, "oid", mod, name, theirs, theirs if theirs in oids.get(name, ()) else n["oid"])
 
 
+# "MOD::name" -> our TypeMeta, over all loaded modules (for t9_hint)
+ALL_TYPES = {}
+T9_HINTS = {"DisplayString": "255a", "PhysAddress": "1x:"}
+
+
+def t9_hint(sx):
+    """The SNMPv2-TC hint our syntax carries because its chain reaches an SMIv1 informal
+    DisplayString or PhysAddress, or ""."""
+    q = sx.get("tc", "")
+    for _ in range(16):
+        if not q:
+            return ""
+        mod, _, name = q.partition("::")
+        t = ALL_TYPES.get(q)
+        if t is None:
+            return ""
+        if name in T9_HINTS and mod != "SNMPv2-TC" and (t.get("syntax") or {}).get("wire") == "OCTET STRING":
+            return T9_HINTS[name]
+        q = t.get("parent", "")
+    return ""
+
+
 def compare_netsnmp(st, mod, ours, lines):
     nodes = {}
     for n in ours["nodes"]:
@@ -343,7 +368,10 @@ def compare_netsnmp(st, mod, ours, lines):
             st.check("netsnmp", "units", mod, name, d["units"], n.get("units", ""))
         if sx is not None:
             st.check("netsnmp", "tc", mod, name, d.get("tc", ""), local(sx.get("tc", "")))
-            st.check("netsnmp", "hint", mod, name, d.get("hint", ""), sx.get("hint", ""))
+            h = sx.get("hint", "")
+            if d.get("hint", "") == "" and h != "" and h == t9_hint(sx):
+                h = ""
+            st.check("netsnmp", "hint", mod, name, d.get("hint", ""), h)
             ours_r = sx.get("ranges") or sx.get("sizes") or []
             st.check("netsnmp", "ranges", mod, name, d.get("ranges", []), ours_r)
             ours_e = sx.get("enums") or sx.get("bits") or []
@@ -410,6 +438,9 @@ def main():
         ap.error("--ours is required")
     mods = set(x for x in a.modules.split(",") if x)
     ours = load_ours(a.ours, mods)
+    for mod, m in ours.items():
+        for t in m.get("types", []):
+            ALL_TYPES[mod + "::" + t["name"]] = t
     dirs = [a.expected] + a.expected_extra
     tcs = PysmiTypes(dirs, [a.pysmi_dir] if a.pysmi_dir else [])
     st = Stats()

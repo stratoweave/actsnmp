@@ -509,6 +509,7 @@ class Resolver(object):
     hint_keys: set[str]
     columns: dict[str, list[mib.model.MibNode]]
     tables_by_oid: dict[str, mib.model.MibNode]
+    closures: dict[str, set[str]]
 
     def __init__(self, ld: Loader):
         self.ms = mib.model.MibSet()
@@ -526,6 +527,28 @@ class Resolver(object):
         self.hint_keys = set()
         self.columns = {}
         self.tables_by_oid = {}
+        self.closures = {}
+
+    def closure(self, name: str) -> set[str]:
+        """The module and every module it imports from, transitively (by the imported symbols'
+        home modules)."""
+        c = self.closures.get(name)
+        if c is not None:
+            return c
+        out: set[str] = set()
+        todo = [name]
+        while len(todo) > 0:
+            nm = todo.pop()
+            if nm in out:
+                continue
+            out.add(nm)
+            m = self.ms.modules.get(nm)
+            if m is not None:
+                for im in m.imports:
+                    if im.home != "" and im.home not in out:
+                        todo.append(im.home)
+        self.closures[name] = out
+        return out
 
     # --- diagnostics ---
 
@@ -572,18 +595,34 @@ class Resolver(object):
             m = ms.modules[nm]
             for n in m.nodes:
                 self.guard_details(n)
-        # columns: children of rows
+        # columns: children of rows. Only a row of the object's own import closure makes it a
+        # column, so a module's model does not depend on unrelated modules of the set (ACC-MIB
+        # registers scalars below an OID assignment that ACC-FLASH, which it does not import,
+        # defines as a row)
+        rows_at: dict[str, list[mib.model.MibNode]] = {}
         for nm in ms.order:
             for n in ms.modules[nm].nodes:
                 if n.kind == "row" and n.linked:
                     k = mib.model.oid_str(n.oid)
                     if k not in self.rows_by_oid:
                         self.rows_by_oid[k] = n
+                    rl = rows_at.get(k)
+                    if rl is not None:
+                        rl.append(n)
+                    else:
+                        rows_at[k] = [n]
         for nm in ms.order:
             for n in ms.modules[nm].nodes:
                 if n.kind == "scalar" and n.linked and len(n.oid) > 1:
                     pk = mib.model.oid_str(n.oid[:-1])
-                    if pk in self.rows_by_oid:
+                    in_clo = False
+                    rws = rows_at.get(pk)
+                    if rws is not None:
+                        clo = self.closure(n.module)
+                        for r in rws:
+                            if r.module in clo:
+                                in_clo = True
+                    if in_clo:
                         n.kind = "column"
                         cl = self.columns.get(pk)
                         if cl is not None:
@@ -870,10 +909,12 @@ class Resolver(object):
         d = t.defn
         syn: ?mib.ast.Syntax = None
         hint = ""
+        hint_raw = ""
         if isinstance(d, mib.ast.TextualConvention):
             syn = d.syntax
             h = d.display_hint
             if h is not None:
+                hint_raw = h.value
                 hint = h.value.strip()
             st0 = d.status
             if st0 is not None:
@@ -900,6 +941,12 @@ class Resolver(object):
                     if pt is not None and pt.kind == "tc":
                         self.rep(t.module, "resolve.tc-nested", t.line, t.col,
                                  "the TC " + t.name + " refines the TC " + s2.tc())
+            if hint != "" and s2.base in STRING_BASES:
+                # a blank after the last octet spec is its separator ("1x " shows octets
+                # separated by blanks, RFC 2579 section 3.1), not white space to trim
+                full = hint_raw.lstrip()
+                if len(full) > len(hint) and full[len(hint)] == " " and hint_ok(hint + " ", s2.base):
+                    hint = hint + " "
             t.display_hint = hint
             if hint != "":
                 if hint_ok(hint, s2.base) and not (s2.base == "INTEGER" and len(s2.enums) > 0):
@@ -1425,7 +1472,7 @@ class Resolver(object):
             if v.kind == mib.ast.VAL_STRING:
                 return mib.model.DefVal(dv.text, "string", v.text, v.text)
             if v.kind == mib.ast.VAL_HEX:
-                return mib.model.DefVal(dv.text, "octets", v.text.lower(), "'" + v.text + "'H" if v.text != "" else "")
+                return mib.model.DefVal(dv.text, "octets", v.text.lower(), "'" + v.text.lower() + "'H" if v.text != "" else "")
             if v.kind == mib.ast.VAL_BIN:
                 bb = v.big_value()
                 hx = ""
@@ -1441,7 +1488,7 @@ class Resolver(object):
         if base == "IpAddress":
             if v.kind == mib.ast.VAL_HEX and len(v.text) == 8:
                 parts = [str(int(v.text[i:i + 2], 16)) for i in range(0, 8, 2)]
-                return mib.model.DefVal(dv.text, "ip", ".".join(parts), "'" + v.text + "'H")
+                return mib.model.DefVal(dv.text, "ip", ".".join(parts), "'" + v.text.lower() + "'H")
             if v.kind == mib.ast.VAL_STRING:
                 ps = v.text.strip().split(".")
                 ok = len(ps) == 4

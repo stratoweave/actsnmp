@@ -1,0 +1,2210 @@
+"""The RFC 6643 YANG emitter.
+
+Emits one YANG 1.0 module per SMI module of a resolved `mib.model.MibSet`, in the statement
+order and layout of libsmi 0.5.0 (`smidump -f yang`), so the output can be diffed against it
+after normalising the known differences (`interop/mibs/compare/yang_vs_libsmi.py`).
+
+`emit_module` returns the text of one module, `translate` the full `YangModule` and
+`emit_set` several modules at once. They share a `Translator`, which caches per-module
+layouts and also answers the data node paths and key names that mibmeta records.
+
+Decisions beyond the RFC:
+
+- Body order is libsmi's: typedefs (MIB order), identities, the module container (scalar
+  groups by first scalar, then tables), per augmenting row two aliases and the augment, then
+  notifications, then aliases. Nodes are visited in OID order, as libsmi's tree walk does.
+- Imports are computed from the statements actually emitted, sorted in byte
+  order. Prefixes follow Appendix B but are unique across the translated set: each module has
+  one prefix, used for itself and wherever it is imported (`set_prefix_map`; option
+  `set_prefixes`, else per module as libsmi: imports first, then the module itself).
+- Rows without INDEX/AUGMENTS become keyless lists; ranges on Counter32, Counter64 and
+  TimeTicks are dropped; enumerations keep the first label per value and fall back to
+  int64 (labels in the description) when a value does not fit int32, bits fall back to
+  binary; identifiers YANG cannot express are rewritten; SMIv1 base-type INDEX items get
+  a synthetic key leaf `<row>Index<N>` without `smiv2:oid`.
+- Descriptions: line ends normalised, leading tabs expanded to 8 columns, the common indent of
+  the continuation lines removed, trailing white space and trailing empty lines dropped, `\\`
+  and `"` escaped, other control characters mapped to a space.
+- SMIv1 informal `DisplayString`/`PhysAddress` type assignments get the SNMPv2-TC hints;
+  `effective_hint()` exposes the rule so mibmeta agrees.
+- Ranges are sorted and overlapping or adjacent ones merged (`1..4094 | 4095` is `1..4095`,
+  as libsmi prints it); ranges outside the YANG type are clamped; an INTEGER range beyond
+  int32 makes the type int64.
+- The `_n` copy of an own index column has no `smiv2:oid`, so every data node OID appears
+  once (checked by the emitter); a leafref leaf copies its target's status only
+  when the target is in the same module.
+- Scalars and rows registered below the same node (misplaced, RFC 3584 (13)/(14)) share one
+  container. A scalar whose parent OID has no descriptor goes into the module container; one
+  whose parent has several descriptors in the module's import closure fails the translation
+  unless `Options.scalar_parent_names` picks one.
+- REVISION/LAST-UPDATED dates that do not parse, are no calendar date, or have a year outside
+  1900..2099 give no revision statement; duplicate dates are merged; revisions are sorted
+  newest first.
+- SMI modules may import each other; YANG modules must not. The translator builds every
+  module's statements once without restriction, and inside a cycle of references keeps the
+  import only from the byte-order smaller to the larger module (an augment's import is always
+  kept); the other side inlines its references (typedefs as their resolved types, leafrefs as
+  typed leafs), level-4 `yang.import-cycle`.
+
+Layouts (names, keys, data node paths) are computed per module before statements are built,
+so leafrefs, augments and mibmeta paths into other modules use the names those modules emit.
+"""
+
+import mib.diag
+import mib.model
+import mib.source
+
+GENERATOR = "actsnmp mib.yang 1"
+
+NS_BASE = "urn:ietf:params:xml:ns:yang:smiv2:"
+
+SMIV2 = "ietf-yang-smiv2"
+YANG_TYPES = "ietf-yang-types"
+INET_TYPES = "ietf-inet-types"
+
+# Modules whose definitions are translated by rules and never imported (RFC 6643 section 3 rule 2,
+# plus the SMIv1 equivalents).
+LANG_MODULES: set[str] = {"SNMPv2-SMI", "SNMPv2-CONF", "RFC1155-SMI", "RFC-1212", "RFC-1215"}
+
+# Type names that are base types when a language module defines them.
+LANG_BASE_TYPES: set[str] = {"Integer32", "Unsigned32", "Gauge32", "Gauge", "Counter32", "Counter",
+                             "Counter64", "TimeTicks", "IpAddress", "NetworkAddress", "Opaque",
+                             "UInteger32", "ObjectName", "NotificationName"}
+
+# RFC 6643 Appendix A: well-known TCs -> (YANG module or "", YANG type)
+WELL_KNOWN: dict[str, (str, str)] = {
+    "SNMPv2-TC::PhysAddress": (YANG_TYPES, "phys-address"),
+    "SNMPv2-TC::MacAddress": (YANG_TYPES, "mac-address"),
+    "SNMPv2-TC::TruthValue": ("", "boolean"),
+    "SNMPv2-TC::TimeStamp": (YANG_TYPES, "timestamp"),
+    "RMON2-MIB::ZeroBasedCounter32": (YANG_TYPES, "zero-based-counter32"),
+    "HCNUM-TC::ZeroBasedCounter64": (YANG_TYPES, "zero-based-counter64"),
+    "HCNUM-TC::CounterBasedGauge64": (YANG_TYPES, "gauge64"),
+    "INET-ADDRESS-MIB::InetAutonomousSystemNumber": (INET_TYPES, "as-number"),
+    "INET-ADDRESS-MIB::InetVersion": (INET_TYPES, "ip-version"),
+    "INET-ADDRESS-MIB::InetPortNumber": (INET_TYPES, "port-number"),
+    "DIFFSERV-DSCP-TC::Dscp": (INET_TYPES, "dscp"),
+    "IPV6-FLOW-LABEL-MIB::IPv6FlowLabel": (INET_TYPES, "ipv6-flow-label"),
+    "URI-TC-MIB::Uri": (INET_TYPES, "uri"),
+}
+
+# SMIv1 informal TCs (type assignments) and the SNMPv2-TC hint they get
+SMIV1_HINTS: dict[str, str] = {"DisplayString": "255a", "PhysAddress": "1x:"}
+
+YANG_BUILTIN_TYPES: set[str] = {"binary", "bits", "boolean", "decimal64", "empty", "enumeration",
+                                "identityref", "instance-identifier", "int8", "int16", "int32", "int64",
+                                "leafref", "string", "uint8", "uint16", "uint32", "uint64", "union"}
+
+LEAFREF_DESCRIPTION = "See the definition of the leaf the leafref path points to.\n[This leaf has been added by the SMIv2 to YANG conversion.]"
+
+# code -> (default level, libsmi error name or "", description)
+CATALOG: dict[str, (int, str, str)] = {
+    "yang.internal": (0, "", "an internal error of the YANG emitter"),
+    "yang.scalar-parent-ambiguous": (1, "", "a scalar's parent OID has several descriptors; RFC 6643 §7.1 says the translation MUST fail (Options.scalar_parent_names picks one)"),
+    "yang.scalar-parent-conflict": (2, "", "a scalar's parent OID is also (or only) registered as a scalar, column, notification or conformance statement, which cannot have subordinate objects (a MIB error); the OID assignment's descriptor names the container"),
+    "yang.scalar-parent-unnamed": (3, "", "a scalar's parent OID has no descriptor; its leaf goes directly into the module container"),
+    "yang.row-unplaced": (2, "", "a row is not below a named table node; it gets no list"),
+    "yang.augment-unresolved": (2, "", "the base row of an AUGMENTS has no list; the augmenting row is not translated"),
+    "yang.column-orphan": (3, "", "a column whose row is defined in another module is not translated"),
+    "yang.type-unresolved": (3, "", "an object whose type is unresolved gets no leaf (a key leaf gets type string)"),
+    "yang.typedef-unresolved": (3, "", "a type whose syntax is unresolved gets no typedef"),
+    "yang.range-dropped": (3, "", "a range on Counter32, Counter64 or TimeTicks is dropped from the YANG (kept in the model and mibmeta)"),
+    "yang.range-clamped": (3, "", "a range or size outside the YANG type's value space is clamped"),
+    "yang.range-int64": (3, "", "an INTEGER range beyond int32 makes the YANG type int64"),
+    "yang.range-merged": (5, "", "overlapping, adjacent or unordered ranges are sorted and merged (YANG needs ascending disjoint ranges)"),
+    "yang.restriction-dropped": (3, "", "a SIZE, range or enumeration subset that YANG cannot express on this type is dropped"),
+    "yang.enum-duplicate-value": (3, "", "an enumeration value or bit position is used twice; only the first label goes into the YANG"),
+    "yang.enum-fallback": (3, "", "an enumeration value outside int32: the type falls back to int64 and the labels go into the description"),
+    "yang.bits-fallback": (3, "", "a bit position YANG cannot express: the type falls back to binary and the labels go into the description"),
+    "yang.identifier-rewritten": (4, "", "a name that is not a valid or unique YANG identifier is rewritten (prefix '_', illegal characters to '_', numeric suffix)"),
+    "yang.index-unresolved": (4, "", "an INDEX object that is not a column or scalar gets a key leaf of type string"),
+    "yang.index-no-leaf": (4, "", "an INDEX or notification object has no data leaf to refer to; a typed leaf is emitted instead of a leafref"),
+    "yang.notification-object": (3, "", "a notification object that is not a column or scalar (or whose OID is unresolved) gets an empty object-<k> container"),
+    "yang.status-reference": (4, "", "a current definition refers to a deprecated or obsolete one in the same module (YANG 1.0 forbids it; pyang reports an error)"),
+    "yang.revision-date": (4, "", "a REVISION or LAST-UPDATED date that does not parse (or has a year outside 1900..2099) gives no revision statement"),
+    "yang.oid-duplicate": (2, "", "two data nodes of the module carry the same smiv2:oid"),
+    "yang.oid-invalid": (3, "", "an OID that the smiv2:oid syntax rejects (one arc, a first arc above 2) is left out; such an OID assignment gets no alias"),
+    "yang.import-cycle": (4, "", "modules that import each other in SMI would import each other in YANG, which YANG forbids; one direction is inlined (typedefs as their base types, leafrefs as typed leafs)"),
+}
+
+# registrations that cannot be the parent of a scalar: leaf objects and notifications,
+# conformance statements
+LEAF_KINDS: set[str] = {"scalar", "column", "notification", "object-group", "notification-group", "compliance", "capabilities"}
+
+
+# statement argument forms
+F_NONE = 0
+F_BARE = 1
+F_QUOTED = 2
+F_TEXT = 3
+
+
+class YangError(Exception):
+    def __init__(self, msg: str):
+        self.error_message = msg
+
+
+class Options(object):
+    """Emitter options.
+
+    - `smiv1_hints`: T9, SMIv1 informal DisplayString/PhysAddress get the SNMPv2-TC hints.
+    - `scalar_parent_names`: T16, parent OID (dotted) -> the descriptor to use when the OID has
+      several names.
+    - `header`: emit the generated-by comment.
+    - `set_prefixes`: give every module of the `MibSet` one prefix, unique in the set, used as
+      its own prefix and wherever it is imported (`set_prefix_map`). Otherwise prefixes are
+      allocated per module (Appendix B as libsmi: imports first, the module last), and two
+      modules can end up with the same own prefix, which acton-yang cannot compile together.
+    - `consistent_status`: a definition that refers to a deprecated or obsolete definition of
+      its own module (a key leaf, an INDEX object, a TC) takes that status in the YANG, so the
+      module satisfies YANG's status rule (RFC 6020 §7.19.2) and pyang accepts it. Off by
+      default: decision G22 keeps the MIB statuses (`yang.status-reference` warns either way).
+    - `prefix_names`: with `set_prefixes`, allocate the prefixes over these module names (plus
+      the modules of the set) instead of the set alone. A corpus run passes every module name
+      of its search path, so a module's YANG does not depend on which chunk loaded it.
+    """
+    smiv1_hints: bool
+    scalar_parent_names: dict[str, str]
+    header: bool
+    set_prefixes: bool
+    consistent_status: bool
+    prefix_names: list[str]
+
+    def __init__(self):
+        self.smiv1_hints = True
+        self.scalar_parent_names = {}
+        self.header = True
+        self.set_prefixes = True
+        self.consistent_status = False
+        self.prefix_names = []
+
+
+def level_of(code: str) -> int:
+    e = CATALOG.get(code)
+    if e is not None:
+        return e.0
+    return mib.diag.level_of(code)
+
+
+# --- identifiers -------------------------------------------------------------------------------
+
+def _ident_char(c: str, first: bool) -> bool:
+    if (c >= "a" and c <= "z") or (c >= "A" and c <= "Z") or c == "_":
+        return True
+    if first:
+        return False
+    return (c >= "0" and c <= "9") or c == "-" or c == "."
+
+
+def valid_identifier(s: str) -> bool:
+    """A YANG 1.0 identifier: `[A-Za-z_][A-Za-z0-9_.-]*`, not starting with `xml`."""
+    if s == "":
+        return False
+    for i, c in enumerate(s):
+        if not _ident_char(c, i == 0):
+            return False
+    return not s.lower().startswith("xml")
+
+
+def rewrite_identifier(s: str) -> str:
+    """Illegal characters become `_`; `_` is prefixed when the name does not
+    start with a letter or underscore (or starts with `xml`)."""
+    if valid_identifier(s):
+        return s
+    out: list[str] = []
+    for c in s:
+        out.append(c if _ident_char(c, False) else "_")
+    r = "".join(out)
+    if r == "" or not _ident_char(r[0], True) or r.lower().startswith("xml"):
+        r = "_" + r
+    return r
+
+
+def typedef_identifier(s: str) -> str:
+    r = rewrite_identifier(s)
+    if r in YANG_BUILTIN_TYPES:
+        return "_" + r
+    return r
+
+
+class Namer(object):
+    """Unique names within one YANG identifier namespace; collisions get `_2`, `_3`, ..."""
+    used: set[str]
+
+    def __init__(self):
+        self.used = set()
+
+    def take(self, want: str) -> str:
+        if want not in self.used:
+            self.used.add(want)
+            return want
+        i = 2
+        c = want + "_" + str(i)
+        while c in self.used:
+            i += 1
+            c = want + "_" + str(i)
+        self.used.add(c)
+        return c
+
+
+# --- prefixes (Appendix B) ----------------------------------------------------------------------
+
+def nice_prefix(module: str, taken: set[str]) -> str:
+    """libsmi's guessNicePrefix: the fixed prefixes of the three IETF modules, else the
+    shortest run of at least two leading `-` tokens of the lowercased name that is not taken,
+    else the whole lowercased name (with a numeric suffix if even that is taken)."""
+    if module == SMIV2 and "smiv2" not in taken:
+        return "smiv2"
+    if module == YANG_TYPES and "yang" not in taken:
+        return "yang"
+    if module == INET_TYPES and "inet" not in taken:
+        return "inet"
+    low = module.lower()
+    d = 0
+    for i, c in enumerate(low):
+        if c == "-":
+            d += 1
+            if d > 1:
+                p = low[:i]
+                if p not in taken:
+                    return p
+    if low not in taken:
+        return low
+    j = 2
+    while low + str(j) in taken:
+        j += 1
+    return low + str(j)
+
+
+def allocate_prefixes(own: str, imports: list[str]) -> dict[str, str]:
+    """Prefixes for the imports (in the given order, byte order of names) and the module itself."""
+    taken: set[str] = set()
+    out: dict[str, str] = {}
+    for im in imports:
+        p = nice_prefix(im, taken)
+        taken.add(p)
+        out[im] = p
+    out[own] = nice_prefix(own, taken)
+    return out
+
+
+def set_prefix_map(names: list[str]) -> dict[str, str]:
+    """One prefix per module, unique across `names` (and the fixed smiv2, yang and inet). Each
+    module takes the first free Appendix B candidate (two leading `-` tokens, three, ..., the
+    whole name); modules with fewer tokens choose first, then byte order, so `CISCO-IF-MIB`
+    keeps `cisco-if` and `CISCO-IF-EXTENSION-MIB` gets `cisco-if-extension`."""
+    taken: set[str] = {"smiv2", "yang", "inet"}
+    out: dict[str, str] = {SMIV2: "smiv2", YANG_TYPES: "yang", INET_TYPES: "inet"}
+    keyed = sorted([(len(nm.split("-")), nm) for nm in names if nm not in out])
+    for k in keyed:
+        p = nice_prefix(k.1, taken)
+        taken.add(p)
+        out[k.1] = p
+    return out
+
+
+def module_prefix(name: str) -> str:
+    """The prefix a module gets when nothing else is allocated (`IF-MIB` -> `if-mib`)."""
+    return nice_prefix(name, set())
+
+
+def _ref(module: str) -> str:
+    """A placeholder for the prefix of `module` inside an argument; resolved when rendering."""
+    return chr(1) + module + chr(2)
+
+
+def qualified(module: str, name: str) -> str:
+    if module == "":
+        return name
+    return _ref(module) + ":" + name
+
+
+def refs_in(arg: str) -> list[str]:
+    out: list[str] = []
+    if chr(1) not in arg:
+        return out
+    parts = arg.split(chr(1))
+    for p in parts[1:]:
+        k = p.find(chr(2))
+        if k >= 0:
+            out.append(p[:k])
+    return out
+
+
+def subst(arg: str, pmap: dict[str, str]) -> str:
+    if chr(1) not in arg:
+        return arg
+    parts = arg.split(chr(1))
+    out = [parts[0]]
+    for p in parts[1:]:
+        k = p.find(chr(2))
+        if k >= 0:
+            out.append(pmap.get_def(p[:k], p[:k].lower()))
+            out.append(p[k + 1:])
+        else:
+            out.append(p)
+    return "".join(out)
+
+
+def path_text(segs: list[(str, str)], pmap: dict[str, str]) -> str:
+    """`/p:a/q:b` of (module, name) segments, with `pmap` giving each module's prefix."""
+    return "".join(["/" + pmap.get_def(s.0, s.0.lower()) + ":" + s.1 for s in segs])
+
+
+def path_ref(segs: list[(str, str)]) -> str:
+    """The same path with prefix placeholders (resolved with the emitting module's prefixes)."""
+    return "".join(["/" + _ref(s.0) + ":" + s.1 for s in segs])
+
+
+# --- text ----------------------------------------------------------------------------------------
+
+def _expand_lead(s: str) -> str:
+    """Leading white space as spaces (tabs to the next multiple of 8)."""
+    w = 0
+    i = 0
+    for c in s:
+        if c == " ":
+            w += 1
+        elif c == "\t":
+            w = (w // 8 + 1) * 8
+        else:
+            break
+        i += 1
+    return " " * w + s[i:]
+
+
+def _indent_of(s: str) -> int:
+    i = 0
+    for c in s:
+        if c != " ":
+            break
+        i += 1
+    return i
+
+
+def _clean_chars(s: str) -> str:
+    """Control characters other than TAB and LF become spaces."""
+    ok = True
+    for c in s:
+        o = ord(c)
+        if (o < 32 and c != "\t" and c != "\n") or o == 127:
+            ok = False
+            break
+    if ok:
+        return s
+    out: list[str] = []
+    for c in s:
+        o = ord(c)
+        if (o < 32 and c != "\t" and c != "\n") or o == 127:
+            out.append(" ")
+        else:
+            out.append(c)
+    return "".join(out)
+
+
+def text_lines(raw: str) -> list[str]:
+    """A DESCRIPTION/REFERENCE/... text as the lines of the YANG string value:
+    LF line ends, leading tabs of continuation lines expanded, their common indent removed,
+    trailing white space and trailing empty lines dropped."""
+    s = _clean_chars(raw.replace("\r\n", "\n").replace("\r", "\n"))
+    lines = s.split("\n")
+    out = [lines[0].rstrip()]
+    rest = [_expand_lead(ln).rstrip() for ln in lines[1:]]
+    common = -1
+    for ln in rest:
+        if ln != "":
+            w = _indent_of(ln)
+            if common < 0 or w < common:
+                common = w
+    for ln in rest:
+        out.append(ln[common:] if ln != "" and common > 0 else ln)
+    while len(out) > 1 and out[-1] == "":
+        out.pop()
+    return out
+
+
+def text_value(raw: str) -> str:
+    """The normalised string value of a text (the lines joined with LF)."""
+    return "\n".join(text_lines(raw))
+
+
+def escape(s: str) -> str:
+    if "\\" not in s and "\"" not in s:
+        return s
+    return s.replace("\\", "\\\\").replace("\"", "\\\"")
+
+
+# --- statements ----------------------------------------------------------------------------------
+
+class Stmt(object):
+    """A YANG statement: keyword, argument (`form` F_NONE, F_BARE, F_QUOTED or F_TEXT) and
+    substatements. Arguments may hold prefix placeholders (`_ref`)."""
+    kw: str
+    arg: str
+    form: int
+    subs: list[Stmt]
+
+    def __init__(self, kw: str, arg: str, form: int):
+        self.kw = kw
+        self.arg = arg
+        self.form = form
+        self.subs = []
+
+    def add(self, s: Stmt) -> Stmt:
+        self.subs.append(s)
+        return s
+
+    def bare(self, kw: str, arg: str) -> Stmt:
+        return self.add(Stmt(kw, arg, F_BARE))
+
+    def quoted(self, kw: str, arg: str) -> Stmt:
+        return self.add(Stmt(kw, arg, F_QUOTED))
+
+    def text(self, kw: str, raw: str) -> None:
+        self.subs.append(Stmt(kw, text_value(raw), F_TEXT))
+
+    def find(self, kw: str) -> ?Stmt:
+        for s in self.subs:
+            if s.kw == kw:
+                return s
+        return None
+
+
+def render(s: Stmt, ind: int, pmap: dict[str, str], out: list[str]) -> None:
+    """libsmi's dump-yang layout: 2-space indent, a blank line before data nodes, a blank line
+    after each top-level statement (except namespace), text arguments on their own lines."""
+    if s.kw == "leaf" or s.kw == "list" or s.kw == "container" or s.kw == "leaf-list":
+        out.append("\n")
+    out.append(" " * ind + s.kw)
+    if s.form == F_BARE:
+        out.append(" " + subst(s.arg, pmap))
+    elif s.form == F_QUOTED:
+        out.append(" \"" + escape(subst(s.arg, pmap)) + "\"")
+    elif s.form == F_TEXT:
+        out.append("\n" + " " * (ind + 1) + "\"")
+        for i, ln in enumerate(s.arg.split("\n")):
+            if i > 0:
+                out.append("\n")
+                if ln != "":
+                    out.append(" " * (ind + 2))
+            out.append(escape(ln))
+        out.append("\"")
+    if len(s.subs) > 0:
+        out.append(" {{\n")
+        for i, c in enumerate(s.subs):
+            if ind == 0 and i == 0:
+                out.append("\n")
+            render(c, ind + 2, pmap, out)
+            if ind == 0 and c.kw != "namespace":
+                out.append("\n")
+        out.append(" " * ind + "}}\n")
+    else:
+        out.append(";\n")
+
+
+def collect_refs(s: Stmt, acc: set[str]) -> None:
+    for r in refs_in(s.arg):
+        acc.add(r)
+    for c in s.subs:
+        collect_refs(c, acc)
+
+
+# --- ranges -------------------------------------------------------------------------------------
+
+def big(v: int) -> bigint:
+    return bigint(v)
+
+
+INT32_LIMITS = (bigint(-2147483648), bigint(2147483647))
+INT64_LIMITS = (bigint("-9223372036854775808"), bigint("9223372036854775807"))
+UINT32_LIMITS = (bigint(0), bigint(4294967295))
+UINT64_LIMITS = (bigint(0), bigint("18446744073709551615"))
+
+
+def norm_ranges(rs: list[mib.model.Range]) -> list[mib.model.Range]:
+    """Sorted, with overlapping and adjacent ranges merged (`1..4094 | 4095` is `1..4095`, as
+    libsmi prints it)."""
+    keyed = sorted([(r.lo, r.hi) for r in rs])
+    out: list[mib.model.Range] = []
+    for k in keyed:
+        if len(out) > 0 and k.0 <= out[-1].hi + bigint(1):
+            if k.1 > out[-1].hi:
+                out[-1] = mib.model.Range(out[-1].lo, k.1)
+        else:
+            out.append(mib.model.Range(k.0, k.1))
+    return out
+
+
+def same_ranges(a: list[mib.model.Range], b: list[mib.model.Range]) -> bool:
+    if len(a) != len(b):
+        return False
+    for i in range(len(a)):
+        if a[i].lo != b[i].lo or a[i].hi != b[i].hi:
+            return False
+    return True
+
+
+def clamp_ranges(rs: list[mib.model.Range], lim: (bigint, bigint)) -> list[mib.model.Range]:
+    out: list[mib.model.Range] = []
+    for r in rs:
+        lo = r.lo if r.lo > lim.0 else lim.0
+        hi = r.hi if r.hi < lim.1 else lim.1
+        if lo <= hi:
+            out.append(mib.model.Range(lo, hi))
+    return out
+
+
+def ranges_text(rs: list[mib.model.Range]) -> str:
+    return "|".join([str(r.lo) if r.lo == r.hi else str(r.lo) + ".." + str(r.hi) for r in rs])
+
+
+def beyond(rs: list[mib.model.Range], lim: (bigint, bigint)) -> bool:
+    for r in rs:
+        if r.lo < lim.0 or r.hi > lim.1:
+            return True
+    return False
+
+
+def string_length(sizes: list[mib.model.Range], hint: str) -> ?list[mib.model.Range]:
+    """The YANG `length` of a hinted string, or None when it must be omitted. Only a single
+    `Na`/`Nt` octet spec with N at least the maximum SIZE keeps the SIZE; lower bounds become
+    ceil(lo/4) because one UTF-8 character takes up to 4 octets."""
+    if len(sizes) == 0 or len(hint) < 2:
+        return None
+    last = hint[-1]
+    if last != "a" and last != "t":
+        return None
+    digits = hint[:-1]
+    for c in digits:
+        if c < "0" or c > "9":
+            return None
+    n = bigint(digits)
+    mx = sizes[0].hi
+    for r in sizes:
+        if r.hi > mx:
+            mx = r.hi
+    if n < mx:
+        return None
+    out: list[mib.model.Range] = []
+    for r in sizes:
+        lo = (r.lo + bigint(3)) // bigint(4) if r.lo > bigint(0) else bigint(0)
+        out.append(mib.model.Range(lo, r.hi))
+    return norm_ranges(out)
+
+
+def enum_expressible(vals: list[mib.model.NamedValue]) -> bool:
+    """Whether an enumeration can be a YANG enumeration (every value fits int32, at least one)."""
+    if len(vals) == 0:
+        return False
+    for v in vals:
+        if v.value < -2147483648 or v.value > 2147483647:
+            return False
+    return True
+
+
+def bits_expressible(vals: list[mib.model.NamedValue]) -> bool:
+    if len(vals) == 0:
+        return False
+    for v in vals:
+        if v.value < 0 or v.value > 4294967295:
+            return False
+    return True
+
+
+def named_list(vals: list[mib.model.NamedValue]) -> str:
+    return ", ".join([v.label + "(" + str(v.value) + ")" for v in vals])
+
+
+# --- model helpers -------------------------------------------------------------------------------
+
+def syntax_ok(s: ?mib.model.Syntax) -> bool:
+    if s is not None:
+        b = s.base
+        return s.unresolved == "" and b != "" and b != "SEQUENCE" and b != "SEQUENCE OF" and b != "CHOICE" and b != "NULL"
+    return False
+
+
+def date_of(raw: str) -> str:
+    """`YYYY-MM-DD` of an SMI date, "" when it does not parse, is no calendar
+    date (`2012-09-31`) or its year is outside 1900..2099 (`000907140000Z`, a 2-digit year
+    with seconds, reads as year 0009, which is no YANG date)."""
+    k = mib.source.date_key(raw)
+    if len(k) < 8:
+        return ""
+    y = int(k[0:4])
+    mo = int(k[4:6])
+    d = int(k[6:8])
+    if y < 1900 or y > 2099:
+        return ""
+    dim = [31, 29 if (y % 4 == 0 and (y % 100 != 0 or y % 400 == 0)) else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    if mo < 1 or mo > 12 or d < 1 or d > dim[mo - 1]:
+        return ""
+    return k[0:4] + "-" + k[4:6] + "-" + k[6:8]
+
+
+def one_line(s: str) -> str:
+    """A text for a diagnostic message: line ends as spaces, at most 60 characters."""
+    t = s.replace("\r", " ").replace("\n", " ")
+    return t if len(t) <= 60 else t[:57] + "..."
+
+
+def split_qname(q: str) -> (str, str):
+    p = q.split("::")
+    if len(p) == 2:
+        return (p[0], p[1])
+    return ("", q)
+
+
+def node_key(n: mib.model.MibNode) -> str:
+    """The key of a node in `Layout.paths` and `Translator.paths()`: its name and OID (a module
+    may define a name twice with different OIDs; the resolver keeps both)."""
+    return n.name + "@" + mib.model.oid_str(n.oid)
+
+
+def is_node(n: mib.model.MibNode, module: str, name: str, ms: mib.model.MibSet) -> bool:
+    """Whether `module::name` (as an INDEX or OBJECTS reference resolves it) is the node `n`."""
+    if n.name != name or n.module != module:
+        return False
+    o = ms.node(module, name)
+    if o is not None:
+        return o.oid == n.oid
+    return False
+
+
+def by_oid(nodes: list[mib.model.MibNode]) -> list[mib.model.MibNode]:
+    keyed = [(n.oid, i) for i, n in enumerate(nodes) if n.linked]
+    return [nodes[k.1] for k in sorted(keyed)]
+
+
+def oid_ok(oid: list[int]) -> bool:
+    """Whether an OID fits the `smiv2:oid` syntax (pyang smi.py): at least two arcs, the
+    first 0, 1 or 2, the second at most 39 below 0 and 1."""
+    if len(oid) < 2 or oid[0] < 0 or oid[0] > 2:
+        return False
+    return oid[0] == 2 or oid[1] <= 39
+
+
+def status_rank(s: str) -> int:
+    if s == "obsolete":
+        return 2
+    if s == "deprecated":
+        return 1
+    return 0
+
+
+def worse_status(a: str, b: str) -> str:
+    return b if status_rank(b) > status_rank(a) else a
+
+
+# --- layout --------------------------------------------------------------------------------------
+
+class Group(object):
+    """A scalar group container (`name` "" for scalars whose parent OID has no descriptor)."""
+    name: str
+    oid: list[int]
+    node: ?mib.model.MibNode
+    scalars: list[(mib.model.MibNode, str)]
+    lists: list[ListL]
+
+    def __init__(self, name: str, oid: list[int], node: ?mib.model.MibNode):
+        self.name = name
+        self.oid = oid
+        self.node = node
+        self.scalars = []
+        self.lists = []
+
+
+class ListL(object):
+    """The list of a non-augmenting row: names, keys and where each key value lives."""
+    row: mib.model.MibNode
+    cname: str
+    lname: str
+    keys: list[str]
+    path: list[(str, str)]
+    namer: Namer
+    key_paths: list[list[(str, str)]]
+    own_parts: set[int]
+    columns: list[(mib.model.MibNode, list[str])]
+
+    def __init__(self, row: mib.model.MibNode, cname: str, lname: str, path: list[(str, str)]):
+        self.row = row
+        self.cname = cname
+        self.lname = lname
+        self.keys = []
+        self.path = path
+        self.namer = Namer()
+        self.key_paths = []
+        self.own_parts = set()
+        self.columns = []
+
+
+class TableC(object):
+    name: str
+    oid: list[int]
+    node: ?mib.model.MibNode
+    lists: list[ListL]
+    namer: Namer
+
+    def __init__(self, name: str, oid: list[int], node: ?mib.model.MibNode):
+        self.name = name
+        self.oid = oid
+        self.node = node
+        self.lists = []
+        self.namer = Namer()
+
+
+class AugL(object):
+    row: mib.model.MibNode
+    base: mib.model.MibNode
+    table: ?mib.model.MibNode
+    target: list[(str, str)]
+    cols: list[(mib.model.MibNode, str)]
+
+    def __init__(self, row: mib.model.MibNode, base: mib.model.MibNode, table: ?mib.model.MibNode, target: list[(str, str)]):
+        self.row = row
+        self.base = base
+        self.table = table
+        self.target = target
+        self.cols = []
+
+
+class Layout(object):
+    """Names and structure of one module's YANG (computed before any statement is built, so
+    other modules can refer to its leafs). `paths` maps node names of the module to their data
+    node schema path as (module, YANG name) segments."""
+    module: str
+    typedefs: dict[str, str]
+    groups: list[Group]
+    tables: list[TableC]
+    lists: dict[str, ListL]
+    augs: list[AugL]
+    namers: dict[str, Namer]
+    paths: dict[str, list[(str, str)]]
+    notifs: dict[str, str]
+    identities: dict[str, str]
+    col_rows: dict[str, mib.model.MibNode]
+    has_container: bool
+    containers: list[(str, list[int], list[(str, str)])]
+    diags: list[mib.diag.Diagnostic]
+
+    def __init__(self, module: str):
+        self.module = module
+        self.typedefs = {}
+        self.groups = []
+        self.tables = []
+        self.lists = {}
+        self.augs = []
+        self.namers = {}
+        self.paths = {}
+        self.notifs = {}
+        self.identities = {}
+        self.col_rows = {}
+        self.has_container = False
+        self.containers = []
+        self.diags = []
+
+    def namer(self, key: str) -> Namer:
+        """The namer of an extra namespace (a scalar group, augments of a foreign row)."""
+        n = self.namers.get(key)
+        if n is not None:
+            return n
+        nn = Namer()
+        self.namers[key] = nn
+        return nn
+
+
+class YangModule(object):
+    """The translation of one module: `text` (YANG 1.0), its `prefix`, `namespace`, newest
+    `revision` ("" when none), the imported module names, diagnostics and `ok` (no level-1
+    diagnostic, the RFC's "translation MUST fail" cases)."""
+    name: str
+    prefix: str
+    namespace: str
+    revision: str
+    imports: list[str]
+    text: str
+    ok: bool
+    diags: list[mib.diag.Diagnostic]
+
+    def __init__(self, name: str):
+        self.name = name
+        self.prefix = ""
+        self.namespace = NS_BASE + name
+        self.revision = ""
+        self.imports = []
+        self.text = ""
+        self.ok = True
+        self.diags = []
+
+
+class Translator(object):
+    """Translates modules of one `MibSet`, caching layouts and results across modules."""
+    ms: mib.model.MibSet
+    opts: Options
+    layouts: dict[str, Layout]
+    results: dict[str, YangModule]
+    gpaths: dict[str, dict[str, str]]
+    closures: dict[str, set[str]]
+    rows: dict[str, mib.model.MibNode]
+    raws: dict[str, Emitter]
+    set_pfx: dict[str, str]
+
+    def __init__(self, ms: mib.model.MibSet, opts: ?Options = None):
+        self.ms = ms
+        self.opts = opts if opts is not None else Options()
+        self.layouts = {}
+        self.results = {}
+        self.gpaths = {}
+        self.closures = {}
+        self.rows = {}
+        self.raws = {}
+        self.set_pfx = {}
+        if self.opts.set_prefixes:
+            if len(self.opts.prefix_names) > 0:
+                uni = set(self.opts.prefix_names)
+                for nm in ms.order:
+                    uni.add(nm)
+                self.set_pfx = set_prefix_map(list(uni))
+            else:
+                self.set_pfx = set_prefix_map(ms.order)
+        for nm in ms.order:
+            for n in ms.modules[nm].nodes:
+                if n.kind == "row" and n.linked:
+                    k = mib.model.oid_str(n.oid)
+                    if k not in self.rows:
+                        self.rows[k] = n
+
+    # --- lookups ---
+
+    def node(self, q: str) -> ?mib.model.MibNode:
+        p = split_qname(q)
+        return self.ms.node(p.0, p.1)
+
+    def row_of(self, col: mib.model.MibNode) -> ?mib.model.MibNode:
+        """The row a column belongs to (the row registered at the parent OID)."""
+        if len(col.oid) < 2:
+            return None
+        lay = self.layout(col.module)
+        if lay is not None:
+            r = lay.col_rows.get(node_key(col))
+            if r is not None:
+                return r
+        clo = self.closure(col.module)
+        other: ?mib.model.MibNode = None
+        for n in self.ms.names_at(col.oid[:-1]):
+            if n.kind == "row":
+                if n.module == col.module:
+                    return n
+                if other is None and n.module in clo:
+                    other = n
+        if other is not None:
+            return other
+        return self.rows.get(mib.model.oid_str(col.oid[:-1]))
+
+    def root_row(self, row: mib.model.MibNode) -> ?mib.model.MibNode:
+        """Follow AUGMENTS to the non-augmenting base row."""
+        cur = row
+        for i in range(16):
+            if cur.augments == "":
+                return cur
+            nx = self.node(cur.augments)
+            if nx is not None:
+                cur = nx
+            else:
+                return None
+        return None
+
+    def closure(self, name: str) -> set[str]:
+        """The module and every module it imports from, transitively."""
+        c = self.closures.get(name)
+        if c is not None:
+            return c
+        out: set[str] = set()
+        todo = [name]
+        while len(todo) > 0:
+            nm = todo.pop()
+            if nm in out:
+                continue
+            out.add(nm)
+            m = self.ms.module(nm)
+            if m is not None:
+                for im in m.imports:
+                    if im.home != "" and im.home not in out:
+                        todo.append(im.home)
+        self.closures[name] = out
+        return out
+
+    def hint(self, s: mib.model.Syntax) -> str:
+        return effective_hint(self.ms, s, self.opts.smiv1_hints)
+
+    def tdef_hint(self, t: mib.model.MibType) -> str:
+        """The effective hint of a type's typedef (its chain, its own hint, T9)."""
+        h = self.hint(t.syntax)
+        if h != "":
+            return h
+        return type_hint(self.ms, t, self.opts.smiv1_hints)
+
+    # --- layouts ---
+
+    def layout(self, name: str) -> ?Layout:
+        lay = self.layouts.get(name)
+        if lay is not None:
+            return lay
+        m = self.ms.module(name)
+        if m is not None:
+            ly = Layout(name)
+            self.layouts[name] = ly
+            build_layout(self, ly, m)
+            return ly
+        return None
+
+    def typedef_name(self, module: str, tname: str) -> str:
+        lay = self.layout(module)
+        if lay is not None:
+            return lay.typedefs.get_def(tname, typedef_identifier(tname))
+        return typedef_identifier(tname)
+
+    def leaf_path(self, n: mib.model.MibNode) -> ?list[(str, str)]:
+        """The data-node path of a column's or scalar's leaf, None when it has none."""
+        lay = self.layout(n.module)
+        if lay is not None:
+            p = lay.paths.get(node_key(n))
+            if p is not None and (n.kind == "column" or n.kind == "scalar"):
+                return p
+        return None
+
+    def list_of(self, row: mib.model.MibNode) -> ?ListL:
+        lay = self.layout(row.module)
+        if lay is not None:
+            return lay.lists.get(node_key(row))
+        return None
+
+    def row_keys(self, row: mib.model.MibNode) -> list[str]:
+        """The key leaf names of a non-augmenting row's list (mibmeta IndexPart.key)."""
+        ll = self.list_of(row)
+        if ll is not None:
+            return ll.keys
+        return []
+
+    def keys(self, module: str, row: str) -> list[str]:
+        """`row_keys` of the row `module::row`."""
+        n = self.ms.node(module, row)
+        if n is not None:
+            return self.row_keys(n)
+        return []
+
+    # --- results ---
+
+    def raw(self, name: str) -> ?Emitter:
+        """The module's statements built without cycle breaking (cached): their references
+        form the import graph the cycle check works on."""
+        e = self.raws.get(name)
+        if e is not None:
+            return e
+        m = self.ms.module(name)
+        lay = self.layout(name)
+        if m is not None and lay is not None:
+            ne = Emitter(self, m, lay, set())
+            ne.build()
+            self.raws[name] = ne
+            return ne
+        return None
+
+    def reaches(self, src: str, dst: str) -> bool:
+        """Whether `src` refers to `dst`, directly or through other modules (raw references)."""
+        seen: set[str] = set()
+        todo = [src]
+        while len(todo) > 0:
+            x = todo.pop()
+            if x == dst:
+                return True
+            if x in seen:
+                continue
+            seen.add(x)
+            e = self.raw(x)
+            if e is not None:
+                for y in e.refs:
+                    if y not in seen and not y.startswith("ietf-"):
+                        todo.append(y)
+        return False
+
+    def drops(self, name: str) -> set[str]:
+        """The modules `name` must not import because they refer back to it. Every edge inside
+        a cycle is kept only from the byte-order smaller to the larger module, except that an
+        augment edge is always kept (and then the opposite edge is the one dropped)."""
+        out: set[str] = set()
+        e = self.raw(name)
+        if e is not None:
+            for y in e.refs:
+                if y == name or y.startswith("ietf-") or y in e.aug_refs:
+                    continue
+                if not self.reaches(y, name):
+                    continue
+                ey = self.raw(y)
+                back_aug = ey is not None and name in ey.aug_refs
+                if back_aug or name > y:
+                    out.add(y)
+        return out
+
+    def module(self, name: str) -> ?YangModule:
+        r = self.results.get(name)
+        if r is not None:
+            return r
+        e = self.raw(name)
+        if e is not None:
+            d = self.drops(name)
+            if len(d) > 0:
+                e2 = Emitter(self, e.m, e.lay, d)
+                e2.build()
+                e = e2
+            res = e.finish()
+            self.results[name] = res
+            return res
+        return None
+
+    def prefix(self, name: str) -> str:
+        """The module's own prefix (as its YANG says)."""
+        p = self.set_pfx.get(name)
+        if p is not None:
+            return p
+        r = self.module(name)
+        if r is not None:
+            return r.prefix
+        return module_prefix(name)
+
+    def prefix_map(self, own: str, imports: list[str]) -> dict[str, str]:
+        """The prefixes a module's YANG uses for itself and its imports."""
+        if len(self.set_pfx) == 0:
+            return allocate_prefixes(own, imports)
+        out: dict[str, str] = {}
+        for im in imports + [own]:
+            out[im] = self.set_pfx.get_def(im, module_prefix(im))
+        return out
+
+    def containers(self, name: str) -> list[(str, list[int], str)]:
+        """The data node containers of the module's YANG that are no node's path in `paths`:
+        (YANG name, OID, schema path) of each scalar group or table container whose OID node is
+        defined in another module (a vendor scalar below `system`) or is a scalar, column or
+        notification (a MIB error, `yang.scalar-parent-conflict`). mibmeta lists them as
+        `containers` (kind "container"), so every data node with `smiv2:oid` has an entry."""
+        out: list[(str, list[int], str)] = []
+        lay = self.layout(name)
+        if lay is not None:
+            pm: dict[str, str] = {}
+            for c in lay.containers:
+                for sg in c.2:
+                    if sg.0 not in pm:
+                        pm[sg.0] = self.prefix(sg.0)
+                out.append((c.0, c.1, path_text(c.2, pm)))
+        return out
+
+    def paths(self, name: str) -> dict[str, str]:
+        """`node_key(n)` -> data node schema path of the module's node `n` (each segment with
+        its module's own prefix)."""
+        g = self.gpaths.get(name)
+        if g is not None:
+            return g
+        out: dict[str, str] = {}
+        lay = self.layout(name)
+        if lay is not None:
+            pm: dict[str, str] = {}
+            for k, segs in lay.paths.items():
+                for s in segs:
+                    if s.0 not in pm:
+                        pm[s.0] = self.prefix(s.0)
+                out[k] = path_text(segs, pm)
+        self.gpaths[name] = out
+        return out
+
+
+def effective_hint(ms: mib.model.MibSet, s: mib.model.Syntax, smiv1_hints: bool = True) -> str:
+    """The DISPLAY-HINT that decides string versus binary (T13): the effective hint, else (T9)
+    the SNMPv2-TC hint of an SMIv1 informal DisplayString/PhysAddress in the type chain."""
+    if s.hint != "" or not smiv1_hints or s.base != "OCTET STRING":
+        return s.hint
+    for q in s.chain:
+        p = split_qname(q)
+        h = SMIV1_HINTS.get(p.1)
+        if h is not None:
+            m = ms.module(p.0)
+            if m is not None:
+                t = m.find_type(p.1)
+                if t is not None and t.kind == "type":
+                    return h
+    return ""
+
+
+def type_hint(ms: mib.model.MibSet, t: mib.model.MibType, smiv1_hints: bool) -> str:
+    """The display hint a typedef carries itself (`smiv2:display-hint`): its own valid
+    DISPLAY-HINT, or the T9 hint of an SMIv1 informal DisplayString/PhysAddress."""
+    own = t.display_hint
+    if own != "" and t.syntax.hint == own:
+        return own
+    if smiv1_hints and t.kind == "type" and t.syntax.base == "OCTET STRING" and t.syntax.hint == "":
+        h = SMIV1_HINTS.get(t.name)
+        if h is not None:
+            return h
+    return ""
+
+
+def row_type_of(n: mib.model.MibNode) -> str:
+    """The SEQUENCE type a row's or table's SYNTAX names ("" when none)."""
+    sx = n.syntax
+    if sx is not None:
+        return sx.row_type
+    return ""
+
+
+def seq_owner(ms: mib.model.MibSet, rows: list[mib.model.MibNode], c: mib.model.MibNode) -> mib.model.MibNode:
+    """The row a column belongs to when several rows share its parent OID: the one whose
+    SEQUENCE type lists the column (else the first)."""
+    if len(rows) > 1:
+        for r in rows:
+            sx = r.syntax
+            if sx is not None and sx.row_type != "":
+                m = ms.module(sx.ref_module if sx.ref_module != "" else r.module)
+                if m is not None:
+                    t = m.find_type(sx.row_type)
+                    if t is not None:
+                        for it in t.items:
+                            if it.0 == c.name:
+                                return r
+    return rows[0]
+
+
+def parent_candidates(ms: mib.model.MibSet, poid: list[int], clo: set[str]) -> list[mib.model.MibNode]:
+    """The descriptors of a scalar's parent OID that can name its container, within the
+    import closure `clo`: OID assignments, identities, tables and rows. Registrations that
+    cannot have subordinate objects (a scalar, column, notification or conformance statement
+    at the same OID: a MIB error) and implicit `name(n)` labels only count when nothing else
+    names the OID."""
+    real: list[mib.model.MibNode] = []
+    implicit: list[mib.model.MibNode] = []
+    leafs: list[mib.model.MibNode] = []
+    for x in ms.names_at(poid):
+        if x.module not in clo:
+            continue
+        if x.macro == "implicit":
+            implicit.append(x)
+        elif x.kind in LEAF_KINDS:
+            leafs.append(x)
+        else:
+            real.append(x)
+    if len(real) > 0:
+        return real
+    if len(implicit) > 0:
+        return implicit
+    return leafs
+
+
+def written_parent(n: mib.model.MibNode) -> str:
+    """The parent descriptor a registration's OID value names (`{ usrIAA 3 }` -> `usrIAA`),
+    "" when the value has another form."""
+    ov = n.defn.oid
+    if ov is not None:
+        cs = ov.components
+        if len(cs) == 2 and cs[0].name != "" and cs[1].name == "":
+            return cs[0].name
+    return ""
+
+
+def column_has_leaf(n: mib.model.MibNode) -> bool:
+    """A non-index column or a scalar gets a data leaf (not-accessible ones too)."""
+    return n.access != "accessible-for-notify" and syntax_ok(n.syntax)
+
+
+def _diag(lay: Layout, ms: mib.model.MibSet, code: str, n_module: str, line: int, col: int, msg: str) -> None:
+    fl = ""
+    m = ms.module(n_module)
+    if m is not None:
+        fl = m.file
+    lay.diags.append(mib.diag.Diagnostic(level_of(code), code, n_module, fl, line, col, msg))
+
+
+def _ndiag(lay: Layout, ms: mib.model.MibSet, code: str, n: mib.model.MibNode, msg: str) -> None:
+    _diag(lay, ms, code, n.module, n.line, n.col, msg)
+
+
+def _yname(lay: Layout, ms: mib.model.MibSet, n: mib.model.MibNode, namer: Namer) -> str:
+    """The YANG name of a node in a namespace: rewritten and made unique."""
+    want = rewrite_identifier(n.name)
+    got = namer.take(want)
+    if got != n.name:
+        _ndiag(lay, ms, "yang.identifier-rewritten", n, n.name + " is " + got + " in the YANG")
+    return got
+
+
+def build_layout(tr: Translator, lay: Layout, m: mib.model.MibModule) -> None:
+    ms = tr.ms
+    mod = m.name
+    # typedefs
+    tn = Namer()
+    for t in m.types:
+        if t.kind == "tc" or t.kind == "type":
+            got = tn.take(typedef_identifier(t.name))
+            if got != t.name:
+                _diag(lay, ms, "yang.identifier-rewritten", mod, t.line, t.col, "type " + t.name + " is typedef " + got + " in the YANG")
+            lay.typedefs[t.name] = got
+    nodes = by_oid(m.nodes)
+    top = Namer()
+    top_path = [(mod, mod)]
+    # scalar groups, in the order of their first scalar
+    clo = tr.closure(mod)
+    groups: dict[str, Group] = {}
+    for n in nodes:
+        if n.kind != "scalar" or not column_has_leaf(n) or len(n.oid) < 2:
+            continue
+        poid = n.oid[:-1]
+        pk = mib.model.oid_str(poid)
+        g = groups.get(pk)
+        if g is None:
+            gname = ""
+            pnode: ?mib.model.MibNode = None
+            cands = parent_candidates(ms, poid, clo)
+            names: list[str] = []
+            for x in cands:
+                if x.name not in names:
+                    names.append(x.name)
+            others: list[str] = []
+            for x in ms.names_at(poid):
+                if x.module in clo and x.name not in names and x.macro != "implicit":
+                    others.append(x.qname() + " (" + x.kind + ")")
+            pick = tr.opts.scalar_parent_names.get(pk)
+            if pick is not None:
+                gname = pick
+            elif len(names) == 1:
+                gname = names[0]
+            elif len(names) > 1:
+                wr = written_parent(n)
+                own = [x.name for x in cands if x.module == mod]
+                gname = wr if wr in names else (own[0] if len(own) > 0 else sorted(names)[0])
+                _ndiag(lay, ms, "yang.scalar-parent-ambiguous", n,
+                       "the parent " + pk + " of " + n.name + " has several descriptors (" + ", ".join(sorted(names)) + "); " + gname + " is used")
+            if len(names) > 0 and len(others) > 0:
+                _ndiag(lay, ms, "yang.scalar-parent-conflict", n,
+                       "the parent " + pk + " of " + n.name + " is also registered as " + ", ".join(sorted(others)) +
+                       ", which cannot have subordinate objects; the container is named " + gname)
+            elif len(cands) > 0 and cands[0].kind in LEAF_KINDS and cands[0].macro != "implicit":
+                _ndiag(lay, ms, "yang.scalar-parent-conflict", n,
+                       "the parent " + pk + " of " + n.name + " is the " + cands[0].kind + " " + cands[0].qname() +
+                       ", which cannot have subordinate objects; the container is named " + gname)
+            if len(names) == 0 and pick is None:
+                _ndiag(lay, ms, "yang.scalar-parent-unnamed", n, "the parent " + pk + " of " + n.name + " has no descriptor; the leaf goes into the module container")
+            for x in cands:
+                if x.name == gname and (pnode is None or x.module == mod):
+                    pnode = x
+            yn = ""
+            if gname != "":
+                yn = top.take(rewrite_identifier(gname))
+                if yn != gname:
+                    _ndiag(lay, ms, "yang.identifier-rewritten", n, "the scalar group " + gname + " is " + yn + " in the YANG")
+            ng = Group(yn, poid, pnode)
+            groups[pk] = ng
+            lay.groups.append(ng)
+            g = ng
+            if yn != "":
+                if pnode is not None and pnode.module == mod and pnode.kind not in LEAF_KINDS:
+                    lay.paths[node_key(pnode)] = top_path + [(mod, yn)]
+                else:
+                    lay.containers.append((yn, poid, top_path + [(mod, yn)]))
+        if g is not None:
+            if g.name == "":
+                leaf = _yname(lay, ms, n, top)
+                g.scalars.append((n, leaf))
+                lay.paths[node_key(n)] = top_path + [(mod, leaf)]
+            else:
+                # one namespace per group container
+                leaf = _yname(lay, ms, n, lay.namer("group:" + g.name))
+                g.scalars.append((n, leaf))
+                lay.paths[node_key(n)] = top_path + [(mod, g.name), (mod, leaf)]
+    # the columns of each row of this module (by row node); a MIB may register two rows at one
+    # OID, then a column belongs to the row whose SEQUENCE lists it
+    rows_at: dict[str, list[mib.model.MibNode]] = {}
+    for n in nodes:
+        if n.kind == "row":
+            rk = mib.model.oid_str(n.oid)
+            rl = rows_at.get(rk)
+            if rl is not None:
+                rl.append(n)
+            else:
+                rows_at[rk] = [n]
+    cols: dict[str, list[mib.model.MibNode]] = {}
+    for n in nodes:
+        if n.kind == "column" and len(n.oid) > 1:
+            rl2 = rows_at.get(mib.model.oid_str(n.oid[:-1]))
+            if rl2 is not None:
+                owner = seq_owner(ms, rl2, n)
+                ok = node_key(owner)
+                lay.col_rows[node_key(n)] = owner
+                lst = cols.get(ok)
+                if lst is not None:
+                    lst.append(n)
+                else:
+                    cols[ok] = [n]
+    # tables of non-augmenting rows
+    tables: dict[str, TableC] = {}
+    own_rows: set[str] = set()
+    for n in nodes:
+        if n.kind != "row" or n.augments != "":
+            continue
+        tnode: ?mib.model.MibNode = None
+        rt = row_type_of(n)
+        trank = -1
+        for x in ms.names_at(n.oid[:-1]):
+            if x.kind == "table":
+                xr = (2 if rt != "" and row_type_of(x) == rt else 0) + (1 if x.module == mod else 0)
+                if xr > trank:
+                    trank = xr
+                    tnode = x
+        if tnode is None:
+            for x in ms.names_at(n.oid[:-1]):
+                if tnode is None or x.module == mod:
+                    tnode = x
+        if tnode is None:
+            _ndiag(lay, ms, "yang.row-unplaced", n, "the row " + n.name + " is not below a named table node; it gets no list")
+            continue
+        tc: ?TableC = None
+        if tnode is not None:
+            own_rows.add(mib.model.oid_str(n.oid))
+            tk = mib.model.oid_str(tnode.oid)
+            g0 = groups.get(tk)
+            if g0 is not None:
+                if g0.name != "":
+                    # scalars and a row below the same node (misplaced, RFC 3584 (13)/(14)):
+                    # one container holds the leafs and the list
+                    gl = _yname(lay, ms, n, lay.namer("group:" + g0.name))
+                    gll = ListL(n, g0.name, gl, top_path + [(mod, g0.name), (mod, gl)])
+                    g0.lists.append(gll)
+                    lay.lists[node_key(n)] = gll
+                    lay.paths[node_key(n)] = gll.path
+                    layout_list(tr, lay, gll, cols.get_def(node_key(n), []))
+                    continue
+            tc = tables.get(node_key(tnode))
+            if tc is None:
+                cname = top.take(rewrite_identifier(tnode.name))
+                if cname != tnode.name:
+                    _ndiag(lay, ms, "yang.identifier-rewritten", tnode, "the table " + tnode.name + " is " + cname + " in the YANG")
+                nt = TableC(cname, tnode.oid, tnode)
+                tables[node_key(tnode)] = nt
+                lay.tables.append(nt)
+                tc = nt
+                if tnode.module == mod and tnode.kind not in LEAF_KINDS:
+                    lay.paths[node_key(tnode)] = top_path + [(mod, cname)]
+                else:
+                    lay.containers.append((cname, tnode.oid, top_path + [(mod, cname)]))
+        if tc is not None:
+            lname = _yname(lay, ms, n, tc.namer)
+            ll = ListL(n, tc.name, lname, top_path + [(mod, tc.name), (mod, lname)])
+            tc.lists.append(ll)
+            lay.lists[node_key(n)] = ll
+            lay.paths[node_key(n)] = ll.path
+            layout_list(tr, lay, ll, cols.get_def(node_key(n), []))
+    lay.has_container = len(lay.groups) > 0 or len(lay.tables) > 0
+    # columns whose row is in another module
+    for n in nodes:
+        if n.kind == "column" and len(n.oid) > 1:
+            pk = mib.model.oid_str(n.oid[:-1])
+            row = tr.row_of(n)
+            if row is not None and row.module != mod and pk not in own_rows:
+                _ndiag(lay, ms, "yang.column-orphan", n, "the column " + n.name + " belongs to the row " + row.qname() + " of another module; it is not translated")
+    # notifications and identities
+    nn = Namer()
+    if lay.has_container:
+        nn.take(mod)
+    idn = Namer()
+    for n in nodes:
+        if n.kind == "notification":
+            nk = node_key(n)
+            lay.notifs[nk] = _yname(lay, ms, n, nn)
+            lay.paths[nk] = [(mod, lay.notifs[nk])]
+        elif n.kind == "object-identity":
+            lay.identities[node_key(n)] = _yname(lay, ms, n, idn)
+    # augmenting rows (the base lists may live in a layout that is still being built)
+    for n in nodes:
+        if n.kind != "row" or n.augments == "":
+            continue
+        base = tr.root_row(n)
+        bl: ?ListL = None
+        if base is not None:
+            bl = tr.list_of(base)
+        if base is None or bl is None:
+            _ndiag(lay, ms, "yang.augment-unresolved", n, "the base row " + n.augments + " of " + n.name + " has no list; the augmentation is not translated")
+            continue
+        if base is not None and bl is not None:
+            atn: ?mib.model.MibNode = None
+            for x in ms.names_at(n.oid[:-1]):
+                if atn is None or x.module == mod:
+                    atn = x
+            al = AugL(n, base, atn, bl.path)
+            lay.augs.append(al)
+            namer = bl.namer if base.module == mod else lay.namer(base.qname())
+            for c in cols.get_def(node_key(n), []):
+                if column_has_leaf(c):
+                    leaf = _yname(lay, ms, c, namer)
+                    al.cols.append((c, leaf))
+                    lay.paths[node_key(c)] = bl.path + [(mod, leaf)]
+                elif c.access != "accessible-for-notify":
+                    _ndiag(lay, ms, "yang.type-unresolved", c, "the column " + c.name + " has an unresolved type; it gets no leaf")
+
+
+def layout_list(tr: Translator, lay: Layout, ll: ListL, cols: list[mib.model.MibNode]) -> None:
+    ms = tr.ms
+    mod = lay.module
+    row = ll.row
+    parts = row.index
+    counts: dict[str, int] = {}
+    for i, p in enumerate(parts):
+        base = ll.lname + "Index" + str(i + 1) if p.name == "" else rewrite_identifier(p.name)
+        c = counts.get_def(base, 0) + 1
+        counts[base] = c
+        want = base if c == 1 else base + "_" + str(c)
+        got = ll.namer.take(want)
+        if got != want:
+            _ndiag(lay, ms, "yang.identifier-rewritten", row, "key " + want + " of " + row.name + " is " + got + " in the YANG")
+        ll.keys.append(got)
+        ll.key_paths.append(ll.path + [(mod, got)])
+    for c in cols:
+        occ: list[int] = []
+        for i, p in enumerate(parts):
+            if is_node(c, p.module, p.name, ms):
+                occ.append(i)
+        if len(occ) > 0:
+            for i in occ:
+                ll.own_parts.add(i)
+            ll.columns.append((c, [ll.keys[i] for i in occ]))
+            lay.paths[node_key(c)] = ll.path + [(mod, ll.keys[occ[0]])]
+        elif column_has_leaf(c):
+            leaf = _yname(lay, ms, c, ll.namer)
+            ll.columns.append((c, [leaf]))
+            lay.paths[node_key(c)] = ll.path + [(mod, leaf)]
+        elif c.access != "accessible-for-notify":
+            _ndiag(lay, ms, "yang.type-unresolved", c, "the column " + c.name + " has an unresolved type; it gets no leaf")
+
+
+# --- the emitter ---------------------------------------------------------------------------------
+
+class Emitter(object):
+    """Builds the statements of one module from its layout, then renders them."""
+    tr: Translator
+    ms: mib.model.MibSet
+    m: mib.model.MibModule
+    lay: Layout
+    mod: str
+    dropped: set[str]
+    diags: list[mib.diag.Diagnostic]
+    oids: dict[str, str]
+    body: list[Stmt]
+    refs: set[str]
+    aug_refs: set[str]
+
+    def __init__(self, tr: Translator, m: mib.model.MibModule, lay: Layout, dropped: set[str]):
+        self.tr = tr
+        self.ms = tr.ms
+        self.m = m
+        self.lay = lay
+        self.mod = m.name
+        self.dropped = dropped
+        self.diags = []
+        self.oids = {}
+        self.body = []
+        self.refs = set()
+        self.aug_refs = set()
+
+    def is_dropped(self, segs: list[(str, str)]) -> bool:
+        """Whether a path enters a module this module must not import (an import cycle)."""
+        for sg in segs:
+            if sg.0 in self.dropped:
+                return True
+        return False
+
+    def diag(self, code: str, n: mib.model.MibNode, msg: str) -> None:
+        self.diags.append(mib.diag.Diagnostic(level_of(code), code, self.mod, self.m.file, n.line, n.col, msg))
+
+    def tdiag(self, code: str, line: int, col: int, msg: str) -> None:
+        self.diags.append(mib.diag.Diagnostic(level_of(code), code, self.mod, self.m.file, line, col, msg))
+
+    # --- types ---
+
+    def ref_type(self, s: mib.model.Syntax) -> ?mib.model.MibType:
+        """The named type a syntax refers to that has a YANG typedef (or a well-known type
+        mapping): the nearest TC or type assignment outside the language modules."""
+        if s.tc_name == "" or s.tc_module in LANG_MODULES:
+            return None
+        if s.tc_module in self.dropped and mib.model.qual_name(s.tc_module, s.tc_name) not in WELL_KNOWN:
+            # the TC is inlined: its module would be a circular import
+            return None
+        m = self.ms.module(s.tc_module)
+        if m is not None:
+            t = m.find_type(s.tc_name)
+            if t is not None and (t.kind == "tc" or t.kind == "type") and syntax_ok(t.syntax):
+                return t
+        return None
+
+    def type_stmt(self, s: mib.model.Syntax, line: int, col: int, what: str, extra: list[str], tdef: ?mib.model.MibType = None) -> Stmt:
+        """The `type` statement of an object (or, with `tdef`, of a typedef) of syntax `s`.
+        Labels that cannot go into the YANG are appended to `extra` (for the description)."""
+        b = s.base
+        rt = self.ref_type(s)
+        hint = self.tr.hint(s)
+        if tdef is not None:
+            if hint == "":
+                hint = type_hint(self.ms, tdef, self.tr.opts.smiv1_hints)
+            if self.adds_hint(rt, b, hint):
+                # a TC adding a hint to an unhinted parent becomes a string of its own
+                rt = None
+        if b == "INTEGER" and len(s.enums) > 0:
+            if len(s.own_ranges) > 0:
+                # a range on an enumeration (`TruthValue (0)`, ANUE-MIB) is not SMI; YANG has
+                # no range on an enumeration either
+                self.tdiag("yang.restriction-dropped", line, col, "the range " + mib.model.dump_ranges(s.own_ranges) + " on the enumeration of " + what + " is dropped from the YANG")
+            if rt is not None:
+                q = mib.model.qual_name(rt.module, rt.name)
+                if q == "SNMPv2-TC::TruthValue":
+                    if s.has_own_named:
+                        self.tdiag("yang.restriction-dropped", line, col, "the enumeration subset of TruthValue in " + what + " is dropped (YANG boolean)")
+                    return Stmt("type", "boolean", F_BARE)
+                if not s.has_own_named:
+                    return Stmt("type", self.type_name(rt), F_BARE)
+            return self.enum_type(s.enums, line, col, what, extra)
+        if b == "BITS":
+            if rt is not None and not s.has_own_named:
+                return Stmt("type", self.type_name(rt), F_BARE)
+            return self.bits_type(s.bits, line, col, what, extra)
+        if len(s.enums) > 0 and (rt is None or s.has_own_named):
+            # named numbers on another base type (SMIv1 `Gauge { no(0), yes(1) }`): the wire
+            # type stays, the labels go into the description (mibmeta keeps them)
+            self.tdiag("yang.restriction-dropped", line, col, "the named numbers " + named_list(s.enums) + " of " + what + " on " + b +
+                       " cannot be a YANG enumeration; they are listed in the description")
+            extra.append("Named numbers (not expressible in YANG on " + b + "): " + named_list(s.enums) + ".")
+        own = len(s.own_ranges) > 0 or len(s.own_sizes) > 0
+        if rt is not None:
+            t = Stmt("type", self.type_name(rt), F_BARE)
+            if own:
+                q = mib.model.qual_name(rt.module, rt.name)
+                wk = WELL_KNOWN.get(q)
+                self.restrict(t, s, hint, line, col, what, wk.1 if wk is not None else "", rt)
+            return t
+        if b == "INTEGER":
+            yt = "int32"
+            if beyond(s.ranges, INT32_LIMITS):
+                yt = "int64"
+                self.tdiag("yang.range-int64", line, col, "the range " + mib.model.dump_ranges(s.ranges) + " of " + what + " exceeds int32; the type is int64")
+            t = Stmt("type", yt, F_BARE)
+            self.restrict(t, s, hint, line, col, what, yt, None)
+            return t
+        if b == "Unsigned32":
+            t = Stmt("type", "uint32", F_BARE)
+            self.restrict(t, s, hint, line, col, what, "uint32", None)
+            return t
+        if b == "OCTET STRING":
+            t = Stmt("type", "string" if hint != "" else "binary", F_BARE)
+            self.restrict(t, s, hint, line, col, what, "", None)
+            return t
+        bt = base_type(b)
+        t = Stmt("type", qualified(bt.0, bt.1), F_BARE)
+        self.restrict(t, s, hint, line, col, what, bt.1, None)
+        return t
+
+    def adds_hint(self, rt: ?mib.model.MibType, b: str, hint: str) -> bool:
+        if rt is not None:
+            return b == "OCTET STRING" and hint != "" and self.tr.tdef_hint(rt) == ""
+        return False
+
+    def type_name(self, t: mib.model.MibType) -> str:
+        q = mib.model.qual_name(t.module, t.name)
+        wk = WELL_KNOWN.get(q)
+        if wk is not None:
+            return qualified(wk.0, wk.1)
+        return qualified(t.module, self.tr.typedef_name(t.module, t.name))
+
+    def restrict(self, t: Stmt, s: mib.model.Syntax, hint: str, line: int, col: int, what: str, ytype: str, rt: ?mib.model.MibType) -> None:
+        """Range or length substatements for the effective constraints of `s`."""
+        b = s.base
+        if len(s.ranges) > 0:
+            if b == "Counter32" or b == "Counter64" or b == "TimeTicks":
+                self.tdiag("yang.range-dropped", line, col, "the range " + mib.model.dump_ranges(s.ranges) + " on " + b + " of " + what + " is dropped from the YANG")
+            elif b == "INTEGER" or b == "Unsigned32" or b == "Gauge32":
+                lim = UINT32_LIMITS
+                if b == "INTEGER":
+                    lim = INT64_LIMITS if ytype == "int64" else INT32_LIMITS
+                    if rt is not None and beyond(rt.syntax.ranges, INT32_LIMITS):
+                        lim = INT64_LIMITS
+                if ytype == "port-number":
+                    lim = (bigint(0), bigint(65535))
+                elif ytype == "dscp":
+                    lim = (bigint(0), bigint(63))
+                elif ytype == "ipv6-flow-label":
+                    lim = (bigint(0), bigint(1048575))
+                rs = self.fit(s.ranges, lim, line, col, what)
+                if len(rs) > 0:
+                    t.quoted("range", ranges_text(rs))
+            else:
+                self.tdiag("yang.restriction-dropped", line, col, "the range " + mib.model.dump_ranges(s.ranges) + " on " + b + " of " + what + " is dropped from the YANG")
+        if len(s.sizes) > 0:
+            if b == "OCTET STRING" or b == "Opaque":
+                rs = self.fit(s.sizes, UINT64_LIMITS, line, col, what)
+                if len(rs) > 0:
+                    if hint != "" and b == "OCTET STRING":
+                        sl = string_length(rs, hint)
+                        if sl is not None:
+                            t.quoted("length", ranges_text(sl))
+                    else:
+                        t.quoted("length", ranges_text(rs))
+            else:
+                self.tdiag("yang.restriction-dropped", line, col, "the SIZE " + mib.model.dump_ranges(s.sizes) + " on " + b + " of " + what + " is dropped from the YANG")
+
+    def fit(self, rs0: list[mib.model.Range], lim: (bigint, bigint), line: int, col: int, what: str) -> list[mib.model.Range]:
+        rs = norm_ranges(rs0)
+        if not same_ranges(rs, rs0):
+            self.tdiag("yang.range-merged", line, col, "the ranges " + mib.model.dump_ranges(rs0) + " of " + what + " are emitted as " + ranges_text(rs))
+        if beyond(rs, lim):
+            c = clamp_ranges(rs, lim)
+            self.tdiag("yang.range-clamped", line, col, "the ranges " + mib.model.dump_ranges(rs) + " of " + what + " are clamped to " + (ranges_text(c) if len(c) > 0 else "nothing"))
+            return c
+        return rs
+
+    def enum_type(self, vals: list[mib.model.NamedValue], line: int, col: int, what: str, extra: list[str]) -> Stmt:
+        if not enum_expressible(vals):
+            self.tdiag("yang.enum-fallback", line, col, "the enumeration of " + what + " cannot be a YANG enumeration; the type is int64")
+            if len(vals) > 0:
+                extra.append("Enumeration (not expressible in YANG): " + named_list(vals) + ".")
+            return Stmt("type", "int64", F_BARE)
+        t = Stmt("type", "enumeration", F_BARE)
+        seen: set[int] = set()
+        dropped: list[mib.model.NamedValue] = []
+        for v in vals:
+            if v.value in seen:
+                dropped.append(v)
+                continue
+            seen.add(v.value)
+            e = t.quoted("enum", v.label)
+            e.quoted("value", str(v.value))
+        if len(dropped) > 0:
+            self.tdiag("yang.enum-duplicate-value", line, col, "the labels " + named_list(dropped) + " of " + what + " repeat a value; they are left out of the YANG")
+        return t
+
+    def bits_type(self, vals: list[mib.model.NamedValue], line: int, col: int, what: str, extra: list[str]) -> Stmt:
+        if not bits_expressible(vals):
+            if len(vals) > 0:
+                self.tdiag("yang.bits-fallback", line, col, "the BITS of " + what + " cannot be YANG bits; the type is binary")
+                extra.append("Bits (not expressible in YANG): " + named_list(vals) + ".")
+            return Stmt("type", "binary", F_BARE)
+        t = Stmt("type", "bits", F_BARE)
+        seen: set[int] = set()
+        names = Namer()
+        dropped: list[mib.model.NamedValue] = []
+        for v in vals:
+            if v.value in seen:
+                dropped.append(v)
+                continue
+            seen.add(v.value)
+            nm = names.take(rewrite_identifier(v.label))
+            if nm != v.label:
+                self.tdiag("yang.identifier-rewritten", line, col, "bit " + v.label + " of " + what + " is " + nm + " in the YANG")
+            b = t.bare("bit", nm)
+            b.quoted("position", str(v.value))
+        if len(dropped) > 0:
+            self.tdiag("yang.enum-duplicate-value", line, col, "the bits " + named_list(dropped) + " of " + what + " repeat a position; they are left out of the YANG")
+        return t
+
+    # --- common substatements ---
+
+    def status(self, st: Stmt, status: str) -> None:
+        if status == "deprecated" or status == "obsolete":
+            st.bare("status", status)
+
+    def describe(self, st: Stmt, description: str, reference: str, extra: list[str]) -> None:
+        d = description
+        if len(extra) > 0:
+            d = (text_value(d) + "\n\n" if d.strip() != "" else "") + "\n".join(extra)
+        if d.strip() != "" or len(extra) > 0:
+            st.text("description", d)
+        if reference.strip() != "":
+            st.text("reference", reference)
+
+    def oid(self, st: Stmt, oid: list[int]) -> None:
+        if oid_ok(oid):
+            st.quoted("smiv2:oid", mib.model.oid_str(oid))
+        else:
+            self.tdiag("yang.oid-invalid", 0, 0, "the OID " + mib.model.oid_str(oid) + " of " + st.kw + " " + subst(st.arg, {}) +
+                       " is no valid smiv2:oid (two arcs at least, the first 0..2); it is left out")
+
+    def data_oid(self, st: Stmt, n: mib.model.MibNode) -> None:
+        """smiv2:oid on a data node, with the uniqueness self-check."""
+        k = mib.model.oid_str(n.oid)
+        q = n.qname()
+        prev = self.oids.get(k)
+        if prev is not None:
+            if prev == q:
+                self.diag("yang.internal", n, "the data node of " + q + " is emitted twice")
+            else:
+                self.diag("yang.oid-duplicate", n, "the OID " + k + " of " + q + " is already the smiv2:oid of " + prev)
+        else:
+            self.oids[k] = q
+        self.oid(st, n.oid)
+
+    def type_status(self, t: mib.model.MibType, depth: int = 0) -> str:
+        """The status a typedef gets: its own, or with `consistent_status` the worst along its
+        TC chain within the module."""
+        st = t.status
+        if self.tr.opts.consistent_status and depth < 32:
+            rt = self.ref_type(t.syntax)
+            if rt is not None and rt.module == self.mod and rt.name != t.name:
+                st = worse_status(st, self.type_status(rt, depth + 1))
+        return st
+
+    def node_status(self, n: mib.model.MibNode) -> str:
+        """The status a leaf gets: its own, or with `consistent_status` also its TC's (same
+        module)."""
+        st = n.status
+        if self.tr.opts.consistent_status:
+            sx = n.syntax
+            if sx is not None and syntax_ok(sx):
+                rt = self.ref_type(sx)
+                if rt is not None and rt.module == self.mod:
+                    st = worse_status(st, self.type_status(rt))
+        return st
+
+    def row_status(self, row: mib.model.MibNode) -> str:
+        """The status a list gets: its row's, or with `consistent_status` the worst of its own
+        module's key leafs (INDEX objects)."""
+        st = row.status
+        if self.tr.opts.consistent_status:
+            for p in row.index:
+                if p.name != "" and p.module == self.mod:
+                    o = self.ms.node(p.module, p.name)
+                    if o is not None:
+                        st = worse_status(st, self.node_status(o))
+        return st
+
+    def check_status(self, user_status: str, target_status: str, target_module: str, line: int, col: int, user: str, what: str) -> None:
+        if target_module == self.mod and status_rank(target_status) > status_rank(user_status):
+            self.tdiag("yang.status-reference", line, col, "the " + user_status + " " + user + " refers to the " + target_status + " " + what)
+
+    # --- leafs ---
+
+    def leaf(self, parent: Stmt, n: mib.model.MibNode, name: str, with_oid: bool = True, data: bool = True) -> None:
+        """A full leaf: type, units, status, description, reference, smiv2:defval,
+        smiv2:max-access, smiv2:oid (`data`: a data node, counted by the OID self-check)."""
+        st = Stmt("leaf", name, F_BARE)
+        extra: list[str] = []
+        sx = n.syntax
+        if sx is not None and syntax_ok(sx):
+            st.add(self.type_stmt(sx, n.line, n.col, n.name, extra))
+            rt = self.ref_type(sx)
+            if rt is not None:
+                self.check_status(n.status, rt.status, rt.module, n.line, n.col, n.name, "type " + rt.name)
+        else:
+            st.bare("type", "string")
+        if n.units != "":
+            st.quoted("units", n.units)
+        self.status(st, self.node_status(n))
+        self.describe(st, n.description, n.reference, extra)
+        dv = n.defval
+        if dv is not None:
+            st.quoted("smiv2:defval", dv.smi)
+        if n.access != "":
+            st.quoted("smiv2:max-access", n.access)
+        if with_oid and n.linked:
+            if data:
+                self.data_oid(st, n)
+            else:
+                self.oid(st, n.oid)
+        parent.add(st)
+
+    def ref_status(self, o: mib.model.MibNode) -> str:
+        """The status a leafref leaf copies from its target (as libsmi): only for a target in the
+        same module. A deprecated INDEX object of another module would otherwise make a current
+        list refer to a deprecated key leaf (YANG 1.0 section 7.19.2), though the MIB is consistent."""
+        return self.node_status(o) if o.module == self.mod else "current"
+
+    def leafref(self, parent: Stmt, name: str, target: list[(str, str)], status: str) -> None:
+        st = Stmt("leaf", name, F_BARE)
+        t = st.bare("type", "leafref")
+        t.quoted("path", path_ref(target))
+        st.text("description", LEAFREF_DESCRIPTION)
+        self.status(st, status)
+        parent.add(st)
+
+    def typed_key_leaf(self, parent: Stmt, name: str, sx: ?mib.model.Syntax, what: str, note: str, n: mib.model.MibNode) -> None:
+        """A key or notification leaf without a leaf to refer to: the type only."""
+        st = Stmt("leaf", name, F_BARE)
+        extra: list[str] = []
+        if sx is not None and syntax_ok(sx):
+            st.add(self.type_stmt(sx, n.line, n.col, what, extra))
+        else:
+            st.bare("type", "string")
+        st.text("description", note + ("\n" + "\n".join(extra) if len(extra) > 0 else "") + "\n[This leaf has been added by the SMIv2 to YANG conversion.]")
+        parent.add(st)
+
+    def index_leaf(self, parent: Stmt, row: mib.model.MibNode, p: mib.model.IndexPart, i: int, name: str) -> None:
+        """The leaf for INDEX part `i` of `row` when it is not a column of the list itself:
+        a leafref to the index object, or a typed leaf (synthetic SMIv1 items,
+        unresolved objects, objects without a leaf)."""
+        if p.name == "":
+            sx = p.syntax
+            tn = sx.ref_name if sx is not None and sx.ref_name != "" else (sx.base if sx is not None else "?")
+            self.typed_key_leaf(parent, name, sx, row.name + " index " + str(i + 1),
+                                "Index component " + str(i + 1) + " of " + row.name + " (an SMIv1 INDEX item of type " + tn + ").", row)
+            return
+        o = self.ms.node(p.module, p.name)
+        if o is not None:
+            tp = self.tr.leaf_path(o)
+            if tp is not None:
+                if self.is_dropped(tp):
+                    self.typed_key_leaf(parent, name, o.syntax, o.name, "A copy of " + o.qname() + " (a leafref would make a circular import).", row)
+                    return
+                self.leafref(parent, name, tp, self.ref_status(o))
+                self.check_status(row.status, o.status, o.module, row.line, row.col, row.name, "index object " + o.name)
+                return
+            if o.kind == "column" or o.kind == "scalar":
+                self.diag("yang.index-no-leaf", row, "the INDEX object " + o.qname() + " of " + row.name + " has no data leaf; a typed leaf is emitted")
+                self.typed_key_leaf(parent, name, o.syntax, o.name, "A copy of " + o.qname() + ", which has no data node.", row)
+                return
+        self.diag("yang.index-unresolved", row, "the INDEX object " + (p.object() if p.module != "" else p.name) + " of " + row.name + " is not a column or scalar; its key leaf has type string")
+        self.typed_key_leaf(parent, name, None, p.name, "The INDEX object " + p.name + " of " + row.name + " is not a column or scalar.", row)
+
+    # --- body parts ---
+
+    def typedefs(self, body: list[Stmt]) -> None:
+        for t in self.m.types:
+            if t.kind != "tc" and t.kind != "type":
+                continue
+            yn = self.lay.typedefs.get_def(t.name, t.name)
+            s = t.syntax
+            if not syntax_ok(s):
+                self.tdiag("yang.typedef-unresolved", t.line, t.col, "the type " + t.name + " has an unresolved syntax; it gets no typedef")
+                continue
+            st = Stmt("typedef", yn, F_BARE)
+            extra: list[str] = []
+            if self.m.name in LANG_MODULES and t.name in LANG_BASE_TYPES:
+                bt = base_type(s.base)
+                st.bare("type", qualified(bt.0, bt.1))
+            else:
+                st.add(self.type_stmt(s, t.line, t.col, t.name, extra, t))
+                rt = self.ref_type(s)
+                if rt is not None:
+                    self.check_status(t.status, rt.status, rt.module, t.line, t.col, t.name, "type " + rt.name)
+            self.status(st, self.type_status(t))
+            self.describe(st, t.description, t.reference, extra)
+            h = type_hint(self.ms, t, self.tr.opts.smiv1_hints)
+            if h != "":
+                st.quoted("smiv2:display-hint", h)
+            body.append(st)
+
+    def identities(self, body: list[Stmt], nodes: list[mib.model.MibNode]) -> None:
+        for n in nodes:
+            if n.kind == "object-identity":
+                st = Stmt("identity", self.lay.identities.get_def(node_key(n), n.name), F_BARE)
+                st.bare("base", "smiv2:object-identity")
+                self.status(st, n.status)
+                self.describe(st, n.description, n.reference, [])
+                self.oid(st, n.oid)
+                body.append(st)
+
+    def container(self, body: list[Stmt]) -> None:
+        if not self.lay.has_container:
+            return
+        top = Stmt("container", self.mod, F_BARE)
+        top.bare("config", "false")
+        for g in self.lay.groups:
+            if g.name == "":
+                for x in g.scalars:
+                    self.leaf(top, x.0, x.1)
+                continue
+            c = Stmt("container", g.name, F_BARE)
+            pn = g.node
+            if pn is not None:
+                self.status(c, pn.status)
+                if pn.kind != "module-identity":
+                    self.describe(c, pn.description, pn.reference, [])
+            self.oid(c, g.oid)
+            for x in g.scalars:
+                self.leaf(c, x.0, x.1)
+            for ll in g.lists:
+                c.add(self.list_stmt(ll))
+            top.add(c)
+        for tc in self.lay.tables:
+            c = Stmt("container", tc.name, F_BARE)
+            tn = tc.node
+            if tn is not None:
+                self.status(c, tn.status)
+                self.describe(c, tn.description, tn.reference, [])
+                if tn.kind == "table":
+                    self.data_oid(c, tn)
+                else:
+                    self.oid(c, tc.oid)
+            for ll in tc.lists:
+                c.add(self.list_stmt(ll))
+            top.add(c)
+        body.append(top)
+
+    def list_stmt(self, ll: ListL) -> Stmt:
+        row = ll.row
+        st = Stmt("list", ll.lname, F_BARE)
+        if len(ll.keys) > 0:
+            st.quoted("key", " ".join(ll.keys))
+            if row.implied:
+                st.quoted("smiv2:implied", ll.keys[-1])
+        self.status(st, self.row_status(row))
+        self.describe(st, row.description, row.reference, [])
+        self.data_oid(st, row)
+        for i, p in enumerate(row.index):
+            if i not in ll.own_parts:
+                self.index_leaf(st, row, p, i, ll.keys[i])
+        for x in ll.columns:
+            c = x.0
+            for j, nm in enumerate(x.1):
+                self.leaf(st, c, nm, j == 0)
+                if nm in ll.keys:
+                    self.check_status(row.status, c.status, c.module, row.line, row.col, row.name, "key " + c.name)
+        # augmenting columns of this module go into the augment statements, not here
+        return st
+
+    def augments(self, body: list[Stmt]) -> None:
+        for al in self.lay.augs:
+            tn = al.table
+            if tn is not None:
+                self.alias(body, tn, False)
+            self.alias(body, al.row, False)
+            a = Stmt("augment", path_ref(al.target), F_QUOTED)
+            self.status(a, al.row.status)
+            self.describe(a, al.row.description, al.row.reference, [])
+            self.oid(a, al.row.oid)
+            for x in al.cols:
+                self.leaf(a, x.0, x.1)
+            body.append(a)
+
+    def alias(self, body: list[Stmt], n: mib.model.MibNode, bare: bool) -> None:
+        if not oid_ok(n.oid):
+            self.diag("yang.oid-invalid", n, "the OID " + mib.model.oid_str(n.oid) + " of " + n.name + " is no valid smiv2:oid (two arcs at least, the first 0..2); it gets no alias")
+            return
+        a = Stmt("smiv2:alias", rewrite_identifier(n.name), F_QUOTED)
+        if not bare:
+            self.status(a, n.status)
+            self.describe(a, n.description, n.reference, [])
+        self.oid(a, n.oid)
+        body.append(a)
+
+    def notifications(self, body: list[Stmt], nodes: list[mib.model.MibNode]) -> None:
+        for n in nodes:
+            if n.kind != "notification":
+                continue
+            st = Stmt("notification", self.lay.notifs.get_def(node_key(n), n.name), F_BARE)
+            self.status(st, n.status)
+            self.describe(st, n.description, n.reference, [])
+            self.oid(st, n.oid)
+            for k, q in enumerate(n.objects):
+                c = Stmt("container", "object-" + str(k + 1), F_BARE)
+                st.add(c)
+                o = self.tr.node(q)
+                if o is not None:
+                    if (o.kind == "column" or o.kind == "scalar") and o.linked:
+                        self.notification_object(c, n, o)
+                        continue
+                self.diag("yang.notification-object", n, "the object " + q + " of " + n.name + " is not a column or scalar with a resolved OID; object-" + str(k + 1) + " is empty")
+            body.append(st)
+
+    def notification_object(self, c: Stmt, n: mib.model.MibNode, o: mib.model.MibNode) -> None:
+        names = Namer()
+        if o.kind == "column":
+            r = self.tr.row_of(o)
+            base: ?mib.model.MibNode = None
+            if r is not None:
+                base = self.tr.root_row(r)
+            if base is not None:
+                bl = self.tr.list_of(base)
+                counts: dict[str, int] = {}
+                for i, p in enumerate(base.index):
+                    if is_node(o, p.module, p.name, self.ms):
+                        continue
+                    nm0 = rewrite_identifier(p.name) if p.name != "" else (bl.keys[i] if bl is not None and i < len(bl.keys) else base.name + "Index" + str(i + 1))
+                    cnt = counts.get_def(nm0, 0) + 1
+                    counts[nm0] = cnt
+                    nm = names.take(nm0 if cnt == 1 else nm0 + "_" + str(cnt))
+                    if p.name == "":
+                        if bl is not None and i < len(bl.key_paths) and not self.is_dropped(bl.key_paths[i] if bl is not None and i < len(bl.key_paths) else []):
+                            self.leafref(c, nm, bl.key_paths[i], self.ref_status(base))
+                        else:
+                            self.typed_key_leaf(c, nm, p.syntax, base.name, "Index component " + str(i + 1) + " of " + base.name + ".", n)
+                        continue
+                    io = self.ms.node(p.module, p.name)
+                    if io is not None:
+                        tp = self.tr.leaf_path(io)
+                        if tp is not None:
+                            if not self.is_dropped(tp):
+                                self.leafref(c, nm, tp, self.ref_status(io))
+                                continue
+                        if io.kind == "column" or io.kind == "scalar":
+                            self.typed_key_leaf(c, nm, io.syntax, io.name, "A copy of " + io.qname() + ", which has no data node.", n)
+                            continue
+                    if bl is not None and i < len(bl.key_paths) and not self.is_dropped(bl.key_paths[i]):
+                        # an unresolved INDEX object: its list has a (string) key leaf for it
+                        self.leafref(c, nm, bl.key_paths[i], self.ref_status(base))
+                        continue
+                    self.typed_key_leaf(c, nm, None, p.name, "The INDEX object " + p.name + " of " + base.name + " is not a column or scalar.", n)
+        own = names.take(rewrite_identifier(o.name))
+        tp = self.tr.leaf_path(o)
+        if (o.access == "read-only" or o.access == "read-write" or o.access == "read-create") and tp is not None and not self.is_dropped(tp if tp is not None else []):
+            self.leafref(c, own, tp, self.ref_status(o))
+        else:
+            self.leaf(c, o, own, True, False)
+
+    def aliases(self, body: list[Stmt], nodes: list[mib.model.MibNode]) -> None:
+        for n in nodes:
+            if n.kind == "node" and n.macro != "implicit":
+                self.alias(body, n, False)
+            elif n.kind == "module-identity":
+                self.alias(body, n, True)
+
+    # --- header ---
+
+    def revisions(self) -> list[Stmt]:
+        dates: list[str] = []
+        descs: dict[str, list[str]] = {}
+        for r in self.m.revisions:
+            d = date_of(r.date)
+            if d == "":
+                self.tdiag("yang.revision-date", 0, 0, "the REVISION date \"" + one_line(r.date) + "\" is no valid date; no revision statement")
+                continue
+            if d not in descs:
+                dates.append(d)
+                descs[d] = []
+            if r.description.strip() != "":
+                descs[d].append(text_value(r.description))
+        if self.m.last_updated != "":
+            d = date_of(self.m.last_updated)
+            if d == "":
+                self.tdiag("yang.revision-date", 0, 0, "the LAST-UPDATED date \"" + one_line(self.m.last_updated) + "\" is no valid date; no revision statement")
+            elif d not in descs:
+                dates.append(d)
+                descs[d] = []
+        out: list[Stmt] = []
+        sd = sorted(dates)
+        for j in range(len(sd)):
+            d = sd[len(sd) - 1 - j]
+            st = Stmt("revision", d, F_BARE)
+            ds = descs[d]
+            if len(ds) > 0:
+                st.text("description", "\n\n".join(ds))
+            out.append(st)
+        return out
+
+    def build(self) -> None:
+        """Build the body statements and collect the modules they refer to (`refs`) and the
+        modules they augment (`aug_refs`, an import that cannot be avoided)."""
+        nodes = by_oid(self.m.nodes)
+        body: list[Stmt] = []
+        self.typedefs(body)
+        self.identities(body, nodes)
+        self.container(body)
+        self.augments(body)
+        self.notifications(body, nodes)
+        self.aliases(body, nodes)
+        self.body = body
+        refs: set[str] = set()
+        refs.add(SMIV2)
+        for st in body:
+            collect_refs(st, refs)
+            if st.kw == "augment":
+                for r in refs_in(st.arg):
+                    self.aug_refs.add(r)
+        self.refs = refs
+
+    def finish(self) -> YangModule:
+        """Render the module built by `build`."""
+        res = YangModule(self.mod)
+        body = self.body
+        for dm in sorted(self.dropped):
+            self.tdiag("yang.import-cycle", 0, 0, "the references to " + dm + " are inlined (typedefs and leafrefs): importing it would make a circular import")
+        imports = sorted([x for x in self.refs if x != self.mod])
+        pmap = self.tr.prefix_map(self.mod, imports)
+        res.prefix = pmap[self.mod]
+        res.imports = imports
+        root = Stmt("module", self.mod, F_BARE)
+        root.quoted("namespace", res.namespace)
+        root.quoted("prefix", res.prefix)
+        for im in imports:
+            i = root.bare("import", im)
+            i.quoted("prefix", pmap[im])
+        if self.m.identity != "":
+            if self.m.organization.strip() != "":
+                root.text("organization", self.m.organization)
+            if self.m.contact.strip() != "":
+                root.text("contact", self.m.contact)
+            if self.m.description.strip() != "":
+                root.text("description", self.m.description)
+        revs = self.revisions()
+        if len(revs) > 0:
+            res.revision = revs[0].arg
+        for r in revs:
+            root.add(r)
+        for st in body:
+            root.add(st)
+        out: list[str] = []
+        if self.tr.opts.header:
+            out.append("/*\n * This YANG module has been generated by " + GENERATOR + " (RFC 6643)\n * from the SMI module " + self.mod)
+            if self.m.sha256 != "":
+                out.append("\n * (source sha256 " + self.m.sha256 + ")")
+            out.append(".\n *\n * Do not edit. Edit the source file instead!\n */\n\n")
+        render(root, 0, pmap, out)
+        res.text = "".join(out)
+        res.diags = self.lay.diags + self.diags
+        for d in res.diags:
+            if d.level <= 1:
+                res.ok = False
+        return res
+
+
+def base_type(b: str) -> (str, str):
+    """The YANG type of an SMI base type (OCTET STRING as binary)."""
+    if b == "INTEGER":
+        return ("", "int32")
+    if b == "Unsigned32":
+        return ("", "uint32")
+    if b == "Gauge32":
+        return (YANG_TYPES, "gauge32")
+    if b == "Counter32":
+        return (YANG_TYPES, "counter32")
+    if b == "Counter64":
+        return (YANG_TYPES, "counter64")
+    if b == "TimeTicks":
+        return (YANG_TYPES, "timeticks")
+    if b == "IpAddress":
+        return (INET_TYPES, "ipv4-address")
+    if b == "OBJECT IDENTIFIER":
+        return (YANG_TYPES, "object-identifier-128")
+    if b == "BITS":
+        return ("", "bits")
+    if b == "Opaque":
+        return (SMIV2, "opaque")
+    return ("", "binary")
+
+
+# --- entry points --------------------------------------------------------------------------------
+
+def translate(ms: mib.model.MibSet, name: str, opts: ?Options = None) -> ?YangModule:
+    """Translate module `name` of a resolved set (None when it is not loaded)."""
+    return Translator(ms, opts).module(name)
+
+
+def emit_module(ms: mib.model.MibSet, name: str, opts: ?Options = None) -> str:
+    """The YANG text of module `name`. Raises `YangError` when the module is not loaded or the
+    translation failed (level-1 `yang.*` diagnostics, e.g. an ambiguous scalar parent)."""
+    r = Translator(ms, opts).module(name)
+    if r is not None:
+        if not r.ok:
+            raise YangError(name + ": " + "; ".join([d.message for d in r.diags if d.level <= 1]))
+        return r.text
+    raise YangError("module " + name + " is not loaded")
+
+
+def emit_set(ms: mib.model.MibSet, names: list[str], opts: ?Options = None) -> list[YangModule]:
+    """Translate several modules with one shared `Translator` (modules not loaded are skipped)."""
+    tr = Translator(ms, opts)
+    out: list[YangModule] = []
+    for nm in names:
+        r = tr.module(nm)
+        if r is not None:
+            out.append(r)
+    return out
