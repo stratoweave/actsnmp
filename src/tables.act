@@ -1,0 +1,1026 @@
+"""Table assembly and fetch planning over mibmeta
+
+plan_table and scalar_oids decide what to fetch for a table or row name:
+the columns of the row and its augmenting rows (one Client.get_table call)
+without the INDEX columns, whose values come from the instance; the
+index_prefix that narrows the walk to rows with given leading keys; and,
+when every key is given, the instance OIDs of that one row
+(TablePlan.get_oids).
+
+Assembler and assemble turn the varbinds that came back (from walk,
+walk_stream, get, or a client.Table) into rows. Each varbind is mapped to
+its column (MetaIndex.lookup_object, or the plan's columns when two
+modules define one OID), its instance suffix is decoded with the base
+row's INDEX, and keys and cells are converted to YANG values with conv.
+Columns of augmenting rows go into the base row's rows by index. Sparse
+rows lack cells, and scalars (instance .0) are collected separately.
+
+A YangData adapter reads the Assembly by smiv2:oid (table_at, scalars_in,
+TableRow.cell_at) or by name (table, scalar, TableRow.cell). TableData.rows
+are in instance order.
+
+Nothing in the data is fatal. A varbind that fits no object, has an
+instance its row's INDEX cannot decode, or repeats an OID becomes an Issue
+with a code (unknown-oid, bad-instance, no-row, no-base-row, bad-index,
+bad-key, duplicate-key, duplicate), and the rest is assembled. Exception
+values of columns are counted in Assembly.absent and create no rows; a
+scalar's are kept as an ABSENT result.
+
+One SNMP table is one TableData even when several modules define its row
+(RFC1213-MIB and IF-MIB both define ifEntry). Tables are keyed by the base
+row's OID, taken from the Assembler's plan or else
+MetaIndex.canonical_row.
+
+TableRow.keys holds conv Results of the index parts, and key_values() the
+dict of YANG key leaf names to values that acton-yang's take_list wants.
+An index value that does not convert makes the row's keys incomplete
+(keys_ok() False, issue bad-key). Lossy conversions (dropped NULs,
+replaced control characters, hex or Latin-1 fallback) can give two
+instances the same YANG keys; the first in instance order keeps them and
+later ones get keys_ok() False and the issue duplicate-key.
+
+With Options.inet_text, InetAddress keys and cells (RFC 4001; YANG type
+binary) are rendered as text by the InetAddressType column registered
+before them in their row (RFC 4001 section 4.1 registers the type object
+first), or else by the row's last InetAddressType key. A cell whose type
+cell was not fetched stays binary. plan_table then also takes such a key as
+text and adds the type column of every InetAddress column it selects.
+"""
+
+import client as client_mod
+import conv
+import errors
+import index
+import values
+import mib.meta
+from oid import Oid
+from values import Value, VarBind
+
+INET_ADDRESS = "INET-ADDRESS-MIB::InetAddress"
+INET_ADDRESS_TYPE = "INET-ADDRESS-MIB::InetAddressType"
+
+
+class PlanError(ValueError):
+    """A plan that cannot be made: an unknown name, a name that is not a table or row, a column
+    of another table, key values that do not fit the INDEX."""
+    def __init__(self, msg: str):
+        ValueError.__init__(self, msg)
+
+
+class Options(object):
+    """convert: the conversion options (conv.Options); inet_text: InetAddress keys and
+    cells as text (see the module doc)."""
+    convert: conv.Options
+    inet_text: bool
+
+    def __init__(self, convert: conv.Options=conv.Options(), inet_text: bool=False):
+        self.convert = convert
+        self.inet_text = inet_text
+
+
+def readable(n: mib.meta.NodeMeta) -> bool:
+    """Whether a GET or walk can return the object: MAX-ACCESS other than not-accessible,
+    accessible-for-notify and write-only."""
+    a = n.access
+    return a != "not-accessible" and a != "accessible-for-notify" and a != "write-only"
+
+
+def index_spec(ix: mib.meta.MetaIndex, row: mib.meta.NodeMeta) -> list[index.IndexPart]:
+    """The index.IndexParts of a row's instances (its base row's INDEX for an augmenting
+    row), named by their YANG key leaf."""
+    return [index.IndexPart(p.enc, p.size, p.key) for p in ix.index_of(row)]
+
+
+def _is_tc(ix: mib.meta.MetaIndex, s: ?mib.meta.SyntaxMeta, q: str) -> bool:
+    """Whether syntax s is TC q or derived from it."""
+    if s is not None:
+        if s.tc == q:
+            return True
+        if s.tc != "":
+            return q in ix.tc_chain(s.tc)
+    return False
+
+
+def _converter(ix: mib.meta.MetaIndex, s: ?mib.meta.SyntaxMeta, opts: conv.Options) -> conv.Converter:
+    chain: list[str] = []
+    if s is not None:
+        if s.tc != "":
+            chain = ix.tc_chain(s.tc)
+    return conv.Converter(s, opts, chain)
+
+
+def _int_value(v: Value) -> ?int:
+    if isinstance(v, values.Integer):
+        return v.value
+    return None
+
+
+def _inet_value(ty: Value, addr: Value, res: conv.Result) -> conv.Result:
+    """InetAddress addr as text by the InetAddressType value ty (conv.inet_address);
+    res (its binary conversion) when either value is not of the expected class."""
+    t = _int_value(ty)
+    if t is not None and isinstance(addr, values.OctetString):
+        return conv.inet_address(t, addr.value)
+    return res
+
+
+# --- assembled data ----------------------------------------------------------------------------------
+
+class Key(object):
+    """One index value of a row: the mibmeta part, the YANG key leaf name, the raw value
+    decoded from the instance suffix and its conversion result."""
+    part: mib.meta.IndexPart
+    name: str
+    raw: Value
+    result: conv.Result
+
+    def __init__(self, part: mib.meta.IndexPart, name: str, raw: Value, result: conv.Result):
+        self.part = part
+        self.name = name
+        self.raw = raw
+        self.result = result
+
+    def __repr__(self) -> str:
+        return self.name + "=" + self.result.brief()
+
+
+class Cell(object):
+    """One column value of a row: the column, the row that defines it (the base row or an
+    augmenting row), the raw wire value and its conversion result."""
+    column: mib.meta.NodeMeta
+    row: mib.meta.NodeMeta
+    raw: Value
+    result: conv.Result
+
+    def __init__(self, column: mib.meta.NodeMeta, row: mib.meta.NodeMeta, raw: Value, result: conv.Result):
+        self.column = column
+        self.row = row
+        self.raw = raw
+        self.result = result
+
+    def __repr__(self) -> str:
+        return self.column.name + "=" + self.result.brief()
+
+
+class TableRow(object):
+    """One row: its instance suffix, the keys (one per INDEX part, [] for a keyless row) and
+    the cells in column OID order."""
+    suffix: list[int]
+    keys: list[Key]
+    cells: list[Cell]
+    by_name: dict[str, Cell]
+    cids: set[int]
+    duplicate: bool
+
+    def __init__(self, suffix: list[int], keys: list[Key]):
+        self.suffix = suffix
+        self.keys = keys
+        self.cells = []
+        self.by_name = {}
+        self.cids = set()
+        self.duplicate = False
+
+    def converted(self) -> bool:
+        """Every key value converted."""
+        for k in self.keys:
+            if not k.result.ok():
+                return False
+        return True
+
+    def keys_ok(self) -> bool:
+        """Every key value converted and no row before it has the same YANG keys
+        (duplicate): a row YANG can key."""
+        return not self.duplicate and self.converted()
+
+    def key_text(self) -> str:
+        """The converted key values as one text, equal for rows with equal YANG keys."""
+        out: list[str] = []
+        for k in self.keys:
+            t = k.result.kind + ":" + k.result.text()
+            out.append(str(len(t)) + ":" + t)
+        return "".join(out)
+
+    def key_values(self) -> dict[str, value]:
+        """YANG key leaf name -> key value, for the keys that converted."""
+        out: dict[str, value] = {}
+        for k in self.keys:
+            v = k.result.value
+            if v is not None and k.result.ok():
+                out[k.name] = v
+        return out
+
+    def key(self, name: str) -> ?Key:
+        for k in self.keys:
+            if k.name == name:
+                return k
+        return None
+
+    def cell(self, name: str) -> ?Cell:
+        """The cell of column name (MOD::column or the bare name)."""
+        return self.by_name.get(name)
+
+    def cell_at(self, oid: list[int]) -> ?Cell:
+        """The cell of the column with OID oid (a leaf's smiv2:oid)."""
+        for c in self.cells:
+            if c.column.oid == oid:
+                return c
+        return None
+
+    def result(self, name: str) -> ?conv.Result:
+        """The converted value of column name, or of key leaf name when no column has it."""
+        c = self.by_name.get(name)
+        if c is not None:
+            return c.result
+        k = self.key(name)
+        if k is not None:
+            return k.result
+        return None
+
+    def _index_names(self) -> None:
+        self.by_name = {}
+        for c in self.cells:
+            self.by_name[c.column.qname()] = c
+        for c in self.cells:
+            if c.column.name not in self.by_name:
+                self.by_name[c.column.name] = c
+
+    def __repr__(self) -> str:
+        return ("TableRow(" + ".".join([str(a) for a in self.suffix]) + " [" + ", ".join([repr(k) for k in self.keys]) + "] "
+                + ", ".join([repr(c) for c in self.cells]) + ")")
+
+
+class TableData(object):
+    """The rows of one base row (a YANG list): the base row (whose INDEX names the rows), its
+    table node, the augmenting rows that contributed cells, the index parts, and the
+    rows sorted by instance suffix."""
+    row: mib.meta.NodeMeta
+    table: ?mib.meta.NodeMeta
+    augmenting: list[mib.meta.NodeMeta]
+    parts: list[index.IndexPart]
+    rows: list[TableRow]
+    by_suffix: dict[Oid, TableRow]
+
+    def __init__(self, row: mib.meta.NodeMeta, table: ?mib.meta.NodeMeta, parts: list[index.IndexPart]):
+        self.row = row
+        self.table = table
+        self.augmenting = []
+        self.parts = parts
+        self.rows = []
+        self.by_suffix = {}
+
+    def find(self, suffix: list[int]) -> ?TableRow:
+        """The row of an instance suffix."""
+        return self.by_suffix.get(Oid(suffix))
+
+    def rows_with_prefix(self, prefix: list[int]) -> list[TableRow]:
+        """The rows whose instance suffix starts with prefix (encoded leading keys,
+        encode_keys), in suffix order."""
+        n = len(prefix)
+        return [r for r in self.rows if len(r.suffix) >= n and r.suffix[:n] == prefix]
+
+    def find_keys(self, keys: dict[str, str]) -> ?TableRow:
+        """The first row whose keys' Result.text() equal keys (key leaf name -> text); for
+        tests and debugging."""
+        for r in self.rows:
+            ok = True
+            for k, t in keys.items():
+                kk = r.key(k)
+                if kk is not None:
+                    if kk.result.text() != t:
+                        ok = False
+                else:
+                    ok = False
+            if ok:
+                return r
+        return None
+
+    def __repr__(self) -> str:
+        return "TableData(" + self.row.qname() + ", %d rows)" % len(self.rows)
+
+
+class ScalarData(object):
+    """One scalar: the node, the raw value and its conversion result (ABSENT for an
+    exception value)."""
+    node: mib.meta.NodeMeta
+    raw: Value
+    result: conv.Result
+
+    def __init__(self, node: mib.meta.NodeMeta, raw: Value, result: conv.Result):
+        self.node = node
+        self.raw = raw
+        self.result = result
+
+    def __repr__(self) -> str:
+        return self.node.name + "=" + self.result.brief()
+
+
+class Issue(object):
+    """A varbind that was not assembled, or a row whose keys did not convert: the oid, its
+    raw value, a code (see the module doc), the reason, and the node it concerns (the
+    column, scalar or row; for unknown-oid the deepest named node on the path, if any)."""
+    oid: Oid
+    raw: Value
+    code: str
+    reason: str
+    node: ?mib.meta.NodeMeta
+
+    def __init__(self, oid: Oid, raw: Value, code: str, reason: str, node: ?mib.meta.NodeMeta):
+        self.oid = oid
+        self.raw = raw
+        self.code = code
+        self.reason = reason
+        self.node = node
+
+    def __repr__(self) -> str:
+        n = self.node
+        return "Issue(" + self.code + " " + str(self.oid) + (" " + n.qname() if n is not None else "") + ": " + self.reason + ")"
+
+
+class Assembly(object):
+    """The result of an Assembler: tables (by base row OID), scalars (by OID), the
+    issues, and absent, the number of column varbinds with exception values."""
+    tables: list[TableData]
+    scalars: list[ScalarData]
+    issues: list[Issue]
+    absent: int
+    ix: mib.meta.MetaIndex
+
+    def __init__(self, ix: mib.meta.MetaIndex, tables: list[TableData], scalars: list[ScalarData], issues: list[Issue], absent: int):
+        self.ix = ix
+        self.tables = tables
+        self.scalars = scalars
+        self.issues = issues
+        self.absent = absent
+
+    def table(self, name: str) -> ?TableData:
+        """The rows of table or row name (also an augmenting table or row: its base row's;
+        by OID, so another module's definition of the table finds them too)."""
+        n = self.ix.find(name)
+        if n is not None:
+            r: ?mib.meta.NodeMeta = n
+            if n.kind == "table":
+                r = self.ix.row_of_table(n)
+            if r is not None:
+                b = self.ix.base_row(r)
+                if b is not None:
+                    for t in self.tables:
+                        if t.row.oid == b.oid:
+                            return t
+        return None
+
+    def table_at(self, oid: list[int]) -> ?TableData:
+        """The rows of the table or row with OID oid (a list's or table container's
+        smiv2:oid; an augmenting table or row gives its base row's)."""
+        for t in self.tables:
+            if t.row.oid == oid:
+                return t
+            tb = t.table
+            if tb is not None:
+                if tb.oid == oid:
+                    return t
+            for a in t.augmenting:
+                if a.oid == oid:
+                    return t
+        for n in self.ix.exact(oid):
+            if n.kind == "table" or n.kind == "row":
+                return self.table(n.qname())
+        return None
+
+    def scalar(self, name: str) -> ?ScalarData:
+        """The scalar name (by its OID: another module's definition at the OID counts)."""
+        n = self.ix.find(name)
+        if n is not None:
+            for s in self.scalars:
+                if s.node.oid == n.oid:
+                    return s
+        return None
+
+    def scalar_at(self, oid: list[int]) -> ?ScalarData:
+        """The scalar with OID oid (without the .0)."""
+        for s in self.scalars:
+            if s.node.oid == oid:
+                return s
+        return None
+
+    def scalars_in(self, group: list[int]) -> list[ScalarData]:
+        """The scalars registered directly below OID group (a scalar group container's
+        smiv2:oid), in OID order."""
+        n = len(group)
+        return [s for s in self.scalars if len(s.node.oid) == n + 1 and s.node.oid[:n] == group]
+
+    def issue_codes(self) -> list[str]:
+        return [i.code for i in self.issues]
+
+
+# --- the assembler ---------------------------------------------------------------------------------
+
+class _Col(object):
+    # per column: the node the OID lookup gave (src), its row, the base row's table state, the
+    # converter, the column the cells name (node: src, or the table's module's column at its
+    # OID), and whether the row is an augmenting row
+    src: mib.meta.NodeMeta
+    row: mib.meta.NodeMeta
+    tab: _Tab
+    cv: conv.Converter
+    node: mib.meta.NodeMeta
+    cid: int
+    aug: bool
+    seen: bool
+
+    def __init__(self, src: mib.meta.NodeMeta, row: mib.meta.NodeMeta, tab: _Tab, cv: conv.Converter, node: mib.meta.NodeMeta, cid: int,
+                 aug: bool):
+        self.src = src
+        self.row = row
+        self.tab = tab
+        self.cv = cv
+        self.node = node
+        self.cid = cid
+        self.aug = aug
+        self.seen = False
+
+
+class _Tab(object):
+    # per base row while assembling; with inet_text, inet_src[i] is the part holding the
+    # InetAddressType of InetAddress part i (-1: not an InetAddress part, or no type part
+    # before it), and type_keys the InetAddressType parts
+    data: TableData
+    parts: list[mib.meta.IndexPart]
+    keycv: list[conv.Converter]
+    keyless: bool
+    bad: dict[Oid, str]
+    aug_seen: set[Oid]
+    last: ?TableRow
+    inet_src: list[int]
+    type_keys: list[int]
+
+    def __init__(self, data: TableData, parts: list[mib.meta.IndexPart], keycv: list[conv.Converter], keyless: bool):
+        self.data = data
+        self.parts = parts
+        self.keycv = keycv
+        self.keyless = keyless
+        self.bad = {}
+        self.aug_seen = set()
+        self.last = None
+        self.inet_src = [-1 for p in parts]
+        self.type_keys = []
+
+
+class Assembler(object):
+    """Assembles varbinds into rows and scalars (see the module doc). add one varbind,
+    add_all a list, add_table a client.Table, then result(). plans name the exact
+    rows and columns of OIDs that several modules define (RFC1213-MIB and IF-MIB); without a
+    plan the canonical row (MetaIndex.canonical_row) holds a table."""
+    ix: mib.meta.MetaIndex
+    opts: Options
+    prefer: dict[Oid, mib.meta.NodeMeta]
+    planned: dict[Oid, mib.meta.NodeMeta]
+    cols: dict[str, list[_Col]]
+    ncols: int
+    tabs: dict[Oid, _Tab]
+    tab_order: list[Oid]
+    scal: dict[str, ScalarData]
+    scal_cv: dict[str, conv.Converter]
+    issues: list[Issue]
+    absent: int
+    inet_cols: dict[str, str]
+
+    def __init__(self, ix: mib.meta.MetaIndex, opts: Options=Options(), plans: list[TablePlan]=[]):
+        self.ix = ix
+        self.opts = opts
+        self.prefer = {}
+        self.planned = {}
+        # only where the OID lookup would pick another module's object (RFC1213-MIB and IF-MIB)
+        for p in plans:
+            k = Oid(p.row.oid)
+            if k not in self.planned:
+                self.planned[k] = p.row
+            for c in p.columns:
+                hit = ix.lookup_object(c.oid)
+                if hit is not None:
+                    if hit.0.qname() != c.qname() and len(hit.1) == 0:
+                        self.prefer[Oid(c.oid)] = c
+        self.cols = {}
+        self.ncols = 0
+        self.tabs = {}
+        self.tab_order = []
+        self.scal = {}
+        self.scal_cv = {}
+        self.issues = []
+        self.absent = 0
+        self.inet_cols = {}
+
+    def _issue(self, vb: VarBind, code: str, reason: str, node: ?mib.meta.NodeMeta) -> None:
+        self.issues.append(Issue(vb.oid, vb.value, code, reason, node))
+
+    def add_all(self, vbs: list[VarBind]) -> None:
+        for vb in vbs:
+            self.add(vb)
+
+    def add_table(self, t: client_mod.Table) -> None:
+        """The cells of a Client.get_table result, as varbinds column.index."""
+        for r in t.rows:
+            for i, c in enumerate(r.cells):
+                if c is not None and i < len(t.columns):
+                    self.add(VarBind(Oid(t.columns[i].arcs + r.index), c))
+
+    def add(self, vb: VarBind) -> None:
+        arcs = vb.oid.arcs
+        hit = self.ix.lookup_object(arcs)
+        if hit is not None:
+            node = hit.0
+            suffix = hit.1
+            if len(self.prefer) > 0:
+                pref = self.prefer.get(Oid(node.oid))
+                if pref is not None:
+                    node = pref
+            if node.kind == "scalar":
+                self._scalar(vb, node, suffix)
+            else:
+                self._column(vb, node, suffix)
+            return
+        near = self.ix.lookup(arcs)
+        if near is not None:
+            self._issue(vb, "unknown-oid", "no column or scalar; deepest name " + near.0.qname(), near.0)
+        else:
+            self._issue(vb, "unknown-oid", "no name in the bundle", None)
+
+    def _scalar(self, vb: VarBind, node: mib.meta.NodeMeta, suffix: list[int]) -> None:
+        if len(suffix) != 1 or suffix[0] != 0:
+            self._issue(vb, "bad-instance", "a scalar's instance is .0, not ." + ".".join([str(a) for a in suffix]), node)
+            return
+        q = node.qname()
+        if q in self.scal:
+            self._issue(vb, "duplicate", "a second value of the scalar", node)
+            return
+        cv = self.scal_cv.get(q)
+        if cv is not None:
+            self.scal[q] = ScalarData(node, vb.value, cv.convert(vb.value))
+        else:
+            c2 = _converter(self.ix, node.syntax, self.opts.convert)
+            self.scal_cv[q] = c2
+            self.scal[q] = ScalarData(node, vb.value, c2.convert(vb.value))
+
+    def _col(self, vb: VarBind, node: mib.meta.NodeMeta) -> ?_Col:
+        # by the bare name (cheaper than the qualified one), then the module
+        cs = self.cols.get(node.name)
+        if cs is not None:
+            n = len(node.oid)
+            for c in cs:
+                # a module may define one name twice, at different OIDs (mib.resolver keeps both)
+                co = c.src.oid
+                if c.src.module == node.module and len(co) == n and co[n - 1] == node.oid[n - 1] and co == node.oid:
+                    return c
+        row = self.ix.row_of(node)
+        if row is not None:
+            base = self.ix.base_row(row)
+            if base is not None:
+                t = self._tab(base)
+                trow = t.data.row
+                col = node
+                crow = row
+                aug = row.oid != trow.oid
+                if not aug and row.module != trow.module:
+                    # another module's definition of the table's row: the table's module's column
+                    alt = self.ix.object_at(node.oid, trow.module)
+                    if alt is not None:
+                        col = alt
+                        crow = trow
+                nc = _Col(node, crow, t, _converter(self.ix, col.syntax, self.opts.convert), col, self.ncols, aug)
+                self.ncols += 1
+                if self.opts.inet_text and _is_tc(self.ix, col.syntax, INET_ADDRESS):
+                    ty = _inet_type_col(self.ix, col)
+                    self.inet_cols[col.qname()] = ty.qname() if ty is not None else ""
+                if cs is not None:
+                    cs.append(nc)
+                else:
+                    self.cols[node.name] = [nc]
+                return nc
+            self._issue(vb, "no-base-row", "row " + row.qname() + " AUGMENTS " + row.augments + ", which is not in the bundle", node)
+            return None
+        self._issue(vb, "no-row", "the column's row is not in the bundle", node)
+        return None
+
+    def _tab(self, base0: mib.meta.NodeMeta) -> _Tab:
+        # one table per base row OID, under the plan's row or the canonical one
+        q = Oid(base0.oid)
+        t = self.tabs.get(q)
+        if t is not None:
+            return t
+        pr = self.planned.get(q)
+        base = pr if pr is not None else self.ix.canonical_row(base0)
+        parts = base.index
+        data = TableData(base, self.ix.table_of(base), [index.IndexPart(p.enc, p.size, p.key) for p in parts])
+        keycv = [_converter(self.ix, p.syntax, self.opts.convert) for p in parts]
+        nt = _Tab(data, parts, keycv, base.keyless or len(parts) == 0)
+        if self.opts.inet_text:
+            for i, p in enumerate(parts):
+                if _is_tc(self.ix, p.syntax, INET_ADDRESS_TYPE):
+                    nt.type_keys.append(i)
+                elif _is_tc(self.ix, p.syntax, INET_ADDRESS) and len(nt.type_keys) > 0:
+                    nt.inet_src[i] = nt.type_keys[len(nt.type_keys) - 1]
+        self.tabs[q] = nt
+        self.tab_order.append(q)
+        return nt
+
+    def _row(self, vb: VarBind, t: _Tab, suffix: list[int], col: mib.meta.NodeMeta) -> ?TableRow:
+        # the rows of get_table (and of lock-step GETBULK answers) come one at a time
+        last = t.last
+        if last is not None:
+            if last.suffix == suffix:
+                return last
+        key = Oid(suffix)
+        r = t.data.by_suffix.get(key)
+        if r is not None:
+            t.last = r
+            return r
+        why = t.bad.get(key)
+        if why is not None:
+            self._issue(vb, "bad-index", why, col)
+            return None
+        if t.keyless:
+            nr = TableRow(suffix, [])
+            t.data.by_suffix[key] = nr
+            t.last = nr
+            return nr
+        vals: list[Value] = []
+        try:
+            vals = index.decode_index(suffix, t.data.parts)
+        except index.IndexDecodeError as e:
+            t.bad[key] = e.reason
+            self._issue(vb, "bad-index", e.reason, col)
+            return None
+        keys: list[Key] = []
+        for i, p in enumerate(t.parts):
+            res = t.keycv[i].convert(vals[i], True)
+            j = t.inet_src[i]
+            if j >= 0:
+                res = _inet_value(vals[j], vals[i], res)
+            keys.append(Key(p, p.key, vals[i], res))
+        nr = TableRow(suffix, keys)
+        t.data.by_suffix[key] = nr
+        t.last = nr
+        for k in keys:
+            if not k.result.ok():
+                self._issue(vb, "bad-key", "key " + k.name + ": " + k.result.brief() + (" (" + k.result.diag + ")" if k.result.diag != "" else ""), t.data.row)
+                break
+        return nr
+
+    def _column(self, vb: VarBind, node: mib.meta.NodeMeta, suffix: list[int]) -> None:
+        if values.is_exception(vb.value):
+            self.absent += 1
+            return
+        c = self._col(vb, node)
+        if c is not None:
+            r = self._row(vb, c.tab, suffix, node)
+            if r is not None:
+                if c.cid in r.cids:
+                    self._issue(vb, "duplicate", "a second value of the column in this row", node)
+                    return
+                r.cids.add(c.cid)
+                if c.aug and not c.seen:
+                    c.seen = True
+                    ro = Oid(c.row.oid)
+                    if ro not in c.tab.aug_seen:
+                        c.tab.aug_seen.add(ro)
+                        c.tab.data.augmenting.append(c.row)
+                r.cells.append(Cell(c.node, c.row, vb.value, c.cv.convert(vb.value)))
+
+    def _inet_cells(self, t: _Tab, r: TableRow) -> None:
+        """InetAddress cells as text by their InetAddressType: the cell of the type column, or
+        the key when the type column is an INDEX object; only when the row has no type column
+        for it, the last InetAddressType key. A cell whose type cell is missing stays binary
+        (the key may be of another address family)."""
+        for c in r.cells:
+            v = c.raw
+            if isinstance(v, values.OctetString):
+                src = self.inet_cols.get(c.column.qname())
+                if src is not None:
+                    ty: ?Value = None
+                    if src != "":
+                        tc = r.cell(src)
+                        if tc is not None:
+                            ty = tc.raw
+                        else:
+                            for k in r.keys:
+                                if k.part.obj == src:
+                                    ty = k.raw
+                    elif len(t.type_keys) > 0 and len(r.keys) == len(t.parts):
+                        ty = r.keys[t.type_keys[len(t.type_keys) - 1]].raw
+                    if ty is not None:
+                        c.result = _inet_value(ty, v, c.result)
+
+    def result(self) -> Assembly:
+        """The assembly so far: tables by base row OID, rows by suffix, cells by column OID,
+        scalars by OID; rows whose YANG keys an earlier row has are marked duplicate (issue
+        duplicate-key)."""
+        tabs: list[TableData] = []
+        dups: list[Issue] = []
+        keyed = [(self.tabs[q].data.row.oid, i) for i, q in enumerate(self.tab_order)]
+        for k in sorted(keyed):
+            t = self.tabs[self.tab_order[k.1]]
+            d = t.data
+            rows = list(d.by_suffix.values())
+            rk = [(r.suffix, i) for i, r in enumerate(rows)]
+            d.rows = [rows[x.1] for x in sorted(rk)]
+            for r in d.rows:
+                if not _in_oid_order(r.cells):
+                    ck = [(c.column.oid, i) for i, c in enumerate(r.cells)]
+                    r.cells = [r.cells[x.1] for x in sorted(ck)]
+                r._index_names()
+                if len(self.inet_cols) > 0:
+                    self._inet_cells(t, r)
+            self._unique_keys(d, dups)
+            ak = [(a.oid, i) for i, a in enumerate(d.augmenting)]
+            d.augmenting = [d.augmenting[x.1] for x in sorted(ak)]
+            tabs.append(d)
+        sl = list(self.scal.values())
+        sk = [(s.node.oid, i) for i, s in enumerate(sl)]
+        return Assembly(self.ix, tabs, [sl[x.1] for x in sorted(sk)], self.issues + dups, self.absent)
+
+    def _unique_keys(self, d: TableData, dups: list[Issue]) -> None:
+        """Mark the rows (in instance order) whose converted keys equal an earlier row's: lossy
+        conversions (a dropped NUL, replaced controls, a Latin-1 or hex fallback, a dropped
+        partial character) can map two instances to one YANG key."""
+        if len(d.parts) == 0:
+            return
+        first: dict[str, TableRow] = {}
+        for r in d.rows:
+            r.duplicate = False
+            if not r.converted():
+                continue
+            kt = r.key_text()
+            f = first.get(kt)
+            if f is not None:
+                r.duplicate = True
+                c0 = r.cells[0]
+                why = "the YANG keys of instance " + ".".join([str(a) for a in f.suffix]) + ": " + ", ".join([repr(k) for k in r.keys])
+                dups.append(Issue(Oid(c0.column.oid + r.suffix), c0.raw, "duplicate-key", why, d.row))
+            else:
+                first[kt] = r
+
+
+def _in_oid_order(cells: list[Cell]) -> bool:
+    for i in range(1, len(cells)):
+        if cells[i].column.oid < cells[i - 1].column.oid:
+            return False
+    return True
+
+
+def assemble(ix: mib.meta.MetaIndex, vbs: list[VarBind], opts: Options=Options(), plans: list[TablePlan]=[]) -> Assembly:
+    """Assemble varbinds in one step (see Assembler)."""
+    a = Assembler(ix, opts, plans)
+    a.add_all(vbs)
+    return a.result()
+
+
+def assemble_table(ix: mib.meta.MetaIndex, t: client_mod.Table, opts: Options=Options(), plans: list[TablePlan]=[]) -> Assembly:
+    """Assemble a Client.get_table result."""
+    a = Assembler(ix, opts, plans)
+    a.add_table(t)
+    return a.result()
+
+
+# --- planning ----------------------------------------------------------------------------------------
+
+class TablePlan(object):
+    """What to fetch for a table
+
+    row is the base row, whose INDEX names the instances, and table its
+    table. rows are the rows whose columns are fetched: the base row and its
+    augmenting rows, or one augmenting row. columns and oids are for
+    Client.get_table. index_meta and parts are the INDEX as mibmeta parts
+    and as index.IndexParts. index_prefix encodes the leading key values
+    given ([] for the whole table), and complete is set when every key was
+    given, so that get_oids() names the instances of one row.
+    """
+    table: ?mib.meta.NodeMeta
+    row: mib.meta.NodeMeta
+    rows: list[mib.meta.NodeMeta]
+    columns: list[mib.meta.NodeMeta]
+    oids: list[Oid]
+    index_meta: list[mib.meta.IndexPart]
+    parts: list[index.IndexPart]
+    index_prefix: list[int]
+    complete: bool
+
+    def __init__(self, table: ?mib.meta.NodeMeta, row: mib.meta.NodeMeta, rows: list[mib.meta.NodeMeta], columns: list[mib.meta.NodeMeta],
+                 parts: list[mib.meta.IndexPart], index_prefix: list[int], complete: bool):
+        self.table = table
+        self.row = row
+        self.rows = rows
+        self.columns = columns
+        self.oids = [Oid(c.oid) for c in columns]
+        self.index_meta = parts
+        self.parts = [index.IndexPart(p.enc, p.size, p.key) for p in parts]
+        self.index_prefix = index_prefix
+        self.complete = complete
+
+    def get_oids(self) -> list[Oid]:
+        """The instance OIDs of the row whose keys were all given (for Client.get); [] unless
+        complete."""
+        if not self.complete:
+            return []
+        return [Oid(c.oid + self.index_prefix) for c in self.columns]
+
+    def __repr__(self) -> str:
+        return ("TablePlan(" + self.row.qname() + ", columns=[" + ", ".join([c.name for c in self.columns]) + "], prefix="
+                + ".".join([str(a) for a in self.index_prefix]) + (", complete" if self.complete else "") + ")")
+
+
+def _resolve_rows(ix: mib.meta.MetaIndex, name: str, augments: bool) -> (?mib.meta.NodeMeta, mib.meta.NodeMeta, list[mib.meta.NodeMeta]):
+    n = ix.find(name)
+    if n is not None:
+        r: ?mib.meta.NodeMeta = None
+        if n.kind == "table":
+            r = ix.row_of_table(n)
+            if r is None:
+                raise PlanError("table " + n.qname() + " has no row in the bundle")
+        elif n.kind == "row":
+            r = n
+        else:
+            raise PlanError(n.qname() + " is a " + n.kind + ", not a table or row")
+        if r is not None:
+            base = ix.base_row(r)
+            if base is not None and "::" not in name and "." not in name and base.qname() == r.qname():
+                # a bare name: the table's canonical row (IF-MIB's ifEntry, not RFC1213-MIB's)
+                base = ix.canonical_row(base)
+                r = base
+            if base is not None:
+                if base.qname() != r.qname():
+                    return (ix.table_of(base), base, [r])
+                rows = [r]
+                if augments:
+                    rows = rows + ix.augmenting_rows(r)
+                return (ix.table_of(base), base, rows)
+            raise PlanError("row " + r.qname() + " AUGMENTS " + r.augments + ", which is not in the bundle")
+    raise PlanError("unknown table or row " + repr(name))
+
+
+def _inet_type_col(ix: mib.meta.MetaIndex, column: mib.meta.NodeMeta) -> ?mib.meta.NodeMeta:
+    """The InetAddressType column of InetAddress column column: the nearest one registered
+    before it in its row (RFC 4001 section 4.1), None when there is none."""
+    out: ?mib.meta.NodeMeta = None
+    row = ix.row_of(column)
+    if row is not None:
+        for c in ix.columns(row):
+            if c.oid >= column.oid:
+                break
+            if _is_tc(ix, c.syntax, INET_ADDRESS_TYPE):
+                out = c
+    return out
+
+
+def _pick_column(ix: mib.meta.MetaIndex, name: str, rows: list[mib.meta.NodeMeta]) -> mib.meta.NodeMeta:
+    rq = [r.qname() for r in rows]
+    cands: list[mib.meta.NodeMeta] = []
+    if "::" in name:
+        n = ix.find(name)
+        if n is not None:
+            cands.append(n)
+    else:
+        lst = ix.by_name.get(name)
+        if lst is not None:
+            cands = lst
+    for c in cands:
+        if c.kind == "column":
+            r = ix.row_of(c)
+            if r is not None and r.qname() in rq:
+                return c
+    raise PlanError(repr(name) + " is not a column of " + ", ".join(rq))
+
+
+def _index_value(v: Value, p: mib.meta.IndexPart) -> Value:
+    """A Counter64 for an int part (an illegal Counter64 INDEX, encoded as int) as Integer."""
+    if p.enc == "int" and isinstance(v, values.Counter64):
+        if v.value > u64(4294967295):
+            raise PlanError("key " + p.key + ": " + str(v.value) + " exceeds 2^32-1")
+        return values.Integer(int(v.value))
+    return v
+
+
+def encode_keys(ix: mib.meta.MetaIndex, row: mib.meta.NodeMeta, keys: list[value], opts: Options=Options()) -> list[int]:
+    """The instance sub-ids of the leading key values keys of a row (YANG values, converted
+    back with conv.to_value, or wire values.Values): a prefix of the instance suffix, the
+    whole suffix when every key is given. With opts.inet_text, an InetAddress key may be
+    text (conv.inet_octets by the preceding InetAddressType key). Raises PlanError."""
+    parts = ix.index_of(row)
+    if len(keys) > len(parts):
+        raise PlanError("%d key values for an INDEX of %d parts" % (len(keys), len(parts)))
+    vals: list[Value] = []
+    for i, x in enumerate(keys):
+        p = parts[i]
+        v: ?Value = None
+        if isinstance(x, values.Value):
+            v = x
+        elif isinstance(x, str) and opts.inet_text and _is_tc(ix, p.syntax, INET_ADDRESS):
+            ty: ?int = None
+            j = i - 1
+            while j >= 0 and ty is None:
+                if _is_tc(ix, parts[j].syntax, INET_ADDRESS_TYPE):
+                    ty = _int_value(vals[j])
+                j -= 1
+            if ty is not None:
+                try:
+                    v = values.OctetString(conv.inet_octets(ty, x))
+                except errors.EncodeError as e:
+                    raise PlanError("key " + p.key + ": " + e.error_message)
+            else:
+                raise PlanError("key " + p.key + ": no InetAddressType key before it")
+        else:
+            cv = _converter(ix, p.syntax, opts.convert)
+            try:
+                v = cv.to_value(x)
+            except errors.EncodeError as e:
+                raise PlanError("key " + p.key + ": " + e.error_message)
+        if v is not None:
+            vals.append(_index_value(v, p))
+    spec = [index.IndexPart(p.enc, p.size, p.key) for p in parts[:len(vals)]]
+    if len(vals) < len(parts) and len(vals) > 0:
+        # a prefix: an IMPLIED part can only be the last one of the whole INDEX
+        last = spec[len(spec) - 1]
+        if last.enc == "implied" or last.enc == "oid-implied":
+            raise PlanError("an IMPLIED key must be the last")
+    try:
+        return index.encode_index(vals, spec)
+    except errors.EncodeError as e:
+        raise PlanError(e.error_message)
+
+
+def plan_table(ix: mib.meta.MetaIndex, name: str, columns: list[str]=[], keys: list[value]=[], augments: bool=True,
+               opts: Options=Options(), index_columns: bool=False) -> TablePlan:
+    """Return the fetch plan of table or row name (also MOD::name)
+
+    The plan holds the row's readable columns and, with augments, those of
+    its augmenting rows; an augmenting table or row gives its own columns
+    under the base row's INDEX. INDEX columns are left out unless
+    index_columns is set, since their values come from the instance.
+    columns selects columns by name and drops unreadable ones; with
+    opts.inet_text the InetAddressType column of a selected InetAddress
+    column comes along. When no column is left, the first readable one
+    enumerates the rows. keys are leading key values (see encode_keys). A
+    bare name that several modules define takes MetaIndex.canonical_row.
+    Raises PlanError.
+    """
+    found = _resolve_rows(ix, name, augments)
+    table = found.0
+    base = found.1
+    rows = found.2
+    parts = ix.index_of(base)
+    cols: list[mib.meta.NodeMeta] = []
+    if len(columns) > 0:
+        for cn in columns:
+            c = _pick_column(ix, cn, rows)
+            if readable(c):
+                if opts.inet_text and _is_tc(ix, c.syntax, INET_ADDRESS):
+                    # its InetAddressType column renders it as text (a key is in every instance)
+                    ty = _inet_type_col(ix, c)
+                    if ty is not None and readable(ty) and ty.qname() not in set([p.obj for p in parts]):
+                        if ty.qname() not in [x.qname() for x in cols]:
+                            cols.append(ty)
+                if c.qname() not in [x.qname() for x in cols]:
+                    cols.append(c)
+    else:
+        keyq = set([p.obj for p in parts])
+        for r in rows:
+            for c in ix.columns(r):
+                if readable(c) and (index_columns or c.qname() not in keyq):
+                    cols.append(c)
+    if len(cols) == 0:
+        for r in rows:
+            for c in ix.columns(r):
+                if readable(c) and len(cols) == 0:
+                    cols.append(c)
+        if len(cols) == 0:
+            raise PlanError(base.qname() + " has no readable column")
+    prefix = encode_keys(ix, base, keys, opts) if len(keys) > 0 else []
+    return TablePlan(table, base, rows, cols, parts, prefix, len(keys) == len(parts) and len(parts) > 0)
+
+
+def _scalars_below(ix: mib.meta.MetaIndex, n: mib.meta.NodeMeta, out: list[Oid], depth: int) -> None:
+    if depth > 16:
+        return
+    for c in ix.children(n):
+        if c.kind == "scalar":
+            if readable(c):
+                out.append(Oid(c.oid + [0]))
+        elif c.kind != "table" and c.kind != "row" and c.kind != "column":
+            _scalars_below(ix, c, out, depth + 1)
+
+
+def scalar_oids(ix: mib.meta.MetaIndex, names: list[str]) -> list[Oid]:
+    """The instances (.0) to GET for names: a scalar itself, or every readable scalar below
+    a group node (an OID assignment such as system, or a module identity), tables left out.
+    Raises PlanError for an unknown name or a table, row or column."""
+    out: list[Oid] = []
+    for nm in names:
+        n = ix.find(nm)
+        if n is not None:
+            if n.kind == "scalar":
+                out.append(Oid(n.oid + [0]))
+            elif n.kind == "table" or n.kind == "row" or n.kind == "column":
+                raise PlanError(n.qname() + " is a " + n.kind + "; use plan_table")
+            else:
+                _scalars_below(ix, n, out, 0)
+        else:
+            raise PlanError("unknown name " + repr(nm))
+    return out

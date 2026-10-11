@@ -1,0 +1,1046 @@
+"""Tests for tables: fetch plans and the assembly of varbinds into rows
+
+The unit tests use the inline MIBs T_MIB and OLD_MIB. The env tests use
+the mibmeta of the golden IETF MIBs (interop/mibs/golden/mibs) and fetch
+their tables from a MemNet agent.
+"""
+
+import file
+import testing
+import client as client_mod
+import conv
+import errors
+import index
+import tables
+import testutil
+import values
+import mib.diag
+import mib.meta
+import mib.resolver
+import mib.source
+from agent import Agent, AgentConfig
+from client import Client, Options, Response, Row, Table
+from mibview import MibView
+from oid import Oid
+from security import Community
+from transport import MemNet
+from values import Value, VarBind, Integer, OctetString, Counter32, Counter64, Gauge32, TimeTicks, IpAddress, Opaque
+from values import ObjectIdentifier, NoSuchInstance
+from testutil import h, outcome, report_env
+
+INET_MIB = r"""INET-ADDRESS-MIB DEFINITIONS ::= BEGIN
+IMPORTS MODULE-IDENTITY, mib-2 FROM SNMPv2-SMI TEXTUAL-CONVENTION FROM SNMPv2-TC;
+inetAddressMIB MODULE-IDENTITY LAST-UPDATED "200502040000Z" ORGANIZATION "o" CONTACT-INFO "c" DESCRIPTION "d" ::= { mib-2 76 }
+InetAddressType ::= TEXTUAL-CONVENTION STATUS current DESCRIPTION "t"
+    SYNTAX INTEGER { unknown(0), ipv4(1), ipv6(2), ipv4z(3), ipv6z(4), dns(16) }
+InetAddress ::= TEXTUAL-CONVENTION STATUS current DESCRIPTION "a" SYNTAX OCTET STRING (SIZE (0..255))
+END
+"""
+
+T_MIB = r"""T-MIB DEFINITIONS ::= BEGIN
+IMPORTS
+    MODULE-IDENTITY, OBJECT-TYPE, Integer32, Unsigned32, Counter32, Counter64, enterprises FROM SNMPv2-SMI
+    TEXTUAL-CONVENTION, DisplayString, MacAddress, TruthValue FROM SNMPv2-TC
+    InetAddressType, InetAddress FROM INET-ADDRESS-MIB;
+tMIB MODULE-IDENTITY LAST-UPDATED "202610110000Z" ORGANIZATION "o" CONTACT-INFO "c" DESCRIPTION "d" ::= { enterprises 99995 }
+Level ::= TEXTUAL-CONVENTION STATUS current DESCRIPTION "l" SYNTAX INTEGER { low(1), high(2) }
+SubLevel ::= TEXTUAL-CONVENTION STATUS current DESCRIPTION "s" SYNTAX Level
+tObjects OBJECT IDENTIFIER ::= { tMIB 1 }
+tScalars OBJECT IDENTIFIER ::= { tObjects 1 }
+tScalarA OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current DESCRIPTION "a" ::= { tScalars 1 }
+tScalarB OBJECT-TYPE SYNTAX DisplayString MAX-ACCESS read-write STATUS current DESCRIPTION "b" ::= { tScalars 2 }
+tScalarN OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS accessible-for-notify STATUS current DESCRIPTION "n" ::= { tScalars 3 }
+tBaseTable OBJECT-TYPE SYNTAX SEQUENCE OF TBaseEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "t" ::= { tObjects 2 }
+tBaseEntry OBJECT-TYPE SYNTAX TBaseEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "e" INDEX { tIndex } ::= { tBaseTable 1 }
+TBaseEntry ::= SEQUENCE { tIndex Integer32, tName DisplayString, tLevel SubLevel, tCount Counter32 }
+tIndex OBJECT-TYPE SYNTAX Integer32 (1..100) MAX-ACCESS not-accessible STATUS current DESCRIPTION "i" ::= { tBaseEntry 1 }
+tName OBJECT-TYPE SYNTAX DisplayString MAX-ACCESS read-only STATUS current DESCRIPTION "n" ::= { tBaseEntry 2 }
+tLevel OBJECT-TYPE SYNTAX SubLevel MAX-ACCESS read-write STATUS current DESCRIPTION "l" ::= { tBaseEntry 3 }
+tCount OBJECT-TYPE SYNTAX Counter32 MAX-ACCESS read-only STATUS current DESCRIPTION "c" ::= { tBaseEntry 4 }
+tExtTable OBJECT-TYPE SYNTAX SEQUENCE OF TExtEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "t" ::= { tObjects 3 }
+tExtEntry OBJECT-TYPE SYNTAX TExtEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "e" AUGMENTS { tBaseEntry } ::= { tExtTable 1 }
+TExtEntry ::= SEQUENCE { tExtHC Counter64, tExtOn TruthValue }
+tExtHC OBJECT-TYPE SYNTAX Counter64 MAX-ACCESS read-only STATUS current DESCRIPTION "h" ::= { tExtEntry 1 }
+tExtOn OBJECT-TYPE SYNTAX TruthValue MAX-ACCESS read-only STATUS current DESCRIPTION "o" ::= { tExtEntry 2 }
+tExt2Table OBJECT-TYPE SYNTAX SEQUENCE OF TExt2Entry MAX-ACCESS not-accessible STATUS current DESCRIPTION "t" ::= { tObjects 4 }
+tExt2Entry OBJECT-TYPE SYNTAX TExt2Entry MAX-ACCESS not-accessible STATUS current DESCRIPTION "e" AUGMENTS { tExtEntry } ::= { tExt2Table 1 }
+TExt2Entry ::= SEQUENCE { tExt2X Integer32 }
+tExt2X OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current DESCRIPTION "x" ::= { tExt2Entry 1 }
+tAddrTable OBJECT-TYPE SYNTAX SEQUENCE OF TAddrEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "t" ::= { tObjects 5 }
+tAddrEntry OBJECT-TYPE SYNTAX TAddrEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "e" INDEX { tAddrType, tAddr, tAddrLen } ::= { tAddrTable 1 }
+TAddrEntry ::= SEQUENCE { tAddrType InetAddressType, tAddr InetAddress, tAddrLen Unsigned32, tAddrIf Integer32, tHopType InetAddressType, tHop InetAddress }
+tAddrType OBJECT-TYPE SYNTAX InetAddressType MAX-ACCESS not-accessible STATUS current DESCRIPTION "t" ::= { tAddrEntry 1 }
+tAddr OBJECT-TYPE SYNTAX InetAddress MAX-ACCESS not-accessible STATUS current DESCRIPTION "a" ::= { tAddrEntry 2 }
+tAddrLen OBJECT-TYPE SYNTAX Unsigned32 (0..128) MAX-ACCESS not-accessible STATUS current DESCRIPTION "l" ::= { tAddrEntry 3 }
+tAddrIf OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current DESCRIPTION "i" ::= { tAddrEntry 4 }
+tHopType OBJECT-TYPE SYNTAX InetAddressType MAX-ACCESS read-only STATUS current DESCRIPTION "t" ::= { tAddrEntry 5 }
+tHop OBJECT-TYPE SYNTAX InetAddress MAX-ACCESS read-only STATUS current DESCRIPTION "h" ::= { tAddrEntry 6 }
+tMacTable OBJECT-TYPE SYNTAX SEQUENCE OF TMacEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "t" ::= { tObjects 6 }
+tMacEntry OBJECT-TYPE SYNTAX TMacEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "e" INDEX { tVlan, tMac } ::= { tMacTable 1 }
+TMacEntry ::= SEQUENCE { tVlan Unsigned32, tMac MacAddress, tMacPort Integer32 }
+tVlan OBJECT-TYPE SYNTAX Unsigned32 (1..4094) MAX-ACCESS not-accessible STATUS current DESCRIPTION "v" ::= { tMacEntry 1 }
+tMac OBJECT-TYPE SYNTAX MacAddress MAX-ACCESS read-only STATUS current DESCRIPTION "m" ::= { tMacEntry 2 }
+tMacPort OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current DESCRIPTION "p" ::= { tMacEntry 3 }
+tNameTable OBJECT-TYPE SYNTAX SEQUENCE OF TNameEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "t" ::= { tObjects 7 }
+tNameEntry OBJECT-TYPE SYNTAX TNameEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "e" INDEX { tOwner, IMPLIED tTName } ::= { tNameTable 1 }
+TNameEntry ::= SEQUENCE { tOwner DisplayString, tTName DisplayString, tNameVal Integer32 }
+tOwner OBJECT-TYPE SYNTAX DisplayString (SIZE (0..32)) MAX-ACCESS not-accessible STATUS current DESCRIPTION "o" ::= { tNameEntry 1 }
+tTName OBJECT-TYPE SYNTAX DisplayString (SIZE (1..32)) MAX-ACCESS not-accessible STATUS current DESCRIPTION "n" ::= { tNameEntry 2 }
+tNameVal OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current DESCRIPTION "v" ::= { tNameEntry 3 }
+tLogTable OBJECT-TYPE SYNTAX SEQUENCE OF TLogEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "t" ::= { tObjects 8 }
+tLogEntry OBJECT-TYPE SYNTAX TLogEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "e" ::= { tLogTable 1 }
+TLogEntry ::= SEQUENCE { tLogText DisplayString }
+tLogText OBJECT-TYPE SYNTAX DisplayString MAX-ACCESS read-only STATUS current DESCRIPTION "x" ::= { tLogEntry 1 }
+tOidTable OBJECT-TYPE SYNTAX SEQUENCE OF TOidEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "t" ::= { tObjects 9 }
+tOidEntry OBJECT-TYPE SYNTAX TOidEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "e" INDEX { tOid } ::= { tOidTable 1 }
+TOidEntry ::= SEQUENCE { tOid OBJECT IDENTIFIER, tOidVal Integer32 }
+tOid OBJECT-TYPE SYNTAX OBJECT IDENTIFIER MAX-ACCESS not-accessible STATUS current DESCRIPTION "o" ::= { tOidEntry 1 }
+tOidVal OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current DESCRIPTION "v" ::= { tOidEntry 2 }
+tLevelTable OBJECT-TYPE SYNTAX SEQUENCE OF TLevelEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "t" ::= { tObjects 10 }
+tLevelEntry OBJECT-TYPE SYNTAX TLevelEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "e" INDEX { tLvl } ::= { tLevelTable 1 }
+TLevelEntry ::= SEQUENCE { tLvl Level, tLvlVal Integer32 }
+tLvl OBJECT-TYPE SYNTAX Level MAX-ACCESS not-accessible STATUS current DESCRIPTION "l" ::= { tLevelEntry 1 }
+tLvlVal OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current DESCRIPTION "v" ::= { tLevelEntry 2 }
+END
+"""
+
+OLD_MIB = r"""OLD-MIB DEFINITIONS ::= BEGIN
+IMPORTS MODULE-IDENTITY, OBJECT-TYPE, Integer32, enterprises FROM SNMPv2-SMI DisplayString FROM SNMPv2-TC;
+oldMIB MODULE-IDENTITY LAST-UPDATED "202610110000Z" ORGANIZATION "o" CONTACT-INFO "c" DESCRIPTION "d" ::= { enterprises 99994 }
+oBaseTable OBJECT-TYPE SYNTAX SEQUENCE OF OBaseEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "t" ::= { enterprises 99995 1 2 }
+oBaseEntry OBJECT-TYPE SYNTAX OBaseEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "e" INDEX { oIndex } ::= { oBaseTable 1 }
+OBaseEntry ::= SEQUENCE { oIndex Integer32, oName DisplayString }
+oIndex OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current DESCRIPTION "i" ::= { oBaseEntry 1 }
+oName OBJECT-TYPE SYNTAX DisplayString MAX-ACCESS read-only STATUS current DESCRIPTION "n" ::= { oBaseEntry 2 }
+END
+"""
+
+T_BASE = [1, 3, 6, 1, 4, 1, 99995, 1]
+
+
+def t_ix(names: list[str]=["T-MIB", "INET-ADDRESS-MIB"]) -> mib.meta.MetaIndex:
+    ms = mib.resolver.resolve_texts([INET_MIB, T_MIB, OLD_MIB])
+    return mib.meta.MetaIndex(mib.meta.bundle(ms, names))
+
+
+def toid(arcs: list[int]) -> Oid:
+    return Oid(T_BASE + arcs)
+
+
+def vb(arcs: list[int], v: Value) -> VarBind:
+    return VarBind(toid(arcs), v)
+
+
+def node(ix: mib.meta.MetaIndex, name: str) -> mib.meta.NodeMeta:
+    n = ix.find(name)
+    if n is not None:
+        return n
+    raise ValueError("no node " + name)
+
+
+def names(ns: list[mib.meta.NodeMeta]) -> list[str]:
+    return [n.name for n in ns]
+
+
+def opt_name(n: ?mib.meta.NodeMeta) -> str:
+    return n.qname() if n is not None else "None"
+
+
+def brief(r: ?conv.Result) -> str:
+    return r.brief() if r is not None else "-"
+
+
+def kv(d: dict[str, value]) -> str:
+    """A key dict as `name=value` text, sorted (dict[str, value] has no ==)."""
+    out: list[str] = []
+    for k in sorted(list(d.keys())):
+        v = d[k]
+        t = "?"
+        if isinstance(v, str):
+            t = repr(v)
+        elif isinstance(v, int):
+            t = str(v)
+        elif isinstance(v, u64):
+            t = "u" + str(v)
+        elif isinstance(v, bytes):
+            t = "0x" + v.hex()
+        elif isinstance(v, bool):
+            t = str(v)
+        out.append(k + "=" + t)
+    return ", ".join(out)
+
+
+def syn(p: mib.meta.IndexPart) -> str:
+    sx = p.syntax
+    if sx is not None:
+        return sx.conv + "|" + sx.tc
+    return "-"
+
+
+def plan_fails(f: proc() -> tables.TablePlan, what: str) -> None:
+    try:
+        p = f()
+        testing.error("no PlanError: " + what + " gave " + repr(p))
+    except tables.PlanError:
+        pass
+
+
+# --- MetaIndex helpers over the inline MIBs ----------------------------------------------------------
+
+def _test_index_helpers() -> None:
+    """row_of, table_of, row_of_table, columns (with augmenting rows), base_row (nested
+    AUGMENTS), augmenting_rows, index_of, lookup_object, tc_chain."""
+    ix = t_ix()
+    name = node(ix, "tName")
+    testing.assertEqual(opt_name(ix.row_of(name)), "T-MIB::tBaseEntry")
+    testing.assertEqual(opt_name(ix.row_of(node(ix, "tScalarA"))), "None")
+    testing.assertEqual(opt_name(ix.table_of(node(ix, "tExtEntry"))), "T-MIB::tExtTable")
+    testing.assertEqual(opt_name(ix.row_of_table(node(ix, "tAddrTable"))), "T-MIB::tAddrEntry")
+    base = node(ix, "tBaseEntry")
+    testing.assertEqual(names(ix.columns(base)), ["tIndex", "tName", "tLevel", "tCount"])
+    testing.assertEqual(names(ix.columns(base, True)), ["tIndex", "tName", "tLevel", "tCount", "tExtHC", "tExtOn", "tExt2X"])
+    testing.assertEqual(names(ix.augmenting_rows(base)), ["tExtEntry", "tExt2Entry"])
+    testing.assertEqual(opt_name(ix.base_row(node(ix, "tExt2Entry"))), "T-MIB::tBaseEntry")
+    testing.assertEqual(opt_name(ix.base_row(base)), "T-MIB::tBaseEntry")
+    testing.assertEqual([p.key + ":" + p.enc for p in ix.index_of(node(ix, "tExt2Entry"))], ["tIndex:int"])
+    testing.assertEqual([p.key + ":" + p.enc for p in ix.index_of(node(ix, "tAddrEntry"))], ["tAddrType:int", "tAddr:var", "tAddrLen:int"])
+    testing.assertEqual([p.key + ":" + p.enc for p in ix.index_of(node(ix, "tNameEntry"))], ["tOwner:var", "tTName:implied"])
+    testing.assertEqual([p.key + ":" + p.enc + ":" + str(p.size) for p in ix.index_of(node(ix, "tMacEntry"))], ["tVlan:int:0", "tMac:fixed:6"])
+    testing.assertEqual(index.spec_str(tables.index_spec(ix, node(ix, "tExtEntry"))), "int")
+    testing.assertTrue(node(ix, "tLogEntry").keyless)
+    testing.assertEqual(len(ix.index_of(node(ix, "tLogEntry"))), 0)
+    r = ix.lookup_object(toid([2, 1, 2, 7]).arcs)
+    testing.assertEqual(r.0.name + str(r.1) if r is not None else "", "tName[7]")
+    s = ix.lookup_object(toid([1, 2, 0]).arcs)
+    testing.assertEqual(s.0.name + str(s.1) if s is not None else "", "tScalarB[0]")
+    testing.assertNone(ix.lookup_object(toid([2, 1]).arcs), "a row is not an object")
+    testing.assertNone(ix.lookup_object(toid([99, 1]).arcs))
+    testing.assertEqual(ix.tc_chain("T-MIB::SubLevel"), ["T-MIB::Level"])
+    testing.assertEqual(ix.tc_chain("T-MIB::Level"), [])
+    testing.assertEqual(ix.tc_chain("X::Unknown"), [])
+    tl = ix.find_type("T-MIB::Level")
+    testing.assertEqual(tl.name if tl is not None else "", "Level")
+    testing.assertEqual(names(ix.children(node(ix, "tScalars"))), ["tScalarA", "tScalarB", "tScalarN"])
+
+
+def _test_index_prefers_module() -> None:
+    """Two modules at one OID: lookup takes the first added, the table helpers the module asked
+    about."""
+    ix = t_ix(["OLD-MIB", "T-MIB", "INET-ADDRESS-MIB"])
+    r = ix.lookup_object(toid([2, 1, 2, 7]).arcs)
+    testing.assertEqual(r.0.qname() if r is not None else "", "OLD-MIB::oName")
+    testing.assertEqual(names(ix.columns(node(ix, "T-MIB::tBaseEntry"))), ["tIndex", "tName", "tLevel", "tCount"])
+    testing.assertEqual(names(ix.columns(node(ix, "OLD-MIB::oBaseEntry"))), ["oIndex", "oName"])
+    testing.assertEqual(opt_name(ix.row_of(node(ix, "T-MIB::tName"))), "T-MIB::tBaseEntry")
+    testing.assertEqual(opt_name(ix.row_of(node(ix, "OLD-MIB::oName"))), "OLD-MIB::oBaseEntry")
+
+
+# --- assembly -------------------------------------------------------------------------------------------
+
+def t_varbinds() -> list[VarBind]:
+    return [
+        vb([1, 1, 0], Integer(5)),
+        vb([1, 2, 0], OctetString(b"hello")),
+        vb([1, 1, 1], Integer(6)),                                  # bad-instance
+        vb([1, 3, 0], Integer(1)),
+        vb([2, 1, 2, 1], OctetString(b"one")),
+        vb([2, 1, 2, 3], OctetString(b"three")),
+        vb([2, 1, 3, 1], Integer(2)),
+        vb([2, 1, 3, 3], Integer(9)),                               # unknown enumeration number: malformed cell
+        vb([2, 1, 4, 1], Counter32(10)),
+        vb([2, 1, 4, 2], Counter32(20)),                            # row 2 has no tName: sparse
+        vb([2, 1, 4, 3], NoSuchInstance()),                         # absent
+        vb([2, 1, 2, 0], OctetString(b"zero")),                     # index 0 outside 1..100: a key warning
+        vb([2, 1, 2, 1, 2], OctetString(b"trailing")),              # bad-index
+        vb([2, 1, 2, 1], OctetString(b"again")),                    # duplicate
+        vb([3, 1, 1, 1], Counter64(u64(100))),
+        vb([3, 1, 1, 9], Counter64(u64(900))),                      # only in the augmenting table: a row of its own
+        vb([3, 1, 2, 1], Integer(1)),
+        vb([4, 1, 1, 1], Integer(7)),
+        vb([5, 1, 4, 1, 4, 192, 0, 2, 1, 24], Integer(1)),
+        vb([5, 1, 5, 1, 4, 192, 0, 2, 1, 24], Integer(1)),
+        vb([5, 1, 6, 1, 4, 192, 0, 2, 1, 24], OctetString(h("c0 00 02 fe"))),
+        vb([5, 1, 4, 2, 16, 32, 1, 13, 184, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 64], Integer(2)),
+        vb([5, 1, 5, 2, 16, 32, 1, 13, 184, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 64], Integer(2)),
+        vb([5, 1, 6, 2, 16, 32, 1, 13, 184, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 64], OctetString(h("fe 80 00 00 00 00 00 00 00 00 00 00 00 00 00 01"))),
+        vb([6, 1, 2, 5, 0, 26, 43, 60, 77, 94], OctetString(h("00 1a 2b 3c 4d 5e"))),
+        vb([6, 1, 3, 5, 0, 26, 43, 60, 77, 94], Integer(3)),
+        vb([6, 1, 3, 5, 0, 26], Integer(4)),                       # bad-index: short suffix
+        vb([7, 1, 3, 5, 111, 119, 110, 101, 114, 116, 114, 105, 103], Integer(1)),
+        vb([8, 1, 1, 17], OctetString(b"a")),
+        vb([8, 1, 1, 18, 1], OctetString(b"b")),
+        vb([9, 1, 2, 3, 1, 3, 6], Integer(4)),
+        vb([9, 1, 2, 1, 5], Integer(5)),                            # OID key [5]: bad-key
+        vb([10, 1, 2, 9], Integer(6)),                              # unknown enumeration key: bad-key
+        vb([10, 1, 2, 2], Integer(7)),
+        vb([99, 1], Integer(0)),                                    # unknown-oid below tObjects
+        VarBind(Oid([1, 3, 6, 1, 4, 1, 1, 2]), Integer(0)),         # unknown-oid outside the bundle
+    ]
+
+
+def rows_of(a: tables.Assembly, name: str) -> list[str]:
+    t = a.table(name)
+    if t is not None:
+        return [repr(r) for r in t.rows]
+    return ["no table " + name]
+
+
+def _test_assemble() -> None:
+    """Scalars, rows merged across AUGMENTS (also nested, also rows only an augmenting table
+    has), sparse rows, every key encoding, and the issues; InetAddress as binary."""
+    ix = t_ix()
+    a = tables.assemble(ix, t_varbinds())
+    testing.assertEqual([repr(s) for s in a.scalars], ["tScalarA=ok:int:5", "tScalarB=ok:string:hello", "tScalarN=ok:int:1"])
+    testing.assertEqual([t.row.name for t in a.tables], ["tBaseEntry", "tAddrEntry", "tMacEntry", "tNameEntry", "tLogEntry", "tOidEntry", "tLevelEntry"])
+    testing.assertEqual(rows_of(a, "tBaseTable"), [
+        "TableRow(0 [tIndex=ok:int:0!range] tName=ok:string:zero)",
+        "TableRow(1 [tIndex=ok:int:1] tName=ok:string:one, tLevel=ok:enum:high, tCount=ok:uint:10, tExtHC=ok:uint:100, tExtOn=ok:boolean:true, tExt2X=ok:int:7)",
+        "TableRow(2 [tIndex=ok:int:2] tCount=ok:uint:20)",
+        "TableRow(3 [tIndex=ok:int:3] tName=ok:string:three, tLevel=malformed:unknown-enum)",
+        "TableRow(9 [tIndex=ok:int:9] tExtHC=ok:uint:900)"])
+    tb = a.table("tExt2Entry")
+    if tb is not None:
+        testing.assertEqual(tb.row.name, "tBaseEntry")
+        testing.assertEqual(names(tb.augmenting), ["tExtEntry", "tExt2Entry"])
+        testing.assertEqual(opt_name(tb.table), "T-MIB::tBaseTable")
+        r1 = tb.find([1])
+        if r1 is not None:
+            testing.assertEqual(kv(r1.key_values()), "tIndex=1")
+            testing.assertTrue(r1.keys_ok())
+            c = r1.cell("tExtOn")
+            testing.assertEqual(c.row.name if c is not None else "", "tExtEntry")
+            testing.assertEqual(c.raw if c is not None else Integer(0), Integer(1))
+            testing.assertEqual(brief(r1.result("T-MIB::tCount")), "ok:uint:10")
+            testing.assertEqual(brief(r1.result("tIndex")), "ok:int:1")
+            testing.assertNone(r1.result("nothing"))
+        else:
+            testing.error("no row 1")
+        testing.assertNone(tb.find([4]))
+        testing.assertEqual(repr(tb.find_keys({"tIndex": "9"})), "TableRow(9 [tIndex=ok:int:9] tExtHC=ok:uint:900)")
+    else:
+        testing.error("no tBaseEntry table")
+    testing.assertEqual(rows_of(a, "tAddrTable"), [
+        "TableRow(1.4.192.0.2.1.24 [tAddrType=ok:enum:ipv4, tAddr=ok:binary:c0000201, tAddrLen=ok:uint:24] tAddrIf=ok:int:1, tHopType=ok:enum:ipv4, tHop=ok:binary:c00002fe)",
+        "TableRow(2.16.32.1.13.184.0.0.0.0.0.0.0.0.0.0.0.1.64 [tAddrType=ok:enum:ipv6, tAddr=ok:binary:20010db8000000000000000000000001, tAddrLen=ok:uint:64] tAddrIf=ok:int:2, tHopType=ok:enum:ipv6, tHop=ok:binary:fe800000000000000000000000000001)"])
+    testing.assertEqual(rows_of(a, "tMacTable"), ["TableRow(5.0.26.43.60.77.94 [tVlan=ok:uint:5, tMac=ok:string:00:1a:2b:3c:4d:5e] tMac=ok:string:00:1a:2b:3c:4d:5e, tMacPort=ok:int:3)"])
+    testing.assertEqual(rows_of(a, "tNameEntry"), ["TableRow(5.111.119.110.101.114.116.114.105.103 [tOwner=ok:string:owner, tTName=ok:string:trig] tNameVal=ok:int:1)"])
+    testing.assertEqual(rows_of(a, "tLogTable"), ["TableRow(17 [] tLogText=ok:string:a)", "TableRow(18.1 [] tLogText=ok:string:b)"])
+    testing.assertEqual(rows_of(a, "tOidTable"), ["TableRow(1.5 [tOid=malformed:bad-oid] tOidVal=ok:int:5)", "TableRow(3.1.3.6 [tOid=ok:string:1.3.6] tOidVal=ok:int:4)"])
+    testing.assertEqual(rows_of(a, "tLevelTable"), ["TableRow(2 [tLvl=ok:enum:high] tLvlVal=ok:int:7)", "TableRow(9 [tLvl=malformed:unknown-enum] tLvlVal=ok:int:6)"])
+    lv = a.table("tLevelTable")
+    if lv is not None:
+        testing.assertFalse(lv.rows[1].keys_ok())
+        testing.assertEqual(kv(lv.rows[1].key_values()), "")
+    testing.assertEqual(a.issue_codes(), ["bad-instance", "bad-index", "duplicate", "bad-index", "bad-key", "bad-key", "unknown-oid", "unknown-oid"])
+    testing.assertEqual(repr(a.issues[0]), "Issue(bad-instance 1.3.6.1.4.1.99995.1.1.1.1 T-MIB::tScalarA: a scalar's instance is .0, not .1)")
+    testing.assertEqual(repr(a.issues[1]), "Issue(bad-index 1.3.6.1.4.1.99995.1.2.1.2.1.2 T-MIB::tName: 1 trailing sub-ids after the index)")
+    testing.assertEqual(repr(a.issues[4]), "Issue(bad-key 1.3.6.1.4.1.99995.1.9.1.2.1.5 T-MIB::tOidEntry: key tOid: malformed:bad-oid (an OID of 1 arcs (yang:object-identifier needs 2)))")
+    testing.assertEqual(repr(a.issues[6]), "Issue(unknown-oid 1.3.6.1.4.1.99995.1.99.1 T-MIB::tObjects: no column or scalar; deepest name T-MIB::tObjects)")
+    testing.assertEqual(repr(a.issues[7]), "Issue(unknown-oid 1.3.6.1.4.1.1.2: no name in the bundle)")
+    testing.assertEqual(a.absent, 1)
+    sc = a.scalar("tScalarB")
+    testing.assertEqual(sc.result.as_str() if sc is not None else "", "hello")
+    testing.assertNone(a.scalar("tName"))
+    testing.assertNone(a.table("tName"))
+    # by OID (smiv2:oid), as the YangData adapter looks them up
+    for nm in ["tBaseTable", "tBaseEntry", "tExtTable", "tExtEntry", "tExt2Table", "tExt2Entry"]:
+        ta = a.table_at(node(ix, nm).oid)
+        testing.assertEqual(ta.row.name if ta is not None else "", "tBaseEntry", nm)
+    testing.assertNone(a.table_at(node(ix, "tName").oid))
+    testing.assertNone(a.table_at(node(ix, "tScalars").oid))
+    testing.assertEqual([repr(x) for x in a.scalars_in(node(ix, "tScalars").oid)], ["tScalarA=ok:int:5", "tScalarB=ok:string:hello", "tScalarN=ok:int:1"])
+    testing.assertEqual(len(a.scalars_in(node(ix, "tObjects").oid)), 0)
+    sb = a.scalar_at(node(ix, "tScalarB").oid)
+    testing.assertEqual(repr(sb) if sb is not None else "", "tScalarB=ok:string:hello")
+    testing.assertNone(a.scalar_at(node(ix, "tName").oid))
+    tm = a.table("tMacTable")
+    if tm is not None:
+        testing.assertEqual([r.suffix for r in tm.rows_with_prefix([5])], [[5, 0, 26, 43, 60, 77, 94]])
+        testing.assertEqual(len(tm.rows_with_prefix([6])), 0)
+        testing.assertEqual(len(tm.rows_with_prefix([])), 1)
+        cm = tm.rows[0].cell_at(node(ix, "tMacPort").oid)
+        testing.assertEqual(repr(cm) if cm is not None else "", "tMacPort=ok:int:3")
+        testing.assertNone(tm.rows[0].cell_at(node(ix, "tName").oid))
+
+
+def _test_assemble_inet_text() -> None:
+    """inet_text: InetAddress keys and cells by their InetAddressType."""
+    ix = t_ix()
+    a = tables.assemble(ix, t_varbinds(), tables.Options(inet_text=True))
+    testing.assertEqual(rows_of(a, "tAddrTable"), [
+        "TableRow(1.4.192.0.2.1.24 [tAddrType=ok:enum:ipv4, tAddr=ok:string:192.0.2.1, tAddrLen=ok:uint:24] tAddrIf=ok:int:1, tHopType=ok:enum:ipv4, tHop=ok:string:192.0.2.254)",
+        "TableRow(2.16.32.1.13.184.0.0.0.0.0.0.0.0.0.0.0.1.64 [tAddrType=ok:enum:ipv6, tAddr=ok:string:2001:db8::1, tAddrLen=ok:uint:64] tAddrIf=ok:int:2, tHopType=ok:enum:ipv6, tHop=ok:string:fe80::1)"])
+    # an address of the wrong length for its type is malformed, the row stays
+    b = tables.assemble(ix, [vb([5, 1, 6, 1, 3, 10, 0, 0, 7], OctetString(h("0a 00"))), vb([5, 1, 5, 1, 3, 10, 0, 0, 7], Integer(1))],
+                        tables.Options(inet_text=True))
+    testing.assertEqual(rows_of(b, "tAddrTable"), ["TableRow(1.3.10.0.0.7 [tAddrType=ok:enum:ipv4, tAddr=malformed:bad-length, tAddrLen=ok:uint:7] tHopType=ok:enum:ipv4, tHop=malformed:bad-length)"])
+    testing.assertEqual(b.issue_codes(), ["bad-key"])
+
+
+def _test_assemble_inet_without_type_cell() -> None:
+    """With inet_text, an InetAddress column whose own InetAddressType column was not fetched
+    stays binary (rendering it by the row's InetAddressType key, here ipv4 for an IPv6 next
+    hop, would make the cell malformed); plans with inet_text fetch the type column."""
+    ix = t_ix()
+    v6 = h("fe 80 00 00 00 00 00 00 00 00 00 00 00 00 00 01")
+    a = tables.assemble(ix, [vb([5, 1, 6, 1, 4, 192, 0, 2, 1, 24], OctetString(v6))], tables.Options(inet_text=True))
+    testing.assertEqual(rows_of(a, "tAddrTable"), [
+        "TableRow(1.4.192.0.2.1.24 [tAddrType=ok:enum:ipv4, tAddr=ok:string:192.0.2.1, tAddrLen=ok:uint:24] tHop=ok:binary:fe800000000000000000000000000001)"])
+    testing.assertEqual(names(tables.plan_table(ix, "tAddrTable", ["tHop"], [], True, tables.Options(inet_text=True)).columns), ["tHopType", "tHop"])
+    testing.assertEqual(names(tables.plan_table(ix, "tAddrTable", ["tHop", "tHopType"], [], True, tables.Options(inet_text=True)).columns), ["tHopType", "tHop"])
+    testing.assertEqual(names(tables.plan_table(ix, "tAddrTable", ["tHop"]).columns), ["tHop"])
+    # with its type cell it is text
+    b = tables.assemble(ix, [vb([5, 1, 6, 1, 4, 192, 0, 2, 1, 24], OctetString(v6)), vb([5, 1, 5, 1, 4, 192, 0, 2, 1, 24], Integer(2))],
+                        tables.Options(inet_text=True))
+    testing.assertEqual(rows_of(b, "tAddrTable"), [
+        "TableRow(1.4.192.0.2.1.24 [tAddrType=ok:enum:ipv4, tAddr=ok:string:192.0.2.1, tAddrLen=ok:uint:24] tHopType=ok:enum:ipv6, tHop=ok:string:fe80::1)"])
+
+
+def _test_assemble_options() -> None:
+    """Conversion options reach keys and cells; unknown_enum="number" keys a row by the number."""
+    ix = t_ix()
+    a = tables.assemble(ix, [vb([10, 1, 2, 9], Integer(6)), vb([2, 1, 3, 3], Integer(9))],
+                        tables.Options(conv.Options(unknown_enum="number")))
+    testing.assertEqual(rows_of(a, "tLevelTable"), ["TableRow(9 [tLvl=ok:enum:9!unknown-enum] tLvlVal=ok:int:6)"])
+    testing.assertEqual(rows_of(a, "tBaseTable"), ["TableRow(3 [tIndex=ok:int:3] tLevel=ok:enum:9!unknown-enum)"])
+    testing.assertEqual(a.issue_codes(), [])
+
+
+def _test_assemble_plan_prefers() -> None:
+    """With two modules at one OID the plan's columns decide; without, the canonical row (the one
+    other rows AUGMENT: T-MIB's, although OLD-MIB was added first)."""
+    ix = t_ix(["OLD-MIB", "T-MIB", "INET-ADDRESS-MIB"])
+    vbs = [vb([2, 1, 2, 7], OctetString(b"seven"))]
+    a = tables.assemble(ix, vbs)
+    testing.assertEqual([t.row.qname() for t in a.tables], ["T-MIB::tBaseEntry"])
+    testing.assertEqual(rows_of(a, "OLD-MIB::oBaseEntry"), ["TableRow(7 [tIndex=ok:int:7] tName=ok:string:seven)"])
+    p = tables.plan_table(ix, "T-MIB::tBaseTable")
+    b = tables.assemble(ix, vbs, tables.Options(), [p])
+    testing.assertEqual([t.row.qname() for t in b.tables], ["T-MIB::tBaseEntry"])
+    testing.assertEqual(rows_of(b, "T-MIB::tBaseEntry"), ["TableRow(7 [tIndex=ok:int:7] tName=ok:string:seven)"])
+    po = tables.plan_table(ix, "OLD-MIB::oBaseTable")
+    c = tables.assemble(ix, vbs, tables.Options(), [po])
+    testing.assertEqual([t.row.qname() for t in c.tables], ["OLD-MIB::oBaseEntry"])
+    testing.assertEqual(rows_of(c, "T-MIB::tBaseEntry"), ["TableRow(7 [oIndex=ok:int:7] oName=ok:string:seven)"])
+
+
+def _test_assemble_one_table_per_oid() -> None:
+    """Two modules defining one table's row (RFC1213-MIB and IF-MIB) must not split it into
+    two TableData (the base columns under the first module's row, the augmenting columns
+    under the other's). Tables are keyed by row OID: one TableData, under the canonical row
+    (the one tExtEntry AUGMENTS), with the table's module's columns; also under a plan's row."""
+    ix = t_ix(["OLD-MIB", "T-MIB", "INET-ADDRESS-MIB"])
+    vbs = [vb([2, 1, 2, 7], OctetString(b"seven")), vb([3, 1, 1, 7], Counter64(u64(70))), vb([2, 1, 1, 7], Integer(7))]
+    a = tables.assemble(ix, vbs)
+    testing.assertEqual([t.row.qname() for t in a.tables], ["T-MIB::tBaseEntry"])
+    testing.assertEqual(rows_of(a, "T-MIB::tBaseTable"), ["TableRow(7 [tIndex=ok:int:7] tIndex=ok:int:7, tName=ok:string:seven, tExtHC=ok:uint:70)"])
+    t = a.tables[0]
+    testing.assertEqual([c.column.qname() for c in t.rows[0].cells], ["T-MIB::tIndex", "T-MIB::tName", "T-MIB::tExtHC"])
+    testing.assertEqual([c.row.qname() for c in t.rows[0].cells], ["T-MIB::tBaseEntry", "T-MIB::tBaseEntry", "T-MIB::tExtEntry"])
+    testing.assertEqual(names(t.augmenting), ["tExtEntry"])
+    for nm in ["OLD-MIB::oBaseTable", "OLD-MIB::oBaseEntry", "T-MIB::tBaseEntry", "T-MIB::tExtTable"]:
+        tn = a.table(nm)
+        testing.assertEqual(tn.row.qname() if tn is not None else "", "T-MIB::tBaseEntry", nm)
+    ta = a.table_at(node(ix, "OLD-MIB::oBaseEntry").oid)
+    testing.assertEqual(len(ta.rows[0].cells) if ta is not None else 0, 3)
+    # the bare name plans the canonical row with its augmenting rows; MOD::name that module's
+    testing.assertEqual(tables.plan_table(ix, "oBaseTable").row.qname(), "T-MIB::tBaseEntry")
+    testing.assertEqual(names(tables.plan_table(ix, "oBaseTable").columns), ["tName", "tLevel", "tCount", "tExtHC", "tExtOn", "tExt2X"])
+    testing.assertEqual(names(tables.plan_table(ix, "OLD-MIB::oBaseTable").columns), ["oName"])
+    # under a plan's row, the augmenting columns join it
+    b = tables.assemble(ix, vbs, tables.Options(), [tables.plan_table(ix, "OLD-MIB::oBaseTable")])
+    testing.assertEqual([t.row.qname() for t in b.tables], ["OLD-MIB::oBaseEntry"])
+    testing.assertEqual(rows_of(b, "oBaseTable"), ["TableRow(7 [oIndex=ok:int:7] oIndex=ok:int:7, oName=ok:string:seven, tExtHC=ok:uint:70)"])
+
+
+def _test_assemble_duplicate_keys() -> None:
+    """Index strings that differ on the wire but convert to the same YANG key (a trailing NUL
+    dropped, control characters replaced, Latin-1 read for invalid UTF-8) must not give rows
+    with equal keys and no issue: the first row in instance order keeps its keys, the later
+    ones are `duplicate` (keys_ok() False, issue duplicate-key); result() is repeatable."""
+    ix = t_ix()
+    assembler = tables.Assembler(ix)
+    assembler.add_all([vb([7, 1, 3, 3, 97, 98, 99, 120], Integer(1)),
+                       vb([7, 1, 3, 4, 97, 98, 99, 0, 120], Integer(2)),
+                       vb([7, 1, 3, 2, 97, 1, 120], Integer(3)),
+                       vb([7, 1, 3, 2, 97, 2, 120], Integer(4)),
+                       vb([7, 1, 3, 2, 0xc3, 0xa4, 120], Integer(5)),
+                       vb([7, 1, 3, 1, 0xe4, 120], Integer(6)),
+                       vb([7, 1, 3, 1, 98, 120], Integer(7))])
+    for i in range(2):
+        a = assembler.result()
+        t = a.table("tNameTable")
+        if t is not None:
+            testing.assertEqual([".".join([str(x) for x in r.suffix]) for r in t.rows if r.keys_ok()],
+                                ["1.98.120", "1.228.120", "2.97.1.120", "3.97.98.99.120"])
+            testing.assertEqual([r.duplicate for r in t.rows], [False, False, False, True, True, False, True])
+            seen: set[str] = set()
+            for r in t.rows:
+                if r.keys_ok():
+                    k = kv(r.key_values())
+                    testing.assertFalse(k in seen, "two keyed rows with " + k)
+                    seen.add(k)
+        else:
+            testing.error("no tNameTable")
+        testing.assertEqual(a.issue_codes(), ["duplicate-key", "duplicate-key", "duplicate-key"])
+        testing.assertEqual(repr(a.issues[0]), "Issue(duplicate-key 1.3.6.1.4.1.99995.1.7.1.3.2.97.2.120 T-MIB::tNameEntry: the YANG keys of instance 2.97.1.120: tOwner=ok:string:a" + chr(0xfffd) + "!control-chars, tTName=ok:string:x)")
+    # a keyless table has no keys to repeat
+    testing.assertEqual(tables.assemble(ix, [vb([8, 1, 1, 1], OctetString(b"a")), vb([8, 1, 1, 2], OctetString(b"a"))]).issue_codes(), [])
+
+
+def _test_assemble_client_table() -> None:
+    """A client.Table (get_table's result) assembles like its varbinds; an Assembler takes more
+    varbinds later."""
+    ix = t_ix()
+    t = Table([toid([2, 1, 2]), toid([2, 1, 4]), toid([3, 1, 1])],
+              [Row([1], {}, [OctetString(b"one"), Counter32(1), Counter64(u64(11))]), Row([2], {}, [None, Counter32(2), None])])
+    assembler = tables.Assembler(ix)
+    assembler.add_table(t)
+    assembler.add(vb([1, 1, 0], Integer(5)))
+    a = assembler.result()
+    testing.assertEqual(rows_of(a, "tBaseTable"), ["TableRow(1 [tIndex=ok:int:1] tName=ok:string:one, tCount=ok:uint:1, tExtHC=ok:uint:11)",
+                                                   "TableRow(2 [tIndex=ok:int:2] tCount=ok:uint:2)"])
+    testing.assertEqual([repr(s) for s in a.scalars], ["tScalarA=ok:int:5"])
+
+
+def _test_assemble_no_base_row() -> None:
+    """An augmenting row whose base row is not in the bundle, and a column whose row is not."""
+    ms = mib.resolver.resolve_texts([INET_MIB, T_MIB])
+    b = mib.meta.bundle(ms, ["T-MIB"])
+    # drop the base row: its columns lose their row, the augmenting rows their base
+    for m in b.modules:
+        m.nodes = [n for n in m.nodes if n.name != "tBaseEntry"]
+    ix = mib.meta.MetaIndex(b)
+    a = tables.assemble(ix, [vb([2, 1, 2, 1], OctetString(b"x")), vb([3, 1, 1, 1], Counter64(u64(1)))])
+    testing.assertEqual(a.issue_codes(), ["no-row", "no-base-row"])
+    testing.assertEqual(len(a.tables), 0)
+    plan_fails(lambda: tables.plan_table(ix, "tExtTable"), "an augmenting table without its base row")
+
+
+def junk_values() -> list[Value]:
+    return [Integer(0), Integer(1), Integer(2), Integer(-1), Integer(9223372036854775807), Counter32(4294967295), Gauge32(7), TimeTicks(0),
+            Counter64(u64(18446744073709551615)), IpAddress(h("0a 00 00 01")), IpAddress(b""), OctetString(b""), OctetString(b"x\x00"),
+            OctetString(h("ff fe 01")), OctetString(h("c0 00 02 01")), ObjectIdentifier(Oid([1])), ObjectIdentifier(Oid([1, 3, 6])),
+            Opaque(h("9f 78 04 3f c0 00 00")), Opaque(b""), values.NoSuchObject(), NoSuchInstance(), values.EndOfMibView(), values.Null(),
+            values.MalformedValue(0x41, h("01 00 00 00 00"), "Counter32 above 2^32-1"), values.UnknownValue(0x45, h("01"))]
+
+
+def junk_suffixes() -> list[list[int]]:
+    return [[], [0], [1], [7], [1, 2], [4294967295], [5, 111, 119, 110, 101, 114], [1, 4, 192, 0, 2, 1, 24], [2, 16] + [0] * 16 + [64],
+            [3, 10, 0, 0, 7], [6, 0, 26, 43, 60, 77, 94], [3, 1, 3, 6], [300], [1, 300, 1], [5, 0, 26], [129] + [1] * 129, [0, 0, 0, 0]]
+
+
+def _test_assemble_junk() -> None:
+    """Odd instances and values of every class: the assembler never raises and accounts for every varbind once
+
+    A row with keys that do not convert, or that repeat an earlier row's,
+    is reported once as `bad-key` or `duplicate-key` and keeps its cells.
+    """
+    ix = t_ix(["OLD-MIB", "T-MIB", "INET-ADDRESS-MIB"])
+    objs = [n for n in ix.by_qname.values() if n.kind == "column" or n.kind == "scalar"]
+    rng = testutil.Lcg(42)
+    vals = junk_values()
+    vbs: list[VarBind] = []
+    for o in objs:
+        for sfx in junk_suffixes():
+            vbs.append(VarBind(Oid(o.oid + sfx), vals[rng.below(len(vals))]))
+    for i in range(50):
+        vbs.append(vbs[rng.below(len(vbs))])
+        vbs.append(VarBind(toid([rng.below(12), rng.below(3), rng.below(8), rng.below(4)]), vals[rng.below(len(vals))]))
+    vbs.append(VarBind(Oid([0, 0]), Integer(0)))
+    for opts in [tables.Options(), tables.Options(conv.Options(strict=True, unknown_enum="number", opaque_special=True), True)]:
+        a = tables.assemble(ix, vbs, opts)
+        cells = 0
+        for t in a.tables:
+            for r in t.rows:
+                cells += len(r.cells)
+        issues = len([i for i in a.issues if i.code != "bad-key" and i.code != "duplicate-key"])
+        testing.assertEqual(len(a.scalars) + cells + a.absent + issues, len(vbs))
+        testing.assertTrue(cells > 100 and issues > 100 and a.absent > 10, "%d cells, %d issues, %d absent" % (cells, issues, a.absent))
+        testing.assertEqual(len(a.tables), len(set([str(Oid(t.row.oid)) for t in a.tables])), "one TableData per row OID")
+        for t in a.tables:
+            seen: set[str] = set()
+            for r in t.rows:
+                if r.keys_ok() and len(r.keys) > 0:
+                    k = r.key_text()
+                    testing.assertFalse(k in seen, "duplicate keys in " + t.row.qname())
+                    seen.add(k)
+
+
+# --- planning --------------------------------------------------------------------------------------
+
+def _test_plan() -> None:
+    """Columns (augmenting rows' too), column selection, key prefixes, whole instances."""
+    ix = t_ix()
+    p = tables.plan_table(ix, "tBaseTable")
+    testing.assertEqual(p.row.name, "tBaseEntry")
+    testing.assertEqual(names(p.rows), ["tBaseEntry", "tExtEntry", "tExt2Entry"])
+    testing.assertEqual(names(p.columns), ["tName", "tLevel", "tCount", "tExtHC", "tExtOn", "tExt2X"])
+    testing.assertEqual([str(o) for o in p.oids][0], "1.3.6.1.4.1.99995.1.2.1.2")
+    testing.assertEqual(p.index_prefix, [])
+    testing.assertFalse(p.complete)
+    testing.assertEqual(p.get_oids(), [])
+    testing.assertEqual(index.spec_str(p.parts), "int")
+    testing.assertEqual(names(tables.plan_table(ix, "tBaseEntry", [], [], False).columns), ["tName", "tLevel", "tCount"])
+    q = tables.plan_table(ix, "tExtTable")
+    testing.assertEqual(q.row.name + " " + str(names(q.rows)) + " " + str(names(q.columns)), "tBaseEntry ['tExtEntry'] ['tExtHC', 'tExtOn']")
+    q2 = tables.plan_table(ix, "T-MIB::tExt2Entry")
+    testing.assertEqual(names(q2.columns), ["tExt2X"])
+    testing.assertEqual(names(tables.plan_table(ix, "tBaseTable", ["tIndex"]).columns), ["tName"])
+    testing.assertEqual(names(tables.plan_table(ix, "tBaseTable", ["tCount", "T-MIB::tExtOn"]).columns), ["tCount", "tExtOn"])
+    k = tables.plan_table(ix, "tBaseTable", ["tName", "tExtHC"], [5])
+    testing.assertEqual(k.index_prefix, [5])
+    testing.assertTrue(k.complete)
+    testing.assertEqual([str(o) for o in k.get_oids()], ["1.3.6.1.4.1.99995.1.2.1.2.5", "1.3.6.1.4.1.99995.1.3.1.1.5"])
+    testing.assertEqual(repr(k), "TablePlan(T-MIB::tBaseEntry, columns=[tName, tExtHC], prefix=5, complete)")
+    testing.assertEqual(tables.plan_table(ix, "tMacTable", [], [7]).index_prefix, [7])
+    m = tables.plan_table(ix, "tMacTable", [], [7, "00:1a:2b:3c:4d:5e"])
+    testing.assertEqual(m.index_prefix, [7, 0, 26, 43, 60, 77, 94])
+    testing.assertTrue(m.complete)
+    testing.assertEqual(names(m.columns), ["tMacPort"], "tMac is an INDEX column: its value is the key")
+    testing.assertEqual(names(tables.plan_table(ix, "tMacTable", [], [], True, tables.Options(), True).columns), ["tMac", "tMacPort"])
+    testing.assertEqual(names(tables.plan_table(ix, "tMacTable", ["tMac"]).columns), ["tMac"], "named: fetched")
+    testing.assertEqual(tables.plan_table(ix, "tNameTable", [], ["owner"]).index_prefix, [5, 111, 119, 110, 101, 114])
+    testing.assertEqual(tables.plan_table(ix, "tNameTable", [], ["owner", "trig"]).index_prefix, [5, 111, 119, 110, 101, 114, 116, 114, 105, 103])
+    testing.assertEqual(tables.plan_table(ix, "tAddrTable", [], ["ipv6"]).index_prefix, [2])
+    testing.assertEqual(tables.plan_table(ix, "tAddrTable", [], ["ipv4", b"\xc0\x00\x02\x01", 24]).index_prefix, [1, 4, 192, 0, 2, 1, 24])
+    testing.assertEqual(tables.plan_table(ix, "tAddrTable", [], ["ipv4", "192.0.2.1"], True, tables.Options(inet_text=True)).index_prefix,
+                        [1, 4, 192, 0, 2, 1])
+    testing.assertEqual(tables.plan_table(ix, "tAddrTable", [], ["ipv6", "2001:db8::1"], True, tables.Options(inet_text=True)).index_prefix,
+                        [2, 16, 32, 1, 13, 184, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1])
+    testing.assertEqual(tables.plan_table(ix, "tOidTable", [], ["1.3.6"]).index_prefix, [3, 1, 3, 6])
+    testing.assertEqual(tables.plan_table(ix, "tLevelTable", [], ["high"]).index_prefix, [2])
+    testing.assertEqual(tables.plan_table(ix, "tBaseTable", [], [Integer(42)]).index_prefix, [42])
+    lg = tables.plan_table(ix, "tLogTable")
+    testing.assertEqual(names(lg.columns) + [str(lg.complete)], ["tLogText", "False"])
+    testing.assertEqual(tables.encode_keys(ix, node(ix, "tExtEntry"), [3]), [3])
+    plan_fails(lambda: tables.plan_table(ix, "tName"), "a column")
+    plan_fails(lambda: tables.plan_table(ix, "tScalars"), "an OID assignment")
+    plan_fails(lambda: tables.plan_table(ix, "nosuch"), "an unknown name")
+    plan_fails(lambda: tables.plan_table(ix, "tBaseTable", ["tMacPort"]), "a column of another table")
+    plan_fails(lambda: tables.plan_table(ix, "tBaseTable", ["nosuch"]), "an unknown column")
+    plan_fails(lambda: tables.plan_table(ix, "tBaseTable", [], [1, 2]), "too many keys")
+    plan_fails(lambda: tables.plan_table(ix, "tBaseTable", [], [0]), "a key outside the MIB range")
+    plan_fails(lambda: tables.plan_table(ix, "tBaseTable", [], ["5"]), "a string for an integer key")
+    plan_fails(lambda: tables.plan_table(ix, "tLevelTable", [], ["bogus"]), "an unknown label")
+    plan_fails(lambda: tables.plan_table(ix, "tAddrTable", [], ["ipv4", "192.0.2.1"]), "address text without inet_text")
+    plan_fails(lambda: tables.plan_table(ix, "tAddrTable", [], ["ipv4", "::1"], True, tables.Options(inet_text=True)), "an IPv6 text for ipv4")
+    plan_fails(lambda: tables.plan_table(ix, "tMacTable", [], [7, "00:1a"]), "a MAC address of 2 octets")
+
+
+def _test_scalar_oids() -> None:
+    ix = t_ix()
+    testing.assertEqual([str(o) for o in tables.scalar_oids(ix, ["tScalars"])], ["1.3.6.1.4.1.99995.1.1.1.0", "1.3.6.1.4.1.99995.1.1.2.0"])
+    testing.assertEqual([str(o) for o in tables.scalar_oids(ix, ["tMIB"])], ["1.3.6.1.4.1.99995.1.1.1.0", "1.3.6.1.4.1.99995.1.1.2.0"])
+    testing.assertEqual([str(o) for o in tables.scalar_oids(ix, ["tScalarN", "T-MIB::tScalarB"])], ["1.3.6.1.4.1.99995.1.1.3.0", "1.3.6.1.4.1.99995.1.1.2.0"])
+    try:
+        tables.scalar_oids(ix, ["tBaseTable"])
+        testing.error("a table accepted")
+    except tables.PlanError:
+        pass
+    try:
+        tables.scalar_oids(ix, ["nosuch"])
+        testing.error("an unknown name accepted")
+    except tables.PlanError:
+        pass
+
+
+# --- golden IETF MIBs (env tests) -----------------------------------------------------------------
+
+GOLDEN = "interop/mibs/golden/mibs"
+GOLDEN_NAMES = ["IF-MIB", "IP-MIB", "BRIDGE-MIB", "Q-BRIDGE-MIB", "P-BRIDGE-MIB", "HOST-RESOURCES-MIB", "ENTITY-MIB", "SNMPv2-MIB",
+                "DISMAN-EVENT-MIB", "UCD-SNMP-MIB", "RFC1213-MIB"]
+
+
+proc def golden_bundle(t: testing.EnvT) -> mib.meta.MibBundle:
+    """The mibmeta of the golden modules above and their imports, in load order."""
+    fc = file.FileCap(t.env.cap)
+    mp = mib.source.MibPath([GOLDEN], True, False)
+    mib.source.index_path(mp, fc, mib.diag.Diagnostics())
+    ms = mib.resolver.resolve_path(fc, mp, GOLDEN_NAMES)
+    return mib.meta.bundle(ms, ms.order)
+
+
+def col(ix: mib.meta.MetaIndex, name: str, inst: list[int]) -> Oid:
+    """The OID of object `name` (bare or MOD::name) with instance `inst`."""
+    n = ix.find(name)
+    if n is not None:
+        return Oid(n.oid + inst)
+    raise ValueError("no object " + name)
+
+
+def check_golden_index(ix: mib.meta.MetaIndex) -> None:
+    """MetaIndex helpers and plans over the real IETF metadata."""
+    if_entry = node(ix, "IF-MIB::ifEntry")
+    testing.assertEqual(node(ix, "ifDescr").oid, [1, 3, 6, 1, 2, 1, 2, 2, 1, 2])
+    testing.assertEqual(node(ix, "ifDescr").module, "IF-MIB", "IF-MIB is loaded before RFC1213-MIB")
+    testing.assertEqual(names(ix.augmenting_rows(if_entry)), ["ifXEntry", "ifTestEntry"])
+    testing.assertEqual(len(ix.columns(if_entry)), 22)
+    testing.assertEqual(len(ix.columns(if_entry, True)), 47)
+    testing.assertEqual(names(ix.columns(node(ix, "RFC1213-MIB::ifEntry"))), names(ix.columns(if_entry)))
+    testing.assertEqual([c.module for c in ix.columns(node(ix, "RFC1213-MIB::ifEntry"))][0], "RFC1213-MIB")
+    testing.assertEqual(opt_name(ix.base_row(node(ix, "ifXEntry"))), "IF-MIB::ifEntry")
+    testing.assertEqual(opt_name(ix.row_of(node(ix, "ifName"))), "IF-MIB::ifXEntry")
+    port = node(ix, "dot1dBasePortEntry")
+    testing.assertEqual(names(ix.augmenting_rows(port)), ["dot1dPortCapabilitiesEntry", "dot1dPortPriorityEntry", "dot1dPortGarpEntry",
+                                                          "dot1dPortGmrpEntry", "dot1qPortVlanEntry"])
+    testing.assertEqual([p.key + ":" + str(index.IndexPart(p.enc, p.size)) for p in ix.index_of(node(ix, "ipAddressEntry"))],
+                        ["ipAddressAddrType:int", "ipAddressAddr:var"])
+    testing.assertEqual(index.spec_str(tables.index_spec(ix, node(ix, "dot1qTpFdbEntry"))), "int,fixed(6)")
+    testing.assertEqual(index.spec_str(tables.index_spec(ix, node(ix, "dot1dTpFdbEntry"))), "fixed(6)")
+    testing.assertEqual(index.spec_str(tables.index_spec(ix, node(ix, "mteTriggerEntry"))), "var,implied")
+    testing.assertEqual(index.spec_str(tables.index_spec(ix, node(ix, "ipNetToPhysicalEntry"))), "int,int,var")
+    testing.assertEqual(index.spec_str(tables.index_spec(ix, node(ix, "dot1qPortVlanEntry"))), "int")
+    ip_ix = ix.index_of(node(ix, "ipAddressEntry"))
+    testing.assertEqual([syn(p) for p in ip_ix], ["enum|INET-ADDRESS-MIB::InetAddressType", "binary|INET-ADDRESS-MIB::InetAddress"])
+    r = ix.lookup_object(col(ix, "ifHCInOctets", [3]).arcs)
+    testing.assertEqual(r.0.qname() + str(r.1) if r is not None else "", "IF-MIB::ifHCInOctets[3]")
+    # plans
+    p = tables.plan_table(ix, "ifTable")
+    testing.assertEqual(len(p.columns), 46, "ifEntry, ifXEntry and ifTestEntry without the INDEX column ifIndex")
+    testing.assertEqual(names(p.columns)[0:3] + names(p.columns)[21:23] + names(p.columns)[39:41] + names(p.columns)[45:],
+                        ["ifDescr", "ifType", "ifMtu", "ifName", "ifInMulticastPkts", "ifCounterDiscontinuityTime", "ifTestId", "ifTestOwner"])
+    testing.assertEqual(names(tables.plan_table(ix, "ifTable", [], [], True, tables.Options(), True).columns)[0:2], ["ifIndex", "ifDescr"])
+    testing.assertEqual(names(tables.plan_table(ix, "dot1dTpFdbTable").columns), ["dot1dTpFdbPort", "dot1dTpFdbStatus"])
+    px = tables.plan_table(ix, "ifXTable", ["ifName", "ifHCInOctets", "ifAlias"])
+    testing.assertEqual(px.row.qname() + " " + str(names(px.columns)), "IF-MIB::ifEntry ['ifName', 'ifHCInOctets', 'ifAlias']")
+    testing.assertEqual(tables.plan_table(ix, "ipAddressTable", [], ["ipv4"]).index_prefix, [1])
+    full = tables.plan_table(ix, "ipAddressTable", ["ipAddressIfIndex"], ["ipv4", b"\xc0\x00\x02\x01"])
+    testing.assertEqual([str(o) for o in full.get_oids()], ["1.3.6.1.2.1.4.34.1.3.1.4.192.0.2.1"])
+    testing.assertEqual(tables.plan_table(ix, "ipAddressTable", [], ["ipv6", "2001:db8::1"], True, tables.Options(inet_text=True)).index_prefix,
+                        [2, 16, 32, 1, 13, 184, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1])
+    testing.assertEqual(names(tables.plan_table(ix, "ipAddressTable", ["ipAddressAddr"]).columns), ["ipAddressIfIndex"],
+                        "an INDEX object is not fetched; the first readable column enumerates the rows")
+    testing.assertEqual(tables.plan_table(ix, "dot1qTpFdbTable", [], [u64(1), "00:1a:2b:3c:4d:5e"]).index_prefix, [1, 0, 26, 43, 60, 77, 94])
+    testing.assertEqual(tables.plan_table(ix, "mteTriggerTable", [], ["owner", "trig"]).index_prefix, [5, 111, 119, 110, 101, 114, 116, 114, 105, 103])
+    pb = tables.plan_table(ix, "dot1dBasePortTable")
+    testing.assertTrue("dot1qPvid" in names(pb.columns) and "dot1dPortCapabilities" in names(pb.columns), "cross-module augmenting columns")
+    testing.assertEqual([c.module for c in pb.columns if c.name == "dot1qPvid"], ["Q-BRIDGE-MIB"])
+    testing.assertEqual([str(o) for o in tables.scalar_oids(ix, ["system"])],
+                        ["1.3.6.1.2.1.1.%d.0" % i for i in range(1, 9)])
+    testing.assertEqual([str(o) for o in tables.scalar_oids(ix, ["hrSystemDate", "hrMemorySize"])], ["1.3.6.1.2.1.25.1.2.0", "1.3.6.1.2.1.25.2.2.0"])
+
+
+actor _test_golden_index(t: testing.EnvT):
+    """MetaIndex helpers and plans over the golden IETF mibmeta (IF-MIB, IP-MIB, BRIDGE-MIB,
+    Q-BRIDGE-MIB, DISMAN-EVENT-MIB, HOST-RESOURCES-MIB, RFC1213-MIB)."""
+    t.timeout(120.0)
+    ix = mib.meta.MetaIndex(golden_bundle(t))
+    report_env(t, outcome(lambda: check_golden_index(ix)))
+
+
+def check_rfc1213_first(ix: mib.meta.MetaIndex) -> None:
+    """RFC1213-MIB loaded before IF-MIB (as when a vendor MIB that imports DisplayString from
+    RFC1213-MIB is listed first): the base columns must not go to RFC1213-MIB's ifEntry and
+    the ifXTable columns to IF-MIB's, two TableData for one table."""
+    testing.assertEqual(node(ix, "ifDescr").module, "RFC1213-MIB", "RFC1213-MIB is loaded first")
+    r = ix.lookup_object(col(ix, "ifDescr", [1]).arcs)
+    testing.assertEqual(r.0.qname() if r is not None else "", "IF-MIB::ifDescr", "an SMIv2 module's object before an SMIv1 module's")
+    sd = ix.lookup_object(col(ix, "sysDescr", [0]).arcs)
+    testing.assertEqual(sd.0.qname() if sd is not None else "", "SNMPv2-MIB::sysDescr")
+    testing.assertEqual(ix.canonical_row(node(ix, "RFC1213-MIB::ifEntry")).qname(), "IF-MIB::ifEntry")
+    vbs = [VarBind(col(ix, "IF-MIB::ifDescr", [1]), OctetString(b"eth0")), VarBind(col(ix, "IF-MIB::ifType", [1]), Integer(6)),
+           VarBind(col(ix, "IF-MIB::ifName", [1]), OctetString(b"eth0")), VarBind(col(ix, "IF-MIB::ifHCInOctets", [1]), Counter64(u64(5))),
+           VarBind(col(ix, "sysDescr", [0]), OctetString(b"box"))]
+    a = tables.assemble(ix, vbs)
+    testing.assertEqual([t.row.qname() for t in a.tables], ["IF-MIB::ifEntry"])
+    testing.assertEqual(rows_of(a, "RFC1213-MIB::ifTable"), [
+        "TableRow(1 [ifIndex=ok:int:1] ifDescr=ok:string:eth0, ifType=ok:enum:ethernetCsmacd, ifName=ok:string:eth0, ifHCInOctets=ok:uint:5)"])
+    testing.assertEqual([c.column.module for c in a.tables[0].rows[0].cells], ["IF-MIB", "IF-MIB", "IF-MIB", "IF-MIB"])
+    ta = a.table_at(node(ix, "IF-MIB::ifEntry").oid)
+    testing.assertEqual(len(ta.rows[0].cells) if ta is not None else 0, 4)
+    testing.assertEqual(rows_of(a, "ifTable"), rows_of(a, "ifXTable"))
+    sc = a.scalar("RFC1213-MIB::sysDescr")
+    testing.assertEqual(sc.node.qname() if sc is not None else "", "SNMPv2-MIB::sysDescr")
+    testing.assertEqual(a.issue_codes(), [])
+    # plans: the bare name takes IF-MIB's ifEntry with its augmenting rows, RFC1213-MIB::ifTable its own
+    p = tables.plan_table(ix, "ifTable")
+    testing.assertEqual(p.row.qname() + " %d" % len(p.columns), "IF-MIB::ifEntry 46")
+    q = tables.plan_table(ix, "RFC1213-MIB::ifTable")
+    testing.assertEqual(q.row.qname() + " %d" % len(q.columns), "RFC1213-MIB::ifEntry 21")
+    b = tables.assemble(ix, vbs, tables.Options(), [q])
+    testing.assertEqual([t.row.qname() for t in b.tables], ["RFC1213-MIB::ifEntry"])
+    testing.assertEqual([c.column.qname() for c in b.tables[0].rows[0].cells],
+                        ["RFC1213-MIB::ifDescr", "RFC1213-MIB::ifType", "IF-MIB::ifName", "IF-MIB::ifHCInOctets"])
+
+
+actor _test_golden_rfc1213_first(t: testing.EnvT):
+    """The golden RFC1213-MIB and IF-MIB, RFC1213-MIB first in the load order: one TableData
+    for ifTable and ifXTable, IF-MIB's objects, plans by name."""
+    t.timeout(120.0)
+    fc = file.FileCap(t.env.cap)
+    mp = mib.source.MibPath([GOLDEN], True, False)
+    mib.source.index_path(mp, fc, mib.diag.Diagnostics())
+    ms = mib.resolver.resolve_path(fc, mp, ["RFC1213-MIB", "IF-MIB"])
+    ix = mib.meta.MetaIndex(mib.meta.bundle(ms, ms.order))
+    report_env(t, outcome(lambda: check_rfc1213_first(ix)))
+
+
+# The agent: IF-MIB ifTable + ifXTable (row 4 only in ifXTable; row 2 without ifAlias),
+# IP-MIB ipAddressTable (IPv4 and IPv6, InetAddress index), BRIDGE-MIB dot1dTpFdbTable and
+# Q-BRIDGE-MIB dot1qTpFdbTable (MAC indexes), dot1dBasePortTable with Q-BRIDGE's and P-BRIDGE's
+# augmenting columns (BITS), HOST-RESOURCES-MIB hrStorageTable and scalars, ENTITY-MIB
+# entPhysicalTable, UCD-SNMP-MIB laTable (Opaque Float), the system group, and an enterprise
+# object no MIB knows.
+
+IPV4_INST = [1, 4, 192, 0, 2, 1]
+IPV6_INST = [2, 16, 32, 1, 13, 184, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+MAC1 = [0, 26, 43, 60, 77, 94]
+MAC2 = [0, 0, 94, 0, 83, 1]
+
+
+def agent_varbinds(ix: mib.meta.MetaIndex) -> list[VarBind]:
+    out: list[VarBind] = []
+
+    def add(name: str, inst: list[int], v: Value) -> None:
+        out.append(VarBind(col(ix, name, inst), v))
+
+    for i in [1, 2, 3]:
+        add("ifIndex", [i], Integer(i))
+        add("ifDescr", [i], OctetString(b"lo" if i == 1 else ("eth%d" % (i - 2)).encode() + b"\x00"))
+        add("ifType", [i], Integer(24 if i == 1 else (6 if i == 2 else 999)))
+        add("ifMtu", [i], Integer(1500))
+        add("ifSpeed", [i], Gauge32(10000000 if i == 1 else 4294967295))
+        add("ifPhysAddress", [i], OctetString(b"" if i == 1 else bytes(MAC1)))
+        add("ifAdminStatus", [i], Integer(1))
+        add("ifOperStatus", [i], Integer(1 if i < 3 else 2))
+        add("ifLastChange", [i], TimeTicks(100 * i))
+        add("ifInOctets", [i], Counter32(1000 * i))
+        add("ifSpecific", [i], ObjectIdentifier(Oid([0, 0])))
+    for i in [1, 2, 3, 4]:
+        add("ifName", [i], OctetString(("if%d" % i).encode()))
+        add("ifHCInOctets", [i], Counter64(u64(10000000000) * u64(i)))
+        add("ifHighSpeed", [i], Gauge32(10000))
+        add("ifPromiscuousMode", [i], Integer(2))
+        add("ifConnectorPresent", [i], Integer(1 if i != 3 else 0))
+        if i != 2:
+            add("ifAlias", [i], OctetString(b"uplink \xe9" if i == 3 else b"alias"))
+    add("ipAddressIfIndex", IPV4_INST, Integer(2))
+    add("ipAddressType", IPV4_INST, Integer(1))
+    add("ipAddressPrefix", IPV4_INST, ObjectIdentifier(col(ix, "ipAddressPrefixOrigin", [2, 1, 4, 192, 0, 2, 0, 24])))
+    add("ipAddressOrigin", IPV4_INST, Integer(2))
+    add("ipAddressStatus", IPV4_INST, Integer(1))
+    add("ipAddressCreated", IPV4_INST, TimeTicks(0))
+    add("ipAddressRowStatus", IPV4_INST, Integer(1))
+    add("ipAddressStorageType", IPV4_INST, Integer(3))
+    add("ipAddressIfIndex", IPV6_INST, Integer(3))
+    add("ipAddressType", IPV6_INST, Integer(1))
+    add("ipAddressStatus", IPV6_INST, Integer(7))
+    add("dot1dTpFdbAddress", MAC1, OctetString(bytes(MAC1)))
+    add("dot1dTpFdbPort", MAC1, Integer(2))
+    add("dot1dTpFdbStatus", MAC1, Integer(3))
+    add("dot1dTpFdbAddress", MAC2, OctetString(bytes(MAC2)))
+    add("dot1dTpFdbPort", MAC2, Integer(0))
+    add("dot1dTpFdbStatus", MAC2, Integer(4))
+    add("dot1qTpFdbPort", [1] + MAC1, Integer(2))
+    add("dot1qTpFdbStatus", [1] + MAC1, Integer(3))
+    add("dot1qTpFdbPort", [20] + MAC2, Integer(5))
+    add("dot1qTpFdbStatus", [20] + MAC2, Integer(5))
+    for p in [1, 2]:
+        add("dot1dBasePort", [p], Integer(p))
+        add("dot1dBasePortIfIndex", [p], Integer(p + 1))
+        add("dot1qPvid", [p], Gauge32(1 if p == 1 else 20))
+        add("dot1dPortCapabilities", [p], OctetString(h("c0") if p == 1 else h("20")))
+    add("hrStorageType", [1], ObjectIdentifier(Oid.parse("1.3.6.1.2.1.25.2.1.2")))
+    add("hrStorageDescr", [1], OctetString(b"Physical memory"))
+    add("hrStorageAllocationUnits", [1], Integer(1024))
+    add("hrStorageSize", [1], Integer(16384))
+    add("hrStorageUsed", [1], Integer(8192))
+    add("hrSystemUptime", [0], TimeTicks(123456))
+    add("hrSystemDate", [0], OctetString(h("07 ea 0a 0b 0c 22 38 05 2b 02 00")))
+    add("hrMemorySize", [0], Integer(16777216))
+    add("entPhysicalDescr", [1], OctetString(b"Chassis \xe2\x80\x93 rev A"))
+    add("entPhysicalVendorType", [1], ObjectIdentifier(Oid([0, 0])))
+    add("entPhysicalClass", [1], Integer(3))
+    add("entPhysicalIsFRU", [1], Integer(2))
+    add("entPhysicalMfgDate", [1], OctetString(h("00 00 00 00 00 00 00 00")))
+    add("laNames", [1], OctetString(b"Load-1"))
+    add("laLoadFloat", [1], Opaque(h("9f 78 04 3f c0 00 00")))
+    add("sysDescr", [0], OctetString(b"actsnmp test agent\x00"))
+    add("sysObjectID", [0], ObjectIdentifier(Oid.parse("1.3.6.1.4.1.8072.3.2.10")))
+    add("sysUpTime", [0], TimeTicks(4200))
+    add("sysContact", [0], OctetString(b""))
+    add("sysName", [0], OctetString(b"agent"))
+    add("sysLocation", [0], OctetString(b"lab"))
+    add("sysServices", [0], Integer(72))
+    add("sysORLastChange", [0], TimeTicks(0))
+    out.append(VarBind(Oid.parse("1.3.6.1.4.1.99999.1.1.0"), Integer(1)))
+    return out
+
+
+AGENT = "10.0.0.1"
+MANAGER = "10.0.0.2"
+
+
+def check_memnet(ix: mib.meta.MetaIndex, a: tables.Assembly, b: tables.Assembly, n_vbs: int, c: tables.Assembly) -> None:
+    """`a`: the tables (get_table per plan) and scalars (get); `b`: the walk of mib-2 and the
+    enterprise subtree, assembled with inet_text and opaque_special; `c`: a get_table narrowed
+    by a plan's index_prefix and a get of a whole row (a complete plan)."""
+    testing.assertEqual(rows_of(c, "dot1qTpFdbTable"), [
+        "TableRow(20.0.0.94.0.83.1 [dot1qFdbId=ok:uint:20, dot1qTpFdbAddress=ok:string:00:00:5e:00:53:01] dot1qTpFdbPort=ok:int:5, dot1qTpFdbStatus=ok:enum:mgmt)"])
+    testing.assertEqual(rows_of(c, "ipAddressTable"), [
+        "TableRow(2.16.32.1.13.184.0.0.0.0.0.0.0.0.0.0.0.1 [ipAddressAddrType=ok:enum:ipv6, ipAddressAddr=ok:string:2001:db8::1] ipAddressIfIndex=ok:int:3, ipAddressType=ok:enum:unicast, ipAddressStatus=ok:enum:duplicate)"])
+    testing.assertEqual(c.absent, 6, "the GET of a whole row: noSuchInstance for the columns the agent does not have")
+    testing.assertEqual(c.issue_codes(), [])
+    testing.assertEqual([t.row.name for t in a.tables], ["ifEntry", "ipAddressEntry", "dot1dBasePortEntry", "dot1dTpFdbEntry", "dot1qTpFdbEntry",
+                                                         "hrStorageEntry", "entPhysicalEntry", "laEntry"])
+    ift = a.table("ifXTable")
+    if ift is not None:
+        testing.assertEqual(names(ift.augmenting), ["ifXEntry"])
+        testing.assertEqual([r.suffix for r in ift.rows], [[1], [2], [3], [4]])
+        r1 = ift.rows[0]
+        testing.assertEqual([repr(c) for c in r1.cells], [
+            "ifDescr=ok:string:lo", "ifType=ok:enum:softwareLoopback", "ifMtu=ok:int:1500", "ifSpeed=ok:uint:10000000",
+            "ifPhysAddress=ok:string:", "ifAdminStatus=ok:enum:up", "ifOperStatus=ok:enum:up", "ifLastChange=ok:uint:100",
+            "ifInOctets=ok:uint:1000", "ifSpecific=ok:string:0.0", "ifName=ok:string:if1", "ifHCInOctets=ok:uint:10000000000",
+            "ifHighSpeed=ok:uint:10000", "ifPromiscuousMode=ok:boolean:false", "ifConnectorPresent=ok:boolean:true", "ifAlias=ok:string:alias"])
+        testing.assertEqual(kv(r1.key_values()), "ifIndex=1")
+        r2 = ift.rows[1]
+        testing.assertEqual([brief(r2.result(x)) for x in ["ifDescr", "ifType", "ifPhysAddress", "ifSpeed", "ifAlias"]],
+                            ["ok:string:eth0!trailing-nul", "ok:enum:ethernetCsmacd", "ok:string:00:1a:2b:3c:4d:5e", "ok:uint:4294967295", "-"])
+        r3 = ift.rows[2]
+        testing.assertEqual([brief(r3.result(x)) for x in ["ifType", "ifConnectorPresent", "ifAlias", "ifOperStatus"]],
+                            ["malformed:unknown-enum", "malformed:bad-truthvalue", "ok:string:uplink é!hint-fallback", "ok:enum:down"])
+        testing.assertEqual([repr(c) for c in ift.rows[3].cells], ["ifName=ok:string:if4", "ifHCInOctets=ok:uint:40000000000",
+                            "ifHighSpeed=ok:uint:10000", "ifPromiscuousMode=ok:boolean:false", "ifConnectorPresent=ok:boolean:true", "ifAlias=ok:string:alias"])
+    else:
+        testing.error("no ifTable")
+    ipt = a.table("ipAddressTable")
+    if ipt is not None:
+        testing.assertEqual([repr(k) for r in ipt.rows for k in r.keys], ["ipAddressAddrType=ok:enum:ipv4", "ipAddressAddr=ok:binary:c0000201",
+                                                                          "ipAddressAddrType=ok:enum:ipv6", "ipAddressAddr=ok:binary:20010db8000000000000000000000001"])
+        testing.assertEqual(kv(ipt.rows[0].key_values()), "ipAddressAddr=0xc0000201, ipAddressAddrType='ipv4'")
+        testing.assertEqual([repr(c) for c in ipt.rows[0].cells], [
+            "ipAddressIfIndex=ok:int:2", "ipAddressType=ok:enum:unicast", "ipAddressPrefix=ok:string:1.3.6.1.2.1.4.32.1.5.2.1.4.192.0.2.0.24",
+            "ipAddressOrigin=ok:enum:manual", "ipAddressStatus=ok:enum:preferred", "ipAddressCreated=ok:uint:0", "ipAddressRowStatus=ok:enum:active",
+            "ipAddressStorageType=ok:enum:nonVolatile"])
+        testing.assertEqual([repr(c) for c in ipt.rows[1].cells], ["ipAddressIfIndex=ok:int:3", "ipAddressType=ok:enum:unicast", "ipAddressStatus=ok:enum:duplicate"])
+    else:
+        testing.error("no ipAddressTable")
+    testing.assertEqual(rows_of(a, "dot1dTpFdbTable"), [
+        "TableRow(0.0.94.0.83.1 [dot1dTpFdbAddress=ok:string:00:00:5e:00:53:01] dot1dTpFdbPort=ok:int:0, dot1dTpFdbStatus=ok:enum:self)",
+        "TableRow(0.26.43.60.77.94 [dot1dTpFdbAddress=ok:string:00:1a:2b:3c:4d:5e] dot1dTpFdbPort=ok:int:2, dot1dTpFdbStatus=ok:enum:learned)"])
+    testing.assertEqual(rows_of(a, "dot1qTpFdbTable"), [
+        "TableRow(1.0.26.43.60.77.94 [dot1qFdbId=ok:uint:1, dot1qTpFdbAddress=ok:string:00:1a:2b:3c:4d:5e] dot1qTpFdbPort=ok:int:2, dot1qTpFdbStatus=ok:enum:learned)",
+        "TableRow(20.0.0.94.0.83.1 [dot1qFdbId=ok:uint:20, dot1qTpFdbAddress=ok:string:00:00:5e:00:53:01] dot1qTpFdbPort=ok:int:5, dot1qTpFdbStatus=ok:enum:mgmt)"])
+    testing.assertEqual(rows_of(a, "dot1dBasePortTable"), [
+        "TableRow(1 [dot1dBasePort=ok:int:1] dot1dBasePortIfIndex=ok:int:2, dot1dPortCapabilities=ok:bits:dot1qDot1qTagging dot1qConfigurableAcceptableFrameTypes, dot1qPvid=ok:uint:1)",
+        "TableRow(2 [dot1dBasePort=ok:int:2] dot1dBasePortIfIndex=ok:int:3, dot1dPortCapabilities=ok:bits:dot1qIngressFiltering, dot1qPvid=ok:uint:20)"])
+    hr = a.table("hrStorageTable")
+    if hr is not None:
+        testing.assertEqual([repr(c) for c in hr.rows[0].cells], ["hrStorageType=ok:string:1.3.6.1.2.1.25.2.1.2", "hrStorageDescr=ok:string:Physical memory",
+                            "hrStorageAllocationUnits=ok:int:1024", "hrStorageSize=ok:int:16384", "hrStorageUsed=ok:int:8192"])
+    testing.assertEqual(rows_of(a, "entPhysicalTable"), [
+        "TableRow(1 [entPhysicalIndex=ok:int:1] entPhysicalDescr=ok:string:Chassis – rev A, entPhysicalVendorType=ok:string:0.0, entPhysicalClass=ok:enum:chassis, entPhysicalIsFRU=ok:boolean:false, entPhysicalMfgDate=ok:string:0-0-0,0:0:0.0)"])
+    testing.assertEqual(rows_of(a, "laTable"), ["TableRow(1 [laIndex=ok:int:1] laNames=ok:string:Load-1, laLoadFloat=ok:binary:9f78043fc00000)"])
+    # the agent serves its own sysUpTime
+    testing.assertEqual([repr(s) if s.node.name != "sysUpTime" else s.node.name + "=" + s.result.kind for s in a.scalars], [
+        "sysDescr=ok:string:actsnmp test agent!trailing-nul", "sysObjectID=ok:string:1.3.6.1.4.1.8072.3.2.10", "sysUpTime=uint",
+        "sysContact=ok:string:", "sysName=ok:string:agent", "sysLocation=ok:string:lab", "sysServices=ok:int:72", "sysORLastChange=ok:uint:0",
+        "hrSystemUptime=ok:uint:123456", "hrSystemDate=ok:string:2026-10-11,12:34:56.5,+2:0", "hrSystemNumUsers=absent:no-such-object",
+        "hrMemorySize=ok:int:16777216"])
+    testing.assertEqual(a.issue_codes(), [])
+    ifx = a.table_at([1, 3, 6, 1, 2, 1, 31, 1, 1])
+    testing.assertEqual(ifx.row.qname() if ifx is not None else "", "IF-MIB::ifEntry", "ifXTable's rows are ifEntry's")
+    testing.assertEqual([x.node.name for x in a.scalars_in([1, 3, 6, 1, 2, 1, 1])],
+                        ["sysDescr", "sysObjectID", "sysUpTime", "sysContact", "sysName", "sysLocation", "sysServices", "sysORLastChange"])
+    # the walk: everything the agent has, the same rows, InetAddress as text, the Float unwrapped
+    testing.assertEqual(n_vbs, len(agent_varbinds(ix)))
+    testing.assertEqual([t.row.name for t in b.tables], [t.row.name for t in a.tables])
+    ipb = b.table("ipAddressTable")
+    if ipb is not None:
+        testing.assertEqual([kv(r.key_values()) for r in ipb.rows], ["ipAddressAddr='192.0.2.1', ipAddressAddrType='ipv4'",
+                                                                     "ipAddressAddr='2001:db8::1', ipAddressAddrType='ipv6'"])
+    testing.assertEqual(rows_of(b, "laTable"), ["TableRow(1 [laIndex=ok:int:1] laNames=ok:string:Load-1, laLoadFloat=ok:float:1.5)"])
+    bif = b.table("ifTable")
+    if bif is not None:
+        testing.assertEqual(repr(bif.rows[0].cell("ifIndex")), "ifIndex=ok:int:1", "the walk has the INDEX column the plan leaves out")
+        testing.assertEqual(kv(bif.rows[0].key_values()), "ifIndex=1")
+    testing.assertEqual(len(b.scalars), 11)
+    testing.assertEqual([repr(i) for i in b.issues], ["Issue(unknown-oid 1.3.6.1.4.1.99999.1.1.0 SNMPv2-SMI::enterprises: no column or scalar; deepest name SNMPv2-SMI::enterprises)"])
+    for t in b.tables:
+        ta = a.table(t.row.qname())
+        if ta is not None:
+            testing.assertEqual([r.suffix for r in t.rows], [r.suffix for r in ta.rows], t.row.name)
+
+
+actor _test_golden_memnet(t: testing.EnvT):
+    """A MemNet agent serving IETF tables; the Client fetches them as the plans say (get_table
+    with the augmenting columns, get of the scalars) and walks everything; both assemble into
+    the expected rows and scalars."""
+    t.timeout(120.0)
+    ix = mib.meta.MetaIndex(golden_bundle(t))
+    vbs = agent_varbinds(ix)
+    mn = MemNet()
+    agent = Agent(mn.server(AGENT, 161), MibView(vbs), AgentConfig({"public": False}, []), None)
+    c = Client(None, AGENT, Community("public"), None, opts=Options(timeout=2.0, retries=0), transport=mn.client(MANAGER, 40001, AGENT, 161))
+    plans: list[tables.TablePlan] = []
+    for name in ["ifTable", "ipAddressTable", "dot1dBasePortTable", "dot1dTpFdbTable", "dot1qTpFdbTable", "hrStorageTable", "entPhysicalTable", "laTable"]:
+        plans.append(tables.plan_table(ix, name))
+    assembler = tables.Assembler(ix, tables.Options(), plans)
+    narrow = tables.plan_table(ix, "dot1qTpFdbTable", [], [20])
+    whole = tables.plan_table(ix, "ipAddressTable", ["ipAddressIfIndex", "ipAddressType", "ipAddressStatus", "ipAddressCreated",
+                              "ipAddressRowStatus", "ipAddressStorageType", "ipAddressPrefix", "ipAddressOrigin", "ipAddressLastChanged"],
+                              ["ipv6", "2001:db8::1"], True, tables.Options(inet_text=True))
+    assembler2 = tables.Assembler(ix, tables.Options(inet_text=True), [narrow, whole])
+    var walked: list[VarBind] = []
+    var pending = len(plans) + 5
+    var errs: list[str] = []
+
+    def finish() -> None:
+        def check() -> None:
+            testing.assertEqual(errs, [])
+            testing.assertEqual(narrow.index_prefix, [20])
+            testing.assertTrue(whole.complete)
+            b = tables.assemble(ix, walked, tables.Options(conv.Options(opaque_special=True), True))
+            check_memnet(ix, assembler.result(), b, len(walked), assembler2.result())
+        report_env(t, outcome(check))
+
+    def done() -> None:
+        pending -= 1
+        if pending == 0:
+            c.close()
+            finish()
+
+    def on_table(cl: Client, tab: ?Table, err: ?errors.SnmpError) -> None:
+        if err is not None:
+            errs.append("table: " + str(err))
+        if tab is not None:
+            assembler.add_table(tab)
+        done()
+
+    def on_get(cl: Client, resp: ?Response, err: ?errors.SnmpError) -> None:
+        if err is not None:
+            errs.append("get: " + str(err))
+        if resp is not None:
+            assembler.add_all(resp.varbinds)
+        done()
+
+    def on_table2(cl: Client, tab: ?Table, err: ?errors.SnmpError) -> None:
+        if err is not None:
+            errs.append("narrowed table: " + str(err))
+        if tab is not None:
+            assembler2.add_table(tab)
+        done()
+
+    def on_get2(cl: Client, resp: ?Response, err: ?errors.SnmpError) -> None:
+        if err is not None:
+            errs.append("row get: " + str(err))
+        if resp is not None:
+            assembler2.add_all(resp.varbinds)
+        done()
+
+    def on_walk(cl: Client, got: list[VarBind], err: ?errors.SnmpError) -> None:
+        if err is not None:
+            errs.append("walk: " + str(err))
+        for x in got:
+            walked.append(x)
+        done()
+
+    for p in plans:
+        c.get_table(on_table, p.oids)
+    c.get(on_get, tables.scalar_oids(ix, ["system", "hrSystemUptime", "hrSystemDate", "hrMemorySize", "hrSystemNumUsers"]))
+    c.walk(on_walk, Oid.parse("1.3.6.1.2.1"))
+    c.walk(on_walk, Oid.parse("1.3.6.1.4.1"))
+    c.get_table(on_table2, narrow.oids, None, narrow.index_prefix)
+    c.get(on_get2, whole.get_oids())

@@ -1,0 +1,1568 @@
+"""Value conversion between the wire and YANG
+
+convert(v, s) turns a wire values.Value into the value that acton-yang
+validates against the leaf type RFC 6643 gives the object, driven by the
+conversion kind of its mibmeta SyntaxMeta (s.conv). The Result holds a
+status (OK, ABSENT or MALFORMED), the value kind and value, and a
+diagnostic code and text. Data problems never raise. An exception value or
+NULL is ABSENT (codes no-such-object, no-such-instance, end-of-mib-view,
+null), a value that cannot be converted is MALFORMED, and a value that
+converts but breaks the MIB (outside its ranges or SIZE, a tag other than
+the MIB's, unknown bits) is OK with a warning code. Options.strict turns
+the range, size, unknown-bits, hint-fallback and truncated-utf8 warnings
+into MALFORMED.
+
+The conversion kinds, with the wire tags they take and the kind they give:
+
+  int, int-hint     Integer -> int, or uint for INTEGER TCs whose YANG type
+                    is unsigned (inet:dscp, inet:ipv6-flow-label)
+  uint              Counter32, Gauge32, TimeTicks, Counter64 -> uint
+  enum              Integer -> enum, the value's first label; an unknown
+                    number is MALFORMED unknown-enum (Options.unknown_enum)
+  truthvalue        Integer -> boolean, 1 true and 2 false
+  string-hint       OctetString -> string, rendered by its DISPLAY-HINT
+  phys-address,
+  mac-address       OctetString -> string, lower-case hex pairs joined by ":"
+  binary            OctetString -> binary
+  bits              OctetString -> bits, the names of the set bits in
+                    position order (bit 0 is the MSB of octet 0); a set
+                    bit without a name is dropped (unknown-bits)
+  ipv4              IpAddress or 4-octet OctetString -> string a.b.c.d
+  oid               ObjectIdentifier -> string, dotted, which must fit
+                    yang:object-identifier-128
+  opaque            Opaque -> binary; with Options.opaque_special,
+                    net-snmp's Float and Double give float, I64 int, and
+                    U64 and Counter64 uint
+  (none)            any tag -> by tag
+
+A tag the conversion does not take is MALFORMED wrong-type, and a
+values.MalformedValue is MALFORMED malformed. The integer conversions
+check the value against the YANG builtin type the emitter gave the leaf
+(SyntaxMeta.builtin: int32, or int64 when the TC chain's ranges leave
+int32). They also take the other integer tags with the warning
+tag-mismatch (a common vendor bug), except for index values, whose tag is
+not on the wire (from_index=True).
+
+string-hint renders with mib.hint.render_octets_ex in RFC mode. For a hint
+of only a and t applications (DisplayString, SnmpAdminString), trailing NUL
+octets are dropped (warning trailing-nul) and invalid UTF-8 is read as
+Latin-1. Another value that does not fit its hint gets the hex fallback of
+mib.hint (hint-fallback). A partial UTF-8 character at the end, where an
+agent cut the value at its SIZE, gives truncated-utf8 (RFC 2579 section
+3.1). C0 control characters other than TAB, LF and CR become U+FFFD
+(control-chars), so the value stays serialisable as XML and JSON.
+
+to_value(x, s) is the inverse, for SET, configuration and the keys of a
+narrowed table walk. It raises errors.EncodeError and enforces the MIB's
+ranges and SIZE (Options.check_ranges); an INTEGER must fit Integer32 even
+where a MIB range is wider. Every OK result without a warning converts back
+to the same wire value, except that BITS come back with as many octets as
+the highest set bit needs, and string-hint renderings round-trip only
+where mib.hint.parse_octets can parse them.
+
+inet_address(type, octets) renders an InetAddress by its InetAddressType
+(RFC 4001) for display; its YANG type is binary. inet_octets is the
+inverse. For many values of one syntax, build a Converter once with
+converter(s, opts): it parses the hint and the label maps a single time.
+"""
+
+import errors
+import math
+import values
+import mib.hint
+import mib.meta
+from oid import Oid
+from values import Value
+
+# Result.status
+OK = 0
+ABSENT = 1
+MALFORMED = 2
+
+STATUS_NAMES: list[str] = ["ok", "absent", "malformed"]
+
+# Diagnostic codes -> description. LENIENT codes are warnings of an OK result that Options.strict
+# turns into MALFORMED.
+CODES: dict[str, str] = {
+    "no-such-object": "absent: noSuchObject",
+    "no-such-instance": "absent: noSuchInstance",
+    "end-of-mib-view": "absent: endOfMibView",
+    "null": "absent: a NULL value",
+    "malformed": "a value whose content is invalid for its tag (values.MalformedValue)",
+    "wrong-type": "a tag this conversion does not take",
+    "tag-mismatch": "warning: another integer (or octet string) tag than the MIB's, accepted",
+    "out-of-range": "a number the YANG builtin type cannot hold",
+    "range": "warning: a number outside the MIB's ranges",
+    "size": "warning: a length outside the MIB's SIZE (mac-address: not 6 octets)",
+    "unknown-enum": "a number that is not one of the enumeration's (Options.unknown_enum)",
+    "bad-truthvalue": "a TruthValue other than 1 (true) and 2 (false)",
+    "unknown-bits": "warning: set bits without a name, dropped",
+    "bad-length": "an IPv4 address (or InetAddress) of the wrong length",
+    "bad-oid": "an OBJECT IDENTIFIER that yang:object-identifier-128 cannot hold",
+    "hint-fallback": "warning: the octets do not fit the DISPLAY-HINT; Latin-1 or hex rendering",
+    "control-chars": "warning: control characters replaced by U+FFFD",
+    "trailing-nul": "warning: NUL octets at the end of a character string dropped",
+    "truncated-utf8": "warning: an incomplete UTF-8 character at the end of a `t` application dropped (RFC 2579)",
+    "unknown-inet-type": "an InetAddressType inet_address does not know",
+    "unknown-conv": "a conversion kind this module does not know",
+}
+
+LENIENT: set[str] = {"range", "size", "unknown-bits", "hint-fallback", "truncated-utf8"}
+
+# INTEGER-based (and narrower unsigned) TCs whose YANG builtin type is unsigned (RFC 6643
+# Appendix A): TC -> largest value of the builtin type
+WELL_KNOWN_UNSIGNED: dict[str, int] = {
+    "DIFFSERV-DSCP-TC::Dscp": 255,                      # inet:dscp, uint8 (range 0..63)
+    "IPV6-FLOW-LABEL-MIB::IPv6FlowLabel": 4294967295,   # inet:ipv6-flow-label, uint32
+    "INET-ADDRESS-MIB::InetPortNumber": 65535,          # inet:port-number, uint16
+}
+
+INT32_MIN = -2147483648
+INT32_MAX = 2147483647
+INT64_MIN = -9223372036854775808
+INT64_MAX = 9223372036854775807
+UINT32_MAX = 4294967295
+
+# Converter.code
+_C_RAW = 0
+_C_INT = 1
+_C_UINT = 2
+_C_ENUM = 3
+_C_TRUTH = 4
+_C_HINT = 5
+_C_PHYS = 6
+_C_MAC = 7
+_C_BINARY = 8
+_C_BITS = 9
+_C_IPV4 = 10
+_C_OID = 11
+_C_OPAQUE = 12
+_C_UNKNOWN = 13
+
+_HEX_DIGITS = "0123456789abcdef"
+
+
+def _code_of(conv_kind: str) -> int:
+    if conv_kind == "int" or conv_kind == "int-hint":
+        return _C_INT
+    if conv_kind == "uint":
+        return _C_UINT
+    if conv_kind == "enum":
+        return _C_ENUM
+    if conv_kind == "truthvalue":
+        return _C_TRUTH
+    if conv_kind == "string-hint":
+        return _C_HINT
+    if conv_kind == "phys-address":
+        return _C_PHYS
+    if conv_kind == "mac-address":
+        return _C_MAC
+    if conv_kind == "binary":
+        return _C_BINARY
+    if conv_kind == "bits":
+        return _C_BITS
+    if conv_kind == "ipv4":
+        return _C_IPV4
+    if conv_kind == "oid":
+        return _C_OID
+    if conv_kind == "opaque":
+        return _C_OPAQUE
+    if conv_kind == "":
+        return _C_RAW
+    return _C_UNKNOWN
+
+
+# --- results -----------------------------------------------------------------------------------------
+
+class Result(object):
+    """One conversion: status (OK, ABSENT, MALFORMED), kind of the value ("int", "uint",
+    "enum", "string", "boolean", "binary", "bits", "float"; "" without a value), the value
+    (int, u64, str, bool, bytes, list[str] or float; None unless OK), and a diagnostic code
+    (a key of CODES, "" for a clean value; an OK result may carry a warning) with its text
+    diag."""
+    status: int
+    kind: str
+    value: ?value
+    code: str
+    diag: str
+
+    def __init__(self, status: int, kind: str, value: ?value, code: str="", diag: str=""):
+        self.status = status
+        self.kind = kind
+        self.value = value
+        self.code = code
+        self.diag = diag
+
+    def ok(self) -> bool:
+        """A value is present (perhaps with a warning)."""
+        return self.status == OK
+
+    def clean(self) -> bool:
+        """A value is present and nothing was wrong with it."""
+        return self.status == OK and self.code == ""
+
+    def as_int(self) -> ?int:
+        v = self.value
+        if isinstance(v, int):
+            return v
+        return None
+
+    def as_u64(self) -> ?u64:
+        v = self.value
+        if isinstance(v, u64):
+            return v
+        return None
+
+    def as_str(self) -> ?str:
+        v = self.value
+        if isinstance(v, str):
+            return v
+        return None
+
+    def as_bool(self) -> ?bool:
+        v = self.value
+        if isinstance(v, bool):
+            return v
+        return None
+
+    def as_bytes(self) -> ?bytes:
+        v = self.value
+        if isinstance(v, bytes):
+            return v
+        return None
+
+    def as_float(self) -> ?float:
+        v = self.value
+        if isinstance(v, float):
+            return v
+        return None
+
+    def as_names(self) -> ?list[str]:
+        v = self.value
+        if isinstance(v, list):
+            out: list[str] = []
+            for x in v:
+                if isinstance(x, str):
+                    out.append(x)
+            return out
+        return None
+
+    def text(self) -> str:
+        """The value as text: numbers in decimal, a bool true/false, bytes as lower-case hex,
+        bits as their names separated by blanks (the YANG lexical forms, except binary, which
+        YANG writes in base64); "" without a value."""
+        v = self.value
+        if isinstance(v, bool):
+            return "true" if v else "false"
+        if isinstance(v, int):
+            return str(v)
+        if isinstance(v, u64):
+            return str(v)
+        if isinstance(v, str):
+            return v
+        if isinstance(v, bytes):
+            return v.hex()
+        if isinstance(v, float):
+            return float_text(v)
+        if isinstance(v, list):
+            return " ".join([x if isinstance(x, str) else "?" for x in v])
+        return ""
+
+    def brief(self) -> str:
+        """A compact text form: status, then kind and text of an OK value, then "!" and the
+        code of a warning, for example "ok:int:5", "ok:string:eth0!size" or "absent:null"."""
+        st = STATUS_NAMES[self.status]
+        if self.status == OK:
+            w = "!" + self.code if self.code != "" else ""
+            return st + ":" + self.kind + ":" + self.text() + w
+        return st + ":" + self.code
+
+    def __repr__(self) -> str:
+        if self.diag != "":
+            return "Result(" + self.brief() + ", " + repr(self.diag) + ")"
+        return "Result(" + self.brief() + ")"
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
+
+def float_text(x: float) -> str:
+    """The shortest %g text (6 to 17 significant digits) that reads back as x; nan,
+    inf, -inf."""
+    if x != x:
+        return "nan"
+    if x > 1.7976931348623157e308:
+        return "inf"
+    if x < -1.7976931348623157e308:
+        return "-inf"
+    t = ""
+    for p in range(6, 18):
+        t = _g(x, p)
+        if float(t) == x:
+            return t
+    return t
+
+
+def _g(x: float, p: int) -> str:
+    if p <= 6:
+        return "%.6g" % x
+    if p == 7:
+        return "%.7g" % x
+    if p == 8:
+        return "%.8g" % x
+    if p == 9:
+        return "%.9g" % x
+    if p == 10:
+        return "%.10g" % x
+    if p == 11:
+        return "%.11g" % x
+    if p == 12:
+        return "%.12g" % x
+    if p == 13:
+        return "%.13g" % x
+    if p == 14:
+        return "%.14g" % x
+    if p == 15:
+        return "%.15g" % x
+    if p == 16:
+        return "%.16g" % x
+    return "%.17g" % x
+
+
+def absent(code: str, diag: str="") -> Result:
+    return Result(ABSENT, "", None, code, diag)
+
+
+def malformed(code: str, diag: str) -> Result:
+    return Result(MALFORMED, "", None, code, diag)
+
+
+# --- options -----------------------------------------------------------------------------------------
+
+class Options(object):
+    """Conversion options
+
+    unknown_enum is "error" (the default: an enumeration value without a
+    label is MALFORMED unknown-enum) or "number" (OK, with the number as a
+    decimal string and unknown-enum as a warning; to_value takes it back).
+    strict makes the range, size, unknown-bits, hint-fallback and
+    truncated-utf8 warnings MALFORMED, also when another warning came
+    first. yang_names names bits by their YANG identifiers rather than their
+    MIB labels. opaque_special unwraps net-snmp's Opaque Float, Double, I64,
+    U64 and Counter64 (also for the integer conversions, as tag-mismatch);
+    it is off by default since smiv2:opaque is binary. check_ranges makes
+    to_value refuse values outside the MIB's ranges and SIZE.
+
+    unsigned_tcs maps INTEGER TCs whose YANG type is unsigned to the largest
+    value of their builtin type. It is only consulted for mibmeta without
+    SyntaxMeta.builtin; a converter built with a TC chain
+    (MetaIndex.tc_chain) also finds TCs derived from them.
+    """
+    unknown_enum: str
+    strict: bool
+    yang_names: bool
+    opaque_special: bool
+    check_ranges: bool
+    unsigned_tcs: dict[str, int]
+
+    def __init__(self, unknown_enum: str="error", strict: bool=False, yang_names: bool=True, opaque_special: bool=False,
+                 check_ranges: bool=True, unsigned_tcs: dict[str, int]=WELL_KNOWN_UNSIGNED):
+        self.unknown_enum = "number" if unknown_enum == "number" else "error"
+        self.strict = strict
+        self.yang_names = yang_names
+        self.opaque_special = opaque_special
+        self.check_ranges = check_ranges
+        self.unsigned_tcs = unsigned_tcs
+
+
+# --- YANG identifiers (bits) ----------------------------------------------------------------------
+
+def _ident_char(c: str, first: bool) -> bool:
+    if (c >= "a" and c <= "z") or (c >= "A" and c <= "Z") or c == "_":
+        return True
+    if first:
+        return False
+    return (c >= "0" and c <= "9") or c == "-" or c == "."
+
+
+def yang_identifier(label: str) -> str:
+    """The YANG identifier the emitter gives a bit label (mib.yang rewrite_identifier): illegal
+    characters become _, and _ is prefixed when the name does not start with a letter or
+    underscore, or starts with "xml"."""
+    ok = label != ""
+    for i, c in enumerate(label):
+        if not _ident_char(c, i == 0):
+            ok = False
+            break
+    if ok and not label.lower().startswith("xml"):
+        return label
+    out: list[str] = []
+    for c in label:
+        out.append(c if _ident_char(c, False) else "_")
+    r = "".join(out)
+    if r == "" or not _ident_char(r[0], True) or r.lower().startswith("xml"):
+        r = "_" + r
+    return r
+
+
+def yang_bit_names(bits: list[(str, int)]) -> dict[int, str]:
+    """Position -> YANG bit name, as the emitter names them: in MIB order, a position's first
+    label, rewritten, collisions suffixed _2, _3, ..."""
+    out: dict[int, str] = {}
+    used: set[str] = set()
+    for b in bits:
+        if b.1 in out:
+            continue
+        want = yang_identifier(b.0)
+        nm = want
+        i = 2
+        while nm in used:
+            nm = want + "_" + str(i)
+            i += 1
+        used.add(nm)
+        out[b.1] = nm
+    return out
+
+
+# --- helpers ------------------------------------------------------------------------------------------
+
+def _clamp_int(v: bigint) -> int:
+    if v > bigint(INT64_MAX):
+        return INT64_MAX
+    if v < bigint(INT64_MIN):
+        return INT64_MIN
+    return int(v)
+
+
+def _pairs(xs: list[(bigint, bigint)]) -> list[(int, int)]:
+    return [(_clamp_int(x.0), _clamp_int(x.1)) for x in xs]
+
+
+def _in_ranges(v: int, rs: list[(int, int)]) -> bool:
+    for r in rs:
+        if v >= r.0 and v <= r.1:
+            return True
+    return False
+
+
+def _ranges_text(rs: list[(int, int)]) -> str:
+    return " | ".join([str(r.0) if r.0 == r.1 else str(r.0) + ".." + str(r.1) for r in rs])
+
+
+def _wire_tag(wire: str) -> int:
+    if wire == "Counter32":
+        return 0x41
+    if wire == "Gauge32" or wire == "Unsigned32":
+        return 0x42
+    if wire == "TimeTicks":
+        return 0x43
+    if wire == "Counter64":
+        return 0x46
+    if wire == "IpAddress":
+        return 0x40
+    if wire == "OBJECT IDENTIFIER":
+        return 0x06
+    if wire == "Opaque":
+        return 0x44
+    if wire == "OCTET STRING" or wire == "BITS":
+        return 0x04
+    return 0x02
+
+
+def ipv4_text(b: bytes) -> str:
+    return "%d.%d.%d.%d" % (b[0], b[1], b[2], b[3])
+
+
+def oid_problem(arcs: list[int]) -> str:
+    """Why an OID cannot be a yang:object-identifier-128 value ("" when it can)."""
+    n = len(arcs)
+    if n < 2:
+        return "an OID of %d arcs (yang:object-identifier needs 2)" % n
+    if n > 128:
+        return "an OID of %d arcs (yang:object-identifier-128 allows 128)" % n
+    if arcs[0] > 2:
+        return "first arc %d (0..2)" % arcs[0]
+    if arcs[0] < 2 and arcs[1] > 39:
+        return "second arc %d below arc %d (0..39)" % (arcs[1], arcs[0])
+    return ""
+
+
+def _controls(b: bytes) -> bool:
+    """Whether the octets hold a C0 control other than TAB, LF and CR."""
+    for c in b:
+        if c < 32 and c != 9 and c != 10 and c != 13:
+            return True
+    return False
+
+
+def _replace_controls(s: str) -> str:
+    out: list[str] = []
+    rep = chr(0xfffd)
+    for ch in s:
+        c = ord(ch)
+        if c < 32 and c != 9 and c != 10 and c != 13:
+            out.append(rep)
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _latin1(b: bytes) -> str:
+    return "".join([chr(c) for c in b])
+
+
+def _ieee_value(c: bytes, start: int, n: int, exp_bits: int) -> float:
+    """IEEE 754 binary32 (n=4, exp_bits=8) or binary64 (n=8, exp_bits=11), big-endian."""
+    frac_bits = 8 * n - 1 - exp_bits
+    negative = c[start] >= 0x80
+    bits = c[start] & 0x7f
+    for i in range(start + 1, start + n):
+        bits = bits * 256 + c[i]
+    exp_max = (1 << exp_bits) - 1
+    bias = exp_max >> 1
+    e = bits >> frac_bits
+    f = bits & ((1 << frac_bits) - 1)
+    x = 0.0
+    if e == exp_max:
+        inf = math.ldexp(1.0, 1024)
+        x = inf if f == 0 else inf - inf
+    elif e == 0:
+        x = math.ldexp(float(f), 1 - bias - frac_bits)
+    else:
+        x = math.ldexp(float(f | (1 << frac_bits)), e - bias - frac_bits)
+    return -x if negative else x
+
+
+def _ieee_bits(x: float, exp_bits: int, frac_bits: int) -> int:
+    """The IEEE 754 encoding (sign, exponent, fraction) of x with round-to-nearest-even."""
+    exp_max = (1 << exp_bits) - 1
+    bias = exp_max >> 1
+    sign = 0
+    a = x
+    if x < 0.0:
+        sign = 1
+        a = -x
+    if a != a:
+        return (exp_max << frac_bits) | (1 << (frac_bits - 1))
+    if a == 0.0:
+        # -0.0 is not below 0.0; its text has the sign
+        if ("%g" % x).startswith("-"):
+            sign = 1
+        return sign << (exp_bits + frac_bits)
+    if a > 1.7976931348623157e308:
+        # infinity
+        return (sign << (exp_bits + frac_bits)) | (exp_max << frac_bits)
+    # a = m * 2^e with 1 <= m < 2
+    e = 0
+    m = a
+    while m >= 2.0:
+        m = m / 2.0
+        e += 1
+    while m < 1.0:
+        m = m * 2.0
+        e -= 1
+    be = e + bias
+    if be >= exp_max:
+        return (sign << (exp_bits + frac_bits)) | (exp_max << frac_bits)
+    q = 0
+    if be <= 0:
+        # subnormal: a / 2^(1 - bias - frac_bits)
+        q = _round_even(math.ldexp(a, bias - 1 + frac_bits))
+        if q >= (1 << frac_bits):
+            return (sign << (exp_bits + frac_bits)) | (1 << frac_bits)
+        return (sign << (exp_bits + frac_bits)) | q
+    q = _round_even(math.ldexp(m - 1.0, frac_bits))
+    if q >= (1 << frac_bits):
+        q = 0
+        be += 1
+        if be >= exp_max:
+            return (sign << (exp_bits + frac_bits)) | (exp_max << frac_bits)
+    return (sign << (exp_bits + frac_bits)) | (be << frac_bits) | q
+
+
+def _round_even(x: float) -> int:
+    """x (>= 0, below 2^62) rounded to the nearest integer, ties to even."""
+    i = int(x)
+    r = x - float(i)
+    if r > 0.5 or (r == 0.5 and (i & 1) == 1):
+        return i + 1
+    return i
+
+
+def _uint_octets(v: int, n: int) -> bytes:
+    out: list[int] = []
+    for i in range(n):
+        out.append((v >> (8 * (n - 1 - i))) & 0xff)
+    return bytes(out)
+
+
+def _opaque_number(v: values.Opaque) -> ?(int, u64, bool):
+    """A net-snmp Opaque I64 (signed) or U64/Counter64 (unsigned): (int value, u64 value,
+    unsigned), None for anything else."""
+    sp = values.opaque_special(v)
+    if sp is not None:
+        if sp.kind == "I64":
+            return (int(sp.value), u64(0), False)
+        if sp.kind == "U64" or sp.kind == "Counter64":
+            return (0, u64(bigint(sp.value)), True)
+    return None
+
+
+# --- the converter ----------------------------------------------------------------------------------
+
+class Converter(object):
+    """The conversion of one syntax, prepared once (hint parsed, label maps built). syntax None
+    converts by tag."""
+    syntax: ?mib.meta.SyntaxMeta
+    opts: Options
+    conv_kind: str
+    code: int
+    wire_tag: int
+    hint: ?mib.hint.DisplayHint
+    chars_only: bool
+    enum_label: dict[int, str]
+    label_value: dict[str, int]
+    bit_name: dict[int, str]
+    name_bit: dict[str, int]
+    ranges: list[(int, int)]
+    sizes: list[(int, int)]
+    unsigned: bool
+    lo: int
+    hi: int
+    umax: u64
+
+    def __init__(self, s: ?mib.meta.SyntaxMeta, opts: Options, chain: list[str]):
+        self.syntax = s
+        self.opts = opts
+        self.conv_kind = ""
+        self.code = _C_RAW
+        self.wire_tag = 0
+        self.hint = None
+        self.chars_only = False
+        self.enum_label = {}
+        self.label_value = {}
+        self.bit_name = {}
+        self.name_bit = {}
+        self.ranges = []
+        self.sizes = []
+        self.unsigned = False
+        self.lo = INT32_MIN
+        self.hi = INT32_MAX
+        self.umax = u64(UINT32_MAX)
+        if s is not None:
+            self._prepare(s, chain)
+
+    def _prepare(self, s: mib.meta.SyntaxMeta, chain: list[str]) -> None:
+        self.conv_kind = s.conv
+        self.code = _code_of(s.conv)
+        self.wire_tag = _wire_tag(s.wire)
+        if s.hint != "" and self.code == _C_HINT:
+            h = mib.hint.try_parse(s.hint)
+            self.hint = h
+            if h is not None and not h.integer:
+                co = len(h.specs) > 0
+                for sp in h.specs:
+                    if sp.fmt != "a" and sp.fmt != "t":
+                        co = False
+                self.chars_only = co
+        for e in s.enums:
+            if e.1 not in self.enum_label:
+                self.enum_label[e.1] = e.0
+            if e.0 not in self.label_value:
+                self.label_value[e.0] = e.1
+        if self.code == _C_BITS:
+            if self.opts.yang_names:
+                self.bit_name = yang_bit_names(s.bits)
+            else:
+                for b in s.bits:
+                    if b.1 not in self.bit_name:
+                        self.bit_name[b.1] = b.0
+            for pos, nm in self.bit_name.items():
+                self.name_bit[nm] = pos
+            for b in s.bits:
+                if b.0 not in self.name_bit:
+                    self.name_bit[b.0] = b.1
+        if s.wire == "INTEGER" or s.wire == "Unsigned32" or s.wire == "Gauge32":
+            self.ranges = _pairs(s.ranges)
+        self.sizes = _pairs(s.sizes)
+        # the YANG builtin type of the integer conversions: compiled into mibmeta (s.builtin),
+        # else (mibmeta written before it existed) from the ranges and Options.unsigned_tcs
+        if (self.code == _C_INT or self.code == _C_UINT) and s.builtin != "":
+            self._builtin(s.builtin, s.wire)
+        elif self.code == _C_INT:
+            top = 0
+            names = [s.tc] + chain
+            for q in names:
+                m = self.opts.unsigned_tcs.get(q)
+                if m is not None and top == 0:
+                    top = m
+            if top > 0:
+                self.unsigned = True
+                self.umax = u64(top)
+            else:
+                wide = False
+                for r in s.ranges:
+                    if r.0 < bigint(INT32_MIN) or r.1 > bigint(INT32_MAX):
+                        wide = True
+                for e in s.enums:
+                    if e.1 < INT32_MIN or e.1 > INT32_MAX:
+                        wide = True
+                if wide:
+                    self.lo = INT64_MIN
+                    self.hi = INT64_MAX
+        elif self.code == _C_UINT:
+            top = 0
+            names = [s.tc] + chain
+            for q in names:
+                m = self.opts.unsigned_tcs.get(q)
+                if m is not None and top == 0:
+                    top = m
+            if s.wire == "Counter64":
+                self.umax = u64(18446744073709551615)
+            elif top > 0:
+                self.umax = u64(top)
+
+    def _builtin(self, b: str, wire: str) -> None:
+        if b == "int64":
+            self.lo = INT64_MIN
+            self.hi = INT64_MAX
+        elif b == "uint8" or b == "uint16" or b == "uint32" or b == "uint64":
+            top = 255 if b == "uint8" else (65535 if b == "uint16" else UINT32_MAX)
+            self.umax = u64(18446744073709551615) if b == "uint64" else u64(top)
+            if self.code == _C_INT:
+                self.unsigned = True
+        elif wire == "Counter64":
+            self.umax = u64(18446744073709551615)
+
+    # --- wire to YANG ---
+
+    def convert(self, v: Value, from_index: bool=False) -> Result:
+        """The YANG value of wire value v (see the module doc). from_index: v was decoded
+        from an instance suffix (its tag is the index encoding's, so no tag-mismatch)."""
+        if isinstance(v, values.NoSuchInstance):
+            return absent("no-such-instance")
+        if isinstance(v, values.NoSuchObject):
+            return absent("no-such-object")
+        if isinstance(v, values.EndOfMibView):
+            return absent("end-of-mib-view")
+        if isinstance(v, values.Null):
+            return absent("null")
+        if isinstance(v, values.MalformedValue):
+            return malformed("malformed", v.type_name() + " tag 0x%02x: " % v.raw_tag + v.reason)
+        k = self.code
+        if k == _C_INT:
+            return self._int(v, from_index)
+        if k == _C_UINT:
+            return self._uint(v, from_index)
+        if k == _C_ENUM:
+            return self._enum(v, from_index)
+        if k == _C_TRUTH:
+            return self._truth(v, from_index)
+        if k == _C_HINT:
+            return self._hinted(v)
+        if k == _C_PHYS or k == _C_MAC:
+            return self._phys(v)
+        if k == _C_BINARY:
+            return self._binary(v)
+        if k == _C_BITS:
+            return self._bits(v)
+        if k == _C_IPV4:
+            return self._ipv4(v)
+        if k == _C_OID:
+            return self._oid(v)
+        if k == _C_OPAQUE:
+            return self._opaque(v)
+        if k == _C_RAW:
+            return convert_raw(v)
+        return malformed("unknown-conv", "unknown conversion kind " + repr(self.conv_kind))
+
+    def _finish(self, r: Result) -> Result:
+        """Apply strict mode to a result with a warning."""
+        if r.status == OK and self.opts.strict and r.code in LENIENT:
+            return malformed(r.code, r.diag)
+        return r
+
+    def _warn(self, r: Result, code: str, diag: str) -> None:
+        """Add a warning: the first one is the code (in strict mode the first LENIENT one, so
+        that _finish sees it), the diagnostic lists all."""
+        if r.code == "":
+            r.code = code
+            r.diag = diag
+        else:
+            if self.opts.strict and code in LENIENT and r.code not in LENIENT:
+                r.code = code
+            r.diag = r.diag + "; " + diag
+
+    def _mismatch(self, v: Value, want: str) -> str:
+        return v.type_name() + " where the MIB has " + want
+
+    def _integer(self, v: Value, from_index: bool) -> ?(int, str):
+        """The number of an integer value and a tag-mismatch text ("" none); None when v is
+        not a number. A Counter64 above int's range gives None."""
+        if isinstance(v, values.Integer):
+            return (v.value, "")
+        mis = "" if from_index else self._mismatch(v, "INTEGER")
+        if isinstance(v, values.Gauge32):
+            return (v.value, mis)
+        if isinstance(v, values.Counter32):
+            return (v.value, mis)
+        if isinstance(v, values.TimeTicks):
+            return (v.value, mis)
+        if isinstance(v, values.Counter64):
+            if v.value <= u64(INT64_MAX):
+                return (int(v.value), mis)
+            return None
+        if isinstance(v, values.Opaque) and self.opts.opaque_special:
+            n = _opaque_number(v)
+            if n is not None:
+                if n.2:
+                    if n.1 <= u64(INT64_MAX):
+                        return (int(n.1), "Opaque " + mis)
+                    return None
+                return (n.0, "Opaque " + mis)
+        return None
+
+    def _int(self, v: Value, from_index: bool) -> Result:
+        got = self._integer(v, from_index)
+        if got is not None:
+            n = got.0
+            r = Result(OK, "int", n)
+            if self.unsigned:
+                if n < 0 or u64(n) > self.umax:
+                    return malformed("out-of-range", "%d outside the YANG type's 0.." % n + str(self.umax))
+                r = Result(OK, "uint", u64(n))
+            elif n < self.lo or n > self.hi:
+                return malformed("out-of-range", "%d outside " % n + ("int32" if self.hi == INT32_MAX else "int64"))
+            if got.1 != "":
+                self._warn(r, "tag-mismatch", got.1)
+            if len(self.ranges) > 0 and not _in_ranges(n, self.ranges):
+                self._warn(r, "range", "%d outside the range " % n + _ranges_text(self.ranges))
+            return self._finish(r)
+        if isinstance(v, values.Counter64):
+            return malformed("out-of-range", "Counter64 " + str(v.value) + " exceeds int64")
+        if isinstance(v, values.Opaque) and self.opts.opaque_special and _opaque_number(v) is not None:
+            return malformed("out-of-range", "Opaque " + repr(v) + " exceeds int64")
+        return malformed("wrong-type", v.type_name() + " for an INTEGER object")
+
+    def _uint(self, v: Value, from_index: bool) -> Result:
+        n = u64(0)
+        mis = ""
+        tag = v.tag()
+        if isinstance(v, values.Counter64):
+            n = v.value
+        elif isinstance(v, values.Counter32):
+            n = u64(v.value)
+        elif isinstance(v, values.Gauge32):
+            n = u64(v.value)
+        elif isinstance(v, values.TimeTicks):
+            n = u64(v.value)
+        elif isinstance(v, values.Integer):
+            if v.value < 0:
+                return malformed("out-of-range", "negative INTEGER %d for an unsigned object" % v.value)
+            n = u64(v.value)
+        elif isinstance(v, values.Opaque) and self.opts.opaque_special and _opaque_number(v) is not None:
+            on = _opaque_number(v)
+            if on is not None:
+                if on.2:
+                    n = on.1
+                elif on.0 < 0:
+                    return malformed("out-of-range", "negative Opaque I64 %d for an unsigned object" % on.0)
+                else:
+                    n = u64(on.0)
+        else:
+            return malformed("wrong-type", v.type_name() + " for an unsigned object")
+        if tag != self.wire_tag and not from_index:
+            sx = self.syntax
+            mis = self._mismatch(v, sx.wire if sx is not None else "")
+        if n > self.umax:
+            return malformed("out-of-range", str(n) + " exceeds " + str(self.umax))
+        r = Result(OK, "uint", n)
+        if mis != "":
+            self._warn(r, "tag-mismatch", mis)
+        if len(self.ranges) > 0 and n <= u64(INT64_MAX) and not _in_ranges(int(n), self.ranges):
+            self._warn(r, "range", str(n) + " outside the range " + _ranges_text(self.ranges))
+        return self._finish(r)
+
+    def _enum(self, v: Value, from_index: bool) -> Result:
+        got = self._integer(v, from_index)
+        if got is not None:
+            n = got.0
+            lbl = self.enum_label.get(n)
+            r = Result(OK, "enum", "")
+            if lbl is not None:
+                r = Result(OK, "enum", lbl)
+            elif self.opts.unknown_enum == "number":
+                r = Result(OK, "enum", str(n), "unknown-enum", "%d is not a value of the enumeration" % n)
+            else:
+                return malformed("unknown-enum", "%d is not a value of the enumeration" % n)
+            if got.1 != "":
+                self._warn(r, "tag-mismatch", got.1)
+            return r
+        return malformed("wrong-type", v.type_name() + " for an enumeration")
+
+    def _truth(self, v: Value, from_index: bool) -> Result:
+        got = self._integer(v, from_index)
+        if got is not None:
+            n = got.0
+            if n != 1 and n != 2:
+                return malformed("bad-truthvalue", "TruthValue %d (1 true, 2 false)" % n)
+            r = Result(OK, "boolean", (n == 1))
+            if got.1 != "":
+                self._warn(r, "tag-mismatch", got.1)
+            return r
+        return malformed("wrong-type", v.type_name() + " for a TruthValue")
+
+    def _size(self, r: Result, n: int) -> None:
+        if len(self.sizes) > 0 and not _in_ranges(n, self.sizes):
+            self._warn(r, "size", "%d octets outside the SIZE " % n + _ranges_text(self.sizes))
+
+    def _hinted(self, v: Value) -> Result:
+        if isinstance(v, values.OctetString):
+            return self._render(v.value)
+        return malformed("wrong-type", v.type_name() + " for a string")
+
+    def _render(self, b0: bytes) -> Result:
+        b = b0
+        n = len(b)
+        h = self.hint
+        text = ""
+        warn = ""
+        nul = ""
+        cut = ""
+        if h is not None:
+            if self.chars_only:
+                k = len(b)
+                while k > 0 and b[k - 1] == 0:
+                    k -= 1
+                if k < len(b):
+                    nul = "%d trailing NUL octets dropped" % (len(b) - k)
+                    b = b[:k]
+            rd = mib.hint.render_octets_ex(h, b)
+            text = rd.text
+            if not rd.ok:
+                if self.chars_only:
+                    text = _latin1(b)
+                    warn = "not UTF-8 (" + rd.reason + "); read as Latin-1"
+                else:
+                    warn = rd.reason + "; hex rendering"
+            elif rd.dropped > 0:
+                cut = "%d octets of an incomplete UTF-8 character dropped" % rd.dropped
+        else:
+            text = mib.hint.hex_fallback(b)
+            sx = self.syntax
+            warn = "DISPLAY-HINT " + repr(sx.hint if sx is not None else "") + " does not parse; hex rendering"
+        r = Result(OK, "string", text)
+        if nul != "":
+            self._warn(r, "trailing-nul", nul)
+        if warn != "":
+            self._warn(r, "hint-fallback", warn)
+        if cut != "":
+            self._warn(r, "truncated-utf8", cut)
+        if _controls(b):
+            ctl = _replace_controls(text)
+            if ctl != text:
+                r.value = ctl
+                self._warn(r, "control-chars", "control characters replaced by U+FFFD")
+        self._size(r, n)
+        return self._finish(r)
+
+    def _phys(self, v: Value) -> Result:
+        if isinstance(v, values.OctetString):
+            b = v.value
+            r = Result(OK, "string", mib.hint.hex_fallback(b))
+            if self.code == _C_MAC and len(self.sizes) == 0 and len(b) != 6:
+                self._warn(r, "size", "a MAC address of %d octets" % len(b))
+            self._size(r, len(b))
+            return self._finish(r)
+        return malformed("wrong-type", v.type_name() + " for a " + self.conv_kind)
+
+    def _binary(self, v: Value) -> Result:
+        if isinstance(v, values.OctetString):
+            r = Result(OK, "binary", v.value)
+            self._size(r, len(v.value))
+            return self._finish(r)
+        return malformed("wrong-type", v.type_name() + " for an octet string")
+
+    def _bits(self, v: Value) -> Result:
+        if isinstance(v, values.OctetString):
+            return self._bit_names(v.value)
+        return malformed("wrong-type", v.type_name() + " for BITS")
+
+    def _bit_names(self, b: bytes) -> Result:
+        names: list[str] = []
+        unknown: list[int] = []
+        for i in range(len(b)):
+            c = b[i]
+            if c == 0:
+                continue
+            for j in range(8):
+                if (c & (0x80 >> j)) != 0:
+                    pos = 8 * i + j
+                    nm = self.bit_name.get(pos)
+                    if nm is not None:
+                        names.append(nm)
+                    else:
+                        unknown.append(pos)
+        r = Result(OK, "bits", names)
+        if len(unknown) > 0:
+            self._warn(r, "unknown-bits", "set bits without a name dropped: " + " ".join([str(p) for p in unknown]))
+        self._size(r, len(b))
+        return self._finish(r)
+
+    def _ipv4(self, v: Value) -> Result:
+        b = b""
+        mis = ""
+        if isinstance(v, values.IpAddress):
+            b = v.value
+        elif isinstance(v, values.OctetString):
+            b = v.value
+            mis = self._mismatch(v, "IpAddress")
+        else:
+            return malformed("wrong-type", v.type_name() + " for an IpAddress")
+        if len(b) != 4:
+            return malformed("bad-length", "an IPv4 address of %d octets" % len(b))
+        r = Result(OK, "string", ipv4_text(b))
+        if mis != "":
+            self._warn(r, "tag-mismatch", mis)
+        return r
+
+    def _oid(self, v: Value) -> Result:
+        if isinstance(v, values.ObjectIdentifier):
+            p = oid_problem(v.value.arcs)
+            if p != "":
+                return malformed("bad-oid", p)
+            return Result(OK, "string", str(v.value))
+        return malformed("wrong-type", v.type_name() + " for an OBJECT IDENTIFIER")
+
+    def _opaque(self, v: Value) -> Result:
+        if isinstance(v, values.Opaque):
+            if self.opts.opaque_special:
+                sp = special_opaque(v)
+                if sp is not None:
+                    return sp
+            r = Result(OK, "binary", v.value)
+            self._size(r, len(v.value))
+            return self._finish(r)
+        return malformed("wrong-type", v.type_name() + " for an Opaque")
+
+    # --- YANG to wire ---
+
+    def _efail(self, msg: str) -> errors.EncodeError:
+        return errors.EncodeError(msg)
+
+    def _check_range(self, n: int) -> None:
+        if self.opts.check_ranges and len(self.ranges) > 0 and not _in_ranges(n, self.ranges):
+            raise self._efail("%d outside the range " % n + _ranges_text(self.ranges))
+
+    def _check_size(self, n: int) -> None:
+        if self.opts.check_ranges and len(self.sizes) > 0 and not _in_ranges(n, self.sizes):
+            raise self._efail("%d octets outside the SIZE " % n + _ranges_text(self.sizes))
+
+    def _number(self, x: value) -> int:
+        if isinstance(x, bool):
+            raise self._efail("a number expected, got a boolean")
+        if isinstance(x, int):
+            return x
+        if isinstance(x, u64):
+            if x > u64(INT64_MAX):
+                raise self._efail(str(x) + " exceeds int64")
+            return int(x)
+        if isinstance(x, bigint):
+            if x > bigint(INT64_MAX) or x < bigint(INT64_MIN):
+                raise self._efail(str(x) + " exceeds int64")
+            return int(x)
+        raise self._efail("a number expected")
+
+    def to_value(self, x: value) -> Value:
+        """The wire value of YANG value x (the inverse of convert); raises
+        errors.EncodeError for a value of the wrong kind or outside the syntax."""
+        s = self.syntax
+        if s is not None:
+            if self.code != _C_RAW:
+                return self._encode(x, s)
+        raise self._efail("no syntax to encode by")
+
+    def _encode(self, x: value, s: mib.meta.SyntaxMeta) -> Value:
+        k = self.code
+        if k == _C_INT:
+            n = 0
+            if isinstance(x, u64):
+                if x > u64(INT64_MAX):
+                    raise self._efail(str(x) + " exceeds int64")
+                n = int(x)
+            else:
+                n = self._number(x)
+            if self.unsigned:
+                if n < 0 or u64(n) > self.umax:
+                    raise self._efail("%d outside 0.." % n + str(self.umax))
+            elif n < INT32_MIN or n > INT32_MAX:
+                raise self._efail("%d outside Integer32" % n)
+            self._check_range(n)
+            return values.Integer(n)
+        if k == _C_UINT:
+            u = u64(0)
+            if isinstance(x, u64):
+                u = x
+            else:
+                n = self._number(x)
+                if n < 0:
+                    raise self._efail("negative value %d for an unsigned object" % n)
+                u = u64(n)
+            if u > self.umax:
+                raise self._efail(str(u) + " exceeds " + str(self.umax))
+            if u <= u64(INT64_MAX):
+                self._check_range(int(u))
+            w = s.wire
+            if w == "Counter64":
+                return values.Counter64(u)
+            iv = int(u)
+            if w == "Counter32":
+                return values.Counter32(iv)
+            if w == "TimeTicks":
+                return values.TimeTicks(iv)
+            return values.Gauge32(iv)
+        if k == _C_ENUM:
+            if isinstance(x, str):
+                n = self.label_value.get(x)
+                if n is not None:
+                    return values.Integer(n)
+                if self.opts.unknown_enum == "number":
+                    t = x[1:] if x.startswith("-") else x
+                    if t != "" and t.isdecimal() and len(t) <= 10:
+                        num = int(x)
+                        if num < INT32_MIN or num > INT32_MAX:
+                            raise self._efail("%d outside Integer32" % num)
+                        return values.Integer(num)
+                raise self._efail(repr(x) + " is not a label of the enumeration")
+            raise self._efail("an enumeration label (str) expected")
+        if k == _C_TRUTH:
+            if isinstance(x, bool):
+                return values.Integer(1 if x else 2)
+            raise self._efail("a boolean expected")
+        if k == _C_HINT:
+            if isinstance(x, str):
+                h = self.hint
+                if h is not None:
+                    b = b""
+                    try:
+                        b = mib.hint.parse_octets(h, x)
+                    except mib.hint.HintError as e:
+                        raise self._efail(e.error_message)
+                    self._check_size(len(b))
+                    return values.OctetString(b)
+                raise self._efail("DISPLAY-HINT " + repr(s.hint) + " does not parse")
+            raise self._efail("a string expected")
+        if k == _C_PHYS or k == _C_MAC:
+            if isinstance(x, str):
+                b = parse_hex_octets(x)
+                if b is not None:
+                    if k == _C_MAC and len(s.sizes) == 0 and len(b) != 6 and self.opts.check_ranges:
+                        raise self._efail("a MAC address has 6 octets, got %d" % len(b))
+                    self._check_size(len(b))
+                    return values.OctetString(b)
+                raise self._efail(repr(x) + " is not a " + self.conv_kind + " (hex octets separated by ':')")
+            raise self._efail("a string expected")
+        if k == _C_BINARY:
+            if isinstance(x, bytes):
+                self._check_size(len(x))
+                return values.OctetString(x)
+            raise self._efail("bytes expected")
+        if k == _C_BITS:
+            if isinstance(x, list):
+                positions: list[int] = []
+                for nm in x:
+                    if isinstance(nm, str):
+                        p = self.name_bit.get(nm)
+                        if p is not None:
+                            positions.append(p)
+                        else:
+                            raise self._efail(repr(nm) + " is not a bit of the BITS")
+                    else:
+                        raise self._efail("bit names (str) expected")
+                b = bits_octets(positions, self.sizes)
+                self._check_size(len(b))
+                return values.OctetString(b)
+            raise self._efail("a list of bit names expected")
+        if k == _C_IPV4:
+            if isinstance(x, str):
+                b = parse_ipv4(x)
+                if b is not None:
+                    if s.wire == "OCTET STRING":
+                        return values.OctetString(b)
+                    return values.IpAddress(b)
+                raise self._efail(repr(x) + " is not an IPv4 address")
+            raise self._efail("a string expected")
+        if k == _C_OID:
+            if isinstance(x, str):
+                o = Oid([])
+                try:
+                    o = Oid.parse(x)
+                except ValueError as e:
+                    raise self._efail(e.error_message)
+                p = oid_problem(o.arcs)
+                if p != "":
+                    raise self._efail(p)
+                return values.ObjectIdentifier(o)
+            raise self._efail("a dotted OID string expected")
+        if k == _C_OPAQUE:
+            if isinstance(x, bytes):
+                self._check_size(len(x))
+                return values.Opaque(x)
+            if self.opts.opaque_special:
+                return opaque_of(x, len(s.sizes) == 1 and s.sizes[0].0 == bigint(7) and s.sizes[0].1 == bigint(7))
+            raise self._efail("bytes expected")
+        raise self._efail("unknown conversion kind " + repr(self.conv_kind))
+
+
+def converter(s: ?mib.meta.SyntaxMeta, opts: Options=Options(), chain: list[str]=[]) -> Converter:
+    """A prepared conversion of syntax s (None: by tag). chain: the TCs s.tc is derived
+    from (MetaIndex.tc_chain), consulted for Options.unsigned_tcs."""
+    return Converter(s, opts, chain)
+
+
+def convert(v: Value, s: ?mib.meta.SyntaxMeta, opts: Options=Options(), from_index: bool=False) -> Result:
+    """The YANG value of wire value v of syntax s (see the module doc)."""
+    return Converter(s, opts, []).convert(v, from_index)
+
+
+def to_value(x: value, s: mib.meta.SyntaxMeta, opts: Options=Options()) -> Value:
+    """The wire value of YANG value x of syntax s; raises errors.EncodeError."""
+    return Converter(s, opts, []).to_value(x)
+
+
+def convert_raw(v: Value) -> Result:
+    """A conversion by tag, for values without mibmeta (unknown OIDs): Integer int, the
+    unsigned tags uint, OctetString and Opaque binary, IpAddress (4 octets) and OIDs
+    string, the exceptions and NULL ABSENT, anything else MALFORMED."""
+    if isinstance(v, values.Integer):
+        return Result(OK, "int", v.value)
+    if isinstance(v, values.OctetString):
+        return Result(OK, "binary", v.value)
+    if isinstance(v, values.Counter32):
+        return Result(OK, "uint", u64(v.value))
+    if isinstance(v, values.Gauge32):
+        return Result(OK, "uint", u64(v.value))
+    if isinstance(v, values.TimeTicks):
+        return Result(OK, "uint", u64(v.value))
+    if isinstance(v, values.Counter64):
+        return Result(OK, "uint", v.value)
+    if isinstance(v, values.ObjectIdentifier):
+        return Result(OK, "string", str(v.value))
+    if isinstance(v, values.IpAddress):
+        if len(v.value) == 4:
+            return Result(OK, "string", ipv4_text(v.value))
+        return malformed("bad-length", "an IPv4 address of %d octets" % len(v.value))
+    if isinstance(v, values.Opaque):
+        return Result(OK, "binary", v.value)
+    if isinstance(v, values.NoSuchInstance):
+        return absent("no-such-instance")
+    if isinstance(v, values.NoSuchObject):
+        return absent("no-such-object")
+    if isinstance(v, values.EndOfMibView):
+        return absent("end-of-mib-view")
+    if isinstance(v, values.Null):
+        return absent("null")
+    if isinstance(v, values.MalformedValue):
+        return malformed("malformed", v.type_name() + " tag 0x%02x: " % v.raw_tag + v.reason)
+    return malformed("wrong-type", v.type_name() + " tag 0x%02x" % v.tag())
+
+
+# --- Opaque special types -------------------------------------------------------------------------
+
+def special_opaque(v: values.Opaque) -> ?Result:
+    """net-snmp's Opaque-wrapped types: Float (binary32) and Double (binary64) as float, I64
+    as int, U64 and Counter64 as uint; None for any other Opaque."""
+    c = v.value
+    n = len(c)
+    if n == 7 and c[0] == 0x9f and c[1] == 0x78 and c[2] == 4:
+        return Result(OK, "float", _ieee_value(c, 3, 4, 8))
+    if n == 11 and c[0] == 0x9f and c[1] == 0x79 and c[2] == 8:
+        return Result(OK, "float", _ieee_value(c, 3, 8, 11))
+    num = _opaque_number(v)
+    if num is not None:
+        if num.2:
+            return Result(OK, "uint", num.1)
+        return Result(OK, "int", num.0)
+    return None
+
+
+def opaque_of(x: value, single: bool) -> values.Opaque:
+    """The net-snmp Opaque of a number: a float as Float (single, SIZE(7) TCs) or Double, an
+    int as I64, a u64 as U64; raises errors.EncodeError for anything else."""
+    if isinstance(x, float):
+        if single:
+            return values.Opaque(b"\x9f\x78\x04" + _uint_octets(_ieee_bits(x, 8, 23), 4))
+        return values.Opaque(b"\x9f\x79\x08" + _uint_octets(_ieee_bits(x, 11, 52), 8))
+    if isinstance(x, bool):
+        raise errors.EncodeError("a boolean is not an Opaque")
+    if isinstance(x, int):
+        return values.Opaque(b"\x9f\x7a" + _ber_int(x))
+    if isinstance(x, u64):
+        return values.Opaque(b"\x9f\x7b" + _ber_uint(x))
+    raise errors.EncodeError("bytes, a float or an integer expected for an Opaque")
+
+
+def _ber_int(v: int) -> bytes:
+    """Length and minimal two's complement content octets of v."""
+    out: list[int] = []
+    x = v
+    while True:
+        out.insert(0, x & 0xff)
+        x = x >> 8
+        if (x == 0 and out[0] < 0x80) or (x == -1 and out[0] >= 0x80):
+            break
+    return bytes([len(out)] + out)
+
+
+def _ber_uint(v: u64) -> bytes:
+    out: list[int] = []
+    x = v
+    while True:
+        out.insert(0, int(x & u64(0xff)))
+        x = x >> 8
+        if x == u64(0):
+            break
+    if out[0] >= 0x80:
+        out.insert(0, 0)
+    return bytes([len(out)] + out)
+
+
+# --- text parsers (inverse) ---------------------------------------------------------------------------
+
+def _hex_value(c: str) -> int:
+    if c >= "0" and c <= "9":
+        return ord(c) - 48
+    if c >= "a" and c <= "f":
+        return ord(c) - 87
+    if c >= "A" and c <= "F":
+        return ord(c) - 55
+    return -1
+
+
+def parse_hex_octets(text: str) -> ?bytes:
+    """Text such as "00:1a:2b" (one or two hex digits per octet, either case) to octets; "" is
+    no octets; None when the text is not of that form."""
+    if text == "":
+        return b""
+    out: list[int] = []
+    for g in text.split(":"):
+        if len(g) < 1 or len(g) > 2:
+            return None
+        v = 0
+        for c in g:
+            d = _hex_value(c)
+            if d < 0:
+                return None
+            v = v * 16 + d
+        out.append(v)
+    return bytes(out)
+
+
+def parse_ipv4(text: str) -> ?bytes:
+    """Dotted-quad text to 4 octets (no zone, no leading zeros beyond one digit), None when it is
+    not one."""
+    p = text.split(".")
+    if len(p) != 4:
+        return None
+    out: list[int] = []
+    for x in p:
+        if x == "" or len(x) > 3 or not x.isdecimal() or (len(x) > 1 and x[0] == "0"):
+            return None
+        v = int(x)
+        if v > 255:
+            return None
+        out.append(v)
+    return bytes(out)
+
+
+def bits_octets(positions: list[int], sizes: list[(int, int)]=[]) -> bytes:
+    """The BITS octets with positions set: as many octets as the highest set bit needs (RFC
+    3416 section 2.5), at least the smallest SIZE allows."""
+    top = -1
+    for p in positions:
+        if p > top:
+            top = p
+    n = top // 8 + 1 if top >= 0 else 0
+    if len(sizes) > 0:
+        least = sizes[0].0
+        for r in sizes:
+            if r.0 < least:
+                least = r.0
+        if n < least and least <= 65535:
+            n = least
+    out = [0] * n
+    for p in positions:
+        out[p // 8] = out[p // 8] | (0x80 >> (p % 8))
+    return bytes(out)
+
+
+# --- InetAddress (RFC 4001) -----------------------------------------------------------------------
+
+INET_UNKNOWN = 0
+INET_IPV4 = 1
+INET_IPV6 = 2
+INET_IPV4Z = 3
+INET_IPV6Z = 4
+INET_DNS = 16
+
+
+def ipv6_text(b: bytes) -> str:
+    """RFC 5952 text of 16 octets: lower-case hex groups without leading zeros, the longest run of
+    two or more zero groups (the first of equal runs) as "::"."""
+    g: list[int] = [b[2 * i] * 256 + b[2 * i + 1] for i in range(8)]
+    best = -1
+    best_len = 0
+    i = 0
+    while i < 8:
+        if g[i] == 0:
+            j = i
+            while j < 8 and g[j] == 0:
+                j += 1
+            if j - i > best_len:
+                best = i
+                best_len = j - i
+            i = j
+        else:
+            i += 1
+    if best_len < 2:
+        return ":".join(["%x" % x for x in g])
+    head = ":".join(["%x" % x for x in g[:best]])
+    tail = ":".join(["%x" % x for x in g[best + best_len:]])
+    return head + "::" + tail
+
+
+def parse_ipv6(text: str) -> ?bytes:
+    """IPv6 text (RFC 4291 section 2.2, also with a trailing dotted quad) to 16 octets; None when it is
+    not one."""
+    if text == "" or "%" in text:
+        return None
+    head = text
+    tail = ""
+    dbl = text.find("::")
+    if dbl >= 0:
+        head = text[:dbl]
+        tail = text[dbl + 2:]
+        if "::" in tail:
+            return None
+    hg = _groups(head)
+    tg = _groups(tail)
+    if hg is not None:
+        if tg is not None:
+            n = len(hg) + len(tg)
+            if dbl >= 0:
+                if n > 14:
+                    return None
+                mid = [0] * (16 - n)
+                return bytes(hg + mid + tg)
+            if n != 16:
+                return None
+            return bytes(hg)
+    return None
+
+
+def _groups(s: str) -> ?list[int]:
+    """The octets of a:b:c hex groups, the last one may be a dotted quad."""
+    out: list[int] = []
+    if s == "":
+        return out
+    parts = s.split(":")
+    for i, g in enumerate(parts):
+        if "." in g and i == len(parts) - 1:
+            q = parse_ipv4(g)
+            if q is not None:
+                for c in q:
+                    out.append(c)
+                continue
+            return None
+        if len(g) < 1 or len(g) > 4:
+            return None
+        v = 0
+        for c in g:
+            d = _hex_value(c)
+            if d < 0:
+                return None
+            v = v * 16 + d
+        out.append(v >> 8)
+        out.append(v & 0xff)
+    return out
+
+
+def inet_address(addr_type: int, b: bytes) -> Result:
+    """The text of an InetAddress b of InetAddressType addr_type (RFC 4001 section 3): unknown(0)
+    "" (no octets), ipv4(1) a.b.c.d, ipv6(2) RFC 5952 text, ipv4z(3) and ipv6z(4) with
+    %zone (the zone index in decimal), dns(16) the name; the wrong length is bad-length, another
+    type unknown-inet-type."""
+    n = len(b)
+    if addr_type == INET_UNKNOWN:
+        if n == 0:
+            return Result(OK, "string", "")
+        return malformed("bad-length", "InetAddress of type unknown(0) with %d octets" % n)
+    if addr_type == INET_IPV4:
+        if n == 4:
+            return Result(OK, "string", ipv4_text(b))
+        return malformed("bad-length", "ipv4 InetAddress of %d octets" % n)
+    if addr_type == INET_IPV6:
+        if n == 16:
+            return Result(OK, "string", ipv6_text(b))
+        return malformed("bad-length", "ipv6 InetAddress of %d octets" % n)
+    if addr_type == INET_IPV4Z:
+        if n == 8:
+            return Result(OK, "string", ipv4_text(b) + "%" + str(_zone(b, 4)))
+        return malformed("bad-length", "ipv4z InetAddress of %d octets" % n)
+    if addr_type == INET_IPV6Z:
+        if n == 20:
+            return Result(OK, "string", ipv6_text(b[:16]) + "%" + str(_zone(b, 16)))
+        return malformed("bad-length", "ipv6z InetAddress of %d octets" % n)
+    if addr_type == INET_DNS:
+        try:
+            t = b.decode()
+            r = Result(OK, "string", t)
+            if _controls(b):
+                r.value = _replace_controls(t)
+                r.code = "control-chars"
+                r.diag = "control characters replaced by U+FFFD"
+            return r
+        except ValueError:
+            r = Result(OK, "string", _latin1(b), "hint-fallback", "dns InetAddress not UTF-8; read as Latin-1")
+            if _controls(b):
+                r.value = _replace_controls(_latin1(b))
+                r.diag = r.diag + "; control characters replaced by U+FFFD"
+            return r
+    return malformed("unknown-inet-type", "InetAddressType %d" % addr_type)
+
+
+def _zone(b: bytes, start: int) -> int:
+    return ((b[start] * 256 + b[start + 1]) * 256 + b[start + 2]) * 256 + b[start + 3]
+
+
+def inet_octets(addr_type: int, text: str) -> bytes:
+    """The InetAddress octets of text for InetAddressType addr_type (inverse of
+    inet_address); raises errors.EncodeError."""
+    if addr_type == INET_UNKNOWN:
+        if text == "":
+            return b""
+        raise errors.EncodeError("an InetAddress of type unknown(0) has no octets")
+    if addr_type == INET_DNS:
+        return text.encode()
+    addr = text
+    zone = -1
+    if addr_type == INET_IPV4Z or addr_type == INET_IPV6Z:
+        p = text.find("%")
+        if p < 0:
+            raise errors.EncodeError(repr(text) + " has no %zone")
+        z = text[p + 1:]
+        if z == "" or not z.isdecimal() or len(z) > 10 or int(z) > UINT32_MAX:
+            raise errors.EncodeError(repr(text) + ": the zone must be a number 0..4294967295")
+        zone = int(z)
+        addr = text[:p]
+    if addr_type == INET_IPV4 or addr_type == INET_IPV4Z:
+        b = parse_ipv4(addr)
+        if b is not None:
+            return b + _uint_octets(zone, 4) if zone >= 0 else b
+        raise errors.EncodeError(repr(text) + " is not an IPv4 address")
+    if addr_type == INET_IPV6 or addr_type == INET_IPV6Z:
+        b6 = parse_ipv6(addr)
+        if b6 is not None:
+            return b6 + _uint_octets(zone, 4) if zone >= 0 else b6
+        raise errors.EncodeError(repr(text) + " is not an IPv6 address")
+    raise errors.EncodeError("unknown InetAddressType %d" % addr_type)

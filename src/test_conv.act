@@ -1,0 +1,740 @@
+"""Tests for conv: wire values to YANG values and back
+
+The SyntaxMeta here are written by hand after the IETF MIBs they name.
+Every clean result must convert back to the same wire value.
+"""
+
+import testing
+import conv
+import errors
+import values
+import mib.meta
+import mib.resolver
+import mib.yang
+from oid import Oid
+from values import Value, Integer, OctetString, IpAddress, Counter32, Gauge32, TimeTicks, Counter64, Opaque
+from values import ObjectIdentifier, NoSuchObject, NoSuchInstance, EndOfMibView, Null, MalformedValue, UnknownValue
+import testutil
+from testutil import h
+
+
+def sm(wire: str, tc: str, cv: str, hint: str="", ranges: list[(int, int)]=[], sizes: list[(int, int)]=[],
+       enums: list[(str, int)]=[], bits: list[(str, int)]=[]) -> mib.meta.SyntaxMeta:
+    s = mib.meta.SyntaxMeta(wire, tc, cv, hint)
+    s.ranges = [(bigint(r.0), bigint(r.1)) for r in ranges]
+    s.sizes = [(bigint(r.0), bigint(r.1)) for r in sizes]
+    s.enums = enums
+    s.bits = bits
+    return s
+
+
+# The syntaxes of the vectors (as mibmeta derives them from the IETF MIBs)
+INTEGER = sm("INTEGER", "", "int")
+IF_INDEX = sm("INTEGER", "IF-MIB::InterfaceIndex", "int", "d", [(1, 2147483647)])
+BIG_RANGE = sm("INTEGER", "", "int", "", [(-1099511627776, 1099511627776)])
+DSCP = sm("INTEGER", "DIFFSERV-DSCP-TC::Dscp", "int", "", [(0, 63)])
+FLOW_LABEL = sm("INTEGER", "IPV6-FLOW-LABEL-MIB::IPv6FlowLabel", "int", "d", [(0, 1048575)])
+PERCENT = sm("INTEGER", "M-MIB::Percent", "int-hint", "d-2", [(0, 10000)])
+COUNTER32 = sm("Counter32", "", "uint")
+GAUGE32 = sm("Gauge32", "", "uint")
+UNSIGNED = sm("Unsigned32", "", "uint", "", [(1, 10)])
+TIMETICKS = sm("TimeTicks", "", "uint")
+COUNTER64 = sm("Counter64", "", "uint")
+PORT = sm("Unsigned32", "INET-ADDRESS-MIB::InetPortNumber", "uint", "d", [(0, 65535)])
+ADMIN = sm("INTEGER", "", "enum", "", [], [], [("up", 1), ("down", 2), ("testing", 3)])
+DUP_ENUM = sm("INTEGER", "", "enum", "", [], [], [("first", 1), ("second", 1), ("other", 2)])
+TRUTH = sm("INTEGER", "SNMPv2-TC::TruthValue", "truthvalue", "", [], [], [("true", 1), ("false", 2)])
+DISPLAY = sm("OCTET STRING", "SNMPv2-TC::DisplayString", "string-hint", "255a", [], [(0, 255)])
+ADMIN_STRING = sm("OCTET STRING", "SNMP-FRAMEWORK-MIB::SnmpAdminString", "string-hint", "255t", [], [(0, 255)])
+DATE = sm("OCTET STRING", "SNMPv2-TC::DateAndTime", "string-hint", "2d-1d-1d,1d:1d:1d.1d,1a1d:1d", [], [(8, 8), (11, 11)])
+INET_V6 = sm("OCTET STRING", "INET-ADDRESS-MIB::InetAddressIPv6", "string-hint", "2x:2x:2x:2x:2x:2x:2x:2x", [], [(16, 16)])
+HEX_HINT = sm("OCTET STRING", "X-MIB::Hex", "string-hint", "1x:")
+BAD_HINT = sm("OCTET STRING", "X-MIB::Bad", "string-hint", "zz")
+PHYS = sm("OCTET STRING", "SNMPv2-TC::PhysAddress", "phys-address", "1x:")
+MAC = sm("OCTET STRING", "SNMPv2-TC::MacAddress", "mac-address", "1x:", [], [(6, 6)])
+MAC_NOSIZE = sm("OCTET STRING", "X-MIB::Mac", "mac-address", "1x:")
+BINARY = sm("OCTET STRING", "INET-ADDRESS-MIB::InetAddress", "binary", "", [], [(0, 255)])
+PORT_LIST = sm("OCTET STRING", "Q-BRIDGE-MIB::PortList", "binary")
+CAPS = sm("BITS", "", "bits", "", [], [], [], [("dot1dExtendedFilteringServices", 0), ("dot1dTrafficClasses", 1), ("dot1qStaticEntryIndividualPort", 2),
+                                               ("dot1qIVLCapable", 3), ("dot1qSVLCapable", 4), ("dot1qHybridCapable", 5),
+                                               ("dot1qConfigurablePvidTagging", 6), ("dot1dLocalVlanCapable", 7)])
+ODD_BITS = sm("BITS", "", "bits", "", [], [], [], [("10BaseT", 0), ("xmlBit", 1), ("a-b", 2), ("_10BaseT", 3), ("dup", 3), ("far", 9)])
+SIZED_BITS = sm("BITS", "", "bits", "", [], [(1, 1)], [], [("a", 0), ("b", 1)])
+IPV4 = sm("IpAddress", "", "ipv4")
+OIDS = sm("OBJECT IDENTIFIER", "SNMPv2-TC::AutonomousType", "oid")
+OPAQUE = sm("Opaque", "", "opaque")
+FLOAT = sm("Opaque", "UCD-SNMP-MIB::Float", "opaque", "", [], [(7, 7)])
+UNKNOWN_CONV = sm("INTEGER", "", "complex")
+
+
+class Vec(object):
+    name: str
+    v: Value
+    s: ?mib.meta.SyntaxMeta
+    want: str
+
+    def __init__(self, name: str, v: Value, s: ?mib.meta.SyntaxMeta, want: str):
+        self.name = name
+        self.v = v
+        self.s = s
+        self.want = want
+
+
+def ostr(b: bytes) -> OctetString:
+    return OctetString(b)
+
+
+def vectors() -> list[Vec]:
+    return [
+        # int (int32 unless a range leaves it; INTEGER TCs with unsigned YANG types)
+        Vec("int", Integer(5), INTEGER, "ok:int:5"),
+        Vec("int negative", Integer(-5), INTEGER, "ok:int:-5"),
+        Vec("int beyond int32", Integer(2147483648), INTEGER, "malformed:out-of-range"),
+        Vec("int below int32", Integer(-2147483649), INTEGER, "malformed:out-of-range"),
+        Vec("int64 by range", Integer(34359738368), BIG_RANGE, "ok:int:34359738368"),
+        Vec("int outside the MIB range", Integer(0), IF_INDEX, "ok:int:0!range"),
+        Vec("int in range", Integer(7), IF_INDEX, "ok:int:7"),
+        Vec("int from Gauge32", Gauge32(7), INTEGER, "ok:int:7!tag-mismatch"),
+        Vec("int from TimeTicks", TimeTicks(8), INTEGER, "ok:int:8!tag-mismatch"),
+        Vec("int from huge Counter64", Counter64(u64(9223372036854775808)), INTEGER, "malformed:out-of-range"),
+        Vec("int from string", ostr(b"5"), INTEGER, "malformed:wrong-type"),
+        Vec("dscp", Integer(46), DSCP, "ok:uint:46"),
+        Vec("dscp outside 0..63", Integer(64), DSCP, "ok:uint:64!range"),
+        Vec("dscp negative", Integer(-1), DSCP, "malformed:out-of-range"),
+        Vec("dscp beyond uint8", Integer(256), DSCP, "malformed:out-of-range"),
+        Vec("flow label", Integer(1048575), FLOW_LABEL, "ok:uint:1048575"),
+        Vec("int-hint", Integer(1234), PERCENT, "ok:int:1234"),
+        # uint
+        Vec("counter32", Counter32(5), COUNTER32, "ok:uint:5"),
+        Vec("counter32 max", Counter32(4294967295), COUNTER32, "ok:uint:4294967295"),
+        Vec("counter32 from Gauge32", Gauge32(5), COUNTER32, "ok:uint:5!tag-mismatch"),
+        Vec("gauge32 from Integer", Integer(5), GAUGE32, "ok:uint:5!tag-mismatch"),
+        Vec("gauge32 from negative Integer", Integer(-1), GAUGE32, "malformed:out-of-range"),
+        Vec("counter32 from big Counter64", Counter64(u64(4294967296)), COUNTER32, "malformed:out-of-range"),
+        Vec("counter32 from small Counter64", Counter64(u64(42)), COUNTER32, "ok:uint:42!tag-mismatch"),
+        Vec("counter64", Counter64(u64(18446744073709551615)), COUNTER64, "ok:uint:18446744073709551615"),
+        Vec("timeticks", TimeTicks(12345), TIMETICKS, "ok:uint:12345"),
+        Vec("unsigned32 outside the range", Gauge32(11), UNSIGNED, "ok:uint:11!range"),
+        Vec("port number beyond uint16", Gauge32(70000), PORT, "malformed:out-of-range"),
+        Vec("port number", Gauge32(161), PORT, "ok:uint:161"),
+        Vec("uint from string", ostr(b"1"), COUNTER32, "malformed:wrong-type"),
+        # enum
+        Vec("enum", Integer(1), ADMIN, "ok:enum:up"),
+        Vec("enum unknown", Integer(7), ADMIN, "malformed:unknown-enum"),
+        Vec("enum duplicate value", Integer(1), DUP_ENUM, "ok:enum:first"),
+        Vec("enum from Gauge32", Gauge32(2), ADMIN, "ok:enum:down!tag-mismatch"),
+        Vec("enum from string", ostr(b"up"), ADMIN, "malformed:wrong-type"),
+        # truthvalue
+        Vec("true", Integer(1), TRUTH, "ok:boolean:true"),
+        Vec("false", Integer(2), TRUTH, "ok:boolean:false"),
+        Vec("truthvalue 0", Integer(0), TRUTH, "malformed:bad-truthvalue"),
+        Vec("truthvalue from octets", ostr(b"\x01"), TRUTH, "malformed:wrong-type"),
+        # string-hint (RFC mode)
+        Vec("display", ostr(b"eth0"), DISPLAY, "ok:string:eth0"),
+        Vec("display empty", ostr(b""), DISPLAY, "ok:string:"),
+        Vec("display NUL-terminated", ostr(b"eth0\x00\x00"), DISPLAY, "ok:string:eth0!trailing-nul"),
+        Vec("display UTF-8", ostr(b"caf\xc3\xa9"), DISPLAY, "ok:string:café"),
+        Vec("display Latin-1", ostr(b"caf\xe9"), DISPLAY, "ok:string:café!hint-fallback"),
+        Vec("display control", ostr(b"a\x01b"), DISPLAY, "ok:string:a" + chr(0xfffd) + "b!control-chars"),
+        Vec("display tab and line end", ostr(b"a\tb\r\n"), DISPLAY, "ok:string:a\tb\r\n"),
+        Vec("display too long", ostr(b"x" * 256), DISPLAY, "ok:string:" + "x" * 256 + "!size"),
+        Vec("admin string", ostr(b"\xe2\x82\xac 5"), ADMIN_STRING, "ok:string:€ 5"),
+        Vec("date and time", ostr(h("07 e6 0a 0b 0c 22 38 05 2b 02 00")), DATE, "ok:string:2022-10-11,12:34:56.5,+2:0"),
+        Vec("date and time local", ostr(h("07 e6 0a 0b 0c 22 38 05")), DATE, "ok:string:2022-10-11,12:34:56.5"),
+        Vec("ipv6 hint", ostr(h("20 01 0d b8 00 00 00 00 00 00 00 00 00 00 00 01")), INET_V6, "ok:string:2001:0db8:0000:0000:0000:0000:0000:0001"),
+        Vec("hex hint", ostr(h("00 1a")), HEX_HINT, "ok:string:00:1a"),
+        Vec("bad hint", ostr(h("01 02")), BAD_HINT, "ok:string:01:02!hint-fallback"),
+        Vec("string from Integer", Integer(1), DISPLAY, "malformed:wrong-type"),
+        # phys-address, mac-address
+        Vec("phys", ostr(h("00 1a 2b 3c 4d 5e")), PHYS, "ok:string:00:1a:2b:3c:4d:5e"),
+        Vec("phys empty", ostr(b""), PHYS, "ok:string:"),
+        Vec("phys long", ostr(h("00 1a 2b 3c 4d 5e 6f 70")), PHYS, "ok:string:00:1a:2b:3c:4d:5e:6f:70"),
+        Vec("mac", ostr(h("0a 0b 0c 0d 0e 0f")), MAC, "ok:string:0a:0b:0c:0d:0e:0f"),
+        Vec("mac short", ostr(h("00 1a")), MAC, "ok:string:00:1a!size"),
+        Vec("mac short, no SIZE", ostr(h("00 1a")), MAC_NOSIZE, "ok:string:00:1a!size"),
+        Vec("phys from IpAddress", IpAddress(h("c0 00 02 01")), PHYS, "malformed:wrong-type"),
+        # binary
+        Vec("binary", ostr(h("c0 00 02 01")), BINARY, "ok:binary:c0000201"),
+        Vec("port list", ostr(h("ff 00 80")), PORT_LIST, "ok:binary:ff0080"),
+        Vec("binary from IpAddress", IpAddress(h("c0 00 02 01")), BINARY, "malformed:wrong-type"),
+        # bits (P-BRIDGE-MIB dot1dDeviceCapabilities)
+        Vec("bits", ostr(h("c0")), CAPS, "ok:bits:dot1dExtendedFilteringServices dot1dTrafficClasses"),
+        Vec("bits none", ostr(b""), CAPS, "ok:bits:"),
+        Vec("bits zero", ostr(h("00")), CAPS, "ok:bits:"),
+        Vec("bits unknown", ostr(h("01 01")), CAPS, "ok:bits:dot1dLocalVlanCapable!unknown-bits"),
+        Vec("bits YANG names", ostr(h("f0 40")), ODD_BITS, "ok:bits:_10BaseT _xmlBit a-b _10BaseT_2 far"),
+        Vec("bits from Integer", Integer(1), CAPS, "malformed:wrong-type"),
+        # ipv4
+        Vec("ipv4", IpAddress(h("c0 00 02 01")), IPV4, "ok:string:192.0.2.1"),
+        Vec("ipv4 from octets", ostr(h("0a 00 00 01")), IPV4, "ok:string:10.0.0.1!tag-mismatch"),
+        Vec("ipv4 of 5 octets", IpAddress(h("c0 00 02 01 05")), IPV4, "malformed:bad-length"),
+        Vec("ipv4 from Integer", Integer(1), IPV4, "malformed:wrong-type"),
+        # oid
+        Vec("oid", ObjectIdentifier(Oid.parse("1.3.6.1.4.1.8072.3.2.10")), OIDS, "ok:string:1.3.6.1.4.1.8072.3.2.10"),
+        Vec("oid zeroDotZero", ObjectIdentifier(Oid.parse("0.0")), OIDS, "ok:string:0.0"),
+        Vec("oid one arc", ObjectIdentifier(Oid([5])), OIDS, "malformed:bad-oid"),
+        Vec("oid first arc 3", ObjectIdentifier(Oid([3, 1])), OIDS, "malformed:bad-oid"),
+        Vec("oid second arc 40", ObjectIdentifier(Oid([1, 40])), OIDS, "malformed:bad-oid"),
+        Vec("oid 2.999", ObjectIdentifier(Oid([2, 999])), OIDS, "ok:string:2.999"),
+        Vec("oid 129 arcs", ObjectIdentifier(Oid([1, 3] + [1] * 127)), OIDS, "malformed:bad-oid"),
+        Vec("oid from octets", ostr(b"1.3"), OIDS, "malformed:wrong-type"),
+        # opaque (raw contents by default)
+        Vec("opaque", Opaque(h("9f 78 04 3f c0 00 00")), FLOAT, "ok:binary:9f78043fc00000"),
+        Vec("opaque other", Opaque(h("01 02")), OPAQUE, "ok:binary:0102"),
+        Vec("opaque from octets", ostr(h("01")), OPAQUE, "malformed:wrong-type"),
+        # no syntax: by tag
+        Vec("raw Integer", Integer(3), None, "ok:int:3"),
+        Vec("raw octets", ostr(b"ab"), None, "ok:binary:6162"),
+        Vec("raw Counter32", Counter32(3), None, "ok:uint:3"),
+        Vec("raw Gauge32", Gauge32(3), None, "ok:uint:3"),
+        Vec("raw TimeTicks", TimeTicks(3), None, "ok:uint:3"),
+        Vec("raw Counter64", Counter64(u64(3)), None, "ok:uint:3"),
+        Vec("raw IpAddress", IpAddress(h("0a 00 00 01")), None, "ok:string:10.0.0.1"),
+        Vec("raw IpAddress of 3 octets", IpAddress(h("0a 00 00")), None, "malformed:bad-length"),
+        Vec("raw OID", ObjectIdentifier(Oid.parse("1.3.6")), None, "ok:string:1.3.6"),
+        Vec("raw Opaque", Opaque(h("01")), None, "ok:binary:01"),
+        Vec("raw unknown tag", UnknownValue(0x47, h("01")), None, "malformed:wrong-type"),
+        # absent and malformed values
+        Vec("noSuchObject", NoSuchObject(), ADMIN, "absent:no-such-object"),
+        Vec("noSuchInstance", NoSuchInstance(), DISPLAY, "absent:no-such-instance"),
+        Vec("endOfMibView", EndOfMibView(), COUNTER64, "absent:end-of-mib-view"),
+        Vec("NULL", Null(), INTEGER, "absent:null"),
+        Vec("raw noSuchInstance", NoSuchInstance(), None, "absent:no-such-instance"),
+        Vec("malformed INTEGER", MalformedValue(0x02, b"", "empty INTEGER"), INTEGER, "malformed:malformed"),
+        Vec("malformed raw", MalformedValue(0x41, h("01 00 00 00 00"), "Counter32 above 2^32-1"), None, "malformed:malformed"),
+        Vec("NsapAddress", UnknownValue(0x45, h("01")), DISPLAY, "malformed:wrong-type"),
+        Vec("unknown conversion kind", Integer(1), UNKNOWN_CONV, "malformed:unknown-conv"),
+    ]
+
+
+def _test_vectors() -> None:
+    """Every vector converts to its expected brief form."""
+    bad: list[str] = []
+    for t in vectors():
+        got = conv.convert(t.v, t.s).brief()
+        if got != t.want:
+            bad.append(t.name + ": got " + repr(got) + ", want " + repr(t.want))
+    testing.assertEqual(bad, [])
+
+
+# vectors whose clean results do not round-trip, and why
+NO_ROUND_TRIP: dict[str, str] = {
+    "int64 by range": "an INTEGER beyond Integer32 cannot be sent (values.Integer.encode refuses it)",
+    "bits zero": "BITS are sent with as many octets as the highest set bit needs (00 -> empty)",
+}
+
+
+def _test_round_trips() -> None:
+    """Every clean result (and the trailing-NUL one, minus its NULs) converts back to the wire
+    value it came from, except NO_ROUND_TRIP."""
+    bad: list[str] = []
+    n = 0
+    for t in vectors():
+        s = t.s
+        if s is not None and t.name not in NO_ROUND_TRIP:
+            r = conv.convert(t.v, s)
+            x = r.value
+            if x is not None and (r.clean() or r.code == "trailing-nul"):
+                n += 1
+                want = t.v
+                if r.code == "trailing-nul":
+                    want = OctetString(b"eth0")
+                try:
+                    back = conv.to_value(x, s)
+                    if not back.equals(want):
+                        bad.append(t.name + ": " + repr(back) + " != " + repr(want))
+                except errors.EncodeError as e:
+                    bad.append(t.name + ": " + e.error_message)
+    testing.assertEqual(bad, [])
+    testing.assertTrue(n >= 40, "round trips: %d" % n)
+
+
+def enc_fails(x: value, s: mib.meta.SyntaxMeta, what: str, opts: conv.Options=conv.Options()) -> None:
+    try:
+        v = conv.to_value(x, s, opts)
+        testing.error("no EncodeError: " + what + " gave " + repr(v))
+    except errors.EncodeError:
+        pass
+
+
+def _test_to_value() -> None:
+    """The inverse builds the MIB's wire type and refuses what does not fit the syntax."""
+    testing.assertEqual(conv.to_value(u64(5), COUNTER32), Counter32(5))
+    testing.assertEqual(conv.to_value(5, GAUGE32), Gauge32(5))
+    testing.assertEqual(conv.to_value(u64(5), TIMETICKS), TimeTicks(5))
+    testing.assertEqual(conv.to_value(5, COUNTER64), Counter64(u64(5)))
+    testing.assertEqual(conv.to_value(u64(46), DSCP), Integer(46))
+    testing.assertEqual(conv.to_value(46, DSCP), Integer(46))
+    testing.assertEqual(conv.to_value("testing", ADMIN), Integer(3))
+    testing.assertEqual(conv.to_value("second", DUP_ENUM), Integer(1))
+    testing.assertEqual(conv.to_value(False, TRUTH), Integer(2))
+    testing.assertEqual(conv.to_value("00:1a:2b:3c:4d:5e", PHYS), OctetString(h("00 1a 2b 3c 4d 5e")))
+    testing.assertEqual(conv.to_value("0:1A:2b:3c:4d:5e", MAC), OctetString(h("00 1a 2b 3c 4d 5e")))
+    testing.assertEqual(conv.to_value("", PHYS), OctetString(b""))
+    testing.assertEqual(conv.to_value(["dot1qIVLCapable", "dot1dExtendedFilteringServices"], CAPS), OctetString(h("90")))
+    testing.assertEqual(conv.to_value(["xmlBit", "_xmlBit", "dup"], ODD_BITS), OctetString(h("50")), "MIB labels and YANG names")
+    testing.assertEqual(conv.to_value(["far"], ODD_BITS), OctetString(h("00 40")))
+    testing.assertEqual(conv.to_value([], SIZED_BITS), OctetString(h("00")), "padded to the smallest SIZE")
+    testing.assertEqual(conv.to_value([], CAPS), OctetString(b""))
+    testing.assertEqual(conv.to_value("10.0.0.1", IPV4), IpAddress(h("0a 00 00 01")))
+    testing.assertEqual(conv.to_value("1.3.6.1", OIDS), ObjectIdentifier(Oid.parse("1.3.6.1")))
+    testing.assertEqual(conv.to_value("2001:0db8:0:0:0:0:0:1", INET_V6), OctetString(h("20 01 0d b8 00 00 00 00 00 00 00 00 00 00 00 01")))
+    testing.assertEqual(conv.to_value("é", DISPLAY), OctetString(b"\xc3\xa9"))
+    testing.assertEqual(conv.to_value(b"\x01", BINARY), OctetString(b"\x01"))
+    testing.assertEqual(conv.to_value(b"\x01", OPAQUE), Opaque(b"\x01"))
+    testing.assertEqual(conv.to_value(1234, PERCENT), Integer(1234))
+    enc_fails("5", INTEGER, "a string for an INTEGER")
+    enc_fails(True, INTEGER, "a boolean for an INTEGER")
+    enc_fails(2147483648, INTEGER, "beyond Integer32")
+    enc_fails(34359738368, BIG_RANGE, "beyond Integer32 within a wider MIB range")
+    testing.assertEqual(conv.to_value(conv.convert(OctetString(h("00")), CAPS).as_names()!, CAPS), OctetString(b""))
+    enc_fails(0, IF_INDEX, "outside the MIB range")
+    testing.assertEqual(conv.to_value(0, IF_INDEX, conv.Options(check_ranges=False)), Integer(0))
+    enc_fails(-1, DSCP, "a negative Dscp")
+    enc_fails(64, DSCP, "a Dscp outside 0..63")
+    enc_fails(-1, GAUGE32, "a negative Gauge32")
+    enc_fails(u64(4294967296), COUNTER32, "beyond Counter32")
+    enc_fails(70000, PORT, "beyond uint16")
+    enc_fails("bogus", ADMIN, "an unknown label")
+    enc_fails("7", ADMIN, "a number without the number mode")
+    testing.assertEqual(conv.to_value("7", ADMIN, conv.Options(unknown_enum="number")), Integer(7))
+    testing.assertEqual(conv.to_value("-7", ADMIN, conv.Options(unknown_enum="number")), Integer(-7))
+    # a number outside Integer32 is refused here, not only later by encode()
+    enc_fails("9999999999", ADMIN, "an enumeration number beyond Integer32", conv.Options(unknown_enum="number"))
+    enc_fails("2147483648", ADMIN, "an enumeration number beyond Integer32", conv.Options(unknown_enum="number"))
+    enc_fails("-2147483649", ADMIN, "an enumeration number below Integer32", conv.Options(unknown_enum="number"))
+    testing.assertEqual(conv.to_value("-2147483648", ADMIN, conv.Options(unknown_enum="number")), Integer(-2147483648))
+    enc_fails(1, TRUTH, "an int for a TruthValue")
+    enc_fails("x" * 256, DISPLAY, "beyond SIZE (0..255)")
+    enc_fails(5, DISPLAY, "an int for a string")
+    enc_fails("zz", PHYS, "not hex")
+    enc_fails("00:1a:2b", MAC, "a MAC address of 3 octets")
+    enc_fails("00:1a:2b", MAC_NOSIZE, "a MAC address of 3 octets without SIZE")
+    enc_fails("001a2b3c4d5e", PHYS, "hex without separators")
+    enc_fails(["nope"], CAPS, "an unknown bit")
+    enc_fails([1], CAPS, "a bit number")
+    enc_fails("300.1.1.1", IPV4, "an octet above 255")
+    enc_fails("1.2.3", IPV4, "three octets")
+    enc_fails("1.2.3.4%1", IPV4, "a zone")
+    enc_fails("01.2.3.4", IPV4, "a leading zero")
+    enc_fails("1.3..6", OIDS, "an empty arc")
+    enc_fails("5", OIDS, "one arc")
+    enc_fails("1.40", OIDS, "second arc 40")
+    enc_fails("abc", BINARY, "a string for binary")
+    enc_fails(1.5, OPAQUE, "a float without opaque_special")
+    enc_fails(1, BAD_HINT, "a hint that does not parse")
+    enc_fails(1, UNKNOWN_CONV, "an unknown conversion kind")
+
+
+def _test_unknown_enum_number() -> None:
+    """unknown_enum="number": the number as the label, with the code as a warning."""
+    o = conv.Options(unknown_enum="number")
+    testing.assertEqual(conv.convert(Integer(7), ADMIN, o).brief(), "ok:enum:7!unknown-enum")
+    testing.assertEqual(conv.convert(Integer(-3), ADMIN, o).brief(), "ok:enum:-3!unknown-enum")
+    testing.assertEqual(conv.convert(Integer(1), ADMIN, o).brief(), "ok:enum:up")
+    testing.assertEqual(conv.Options(unknown_enum="other").unknown_enum, "error")
+
+
+def _test_strict() -> None:
+    """strict: the lenient warnings become MALFORMED, the others stay warnings."""
+    o = conv.Options(strict=True)
+    testing.assertEqual(conv.convert(Integer(0), IF_INDEX, o).brief(), "malformed:range")
+    testing.assertEqual(conv.convert(OctetString(b"x" * 256), DISPLAY, o).brief(), "malformed:size")
+    testing.assertEqual(conv.convert(OctetString(h("01 01")), CAPS, o).brief(), "malformed:unknown-bits")
+    testing.assertEqual(conv.convert(OctetString(b"caf\xe9"), DISPLAY, o).brief(), "malformed:hint-fallback")
+    testing.assertEqual(conv.convert(Gauge32(5), COUNTER32, o).brief(), "ok:uint:5!tag-mismatch")
+    testing.assertEqual(conv.convert(OctetString(b"a\x01"), DISPLAY, o).brief(), "ok:string:a" + chr(0xfffd) + "!control-chars")
+    testing.assertEqual(conv.convert(OctetString(b"r\xc3\xa4ksm\xc3"), ADMIN_STRING, o).brief(), "malformed:truncated-utf8")
+    # a lenient warning after another one still counts
+    g = conv.convert(Gauge32(0), IF_INDEX, o)
+    testing.assertEqual(g.brief(), "malformed:range")
+    testing.assertEqual(g.diag, "Gauge32 where the MIB has INTEGER; 0 outside the range 1..2147483647")
+    testing.assertEqual(conv.convert(Gauge32(0), IF_INDEX).brief(), "ok:int:0!tag-mismatch", "not strict: the first warning")
+
+
+def _test_truncated_utf8() -> None:
+    """A `t` hint that drops a trailing partial UTF-8 character (an agent cut the value at its
+    SIZE) gives the warning truncated-utf8 (lenient), not a clean result."""
+    r = conv.convert(OctetString(b"r\xc3\xa4ksm\xc3"), ADMIN_STRING)
+    testing.assertEqual(r.brief(), "ok:string:r" + chr(0xe4) + "ksm!truncated-utf8")
+    testing.assertEqual(r.diag, "1 octets of an incomplete UTF-8 character dropped")
+    testing.assertEqual(conv.convert(OctetString(b"r\xc3\xa4ksm\xc3\xb6"), ADMIN_STRING).brief(), "ok:string:r" + chr(0xe4) + "ksm" + chr(0xf6))
+    testing.assertEqual(conv.convert(OctetString(b"r\xc3\xa4ksm\xc3"), DISPLAY).brief(),
+                        "ok:string:r" + chr(0xc3) + chr(0xa4) + "ksm" + chr(0xc3) + "!hint-fallback", "an `a` hint reads invalid UTF-8 as Latin-1")
+    testing.assertTrue("truncated-utf8" in conv.LENIENT)
+
+
+def _test_warnings_accumulate() -> None:
+    """The first warning is the code, the diagnostic lists all."""
+    r = conv.convert(Gauge32(0), IF_INDEX)
+    testing.assertEqual(r.code, "tag-mismatch")
+    testing.assertEqual(r.diag, "Gauge32 where the MIB has INTEGER; 0 outside the range 1..2147483647")
+    testing.assertEqual(r.as_int(), 0)
+    testing.assertTrue(r.ok())
+    testing.assertFalse(r.clean())
+
+
+def _test_from_index() -> None:
+    """Index values carry the index encoding's tag: no tag-mismatch."""
+    testing.assertEqual(conv.convert(Integer(5), GAUGE32, conv.Options(), True).brief(), "ok:uint:5")
+    testing.assertEqual(conv.convert(Integer(5), TIMETICKS, conv.Options(), True).brief(), "ok:uint:5")
+    testing.assertEqual(conv.convert(Integer(5), GAUGE32).brief(), "ok:uint:5!tag-mismatch")
+
+
+def _test_mib_labels() -> None:
+    """yang_names=False: the MIB labels, the first one of a position."""
+    o = conv.Options(yang_names=False)
+    testing.assertEqual(conv.convert(OctetString(h("f0 40")), ODD_BITS, o).brief(), "ok:bits:10BaseT xmlBit a-b _10BaseT far")
+    testing.assertEqual(conv.to_value(["10BaseT", "far"], ODD_BITS, o), OctetString(h("80 40")))
+
+
+def _test_yang_identifiers() -> None:
+    """conv's bit names equal the emitter's identifier rewriting."""
+    for lbl in ["up", "10BaseT", "xmlBit", "XMLx", "a-b", "a.b", "a b", "a$b", "_x", "9", "", "ä"]:
+        testing.assertEqual(conv.yang_identifier(lbl), mib.yang.rewrite_identifier(lbl), lbl)
+    testing.assertEqual(conv.yang_bit_names([("a", 0), ("a", 1), ("b", 1), ("a_2", 2)]), {0: "a", 1: "a_2", 2: "a_2_2"})
+
+
+def _test_opaque_special() -> None:
+    """net-snmp's Opaque types (opaque_special): Float, Double, I64, U64, Counter64, both ways."""
+    o = conv.Options(opaque_special=True)
+    vecs: list[(bytes, str)] = [
+        (h("9f 78 04 3f c0 00 00"), "ok:float:1.5"),
+        (h("9f 78 04 c0 49 0f db"), "ok:float:-3.1415927410125732"),
+        (h("9f 79 08 3f f8 00 00 00 00 00 00"), "ok:float:1.5"),
+        (h("9f 79 08 40 09 21 fb 54 44 2d 18"), "ok:float:3.141592653589793"),
+        (h("9f 7a 01 ff"), "ok:int:-1"),
+        (h("9f 7a 08 7f ff ff ff ff ff ff ff"), "ok:int:9223372036854775807"),
+        (h("9f 7b 09 00 ff ff ff ff ff ff ff ff"), "ok:uint:18446744073709551615"),
+        (h("9f 76 01 05"), "ok:uint:5"),
+        (h("9f 78 03 3f c0 00"), "ok:binary:9f78033fc000"),
+        (h("01 02"), "ok:binary:0102"),
+    ]
+    for t in vecs:
+        testing.assertEqual(conv.convert(Opaque(t.0), OPAQUE, o).brief(), t.1, t.0.hex())
+    testing.assertEqual(conv.to_value(1.5, FLOAT, o), Opaque(h("9f 78 04 3f c0 00 00")))
+    testing.assertEqual(conv.to_value(1.5, OPAQUE, o), Opaque(h("9f 79 08 3f f8 00 00 00 00 00 00")))
+    testing.assertEqual(conv.to_value(-1, OPAQUE, o), Opaque(h("9f 7a 01 ff")))
+    testing.assertEqual(conv.to_value(128, OPAQUE, o), Opaque(h("9f 7a 02 00 80")))
+    testing.assertEqual(conv.to_value(u64(18446744073709551615), OPAQUE, o), Opaque(h("9f 7b 09 00 ff ff ff ff ff ff ff ff")))
+    testing.assertEqual(conv.to_value(b"\x01", OPAQUE, o), Opaque(b"\x01"))
+    # Float: round to nearest even, subnormals, the extremes
+    fl: list[(float, str)] = [(0.1, "3dcccccd"), (-2.0, "c0000000"), (0.0, "00000000"), (1e-45, "00000001"),
+                              (3.4028234663852886e38, "7f7fffff"), (1e39, "7f800000"), (16777217.0, "4b800000"),
+                              (1.401298464324817e-45 * 3.0, "00000003")]
+    for f in fl:
+        testing.assertEqual(conv.to_value(f.0, FLOAT, o), Opaque(h("9f 78 04 " + f.1)), str(f.0))
+    db: list[(float, str)] = [(0.1, "3fb999999999999a"), (-0.5, "bfe0000000000000"), (5e-324, "0000000000000001"),
+                              (1.7976931348623157e308, "7fefffffffffffff")]
+    for d in db:
+        testing.assertEqual(conv.to_value(d.0, OPAQUE, o), Opaque(h("9f 79 08 " + d.1)), str(d.0))
+    # Float and Double back to the same octets
+    for raw in ["3dcccccd", "c0490fdb", "00000001", "7f7fffff", "80000000", "7f800000", "ff800000"]:
+        r = conv.convert(Opaque(h("9f 78 04 " + raw)), FLOAT, o)
+        x = r.value
+        if x is not None:
+            testing.assertEqual(conv.to_value(x, FLOAT, o), Opaque(h("9f 78 04 " + raw)), raw)
+    nan = conv.convert(Opaque(h("9f 79 08 7f f8 00 00 00 00 00 00")), OPAQUE, o).as_float()
+    if nan is not None:
+        testing.assertTrue(nan != nan, "NaN")
+    # integer conversions take net-snmp's 64-bit Opaques as a tag mismatch
+    testing.assertEqual(conv.convert(Opaque(h("9f 76 01 05")), COUNTER64, o).brief(), "ok:uint:5!tag-mismatch")
+    testing.assertEqual(conv.convert(Opaque(h("9f 7a 01 ff")), INTEGER, o).brief(), "ok:int:-1!tag-mismatch")
+    testing.assertEqual(conv.convert(Opaque(h("9f 7a 01 ff")), COUNTER64, o).brief(), "malformed:out-of-range")
+    testing.assertEqual(conv.convert(Opaque(h("9f 76 01 05")), COUNTER64).brief(), "malformed:wrong-type")
+
+
+def _test_unsigned_chain() -> None:
+    """A TC derived from Dscp is unsigned when the converter knows the chain; unsigned_tcs can
+    name more TCs."""
+    my = sm("INTEGER", "X-MIB::MyDscp", "int", "", [(0, 63)])
+    testing.assertEqual(conv.converter(my).convert(Integer(10)).brief(), "ok:int:10")
+    testing.assertEqual(conv.converter(my, conv.Options(), ["DIFFSERV-DSCP-TC::Dscp"]).convert(Integer(10)).brief(), "ok:uint:10")
+    testing.assertEqual(conv.converter(my, conv.Options(unsigned_tcs={"X-MIB::MyDscp": 255})).convert(Integer(10)).brief(), "ok:uint:10")
+    testing.assertEqual(conv.converter(DSCP, conv.Options(unsigned_tcs={})).convert(Integer(10)).brief(), "ok:int:10")
+
+
+def _test_result_accessors() -> None:
+    testing.assertEqual(conv.convert(Integer(5), INTEGER).as_int(), 5)
+    testing.assertEqual(conv.convert(Counter32(5), COUNTER32).as_u64(), u64(5))
+    testing.assertEqual(conv.convert(Integer(1), TRUTH).as_bool(), True)
+    testing.assertEqual(conv.convert(Integer(1), ADMIN).as_str(), "up")
+    testing.assertEqual(conv.convert(OctetString(b"\x01"), BINARY).as_bytes(), b"\x01")
+    testing.assertEqual(conv.convert(OctetString(h("c0")), CAPS).as_names(), ["dot1dExtendedFilteringServices", "dot1dTrafficClasses"])
+    testing.assertNone(conv.convert(Integer(5), INTEGER).as_str())
+    testing.assertNone(conv.convert(NoSuchObject(), INTEGER).value)
+    testing.assertEqual(repr(conv.convert(Integer(7), ADMIN)), "Result(malformed:unknown-enum, '7 is not a value of the enumeration')")
+    testing.assertEqual(repr(conv.convert(Integer(1), ADMIN)), "Result(ok:enum:up)")
+    testing.assertEqual(conv.convert(MalformedValue(0x02, b"", "empty INTEGER"), INTEGER).diag, "Malformed tag 0x02: empty INTEGER")
+    for c in ["no-such-object", "malformed", "wrong-type", "tag-mismatch", "out-of-range", "range", "size", "unknown-enum",
+              "bad-truthvalue", "unknown-bits", "bad-length", "bad-oid", "hint-fallback", "control-chars", "trailing-nul",
+              "truncated-utf8"]:
+        testing.assertTrue(c in conv.CODES, c)
+
+
+# --- syntaxes the resolver derives -------------------------------------------------------------------
+
+C_MIB = r"""C-MIB DEFINITIONS ::= BEGIN
+IMPORTS
+    MODULE-IDENTITY, OBJECT-TYPE, Integer32, Unsigned32, Counter64, enterprises FROM SNMPv2-SMI
+    TEXTUAL-CONVENTION, DisplayString, PhysAddress, MacAddress, TruthValue, DateAndTime, RowStatus FROM SNMPv2-TC;
+cMIB MODULE-IDENTITY LAST-UPDATED "202610110000Z" ORGANIZATION "o" CONTACT-INFO "c" DESCRIPTION "d" ::= { enterprises 99996 }
+Percent ::= TEXTUAL-CONVENTION DISPLAY-HINT "d-2" STATUS current DESCRIPTION "p" SYNTAX Integer32 (0..10000)
+Flags ::= TEXTUAL-CONVENTION STATUS current DESCRIPTION "f" SYNTAX BITS { up(0), running(1), 10mbps(2) }
+cObjects OBJECT IDENTIFIER ::= { cMIB 1 }
+cName OBJECT-TYPE SYNTAX DisplayString (SIZE (0..32)) MAX-ACCESS read-only STATUS current DESCRIPTION "n" ::= { cObjects 1 }
+cMac OBJECT-TYPE SYNTAX MacAddress MAX-ACCESS read-only STATUS current DESCRIPTION "m" ::= { cObjects 2 }
+cPhys OBJECT-TYPE SYNTAX PhysAddress MAX-ACCESS read-only STATUS current DESCRIPTION "p" ::= { cObjects 3 }
+cOn OBJECT-TYPE SYNTAX TruthValue MAX-ACCESS read-only STATUS current DESCRIPTION "o" ::= { cObjects 4 }
+cDate OBJECT-TYPE SYNTAX DateAndTime MAX-ACCESS read-only STATUS current DESCRIPTION "d" ::= { cObjects 5 }
+cPct OBJECT-TYPE SYNTAX Percent MAX-ACCESS read-only STATUS current DESCRIPTION "p" ::= { cObjects 6 }
+cFlags OBJECT-TYPE SYNTAX Flags MAX-ACCESS read-only STATUS current DESCRIPTION "f" ::= { cObjects 7 }
+cStatus OBJECT-TYPE SYNTAX RowStatus MAX-ACCESS read-only STATUS current DESCRIPTION "s" ::= { cObjects 8 }
+cBig OBJECT-TYPE SYNTAX Counter64 MAX-ACCESS read-only STATUS current DESCRIPTION "b" ::= { cObjects 9 }
+cRaw OBJECT-TYPE SYNTAX OCTET STRING (SIZE (4)) MAX-ACCESS read-only STATUS current DESCRIPTION "r" ::= { cObjects 10 }
+cLevel OBJECT-TYPE SYNTAX INTEGER { low(1), high(2) } MAX-ACCESS read-only STATUS current DESCRIPTION "l" ::= { cObjects 11 }
+cUnits OBJECT-TYPE SYNTAX Unsigned32 (1..100) MAX-ACCESS read-only STATUS current DESCRIPTION "u" ::= { cObjects 12 }
+END
+"""
+
+
+def _test_resolved_syntaxes() -> None:
+    """Values of the syntaxes the resolver and mibmeta derive from a MIB text."""
+    ms = mib.resolver.resolve_texts([C_MIB])
+    mm = mib.meta.module_meta(ms, "C-MIB")
+    ix = mib.meta.MetaIndex(mib.meta.MibBundle([mm!]))
+
+    def conv_of(name: str, v: Value) -> str:
+        n = ix.find(name)
+        if n is not None:
+            sx = n.syntax
+            if sx is not None:
+                return sx.conv + " " + conv.convert(v, sx).brief()
+            return "no syntax"
+        return "no node " + name
+
+    testing.assertEqual(conv_of("cName", OctetString(b"x")), "string-hint ok:string:x")
+    testing.assertEqual(conv_of("cName", OctetString(b"x" * 33)), "string-hint ok:string:" + "x" * 33 + "!size")
+    testing.assertEqual(conv_of("cMac", OctetString(h("00 00 5e 00 53 01"))), "mac-address ok:string:00:00:5e:00:53:01")
+    testing.assertEqual(conv_of("cPhys", OctetString(h("0a"))), "phys-address ok:string:0a")
+    testing.assertEqual(conv_of("cOn", Integer(2)), "truthvalue ok:boolean:false")
+    testing.assertEqual(conv_of("cDate", OctetString(h("07 ea 0a 0b 0c 00 00 00"))), "string-hint ok:string:2026-10-11,12:0:0.0")
+    testing.assertEqual(conv_of("cPct", Integer(1234)), "int-hint ok:int:1234")
+    testing.assertEqual(conv_of("cPct", Integer(10001)), "int-hint ok:int:10001!range")
+    testing.assertEqual(conv_of("cFlags", OctetString(h("a0"))), "bits ok:bits:up _10mbps")
+    testing.assertEqual(conv_of("cStatus", Integer(4)), "enum ok:enum:createAndGo")
+    testing.assertEqual(conv_of("cBig", Counter64(u64(1) << 40)), "uint ok:uint:1099511627776")
+    testing.assertEqual(conv_of("cRaw", OctetString(h("01 02 03"))), "binary ok:binary:010203!size")
+    testing.assertEqual(conv_of("cLevel", Integer(2)), "enum ok:enum:high")
+    testing.assertEqual(conv_of("cUnits", Gauge32(0)), "uint ok:uint:0!range")
+    flags = ix.find("cFlags")
+    if flags is not None:
+        sx = flags.syntax
+        if sx is not None:
+            testing.assertEqual(conv.to_value(["_10mbps", "running"], sx), OctetString(h("60")))
+
+
+# The YANG builtin type along the TC chain: a column refining a wide TC, and a TC derived from
+# Dscp converted through conv.convert
+
+R_DSCP_MIB = r"""DIFFSERV-DSCP-TC DEFINITIONS ::= BEGIN
+IMPORTS MODULE-IDENTITY, Integer32, mib-2 FROM SNMPv2-SMI TEXTUAL-CONVENTION FROM SNMPv2-TC;
+diffServDSCPTC MODULE-IDENTITY LAST-UPDATED "200205090000Z" ORGANIZATION "o" CONTACT-INFO "c" DESCRIPTION "d" ::= { mib-2 96 }
+Dscp ::= TEXTUAL-CONVENTION DISPLAY-HINT "d" STATUS current DESCRIPTION "d" SYNTAX Integer32 (0..63)
+END
+"""
+
+R_INET_MIB = r"""INET-ADDRESS-MIB DEFINITIONS ::= BEGIN
+IMPORTS MODULE-IDENTITY, Unsigned32, mib-2 FROM SNMPv2-SMI TEXTUAL-CONVENTION FROM SNMPv2-TC;
+inetAddressMIB MODULE-IDENTITY LAST-UPDATED "200502040000Z" ORGANIZATION "o" CONTACT-INFO "c" DESCRIPTION "d" ::= { mib-2 76 }
+InetPortNumber ::= TEXTUAL-CONVENTION DISPLAY-HINT "d" STATUS current DESCRIPTION "p" SYNTAX Unsigned32 (0..65535)
+END
+"""
+
+R_MIB = r"""R-MIB DEFINITIONS ::= BEGIN
+IMPORTS
+    MODULE-IDENTITY, OBJECT-TYPE, Integer32, Unsigned32, Counter64, enterprises FROM SNMPv2-SMI
+    TEXTUAL-CONVENTION FROM SNMPv2-TC
+    Dscp FROM DIFFSERV-DSCP-TC
+    InetPortNumber FROM INET-ADDRESS-MIB;
+rMIB MODULE-IDENTITY LAST-UPDATED "202610110000Z" ORGANIZATION "o" CONTACT-INFO "c" DESCRIPTION "d" ::= { enterprises 99993 }
+Big ::= TEXTUAL-CONVENTION STATUS current DESCRIPTION "b" SYNTAX INTEGER (0..4294967295)
+Narrow ::= TEXTUAL-CONVENTION STATUS current DESCRIPTION "n" SYNTAX Big (0..10)
+MyDscp ::= TEXTUAL-CONVENTION STATUS current DESCRIPTION "m" SYNTAX Dscp
+MyPort ::= TEXTUAL-CONVENTION STATUS current DESCRIPTION "p" SYNTAX InetPortNumber (1..1024)
+rObjects OBJECT IDENTIFIER ::= { rMIB 1 }
+rBig OBJECT-TYPE SYNTAX Big (0..10) MAX-ACCESS read-only STATUS current DESCRIPTION "b" ::= { rObjects 1 }
+rBigPlain OBJECT-TYPE SYNTAX Big MAX-ACCESS read-only STATUS current DESCRIPTION "b" ::= { rObjects 2 }
+rDscp OBJECT-TYPE SYNTAX MyDscp MAX-ACCESS read-only STATUS current DESCRIPTION "d" ::= { rObjects 3 }
+rNarrow OBJECT-TYPE SYNTAX Narrow MAX-ACCESS read-only STATUS current DESCRIPTION "n" ::= { rObjects 4 }
+rInt OBJECT-TYPE SYNTAX Integer32 (0..10) MAX-ACCESS read-only STATUS current DESCRIPTION "i" ::= { rObjects 5 }
+rPort OBJECT-TYPE SYNTAX MyPort MAX-ACCESS read-only STATUS current DESCRIPTION "p" ::= { rObjects 6 }
+rWide OBJECT-TYPE SYNTAX INTEGER (-1..4294967296) MAX-ACCESS read-only STATUS current DESCRIPTION "w" ::= { rObjects 7 }
+rCount OBJECT-TYPE SYNTAX Counter64 MAX-ACCESS read-only STATUS current DESCRIPTION "c" ::= { rObjects 8 }
+END
+"""
+
+
+def _test_builtin_from_tc_chain() -> None:
+    """mibmeta records the YANG builtin type the emitter gives an integer leaf along the TC chain
+    (SyntaxMeta.builtin), and conv.convert / to_value use it without a TC chain."""
+    ms = mib.resolver.resolve_texts([R_DSCP_MIB, R_INET_MIB, R_MIB])
+    mm = mib.meta.module_meta(ms, "R-MIB")
+    ix = mib.meta.MetaIndex(mib.meta.MibBundle([mm!]))
+
+    def syn(name: str) -> mib.meta.SyntaxMeta:
+        n = ix.find(name)
+        if n is not None:
+            sx = n.syntax
+            if sx is not None:
+                return sx
+        raise ValueError("no syntax of " + name)
+
+    testing.assertEqual([syn(n).conv + ":" + syn(n).builtin for n in ["rBig", "rBigPlain", "rDscp", "rNarrow", "rInt", "rPort", "rWide", "rCount"]],
+                        ["int:int64", "int:int64", "int:uint8", "int:int64", "int:", "uint:uint16", "int:int64", "uint:"])
+    testing.assertEqual(conv.convert(Integer(3000000000), syn("rBig")).brief(), "ok:int:3000000000!range", "int64 holds it; outside 0..10")
+    testing.assertEqual(conv.convert(Integer(3000000000), syn("rBigPlain")).brief(), "ok:int:3000000000")
+    testing.assertEqual(conv.convert(Integer(3000000000), syn("rNarrow")).brief(), "ok:int:3000000000!range")
+    testing.assertEqual(conv.convert(Integer(3000000000), syn("rInt")).brief(), "malformed:out-of-range")
+    testing.assertEqual(conv.convert(Integer(10), syn("rDscp")).brief(), "ok:uint:10")
+    testing.assertEqual(conv.convert(Integer(256), syn("rDscp")).brief(), "malformed:out-of-range")
+    testing.assertEqual(conv.convert(Gauge32(70000), syn("rPort")).brief(), "malformed:out-of-range")
+    testing.assertEqual(conv.convert(Gauge32(2000), syn("rPort")).brief(), "ok:uint:2000!range")
+    testing.assertEqual(conv.convert(Counter64(u64(18446744073709551615)), syn("rCount")).brief(), "ok:uint:18446744073709551615")
+    testing.assertEqual(conv.to_value(u64(10), syn("rDscp")), Integer(10))
+    enc_fails(-1, syn("rDscp"), "a negative value of an unsigned TC")
+    # the JSON keeps it
+    j = mib.meta.to_json(mm!)
+    testing.assertTrue("\"builtin\":\"uint8\"" in j)
+    back = mib.meta.MetaIndex(mib.meta.MibBundle([mib.meta.from_json(j)]))
+    bd = back.find("rDscp")
+    bs: ?mib.meta.SyntaxMeta = bd.syntax if bd is not None else None
+    testing.assertEqual(bs.builtin if bs is not None else "", "uint8")
+    # mibmeta without it: the syntax's own ranges and unsigned_tcs
+    old = sm("INTEGER", "R-MIB::Big", "int", "", [(0, 10)])
+    testing.assertEqual(conv.convert(Integer(3000000000), old).brief(), "malformed:out-of-range")
+
+
+# --- InetAddress (RFC 4001) ------------------------------------------------------------------------
+
+def _test_inet_address() -> None:
+    vecs: list[(int, str, str)] = [
+        (1, "c0 00 02 01", "ok:string:192.0.2.1"),
+        (2, "20 01 0d b8 00 00 00 00 00 00 00 00 00 00 00 01", "ok:string:2001:db8::1"),
+        (2, "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00", "ok:string:::"),
+        (2, "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 01", "ok:string:::1"),
+        (2, "20 01 0d b8 00 00 00 00 00 01 00 00 00 00 00 01", "ok:string:2001:db8::1:0:0:1"),
+        (2, "20 01 0d b8 00 00 00 01 00 01 00 01 00 01 00 01", "ok:string:2001:db8:0:1:1:1:1:1"),
+        (2, "fe 80 00 00 00 00 00 00 00 00 00 00 00 00 00 00", "ok:string:fe80::"),
+        (2, "20 01 0d b8 00 00 00 00 00 01 00 00 00 00 00 00", "ok:string:2001:db8:0:0:1::"),
+        (3, "c0 a8 00 01 00 00 00 05", "ok:string:192.168.0.1%5"),
+        (4, "fe 80 00 00 00 00 00 00 00 00 00 00 00 00 00 01 00 00 00 03", "ok:string:fe80::1%3"),
+        (16, "77 77 77 2e 65 78 61 6d 70 6c 65 2e 63 6f 6d", "ok:string:www.example.com"),
+        (0, "", "ok:string:"),
+        (0, "01", "malformed:bad-length"),
+        (1, "c0 00 02", "malformed:bad-length"),
+        (2, "c0 00 02 01", "malformed:bad-length"),
+        (3, "c0 00 02 01", "malformed:bad-length"),
+        (4, "c0 00 02 01", "malformed:bad-length"),
+        (5, "c0 00 02 01", "malformed:unknown-inet-type"),
+    ]
+    for t in vecs:
+        b = h(t.1)
+        r = conv.inet_address(t.0, b)
+        testing.assertEqual(r.brief(), t.2, t.1)
+        x = r.as_str()
+        if x is not None and r.clean():
+            testing.assertEqual(conv.inet_octets(t.0, x), b, "back: " + x)
+    # a dns name that is not UTF-8 has its control characters (NUL) replaced in the Latin-1 reading
+    dn = conv.inet_address(16, b"\xff\x00a")
+    testing.assertEqual(dn.brief(), "ok:string:" + chr(0xff) + chr(0xfffd) + "a!hint-fallback")
+    testing.assertEqual(dn.diag, "dns InetAddress not UTF-8; read as Latin-1; control characters replaced by U+FFFD")
+    testing.assertEqual(conv.inet_address(16, b"a\x00").brief(), "ok:string:a" + chr(0xfffd) + "!control-chars")
+    testing.assertEqual(conv.inet_octets(2, "::ffff:192.0.2.1"), h("00 00 00 00 00 00 00 00 00 00 ff ff c0 00 02 01"))
+    testing.assertEqual(conv.inet_octets(2, "2001:DB8:0:0:0:0:0:1"), h("20 01 0d b8 00 00 00 00 00 00 00 00 00 00 00 01"))
+    for bad in [(1, "1.2.3"), (2, "1::2::3"), (2, "12345::"), (2, "1:2:3:4:5:6:7"), (2, "1:2:3:4:5:6:7:8:9"), (2, "::1%2"),
+                (3, "1.2.3.4"), (3, "1.2.3.4%x"), (4, "fe80::1%"), (0, "x"), (7, "x"), (2, "g::")]:
+        try:
+            got = conv.inet_octets(bad.0, bad.1)
+            testing.error("no EncodeError for %d " % bad.0 + bad.1 + ": " + got.hex())
+        except errors.EncodeError:
+            pass
+
+
+def _test_bits_octets() -> None:
+    """RFC 3416 section 2.5: as many octets as the highest set bit needs."""
+    testing.assertEqual(conv.bits_octets([0, 3, 9]), h("90 40"))
+    testing.assertEqual(conv.bits_octets([]), b"")
+    testing.assertEqual(conv.bits_octets([], [(2, 4)]), h("00 00"))
+    testing.assertEqual(conv.bits_octets([7, 7]), h("01"))
+
+
+# --- robustness ----------------------------------------------------------------------------------------
+
+def all_syntaxes() -> list[?mib.meta.SyntaxMeta]:
+    return [None, INTEGER, IF_INDEX, BIG_RANGE, DSCP, FLOW_LABEL, PERCENT, COUNTER32, GAUGE32, UNSIGNED, TIMETICKS, COUNTER64, PORT,
+            ADMIN, DUP_ENUM, TRUTH, DISPLAY, ADMIN_STRING, DATE, INET_V6, HEX_HINT, BAD_HINT, PHYS, MAC, MAC_NOSIZE, BINARY, PORT_LIST,
+            CAPS, ODD_BITS, SIZED_BITS, IPV4, OIDS, OPAQUE, FLOAT, UNKNOWN_CONV]
+
+
+def all_values() -> list[Value]:
+    """Every value class, with contents at and beyond the edges."""
+    out: list[Value] = [
+        Integer(0), Integer(1), Integer(2), Integer(-1), Integer(2147483647), Integer(2147483648), Integer(-2147483649),
+        Integer(9223372036854775807), Integer(-9223372036854775808),
+        Counter32(0), Counter32(4294967295), Gauge32(0), Gauge32(65536), Gauge32(4294967295), TimeTicks(0), TimeTicks(4294967295),
+        Counter64(u64(0)), Counter64(u64(9223372036854775807)), Counter64(u64(18446744073709551615)),
+        IpAddress(b""), IpAddress(h("0a 00 00 01")), IpAddress(h("01 02 03 04 05")),
+        ObjectIdentifier(Oid([])), ObjectIdentifier(Oid([0, 0])), ObjectIdentifier(Oid([1, 3, 6, 4294967295])), ObjectIdentifier(Oid([2, 40])),
+        Opaque(b""), Opaque(h("9f 78 04 3f c0 00 00")), Opaque(h("9f 79 08 7f f0 00 00 00 00 00 00")), Opaque(h("9f 7a 09 01 00 00 00 00 00 00 00 00")),
+        Opaque(h("9f 7a 00")), Opaque(h("9f 7b 01 80")), Opaque(h("9f 76 08 ff ff ff ff ff ff ff ff")), Opaque(h("9f 78 05 00 00 00 00 00")),
+        NoSuchObject(), NoSuchInstance(), EndOfMibView(), Null(),
+        MalformedValue(0x02, b"", "empty INTEGER"), MalformedValue(0x06, h("2b 8f"), "truncated sub-identifier"),
+        UnknownValue(0x45, h("01 02")), UnknownValue(0x47, h("01")),
+    ]
+    for n in [0, 1, 2, 3, 4, 5, 6, 7, 8, 11, 16, 20, 33, 255, 256, 300]:
+        out.append(OctetString(testutil.pseudo_random(n, 7 * n + 1)))
+    for b in [b"\x00", b"\x00\x00\x00", b"eth0\x00", b"\xff\xfe", b"\xc3", b"a\x1b[0m", b"\xe2\x82", b"\xf4\x90\x80\x80", b"   ", b"\x7f"]:
+        out.append(OctetString(b))
+    return out
+
+
+def all_options() -> list[conv.Options]:
+    return [conv.Options(), conv.Options(strict=True), conv.Options(unknown_enum="number"), conv.Options(opaque_special=True),
+            conv.Options(yang_names=False), conv.Options(unsigned_tcs={})]
+
+
+def _test_never_raises() -> None:
+    """Every conversion of every value class under every option set returns a Result (data
+    problems never raise); an OK result has a value of its kind, a non-OK one has none and a
+    known code. Whatever converts back (`to_value` without range checks) converts again to the
+    same text: the inverse is consistent with the conversion even for values with warnings."""
+    bad: list[str] = []
+    n_ok = 0
+    n_back = 0
+    for o in all_options():
+        lax = conv.Options(o.unknown_enum, o.strict, o.yang_names, o.opaque_special, False, o.unsigned_tcs)
+        for s in all_syntaxes():
+            cv = conv.converter(s, o)
+            for v in all_values():
+                what = (s.conv + "/" + s.tc if s is not None else "raw") + " " + repr(v)
+                r = cv.convert(v)
+                if r.code != "" and r.code not in conv.CODES:
+                    bad.append(what + ": unknown code " + r.code)
+                if r.ok():
+                    n_ok += 1
+                    if r.value is None or r.kind == "":
+                        bad.append(what + ": OK without a value")
+                    if s is not None and s.conv != "":
+                        try:
+                            back = conv.converter(s, lax).to_value(r.value!)
+                            n_back += 1
+                            again = conv.converter(s, o).convert(back)
+                            if again.text() != r.text() or again.kind != r.kind:
+                                bad.append(what + ": " + r.brief() + " -> " + repr(back) + " -> " + again.brief())
+                        except errors.EncodeError:
+                            pass
+                elif r.value is not None or r.code == "":
+                    bad.append(what + ": " + r.brief() + " with a value or without a code")
+    testing.assertEqual(bad, [])
+    testing.assertTrue(n_ok > 1000 and n_back > 500, "%d OK, %d converted back" % (n_ok, n_back))

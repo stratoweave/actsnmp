@@ -1,28 +1,18 @@
-"""DISPLAY-HINT: parse, validate, render and parse back (RFC 2579 §3.1)
+"""DISPLAY-HINT parsing, validation, rendering and parsing back (RFC 2579 section 3.1).
 
-Meant for runtime use (values whose mibmeta conversion is `string-hint`, and the CLI), so it
-imports nothing from the MIB compiler.
+Used at runtime by the SNMP value conversion (`string-hint`) and by the CLI; it imports
+nothing from the MIB compiler.
 
-- `parse(text)` compiles a hint into a `DisplayHint` (`HintError` when it does not parse);
-  `try_parse(text)` returns None instead. An integer-format hint is `x`, `o`, `b`, `d` or `d-N`;
-  an octet-format hint is one or more `OctetSpec`s `[*]<length><format>[sep[term]]` with format
-  x, d, o, a or t. The two forms cannot be confused: an octet-format hint starts with `*` or a
-  digit.
-- `check(h, base, enumerated, strict)` says whether a hint fits an SMI base type ("" when it
-  does, else the reason). `strict` applies RFC 2579 §3.1 literally (no hint on Counter32,
-  Counter64, Opaque); without it, the hint only has to be renderable for the base type.
-- `render_octets(h, b)` and `render_int(h, v)` render a value. They never raise: when the value
-  does not fit the hint (or the hint is of the other form) they fall back to a plain rendering,
-  and `render_octets_ex` / `render_int_ex` return that fact as a `Rendered` with `ok = False`
-  and a reason. The octet fallback is lower-case hex pairs joined by `:` (the yang:hex-string
-  form, "" for no octets); the integer fallback is the decimal number.
-- `parse_octets(h, text)` and `parse_int(h, text)` are the inverse, for SET and configuration.
-  They raise `HintError` when the text does not match the hint or is ambiguous. Where the
-  rendering is not injective (a short final `d`/`o` application; `1d` renders both 01 02 and
-  0c as `12`), the octets returned render to the same text. Octets that a `t` application
-  discarded (an incomplete character) cannot be recovered.
-- `format_octets(text, b)` / `format_int(text, v)` parse the hint text and render in one step
-  (an unparseable hint gives the fallback).
+`parse` compiles a hint into a `DisplayHint`. An integer-format hint is `x`, `o`, `b`, `d` or
+`d-N`; an octet-format hint is a sequence of `[*]<length><format>[sep[term]]` specifications,
+so it always starts with `*` or a digit. `check` tells whether a hint fits an SMI base type.
+
+The render functions never raise. When a value does not fit the hint they fall back to
+lower-case hex pairs joined by `:` (the yang:hex-string form) or to the decimal number, and
+the `_ex` variants report that with `ok = False` and a reason. `parse_octets` and `parse_int`
+are the inverse, for SET and configuration, and raise `HintError` on text that does not match.
+Where rendering is not injective (`1d` renders both 01 02 and 0c as `12`) they return octets
+that render to the same text.
 
 Rendering policy (RFC mode, the default), beyond the RFC text:
 
@@ -33,7 +23,7 @@ Rendering policy (RFC mode, the default), beyond the RFC text:
   separator, as in the `0a[2x:...]0a:2d` idiom). When a length-0 specification would have to
   be re-applied to remaining octets (it can never consume them), the value falls back.
 - When the specifications are used up, the last one is re-applied including its repeat
-  indicator (RFC 2579 §3.1 "the last octet-format specification is re-interpreted").
+  indicator (RFC 2579 section 3.1 "the last octet-format specification is re-interpreted").
 - Repetitions stop when the value is exhausted. A separator or terminator is suppressed when
   nothing but other separators and terminators follow it (RFC rule "suppressed if it would
   occur as the last character of the display", applied repeatedly).
@@ -143,18 +133,23 @@ class DisplayHint(object):
 
 class Rendered(object):
     """A rendering: `text`, and `ok` False when the value did not fit the hint and `text` is
-    the fallback (`reason` says why)."""
+    the fallback (`reason` says why). `dropped` counts the octets of incomplete UTF-8
+    characters a `t` application discarded (RFC mode; the text is still `ok`)."""
     text: str
     ok: bool
     reason: str
+    dropped: int
 
-    def __init__(self, text: str, ok: bool, reason: str):
+    def __init__(self, text: str, ok: bool, reason: str, dropped: int=0):
         self.text = text
         self.ok = ok
         self.reason = reason
+        self.dropped = dropped
 
     def __repr__(self) -> str:
         if self.ok:
+            if self.dropped > 0:
+                return "Rendered(" + repr(self.text) + ", %d octets dropped)" % self.dropped
             return "Rendered(" + repr(self.text) + ")"
         return "Rendered(" + repr(self.text) + ", fallback: " + self.reason + ")"
 
@@ -455,6 +450,7 @@ class _Out(object):
     carry: bytes
     carry_fmt: str
     error: str
+    dropped: int
 
     def __init__(self):
         self.pieces = []
@@ -462,12 +458,15 @@ class _Out(object):
         self.carry = b""
         self.carry_fmt = ""
         self.error = ""
+        self.dropped = 0
 
     def resolve(self, netsnmp: bool) -> None:
         """Something other than an a/t application follows: a carried incomplete character is
-        discarded after `t` (RFC), and makes the value fall back otherwise."""
+        discarded after `t` (RFC; counted in `dropped`), and makes the value fall back
+        otherwise."""
         if len(self.carry) > 0:
             if self.carry_fmt == "t" and not netsnmp:
+                self.dropped += len(self.carry)
                 self.carry = b""
             elif self.error == "":
                 self.error = "octets that are not valid UTF-8"
@@ -507,14 +506,14 @@ class _Out(object):
         return "".join(self.pieces)
 
 
-def _render_octets(h: DisplayHint, b: bytes, netsnmp: bool) -> (str, str):
-    """(text, "") or ("", reason)."""
+def _render_octets(h: DisplayHint, b: bytes, netsnmp: bool) -> (str, str, int):
+    """(text, "", octets of incomplete characters dropped) or ("", reason, 0)."""
     if h.integer:
-        return ("", "integer-format DISPLAY-HINT \"" + h.text + "\" on an octet string")
+        return ("", "integer-format DISPLAY-HINT \"" + h.text + "\" on an octet string", 0)
     specs = h.specs
     ns = len(specs)
     if ns == 0:
-        return ("", "empty DISPLAY-HINT")
+        return ("", "empty DISPLAY-HINT", 0)
     n = len(b)
     o = _Out()
     pos = 0
@@ -528,7 +527,7 @@ def _render_octets(h: DisplayHint, b: bytes, netsnmp: bool) -> (str, str):
         if netsnmp and width == 0:
             width = 1
         if reuse and width == 0 and not sp.repeat:
-            return ("", "the octet length 0 of the last octet-format specification cannot consume the remaining octets")
+            return ("", "the octet length 0 of the last octet-format specification cannot consume the remaining octets", 0)
         count = 1
         if sp.repeat and not (netsnmp and reuse):
             count = b[pos]
@@ -566,19 +565,20 @@ def _render_octets(h: DisplayHint, b: bytes, netsnmp: bool) -> (str, str):
             else:
                 o.sep(sp.term, netsnmp)
         if o.error != "":
-            return ("", o.error)
+            return ("", o.error, 0)
     o.resolve(netsnmp)
     if o.error != "":
-        return ("", o.error)
-    return (o.result(), "")
+        return ("", o.error, 0)
+    return (o.result(), "", o.dropped)
 
 
 def render_octets_ex(h: DisplayHint, b: bytes, netsnmp: bool=False) -> Rendered:
     """Render an OCTET STRING value with an octet-format hint (see the module doc); never raises.
-    `netsnmp` selects the net-snmp 5.9 compatible rendering."""
+    `netsnmp` selects the net-snmp 5.9 compatible rendering. `Rendered.dropped` counts the
+    octets of incomplete characters a `t` application discarded."""
     r = _render_octets(h, b, netsnmp)
     if r.1 == "":
-        return Rendered(r.0, True, "")
+        return Rendered(r.0, True, "", r.2)
     return Rendered(hex_fallback(b), False, r.1)
 
 

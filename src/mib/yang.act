@@ -95,6 +95,14 @@ WELL_KNOWN: dict[str, (str, str)] = {
     "URI-TC-MIB::Uri": (INET_TYPES, "uri"),
 }
 
+# Well-known TCs on INTEGER (or narrower than their SMI base) whose YANG type is an unsigned integer
+UNSIGNED_WELL_KNOWN: dict[str, str] = {
+    "DIFFSERV-DSCP-TC::Dscp": "uint8",                  # inet:dscp
+    "INET-ADDRESS-MIB::InetPortNumber": "uint16",       # inet:port-number
+    "IPV6-FLOW-LABEL-MIB::IPv6FlowLabel": "uint32",     # inet:ipv6-flow-label
+}
+
+
 # SMIv1 informal TCs (type assignments) and the SNMPv2-TC hint they get
 SMIV1_HINTS: dict[str, str] = {"DisplayString": "255a", "PhysAddress": "1x:"}
 
@@ -1294,6 +1302,47 @@ def yang_boolean(ms: mib.model.MibSet, s: mib.model.Syntax) -> bool:
         else:
             return False
     return False
+
+
+def int_builtin(ms: ?mib.model.MibSet, s: mib.model.Syntax) -> str:
+    """The YANG builtin type of an integer syntax as `type_stmt` makes it ("" for other syntaxes).
+
+    Follows the typedef chain to the first TC with an unsigned well-known type, else to the
+    base: INTEGER is `int32`, or `int64` when the root typedef's ranges leave int32 or the
+    enumeration cannot be a YANG enumeration; Unsigned32, Gauge32, Counter32 and TimeTicks are
+    `uint32`, Counter64 `uint64`. mibmeta records it so the adapter converts to the value
+    space acton-yang validates against. Without `ms` only the syntax itself counts. A TC that
+    the emitter inlines to break an import cycle is not taken into account."""
+    if s.base == "INTEGER" and len(s.enums) > 0 and not enum_expressible(s.enums):
+        return "int64"
+    cur = s
+    for i in range(32):
+        if cur.tc_name == "" or cur.tc_module in LANG_MODULES:
+            break
+        u = UNSIGNED_WELL_KNOWN.get(mib.model.qual_name(cur.tc_module, cur.tc_name))
+        if u is not None:
+            return u
+        nx: ?mib.model.Syntax = None
+        if ms is not None:
+            m = ms.module(cur.tc_module)
+            if m is not None:
+                t = m.find_type(cur.tc_name)
+                if t is not None and (t.kind == "tc" or t.kind == "type") and syntax_ok(t.syntax):
+                    nx = t.syntax
+        if nx is not None:
+            cur = nx
+        else:
+            break
+    b = cur.base
+    if b == "INTEGER":
+        if len(cur.enums) > 0 and not enum_expressible(cur.enums):
+            return "int64"
+        return "int64" if beyond(cur.ranges, INT32_LIMITS) else "int32"
+    if b == "Unsigned32" or b == "Gauge32" or b == "Counter32" or b == "TimeTicks":
+        return "uint32"
+    if b == "Counter64":
+        return "uint64"
+    return ""
 
 
 def row_type_of(n: mib.model.MibNode) -> str:

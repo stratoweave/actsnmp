@@ -311,6 +311,10 @@ def _test_fallbacks() -> None:
     testing.assertEqual(mib.hint.render_octets_ex(hp("1d.0a"), unhex("01")).text, "1")
     # an incomplete character at the end of `t` is discarded, of `a` it is bad data
     testing.assertEqual(mib.hint.render_octets_ex(hp("255t"), unhex("41f09f98")).text, "A")
+    # ... and counted (conv's truncated-utf8 warning); a complete value drops nothing
+    testing.assertEqual(mib.hint.render_octets_ex(hp("255t"), unhex("41f09f98")).dropped, 3)
+    testing.assertEqual(mib.hint.render_octets_ex(hp("255t"), unhex("41f09f9880")).dropped, 0)
+    testing.assertEqual(mib.hint.render_octets_ex(hp("2t-"), unhex("41c3c3a9")).dropped, 1)
     testing.assertFalse(mib.hint.render_octets_ex(hp("255a"), unhex("41f09f98")).ok)
     testing.assertEqual(mib.hint.render_octets(hp("255t"), unhex("f09f9880")), "😀")
     testing.assertEqual(mib.hint.render_octets(hp("1t"), unhex("f09f9880")), "😀")

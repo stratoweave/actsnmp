@@ -107,3 +107,95 @@ def _test_bad_format() -> None:
         testing.error("accepted a wrong format")
     except mib.meta.MetaError as e:
         testing.assertEqual(e.error_message, "unsupported mibmeta format other/1")
+
+
+def meta_error(text: str) -> str:
+    """The MetaError message of from_json(text) ("" when it parsed); any other exception
+    propagates and fails the test."""
+    try:
+        mib.meta.from_json(text)
+        return ""
+    except mib.meta.MetaError as e:
+        return e.error_message
+
+
+def _test_malformed_json() -> None:
+    """Malformed input raises MetaError (a ValueError), never another exception."""
+    good = r"""{"format":"actsnmp-mibmeta/1","module":"X","smi":"v2","nodes":[{"name":"a","oid":"1.3.6","kind":"node","status":"current"}]}"""
+    testing.assertEqual(meta_error(good), "")
+    bad: list[(str, str)] = [
+        ("{{", "malformed mibmeta JSON"),
+        ("[1, 2]", "malformed mibmeta JSON"),
+        ("", "malformed mibmeta JSON"),
+        (r"""{"format":"actsnmp-mibmeta/1"}""", "module name missing"),
+        (r"""{"format":"actsnmp-mibmeta/1","module":"X","nodes":{"a":1}}""", "X: \"nodes\" is not a list"),
+        (r"""{"format":"actsnmp-mibmeta/1","module":"X","nodes":[1]}""", "X: object expected"),
+        (r"""{"format":"actsnmp-mibmeta/1","module":"X","nodes":[{"oid":"1.3","kind":"node"}]}""", "X: node: \"name\" missing"),
+        (r"""{"format":"actsnmp-mibmeta/1","module":"X","nodes":[{"name":"a","kind":"node"}]}""", "X: a: \"oid\" missing"),
+        (r"""{"format":"actsnmp-mibmeta/1","module":"X","nodes":[{"name":"a","oid":"1.3"}]}""", "X: a: \"kind\" missing"),
+        (r"""{"format":"actsnmp-mibmeta/1","module":"X","nodes":[{"name":"a","oid":5,"kind":"node"}]}""", "X: a: \"oid\" is not a string"),
+        (r"""{"format":"actsnmp-mibmeta/1","module":"X","nodes":[{"name":"a","oid":"","kind":"node"}]}""", "X: a: \"oid\" missing"),
+        (r"""{"format":"actsnmp-mibmeta/1","module":"X","nodes":[{"name":"r","oid":"1.3","kind":"row","index":{"enc":"int"}}]}""", "X: \"index\" is not a list"),
+        (r"""{"format":"actsnmp-mibmeta/1","module":"X","types":"T"}""", "X: \"types\" is not a list"),
+        (r"""{"format":"actsnmp-mibmeta/1","module":"X","nodes":[{"name":"a","oid":"1.3","kind":"scalar","syntax":{"wire":"INTEGER","enums":[["a",1e400]]}}]}""", "malformed mibmeta JSON"),
+        (r"""{"format":"actsnmp-mibmeta/1","module":"X","nodes":[{"name":"a","oid":"1.3","kind":"scalar","syntax":{"wire":"INTEGER","ranges":"0..5"}}]}""", "X: \"ranges\" is not a list"),
+        (r"""{"format":"actsnmp-mibmeta/1","module":"X","nodes":[{"name":"a","oid":"1.x","kind":"node"}]}""", "X: bad OID '1.x'"),
+        (r"""{"format":"actsnmp-mibmeta/1","module":"X","nodes":[{"name":"a","oid":"1.4294967296","kind":"node"}]}""", "X: bad OID '1.4294967296'"),
+        (r"""{"format":"actsnmp-mibmeta/1","module":"X","nodes":[{"name":"a","oid":"1..3","kind":"node"}]}""", "X: bad OID '1..3'"),
+        (r"""{"format":"actsnmp-mibmeta/1","module":"X","nodes":[{"name":"r","oid":"1.3","kind":"row","index":[{"enc":"fixed","size":"x"}]}]}""", "X: integer expected"),
+        (r"""{"format":"actsnmp-mibmeta/1","module":"X","nodes":[{"name":"a","oid":"1.3","kind":"scalar","syntax":{"wire":"INTEGER","ranges":[["a",1]]}}]}""", "X: "),
+        (r"""{"format":"actsnmp-mibmeta/1","module":"X","nodes":[{"name":"a","oid":"1.3","kind":"scalar","syntax":{"wire":"INTEGER","ranges":[[true,1]]}}]}""", "X: number expected"),
+        (r"""{"format":"actsnmp-mibmeta/1","module":"X","nodes":[{"name":"a","oid":"1.3","kind":"scalar","syntax":7}]}""", "X: object expected"),
+        (r"""{"format":"actsnmp-mibmeta/1","module":"X","types":[{"name":"T","syntax":{"wire":"BITS","bits":[["b",1e30]]}}]}""", "X: "),
+        (r"""{"format":"actsnmp-mibmeta/1","module":"X","yang":"x"}""", "X: object expected"),
+        (r"""{"format":"other/1","module":"X"}""", "unsupported mibmeta format other/1"),
+    ]
+    for t in bad:
+        got = meta_error(t.0)
+        testing.assertTrue(got.startswith(t.1) and got != "", repr(t.0) + " gave " + repr(got))
+    try:
+        mib.meta.bundle_from_json(r"""{"format":"actsnmp-mibmeta/1","modules":[{"module":"X","nodes":[{"name":"a"}]}]}""")
+        testing.error("bundle_from_json accepted a node without an OID")
+    except ValueError as e:
+        testing.assertEqual(e.error_message, "X: a: \"oid\" missing", "a MetaError is a ValueError")
+    try:
+        mib.meta.bundle_from_json("{{")
+        testing.error("bundle_from_json accepted bad JSON")
+    except mib.meta.MetaError:
+        pass
+
+
+def _test_index_helpers() -> None:
+    """The table helpers on M-MIB; test_tables covers AUGMENTS."""
+    mm = meta()
+    ix = mib.meta.MetaIndex(mib.meta.MibBundle([mm]))
+    key = ix.find("mKey")
+    entry = ix.find("mEntry")
+    table = ix.find("mTable")
+    if key is not None and entry is not None and table is not None:
+        r = ix.row_of(key)
+        testing.assertEqual(r.name if r is not None else "", "mEntry")
+        tb = ix.table_of(entry)
+        testing.assertEqual(tb.name if tb is not None else "", "mTable")
+        rt = ix.row_of_table(table)
+        testing.assertEqual(rt.name if rt is not None else "", "mEntry")
+        testing.assertEqual([c.name for c in ix.columns(entry, True)], ["mAddr", "mKey", "mMac", "mOn", "mPct", "mStatus"])
+        testing.assertEqual([c.name for c in ix.augmenting_rows(entry)], [])
+        b = ix.base_row(entry)
+        testing.assertEqual(b.name if b is not None else "", "mEntry")
+        testing.assertEqual([p.key + ":" + p.enc for p in ix.index_of(entry)], ["mAddr:ipv4", "mKey:implied"])
+        testing.assertNone(ix.row_of(entry), "a row is not below a row")
+        testing.assertNone(ix.table_of(table))
+    else:
+        testing.error("M-MIB nodes missing")
+    o = ix.lookup_object([1, 3, 6, 1, 4, 1, 99997, 1, 3, 1, 3, 10, 0, 0, 1, 120])
+    testing.assertEqual(o.0.name + str(o.1) if o is not None else "", "mMac[10, 0, 0, 1, 120]")
+    testing.assertNone(ix.lookup_object([1, 3, 6, 1, 4, 1, 99997, 1, 3, 1]))
+    testing.assertNone(ix.lookup_object([1, 3, 6, 1, 4, 1, 99997, 1]))
+    obj = ix.find("mObjects")
+    if obj is not None:
+        testing.assertEqual([c.name for c in ix.children(obj)], ["mName", "mBig", "mTable"])
+    pct = ix.find_type("M-MIB::Percent")
+    testing.assertEqual(pct.name if pct is not None else "", "Percent")
+    testing.assertNone(ix.find_type("M-MIB::Nothing"))
+    testing.assertEqual(ix.tc_chain("M-MIB::Percent"), [])

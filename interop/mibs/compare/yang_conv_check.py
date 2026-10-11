@@ -12,8 +12,9 @@ leafs) is matched to its mibmeta node by module and OID; its type is followed th
 type, and the conversion must fit:
 
     truthvalue -> boolean          enum -> enumeration       bits -> bits
-    int, int-hint -> int32/int64 (int also an unsigned type: Dscp, IPv6FlowLabel, §7.4)
-    uint -> uint8..uint64          ipv4 -> inet:ipv4-address
+    int, int-hint -> exactly the mibmeta `builtin` (int64, uint8, uint16, uint32), else int32
+    uint -> exactly the mibmeta `builtin` (uint16), else uint32 (uint64 for Counter64)
+    ipv4 -> inet:ipv4-address
     oid -> yang:object-identifier-128                        opaque -> smiv2:opaque
     phys-address -> yang:phys-address   mac-address -> yang:mac-address
     string-hint -> string (other than the named string types above)
@@ -81,20 +82,21 @@ def chain(mod, tstmt, td):
     return "?loop", names
 
 
-def fits(conv, builtin, names):
+def fits(conv, builtin, names, sx=None):
+    """Whether a conversion fits the YANG builtin type; `sx` (the mibmeta syntax) names the exact
+    integer type (`builtin`, else the conversion's default), which the adapter converts to."""
     named = [NAMED[n] for n in names if n in NAMED]
+    sx = sx or {}
     if conv == "truthvalue":
         return builtin == "boolean"
     if conv == "enum":
         return builtin == "enumeration"
     if conv == "bits":
         return builtin == "bits"
-    if conv == "int":
-        return builtin in ("int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64")
-    if conv == "int-hint":
-        return builtin in ("int32", "int64")
+    if conv == "int" or conv == "int-hint":
+        return builtin == (sx.get("builtin") or "int32")
     if conv == "uint":
-        return builtin in ("uint8", "uint16", "uint32", "uint64")
+        return builtin == (sx.get("builtin") or ("uint64" if sx.get("wire") == "Counter64" else "uint32"))
     if conv in ("ipv4", "oid", "opaque", "phys-address", "mac-address"):
         return conv in named
     if conv == "string-hint":
@@ -150,7 +152,7 @@ def main():
         for nd in mm.get("nodes", []):
             sx = nd.get("syntax")
             cv = sx.get("conv", "") if sx is not None and nd.get("kind") in ("scalar", "column") else None
-            conv.setdefault((name, nd["oid"]), []).append((nd["name"], cv, nd.get("yang", "")))
+            conv.setdefault((name, nd["oid"]), []).append((nd["name"], cv, nd.get("yang", ""), sx))
     for name in sorted(mods):
         if not os.path.exists(os.path.join(d, name + ".mibmeta.json")):
             continue
@@ -173,8 +175,10 @@ def main():
             c = same[0]
             n += 1
             b, names = chain(name, t, td)
-            if not fits(c[1], b, names):
-                bad.append("%s %s (%s): conv %s, YANG %s via %s" % (name, c[0], oid, c[1], b, " ".join(names) or "-"))
+            if not fits(c[1], b, names, c[3]):
+                bt = (c[3] or {}).get("builtin", "")
+                bad.append("%s %s (%s): conv %s%s, YANG %s via %s" % (name, c[0], oid, c[1], "/" + bt if bt else "", b,
+                                                                     " ".join(names) or "-"))
     print("leafs checked %d, mismatches %d" % (n, len(bad)))
     for x in bad[:show]:
         print("MISMATCH " + x)

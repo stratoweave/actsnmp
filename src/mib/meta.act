@@ -1,32 +1,26 @@
 """mibmeta: compact runtime metadata of compiled MIB modules.
 
-- Classes `MibBundle`, `ModuleMeta`, `TypeMeta`, `NodeMeta`, `SyntaxMeta` and `IndexPart`
-  (`NodeMeta.keyless` marks a row without a usable INDEX or AUGMENTS). Optional strings are
-  "" when absent (written as missing keys in JSON).
-- `module_meta(ms, name)` / `bundle(ms, names)` derive them from a resolved
-  `mib.model.MibSet`, together with the YANG emitter (`mib.yang.Translator`), so the module
-  prefix, the revision, `NodeMeta.yang` data node paths and `IndexPart.key` names are the ones
-  the emitted YANG uses.
-- `to_json(m)` / `bundle_to_json(b)` write the `actsnmp-mibmeta/1` JSON format, with a
-  fixed key order so the output is diffable; `from_json(text)` / `bundle_from_json(text)`
-  read it back (`MetaError` on malformed input).
-- `MetaIndex`: an OID trie with longest-prefix match (`lookup(oid)` gives the node and
-  the instance suffix), by-name lookup (`find("ifIndex")`, `find("IF-MIB::ifIndex")`) and
-  by YANG path (`find_path("/if-mib:IF-MIB/if-mib:ifTable/if-mib:ifEntry/if-mib:ifIndex")`).
+`module_meta` and `bundle` derive `ModuleMeta`s from a resolved `mib.model.MibSet`. They work
+together with the YANG emitter (`mib.yang.Translator`), so prefixes, revisions, data node
+paths and key names are the ones the emitted YANG uses, and value conversions (`conv`,
+`hint`) match the YANG types. Optional strings are "" when absent.
 
-YANG paths: every segment carries the own prefix of the module that defines
-it (the prefix in that module's YANG file), e.g. an augmenting column of Q-BRIDGE-MIB is
-`/bridge-mib:BRIDGE-MIB/.../bridge-mib:dot1dBasePortEntry/q-bridge:dot1qPvid`. Nodes without a
-data node have none: accessible-for-notify objects (non-index), OID assignments, identities,
-groups, compliances, augmenting rows and their tables. A scalar group container gets the path
-of its parent node when that node is defined in the same module; notifications get
-`/<prefix>:<name>`. A container whose OID node is defined in another module (a vendor scalar
-below SNMPv2-MIB's `system`), or is a scalar, column or notification (a MIB error), is listed
-in `ModuleMeta.containers` (JSON `containers`) as a `NodeMeta` of kind "container" with the
-container's YANG name, its OID and path; `MetaIndex.find_path` finds those too, so every data
-node with `smiv2:oid` has an entry. Value conversion (`conv`, `hint`) follows the emitter:
-SMIv1 informal DisplayString/PhysAddress carry the SNMPv2-TC hints, and enumerations YANG
-cannot express (values outside int32) convert as `int`, like their int64 YANG leaf.
+`to_json` and `bundle_to_json` write the `actsnmp-mibmeta/1` JSON format with a fixed key
+order, so the output diffs cleanly; `from_json` and `bundle_from_json` read it back.
+Malformed input raises `MetaError` (a ValueError) and nothing else.
+
+`MetaIndex` is the runtime lookup: an OID trie with longest-prefix match, lookup by name and
+by YANG path, and the table structure (rows, columns, AUGMENTS, INDEX) the SNMP side needs.
+OIDs are `list[int]`.
+
+Every segment of a YANG path carries the prefix of the module that defines it, so an
+augmenting column of Q-BRIDGE-MIB is
+`/bridge-mib:BRIDGE-MIB/.../bridge-mib:dot1dBasePortEntry/q-bridge:dot1qPvid`. Nodes that
+are not data nodes have no path: non-index accessible-for-notify objects, OID assignments,
+identities, conformance statements, augmenting rows and their tables. A container whose OID
+node is defined in another module (a vendor scalar below SNMPv2-MIB's `system`), or is a
+scalar, column or notification (a MIB error), is listed in `ModuleMeta.containers`, so every
+data node with `smiv2:oid` has an entry.
 """
 
 import json
@@ -37,17 +31,21 @@ import mib.yang
 FORMAT = "actsnmp-mibmeta/1"
 
 
-class MetaError(Exception):
+class MetaError(ValueError):
+    """Malformed mibmeta input (`from_json`, `bundle_from_json`)."""
     def __init__(self, msg: str):
-        self.error_message = msg
+        ValueError.__init__(self, msg)
 
 
 class SyntaxMeta(object):
-    """Wire syntax of a leaf: `wire` the SMI base (INTEGER, OCTET STRING, OBJECT
-    IDENTIFIER, IpAddress, Counter32, Gauge32, Unsigned32, TimeTicks, Counter64, Opaque,
-    BITS), `tc` the nearest named type as `MOD::TC` ("" none), `conv` the value conversion
-    kind, `hint` the effective DISPLAY-HINT, effective `ranges`/`sizes`, `enums` and
-    `bits` in MIB order."""
+    """Wire syntax of a leaf.
+
+    `wire` is the SMI base type, `tc` the nearest named type as `MOD::TC` ("" if none), `conv`
+    the value conversion kind and `hint` the effective DISPLAY-HINT. Constraints are the
+    effective ones; `enums` and `bits` are in MIB order. `builtin` is the YANG builtin type of
+    an integer conversion when it differs from the conversion's default, as
+    `mib.yang.int_builtin` decides it: `int64` for values beyond int32, or the unsigned type
+    of a well-known TC such as inet:port-number. It is "" otherwise."""
     wire: str
     tc: str
     conv: str
@@ -56,8 +54,9 @@ class SyntaxMeta(object):
     sizes: list[(bigint, bigint)]
     enums: list[(str, int)]
     bits: list[(str, int)]
+    builtin: str
 
-    def __init__(self, wire: str, tc: str, conv: str, hint: str):
+    def __init__(self, wire: str, tc: str, conv: str, hint: str, builtin: str=""):
         self.wire = wire
         self.tc = tc
         self.conv = conv
@@ -66,6 +65,7 @@ class SyntaxMeta(object):
         self.sizes = []
         self.enums = []
         self.bits = []
+        self.builtin = builtin
 
 
 class IndexPart(object):
@@ -248,10 +248,23 @@ def conv_of(s: mib.model.Syntax, ms: ?mib.model.MibSet = None, tr: ?mib.yang.Tra
     return ""
 
 
+def builtin_of(s: mib.model.Syntax, conv: str, ms: ?mib.model.MibSet = None) -> str:
+    """`SyntaxMeta.builtin`: the YANG builtin type of an integer conversion when it is not the
+    conversion's default, else ""."""
+    if conv != "int" and conv != "int-hint" and conv != "uint":
+        return ""
+    b = mib.yang.int_builtin(ms, s)
+    dflt = "int32"
+    if conv == "uint":
+        dflt = "uint64" if s.base == "Counter64" else "uint32"
+    return "" if b == dflt else b
+
+
 def syntax_meta(s: mib.model.Syntax, ms: ?mib.model.MibSet = None, tr: ?mib.yang.Translator = None, hint: ?str = None) -> SyntaxMeta:
     """`hint`: the hint to use instead of the syntax's (a TC's own, `Translator.tdef_hint`)."""
     h = hint if hint is not None else yang_hint(s, ms, tr)
-    sm = SyntaxMeta(s.base, s.tc(), conv_of(s, ms, tr, h), h)
+    cv = conv_of(s, ms, tr, h)
+    sm = SyntaxMeta(s.base, s.tc(), cv, h, builtin_of(s, cv, ms if ms is not None else (tr.ms if tr is not None else None)))
     sm.ranges = [(r.lo, r.hi) for r in s.ranges]
     sm.sizes = [(r.lo, r.hi) for r in s.sizes]
     sm.enums = [(e.label, e.value) for e in s.enums]
@@ -377,6 +390,8 @@ def syntax_json(s: SyntaxMeta) -> str:
     if s.tc != "":
         f.append("\"tc\":" + jq(s.tc))
     f.append("\"conv\":" + jq(s.conv))
+    if s.builtin != "":
+        f.append("\"builtin\":" + jq(s.builtin))
     if s.hint != "":
         f.append("\"hint\":" + jq(s.hint))
     if len(s.ranges) > 0:
@@ -481,6 +496,16 @@ def _str(d: dict[str, ?value], k: str) -> str:
     return ""
 
 
+def _need_str(d: dict[str, ?value], k: str, what: str) -> str:
+    v = _get(d, k)
+    if isinstance(v, str):
+        if v != "":
+            return v
+    elif v is not None:
+        raise MetaError(what + ": \"" + k + "\" is not a string")
+    raise MetaError(what + ": \"" + k + "\" missing")
+
+
 def _bool(d: dict[str, ?value], k: str) -> bool:
     v = _get(d, k)
     if isinstance(v, bool):
@@ -515,6 +540,8 @@ def _list(d: dict[str, ?value], k: str) -> list[?value]:
     if isinstance(v, list):
         lst: list[?value] = v
         return lst
+    if v is not None:
+        raise MetaError("\"" + k + "\" is not a list")
     return []
 
 
@@ -559,7 +586,7 @@ def _syntax(v: ?value) -> ?SyntaxMeta:
     if v is None:
         return None
     d = _dict(v)
-    s = SyntaxMeta(_str(d, "wire"), _str(d, "tc"), _str(d, "conv"), _str(d, "hint"))
+    s = SyntaxMeta(_str(d, "wire"), _str(d, "tc"), _str(d, "conv"), _str(d, "hint"), _str(d, "builtin"))
     s.ranges = _pairs_b(d, "ranges")
     s.sizes = _pairs_b(d, "sizes")
     s.enums = _pairs_n(d, "enums")
@@ -568,15 +595,33 @@ def _syntax(v: ?value) -> ?SyntaxMeta:
 
 
 def parse_oid(s: str) -> list[int]:
+    """Dotted decimal (no leading dot) to arcs, [] for ""; MetaError for anything else."""
     if s == "":
         return []
-    return [int(x) for x in s.split(".")]
+    out: list[int] = []
+    for x in s.split("."):
+        if x == "" or len(x) > 10 or not x.isdecimal():
+            raise MetaError("bad OID " + repr(s))
+        a = int(x)
+        if a > 4294967295:
+            raise MetaError("bad OID " + repr(s))
+        out.append(a)
+    return out
 
 
 def _module(d: dict[str, ?value]) -> ModuleMeta:
     name = _str(d, "module")
     if name == "":
         raise MetaError("module name missing")
+    try:
+        return _module_body(d, name)
+    except MetaError as e:
+        raise MetaError(name + ": " + e.error_message)
+    except ValueError as e:
+        raise MetaError(name + ": " + e.error_message)
+
+
+def _module_body(d: dict[str, ?value], name: str) -> ModuleMeta:
     m = ModuleMeta(name, _str(d, "smi"))
     yv = _get(d, "yang")
     if yv is not None:
@@ -590,7 +635,8 @@ def _module(d: dict[str, ?value]) -> ModuleMeta:
         m.types.append(TypeMeta(_str(td, "name"), _str(td, "parent"), _str(td, "status"), _syntax(_get(td, "syntax"))))
     for nv in _list(d, "nodes"):
         nd = _dict(nv)
-        n = NodeMeta(_str(nd, "name"), name, parse_oid(_str(nd, "oid")), _str(nd, "kind"))
+        nn = _need_str(nd, "name", "node")
+        n = NodeMeta(nn, name, parse_oid(_need_str(nd, "oid", nn)), _need_str(nd, "kind", nn))
         n.access = _str(nd, "access")
         n.status = _str(nd, "status")
         n.units = _str(nd, "units")
@@ -611,64 +657,92 @@ def _module(d: dict[str, ?value]) -> ModuleMeta:
         m.nodes.append(n)
     for cv in _list(d, "containers"):
         cd = _dict(cv)
-        c = NodeMeta(_str(cd, "name"), name, parse_oid(_str(cd, "oid")), _str(cd, "kind"))
+        cn = _need_str(cd, "name", "container")
+        c = NodeMeta(cn, name, parse_oid(_need_str(cd, "oid", cn)), _need_str(cd, "kind", cn))
         c.status = _str(cd, "status")
         c.yang = _str(cd, "yang")
         m.containers.append(c)
     return m
 
 
+def _decode(text: str) -> dict[str, ?value]:
+    try:
+        d = json.decode(text)
+        f = _str(d, "format")
+        if f != FORMAT:
+            raise MetaError("unsupported mibmeta format " + f)
+        return d
+    except MetaError as e:
+        raise e
+    except ValueError as e:
+        raise MetaError("malformed mibmeta JSON: " + e.error_message)
+
+
 def from_json(text: str) -> ModuleMeta:
-    """Read one module written by `to_json`."""
-    d = json.decode(text)
-    f = _str(d, "format")
-    if f != FORMAT:
-        raise MetaError("unsupported mibmeta format " + f)
-    return _module(d)
+    """Read one module written by `to_json`; raises MetaError on malformed input."""
+    return _module(_decode(text))
 
 
 def bundle_from_json(text: str) -> MibBundle:
-    d = json.decode(text)
-    f = _str(d, "format")
-    if f != FORMAT:
-        raise MetaError("unsupported mibmeta format " + f)
+    """Read a bundle written by `bundle_to_json`; raises MetaError."""
+    d = _decode(text)
     return MibBundle([_module(_dict(v)) for v in _list(d, "modules")])
 
 
 # --- lookup structures --------------------------------------------------------------------------
 
 class TrieNode(object):
+    """One OID of the trie: the `nodes` named there and `obj`, the column or scalar among them
+    `lookup_object` returns (the first one added, an SMIv2 module's before an SMIv1 module's)."""
     children: dict[int, TrieNode]
     nodes: list[NodeMeta]
+    obj: ?NodeMeta
 
     def __init__(self):
         self.children = {}
         self.nodes = []
+        self.obj = None
+
+
+def _is_object(n: NodeMeta) -> bool:
+    return n.kind == "column" or n.kind == "scalar"
 
 
 class MetaIndex(object):
-    """Runtime lookup over a bundle: an OID trie (longest-prefix match), names and YANG data
-    node paths.
+    """Runtime lookup over a bundle: an OID trie (longest-prefix match), names, YANG data
+    node paths, types, and the table structure (rows, their columns and AUGMENTS).
 
-    At an OID with several names the first one added wins for `lookup` (bundle order, then
-    module order); a registration is preferred over a plain OID assignment. A YANG path maps
-    to the first node added with that path."""
+    At an OID with several names, `lookup` returns the first one added, preferring a
+    registration over a plain OID assignment. Where two modules define the same object (both
+    RFC1213-MIB and IF-MIB define `ifEntry` and its columns), `lookup_object` prefers the
+    SMIv2 module's, `canonical_row` picks the one row tables are assembled under, and the
+    table helpers prefer the node of the module asked about."""
     root: TrieNode
     by_qname: dict[str, NodeMeta]
     by_name: dict[str, list[NodeMeta]]
     by_yang_path: dict[str, NodeMeta]
+    by_type: dict[str, TypeMeta]
+    augmented_by: dict[str, list[NodeMeta]]
+    smiv1: set[str]
 
     def __init__(self, b: MibBundle):
         self.root = TrieNode()
         self.by_qname = {}
         self.by_name = {}
         self.by_yang_path = {}
+        self.by_type = {}
+        self.augmented_by = {}
+        self.smiv1 = set([m.name for m in b.modules if m.smi == "v1"])
         for m in b.modules:
             for n in m.nodes:
                 self.add(n)
             for c in m.containers:
                 if c.yang != "" and c.yang not in self.by_yang_path:
                     self.by_yang_path[c.yang] = c
+            for t in m.types:
+                q = m.name + "::" + t.name
+                if q not in self.by_type:
+                    self.by_type[q] = t
 
     def add(self, n: NodeMeta) -> None:
         cur = self.root
@@ -684,6 +758,13 @@ class MetaIndex(object):
             cur.nodes.insert(0, n)
         else:
             cur.nodes.append(n)
+        if _is_object(n):
+            o = cur.obj
+            if o is not None:
+                if o.module in self.smiv1 and n.module not in self.smiv1:
+                    cur.obj = n
+            else:
+                cur.obj = n
         q = n.qname()
         if q not in self.by_qname:
             self.by_qname[q] = n
@@ -694,6 +775,12 @@ class MetaIndex(object):
             lst.append(n)
         else:
             self.by_name[n.name] = [n]
+        if n.kind == "row" and n.augments != "":
+            al = self.augmented_by.get(n.augments)
+            if al is not None:
+                al.append(n)
+            else:
+                self.augmented_by[n.augments] = [n]
 
     def lookup(self, oid: list[int]) -> ?(NodeMeta, list[int]):
         """The deepest named node that is a prefix of `oid`, with the remaining sub-ids (the
@@ -739,3 +826,224 @@ class MetaIndex(object):
         if len(p) == 2:
             return self.by_qname.get(p[0] + "::" + p[1])
         return None
+
+    def find_type(self, qname: str) -> ?TypeMeta:
+        """A TC or type assignment by `MOD::Name`."""
+        return self.by_type.get(qname)
+
+    def tc_chain(self, qname: str) -> list[str]:
+        """The parent TCs of TC `qname` (`TypeMeta.parent`, nearest first, without `qname`
+        itself), as far as the bundle has them; cycles end the chain."""
+        out: list[str] = []
+        cur = qname
+        for i in range(32):
+            t = self.by_type.get(cur)
+            if t is not None:
+                if t.parent == "" or t.parent == qname or t.parent in out:
+                    break
+                out.append(t.parent)
+                cur = t.parent
+            else:
+                break
+        return out
+
+    # --- OIDs with instances ---
+
+    def lookup_object(self, oid: list[int]) -> ?(NodeMeta, list[int]):
+        """The deepest column or scalar whose OID is a prefix of `oid`, with the instance
+        suffix (the remaining sub-ids), or None. Unlike `lookup`, names registered below an
+        object (a MIB error) and plain OID assignments at its OID do not hide it; at an OID
+        with several objects an SMIv2 module's wins over an SMIv1 module's, else the first
+        added."""
+        cur = self.root
+        best: ?NodeMeta = None
+        depth = 0
+        n = len(oid)
+        for i in range(n):
+            c = cur.children.get(oid[i])
+            if c is not None:
+                cur = c
+                o = c.obj
+                if o is not None:
+                    best = o
+                    depth = i + 1
+            else:
+                break
+        if best is not None:
+            return (best, oid[depth:])
+        return None
+
+    def _at(self, oid: list[int], kind: str, module: str) -> ?NodeMeta:
+        """The node of `kind` at `oid`, preferring one of `module`."""
+        first: ?NodeMeta = None
+        for n in self.exact(oid):
+            if n.kind == kind:
+                if n.module == module:
+                    return n
+                if first is None:
+                    first = n
+        return first
+
+    def object_at(self, oid: list[int], module: str) -> ?NodeMeta:
+        """The column or scalar `module` defines at `oid`, None when it defines none there."""
+        for n in self.exact(oid):
+            if n.module == module and _is_object(n):
+                return n
+        return None
+
+    def canonical_row(self, row: NodeMeta) -> NodeMeta:
+        """The base row tables are assembled under when several modules define a row without
+        AUGMENTS at `row`'s OID (RFC1213-MIB and IF-MIB `ifEntry`, RFC1271-MIB and RMON-MIB
+        `etherStatsEntry`): one that other rows AUGMENT (`ifXEntry` augments IF-MIB's), else an
+        SMIv2 module's, else the first added; `row` itself when it is the only one."""
+        cands = [n for n in self.exact(row.oid) if n.kind == "row" and n.augments == ""]
+        if len(cands) < 2:
+            return row
+        for c in cands:
+            if c.qname() in self.augmented_by:
+                return c
+        for c in cands:
+            if c.module not in self.smiv1:
+                return c
+        return cands[0]
+
+    def children(self, node: NodeMeta) -> list[NodeMeta]:
+        """The nodes one arc below `node`, in arc order: per arc the node of `node`'s module,
+        else the first one there."""
+        cur = self.root
+        for a in node.oid:
+            c = cur.children.get(a)
+            if c is not None:
+                cur = c
+            else:
+                return []
+        out: list[NodeMeta] = []
+        for a in sorted(list(cur.children.keys())):
+            ch = cur.children[a]
+            pick: ?NodeMeta = None
+            for n in ch.nodes:
+                if n.module == node.module:
+                    pick = n
+                    break
+            if pick is None and len(ch.nodes) > 0:
+                pick = ch.nodes[0]
+            if pick is not None:
+                out.append(pick)
+        return out
+
+    # --- tables ---
+
+    def row_of(self, column: NodeMeta) -> ?NodeMeta:
+        """The row a column belongs to (the row node at its parent OID; one of the column's
+        module when several modules define a row there), None for a node that is not below a
+        row."""
+        n = len(column.oid)
+        if n == 0:
+            return None
+        return self._at(column.oid[:n - 1], "row", column.module)
+
+    def table_of(self, row: NodeMeta) -> ?NodeMeta:
+        """The table node at a row's parent OID, None when there is none."""
+        n = len(row.oid)
+        if n == 0:
+            return None
+        return self._at(row.oid[:n - 1], "table", row.module)
+
+    def row_of_table(self, table: NodeMeta) -> ?NodeMeta:
+        """The row below a table (the first row node one arc below it)."""
+        for n in self.children(table):
+            if n.kind == "row":
+                return n
+        for c in self.children(table):
+            for n in self.exact(c.oid):
+                if n.kind == "row":
+                    return n
+        return None
+
+    def base_row(self, row: NodeMeta) -> ?NodeMeta:
+        """The row whose INDEX applies to `row`: `row` itself, or for an augmenting row the row
+        it AUGMENTS, followed to the end of an (illegal) AUGMENTS chain. None when a row of the
+        chain is not in the bundle, or the chain loops."""
+        cur = row
+        seen: set[str] = set()
+        for i in range(32):
+            if cur.augments == "":
+                return cur
+            q = cur.qname()
+            if q in seen:
+                return None
+            seen.add(q)
+            nxt = self.by_qname.get(cur.augments)
+            if nxt is not None:
+                cur = nxt
+            else:
+                return None
+        return None
+
+    def augmenting_rows(self, row: NodeMeta) -> list[NodeMeta]:
+        """The rows that AUGMENT `row`, also through augmenting rows (illegal, but written), in
+        OID order."""
+        out: list[NodeMeta] = []
+        seen: set[str] = {row.qname()}
+        todo = [row.qname()]
+        while len(todo) > 0:
+            q = todo.pop(0)
+            lst = self.augmented_by.get(q)
+            if lst is not None:
+                for r in lst:
+                    rq = r.qname()
+                    if rq not in seen:
+                        seen.add(rq)
+                        out.append(r)
+                        todo.append(rq)
+        keyed = [(r.oid, i) for i, r in enumerate(out)]
+        return [out[k.1] for k in sorted(keyed)]
+
+    def _own_columns(self, row: NodeMeta) -> list[NodeMeta]:
+        cur = self.root
+        for a in row.oid:
+            c = cur.children.get(a)
+            if c is not None:
+                cur = c
+            else:
+                return []
+        q = row.qname()
+        out: list[NodeMeta] = []
+        for a in sorted(list(cur.children.keys())):
+            pick: ?NodeMeta = None
+            other: ?NodeMeta = None
+            for n in cur.children[a].nodes:
+                if n.kind == "column":
+                    if n.module == row.module:
+                        pick = n
+                        break
+                    if other is None:
+                        r = self.row_of(n)
+                        if r is not None and r.qname() == q:
+                            other = n
+            if pick is not None:
+                out.append(pick)
+            elif other is not None:
+                out.append(other)
+        return out
+
+    def columns(self, row: NodeMeta, augments: bool=False) -> list[NodeMeta]:
+        """The columns of `row` in OID order, then with `augments` those of the rows augmenting
+        it (`augmenting_rows`). Per arc the column of the row's module; a column of another
+        module counts when its own `row_of` is `row` (registered below it without a row of its
+        module there), so a second module defining the row's OIDs (RFC1213-MIB and IF-MIB)
+        contributes nothing."""
+        out = self._own_columns(row)
+        if augments:
+            for r in self.augmenting_rows(row):
+                for n in self._own_columns(r):
+                    out.append(n)
+        return out
+
+    def index_of(self, row: NodeMeta) -> list[IndexPart]:
+        """The INDEX parts that name `row`'s instances: its own, or for an augmenting row the
+        base row's ([] when the base row is not in the bundle; check `base_row`)."""
+        b = self.base_row(row)
+        if b is not None:
+            return b.index
+        return []
