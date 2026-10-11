@@ -28,8 +28,10 @@ written in Acton. The Acton package name is `snmp`.
 - **Command-line tool:** `actsnmp` takes net-snmp-style options and prints
   net-snmp-style output.
 - **MIB compiler:** parses SMIv1/SMIv2 MIB modules, resolves them, and
-  emits JSON metadata with OIDs, types, enumerations, display hints and
-  table index encodings.
+  emits YANG modules following RFC 6643. It also emits JSON metadata with
+  OIDs, types, enumerations, display hints and table index encodings.
+  DISPLAY-HINT rendering and table index decoding are available at
+  runtime.
 
 ## Building
 
@@ -84,50 +86,22 @@ actor main(env):
     c.walk(walked, snmp.oid.Oid.parse("1.3.6.1.2.1.1"))
 ```
 
-### SNMPv3
-
-For SNMPv3, pass USM credentials instead of a community:
-
-```python
-    sec = snmp.security.Usm.from_passwords("admin", snmp.usm.AUTH_SHA256, "authpass123",
-                                           snmp.usm.PRIV_AES128, "privpass123")
-    c = snmp.client.Client(cap, "192.0.2.1", sec, None)
-```
-
-The client discovers the agent's engine ID and time on first use. The
-security protocols are the `snmp.usm.AUTH_*` and `snmp.usm.PRIV_*`
-constants.
-
-Turning a password into a key costs a megabyte of hashing, so create one
-`Usm` per set of credentials and share it between clients.
-`Usm.with_context()` returns the same credentials for another context, and
-`Options(context_name=...)` sets the context of a single request.
-
-### Errors
-
-A failed request passes an `snmp.errors.SnmpError` to the callback. Its
-`transient` attribute is true when the same request may succeed if it is
-tried again later on the same client, for example after a timeout.
-
-### Many devices on one socket
-
-A client created from a `UDPConnectCap` has its own UDP socket, so a
-process needs one file descriptor per device. A `Dispatcher` instead gives
-each client a transport on a single shared UDP socket:
+### Get with SNMPv3
 
 ```python
 import net
 import snmp.client
-import snmp.dispatcher
 import snmp.errors
 import snmp.fmt
 import snmp.oid
 import snmp.security
+import snmp.usm
 
 actor main(env):
-    cap = net.UDPListenCap(net.UDPCap(net.NetCap(env.cap)))
-    devices = ["192.0.2.1", "192.0.2.2", "2001:db8::1"]
-    var left = len(devices)
+    cap = net.UDPConnectCap(net.UDPCap(net.NetCap(env.cap)))
+    sec = snmp.security.Usm.from_passwords("admin", snmp.usm.AUTH_SHA256, "authpass123",
+                                           snmp.usm.PRIV_AES128, "privpass123")
+    c = snmp.client.Client(cap, "192.0.2.1", sec, None)
 
     def got(cl: snmp.client.Client, resp: ?snmp.client.Response, err: ?snmp.errors.SnmpError):
         if err is not None:
@@ -136,39 +110,86 @@ actor main(env):
             for vb in resp.varbinds:
                 print(snmp.fmt.netsnmp_varbind(vb))
         cl.close()
-        left -= 1
-        if left == 0:
-            env.exit(0)
+        env.exit(0 if err is None else 1)
 
-    def listening(d: snmp.dispatcher.Dispatcher, err: ?str):
+    c.get(got, [snmp.oid.Oid.parse("1.3.6.1.2.1.1.1.0"), snmp.oid.Oid.parse("1.3.6.1.2.1.1.5.0")])
+```
+
+The client discovers the agent's engine ID and time on first use. The
+security protocols are the `snmp.usm.AUTH_*` and `snmp.usm.PRIV_*`
+constants.
+
+### Fetch a table
+
+`get_table` walks the given columns together and groups the values into
+rows by index. `row.cells` holds one value per requested column, or `None`
+where the row has no value.
+
+```python
+    columns = [snmp.oid.Oid.parse("1.3.6.1.2.1.2.2.1.2"),    # ifDescr
+               snmp.oid.Oid.parse("1.3.6.1.2.1.2.2.1.8")]    # ifOperStatus
+
+    def got_table(cl: snmp.client.Client, t: ?snmp.client.Table, err: ?snmp.errors.SnmpError):
+        if t is not None:
+            for row in t.rows:
+                print(".".join([str(a) for a in row.index]),
+                      [snmp.fmt.netsnmp_value(v) if v is not None else "-" for v in row.cells])
+
+    c.get_table(got_table, columns)
+```
+
+### Receive traps and informs
+
+```python
+import net
+import snmp.fmt
+import snmp.notify
+import snmp.receiver
+import snmp.transport
+
+actor main(env):
+    cap = net.UDPListenCap(net.UDPCap(net.NetCap(env.cap)))
+    # Accepted communities, SNMPv3 users, SNMPv3 trap engine IDs (empty: any),
+    # our engine ID (for SNMPv3 informs) and engine boots
+    config = snmp.receiver.ReceiverConfig(["public"], [], [], bytes.from_hex("80001f8880616374736e6d7072"), 1)
+    var receiver: ?snmp.receiver.NotificationReceiver = None
+
+    def received(r: snmp.receiver.NotificationReceiver, n: snmp.notify.Notification):
+        print("trap", n.trap_oid.dotted(), "from", n.source_address)
+        for vb in n.payload():
+            print("  " + snmp.fmt.netsnmp_varbind(vb))
+
+    def listening(t: snmp.transport.ServerTransport, err: ?str):
         if err is not None:
             print("listen failed:", err)
             env.exit(1)
         else:
-            for address in devices:
-                c = snmp.client.Client(None, address, snmp.security.Community("public"), None,
-                                       transport=d.attach(address, 161))
-                c.get(got, [snmp.oid.Oid.parse("1.3.6.1.2.1.1.5.0")])
+            receiver = snmp.receiver.NotificationReceiver(t, config, received, None)
+
+    snmp.transport.udp_server_transport(cap, "0.0.0.0", 162, listening)
+```
+
+SNMPv1 traps are converted to the SNMPv2 form (RFC 3584), and informs are
+acknowledged.
+
+### Many devices on one socket
+
+A `Dispatcher` gives each client a transport on a single shared UDP
+socket:
+
+```python
+    cap = net.UDPListenCap(net.UDPCap(net.NetCap(env.cap)))
+
+    def listening(d: snmp.dispatcher.Dispatcher, err: ?str):
+        if err is None:
+            for address in ["192.0.2.1", "192.0.2.2", "2001:db8::1"]:
+                c = snmp.client.Client(None, address, sec, None, transport=d.attach(address, 161))
+                ...
 
     snmp.dispatcher.udp_dispatcher(cap, "::", 0, listening)
 ```
 
-Addresses given to `attach` must be IP literals, so resolve host names
-first. A socket bound to `"::"` reaches both IPv4 and IPv6 devices; bind a
-specific address or port to choose the source of the requests. Closing a
-client detaches its transport.
-
-Several clients may share a device, for example with different
-communities, SNMPv3 users or contexts. Answers are routed by request-id or
-msgID. Some multi-homed agents answer from another address than the one
-that was queried: `d.attach(address, 161, False)`, or `strict_source=False`
-on `udp_dispatcher`, accepts such answers when the id, and for SNMPv1/v2c
-the community, match a pending request. That gives up the source address
-check, so use it only for the devices that need it.
-
-All answers arrive through one socket, whose kernel receive buffer
-(`net.core.rmem_default`) holds a few hundred of them. Keep the number of
-outstanding requests per Dispatcher below that, or raise the buffer size.
+Addresses given to `attach` must be IP literals.
 
 ## Command-line tool
 
@@ -216,23 +237,7 @@ interop/run-interop.sh
 `interop/run-interop.sh` builds the lab, runs the library and the command-line
 tool against the reference implementations in both directions, compares
 output with net-snmp's, and writes a summary to
-`interop/results/LATEST.md`.
-
-Each check can also be run on its own while the lab is up (`interop/up.sh`
-starts it, `interop/down.sh` stops it):
-
-- `src/test_interop.act`, the tests tagged `interop`, runs the library
-  against snmpd, snmpsim and snmptrapd;
-- `interop/clicheck.sh` runs `actsnmp` and net-snmp's tools side by side
-  and compares their output;
-- `interop/agentcheck.sh` runs net-snmp's and pysnmp's managers against
-  `actsnmp agent`;
-- `interop/notifycheck.sh` sends traps and informs from net-snmp and pysnmp
-  to `actsnmp trapd`;
-- `interop/trapdcheck.sh` checks what net-snmp's snmptrapd received from
-  actsnmp as the sender.
-
-See `interop/README.md` for ports, users and options.
+`interop/results/LATEST.md`. See `interop/README.md` for details.
 
 `interop/mibs/` holds a MIB corpus and oracle setup for testing the MIB
 compiler against pysmi, net-snmp and libsmi; see `interop/mibs/README.md`.
