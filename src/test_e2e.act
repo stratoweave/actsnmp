@@ -1,32 +1,10 @@
-"""End-to-end tests: the real Client against the real Agent and NotificationReceiver, over MemNet
+"""End-to-end tests: the real Client against the real Agent and NotificationReceiver over MemNet
 
-Nothing here is scripted on the wire: a Client (client.act) talks to an
-Agent (agent.act) or a NotificationReceiver (receiver.act) through a
-transport.MemNet, so every byte is produced and checked by the library
-itself. Covered:
-
-  * SNMPv1 and SNMPv2c get, get_next, get_bulk and set, with the SET error
-    statuses (and their SNMPv1 mapping, RFC 3584 section 4.4), exceptions,
-    Counter64 hidden from SNMPv1 and atomic SETs;
-  * SNMPv3 with every authentication and privacy protocol the library has
-    (the users of interop/config/users.tsv, embedded below): engine
-    discovery from cold, time synchronisation, get, get_next, get_bulk,
-    set, and noAccess for the read-only user;
-  * the Agent's Faults (and NetFaults) seen through the real Client:
-    lost answers, wrong request-ids, duplicates, late answers, a forced
-    notInTimeWindows Report, tooBig with splitting and halving, truncated
-    GETBULK, injected error statuses, answers from another port, the wrong
-    version or community, trailing octets;
-  * Client.trap, trap_v1 and inform to a NotificationReceiver for SNMPv1,
-    SNMPv2c and SNMPv3 with every lab user, checked as fmt.canon_notification
-    blocks (the format of interop/expected/notify/).
-
-Requests of one Client complete in the order they were made
-(max_in_flight 1 queues them FIFO), so a Collector records the outcomes in
-order and the checks index them. Tests wait for causal events only; the
-watchdog timeouts are generous because the Reeder key extension
-(AES-192-C, AES-256-C, 3DES with a short hash) costs a password-to-key
-round per localization.
+Nothing is scripted on the wire, so every byte is produced and checked by
+the library itself. Requests of one Client complete in order
+(max_in_flight 1), so a Collector records the outcomes in order. The
+watchdog timeouts are generous because the Reeder key extension runs a
+password-to-key round per localization.
 """
 
 import logging
@@ -919,6 +897,47 @@ actor _test_v3_agent_reboot(t: testing.AsyncT):
         c.get(second, [SYS_DESCR])
 
     c.get(first, [SYS_DESCR])
+
+actor _test_v3_agent_restart_boots_lost(t: testing.AsyncT):
+    """The agent restarts without its boots (5 before, 1 after, its time from 0 again, as the lab's snmpd does
+    after a docker restart): two requests in flight both get authenticated notInTimeWindows Reports that fail
+    RFC 3414 3.2 step 7b; the Client resynchronises from the first, the second is then in the
+    window, and both are resent: no request is lost"""
+    t.timeout(30.0)
+    u = _sha_aes()
+    mn = MemNet()
+    agent = Agent(mn.server(AGENT, 161), make_view(), agent_config([u]), t.log_handler)
+    c = _client(mn, u, 40001, OPTS.with_(max_in_flight=2), t.log_handler)
+
+    def reported(label: str, outs: list[Outcome]) -> None:
+        info = c.engine_info()
+        s = c.stats()
+        def run() -> None:
+            testing.assertEqual(len(outs), 3, "one callback per request")
+            testing.assertEqual(vbs_of(outs[0], "before the restart"), [VarBind(SYS_DESCR, OctetString(DESCR))])
+            r1 = ok(outs[1], "first request after the restart")
+            testing.assertEqual((r1.varbinds, r1.attempts), ([VarBind(SYS_DESCR, OctetString(DESCR))], 2))
+            r2 = ok(outs[2], "second request after the restart")
+            testing.assertEqual((r2.varbinds, r2.attempts), ([VarBind(e([1, 1, 0]), Integer(42))], 2))
+            if info is not None:
+                testing.assertEqual((info.engine_id, info.boots), (h(AGENT_ENGINE), 1))
+                testing.assertTrue(info.time < 10, "time %d" % info.time)
+            else:
+                raise AssertionError("no engine info")
+            # discovery and the two notInTimeWindows Reports; nothing dropped, nothing timed out
+            testing.assertEqual((s.reports, s.timeouts, s.drops_auth, s.retries), (3, 0, 0, 0), str(s))
+        report(t, outcome(run))
+
+    col = Collector("restart", reported)
+
+    def first(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+        col.cb(cl, r, err)
+        agent.reboot(1)
+        c.get(col.cb, [SYS_DESCR])
+        c.get(col.cb, [e([1, 1, 0])])
+
+    c.get(first, [SYS_DESCR])
+    col.expect(3)
 
 actor _test_fault_too_big_v3(t: testing.AsyncT):
     """SNMPv3 authPriv with too_big_over: the GET is split into new exchanges and merged in order"""

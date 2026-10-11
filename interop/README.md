@@ -275,8 +275,7 @@ Packet capture:
   `decryptionErrors` report.
 * A request with a stale engine ID: snmpd sends `unknownEngineIDs`, snmpsim
   an unauthenticated `unknownUserNames` report naming its own engine. The
-  Client rediscovers on the first. It drops the second, forgets the engine
-  after two timeouts, and the next request rediscovers.
+  Client takes both as a stale engine ID, rediscovers and resends once.
 * GETBULK returns at most 100 varbinds on snmpd and 64 on snmpsim.
   Max-repetitions 0 gives an empty response on snmpd and no answer on
   snmpsim.
@@ -286,8 +285,9 @@ Packet capture:
   `noSuchInstance` value instead of an error-status.
 * `docker restart actsnmp-snmpd` resets engineBoots to 1 and engineTime to 0,
   so a long-lived manager gets `notInTimeWindows` reports that fail RFC 3414
-  section 3.2 step 7b. The Client drops them: its first request after the
-  restart times out, the next one rediscovers.
+  section 3.2 step 7b. The Client still takes such a report when its MAC
+  verifies and it answers one of the request's outstanding msgIDs: it
+  resynchronizes and resends once, so the request succeeds.
 * net-snmp `snmptrap` sends the host uptime in hundredths of a second as
   engineTime and cannot send a raw Opaque; snmptrapd drops v3 notifications
   below the user's level without a trace.

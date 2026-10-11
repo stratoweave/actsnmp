@@ -102,7 +102,8 @@ K_DEFAULT_VERSION = ("the default SNMP version is a build option of net-snmp (Ub
                      "is 2c")
 K_OP = "-Op PRECISION (printf format of Opaque floats) is not implemented"
 K_ENGINE_HINT = ("with -e, net-snmp keeps the given engine ID and times out when the agent reports "
-                 "unknownEngineIDs; actsnmp's Client takes -e as a hint and rediscovers")
+                 "unknownEngineIDs (snmpd) or unknownUserNames from its own engine (snmpsim); actsnmp's "
+                 "Client takes -e as a hint and rediscovers")
 K_VERSION = "-V prints actsnmp's own version"
 K_TRAP_UPTIME = ("snmptrap ignores a v2c UPTIME it cannot read (the trap goes out without sysUpTime.0); "
                  "actsnmp refuses it")
@@ -311,7 +312,7 @@ def v3_error_cases():
         case(sec, "%s level above the user's" % ag, "get", ["-On"] + v3("u_sha", "authPriv", "SHA", "AES")
              + QUICK_FAIL + [a, B + ".1.1.0"])
         case(sec, "%s wrong -e engine ID" % ag, "get", ["-On", "-e", "0x8000000001020399"] + U_SHA + QUICK_FAIL
-             + [a, B + ".1.1.0"], known=K_ENGINE_HINT if ag == "snmpd" else None)
+             + [a, B + ".1.1.0"], known=K_ENGINE_HINT)
         case(sec, "%s no user" % ag, "get", ["-On", "-v3", "-l", "authNoPriv", "-A", AUTH] + QUICK_FAIL
              + [a, B + ".1.1.0"])
         case(sec, "%s no auth pass phrase" % ag, "get", ["-On", "-v3", "-u", "u_sha", "-l", "authNoPriv"] + QUICK_FAIL

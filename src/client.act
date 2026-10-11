@@ -51,9 +51,13 @@ The request engine:
   * SNMPv3: lazy engine discovery shared by all requests, the 2-round-trip
     time synchronisation with the discovery Report's boots and time as an
     unauthenticated hint, resynchronisation on an authenticated
-    notInTimeWindows Report (one resend), rediscovery on unknownEngineIDs
-    (one resend), errors.ReportError for every other Report, and a reset
-    of the engine state after repeated timeouts or time-window failures.
+    notInTimeWindows Report (one resend; also when the agent's boots or
+    time went back, because the Report answers one of our outstanding
+    msgIDs and its MAC verified), rediscovery on
+    unknownEngineIDs and on any Report that names another engine than the
+    request went to (one resend), errors.ReportError for every other
+    Report, and a reset of the engine state after repeated timeouts or
+    time-window failures.
 
 Walks and tables: walk() collects a subtree,
 walk_stream() hands it over one response at a time, get_table() fetches
@@ -75,7 +79,10 @@ An empty GETBULK response makes no progress and fails the walk
 (errors.InvalidResponseError). With Options.adaptive_bulk a GETBULK of a
 walk that gets tooBig, or times out, is resent with half the
 max-repetitions (at least 1), and the value that worked is remembered for
-the Client's later walks.
+the Client's later walks; it doubles again (up to the walk's
+max_repetitions) after BULK_REGROW_AFTER clean responses at it, and a
+doubling that fails makes the next one wait twice as long (at most
+BULK_REGROW_AFTER_MAX responses).
 
 Notifications: trap() sends an SNMPv2-Trap (v2c, or v3 where the Client is
 the authoritative engine: local_engine_id, local_engine_boots, time since
@@ -111,6 +118,13 @@ MAX_MSG_SIZE = 65507
 # Consecutive SNMPv3 request timeouts after which the engine's ID and time are
 # forgotten and discovered again before the next request
 RESET_AFTER_TIMEOUTS = 2
+
+# Adaptive bulk regrowth: the max-repetitions that walks learned doubles (up to the walk's
+# Options.max_repetitions) after this many consecutive clean GETBULK responses at it. A doubled value
+# that fails again doubles the count for the next attempt, up to BULK_REGROW_AFTER_MAX, so an agent
+# that drops answers above some size costs at most one retry per BULK_REGROW_AFTER_MAX responses.
+BULK_REGROW_AFTER = 8
+BULK_REGROW_AFTER_MAX = 256
 
 # Enterprise number in the default local engine ID (RFC 3411 format 5,
 # "octets"): net-snmp's 8072, as the actsnmp agent's default engine ID uses
@@ -187,9 +201,11 @@ class Options(object):
     SNMPv2c and SNMPv3 (SNMPv1 always uses GETNEXT). With adaptive_bulk a
     GETBULK of a walk that gets tooBig, or times out, is resent with half
     the max-repetitions (at least 1, within the request's retries), and
-    the value that worked is kept for the Client's later walks (it does
-    not grow again). check_increasing requires every OID a walk receives
-    to be greater than the previous one of its subtree
+    the value that worked is kept for the Client's later walks; it doubles
+    again, up to the walk's max_repetitions, after BULK_REGROW_AFTER clean
+    responses at it (a doubling that fails waits twice as long next time,
+    at most BULK_REGROW_AFTER_MAX). check_increasing requires every OID a
+    walk receives to be greater than the previous one of its subtree
     (errors.OidNotIncreasingError); without it, an OID received a second
     time ends the walk with that error (a loop guard). get_root_if_empty
     makes a walk that found nothing GET its root. max_walk_varbinds stops
@@ -626,6 +642,7 @@ class _Exchange(object):
     keys: ?LocalizedUser
     time_window_drops: int
     bulk_limit: int
+    resync_from: int
 
     def __init__(self, serial: int, handle: int, pdu_type: int, positions: list[int], varbinds: list[VarBind],
                  non_repeaters: int, max_repetitions: int, opts: Options, counters: list[int]):
@@ -655,6 +672,9 @@ class _Exchange(object):
         # The largest max-repetitions any attempt carried (adaptive bulk shrinks it between
         # attempts; a late answer to an earlier attempt may hold that many rows)
         self.bulk_limit = max_repetitions
+        # len(ids) when the exchange resynchronised (0: never): a notInTimeWindows Report to an
+        # attempt before that (ids[:resync_from], a late or duplicated one) is already dealt with
+        self.resync_from = 0
 
 
 def _budget(o: Options) -> float:
@@ -744,6 +764,15 @@ def _process(data: bytes, m: V3Message, keys: ?LocalizedUser, min_level: int, et
         return (None, None, e.kind)
     except ValueError as e:
         return (None, None, e.error_message)
+
+def _mac_failure(data: bytes, m: V3Message, keys: LocalizedUser) -> str:
+    # usm.authenticate() (RFC 3414 3.2 steps 1 to 6, the MAC in constant time): "" when it passes,
+    # else the counter name of the failure
+    try:
+        usm.authenticate(data, m, keys)
+        return ""
+    except usm.UsmIncomingError as e:
+        return e.kind
 
 def _report_error(s: ScopedPdu) -> errors.ReportError:
     # The ReportError for a Report-PDU: its first varbind names the counter
@@ -948,13 +977,18 @@ actor Client(cap: ?net.UDPConnectCap,
     var _ids: dict[int, int] = {}
 
     # Walks and tables by handle, their callbacks, and the max-repetitions adaptive bulk learned
-    # (0: nothing learned yet)
+    # (0: nothing learned yet). Regrowth (_bulk_learn): _bulk_ok counts the consecutive clean walk
+    # GETBULK responses at _bulk_reps, _bulk_need is how many double it, and _bulk_trial is set while
+    # a doubled value has not yet been confirmed by _bulk_need clean responses.
     var _jobs: dict[int, _Job] = {}
     var _walk_cbs: dict[int, action(Client, list[VarBind], ?errors.SnmpError) -> None] = {}
     var _batch_cbs: dict[int, action(Client, list[VarBind]) -> None] = {}
     var _done_cbs: dict[int, action(Client, int, ?errors.SnmpError) -> None] = {}
     var _table_cbs: dict[int, action(Client, ?Table, ?errors.SnmpError) -> None] = {}
     var _bulk_reps = 0
+    var _bulk_ok = 0
+    var _bulk_need = BULK_REGROW_AFTER
+    var _bulk_trial = False
 
     # SNMPv3 state: the agent's engine ID (None until discovered), the time
     # records and localized keys per engine ID, the running discovery probe
@@ -1554,27 +1588,86 @@ actor Client(cap: ?net.UDPConnectCap,
 
     proc def _receive_report(data: bytes, m: V3Message, s: ScopedPdu, ex: _Exchange) -> None:
         # A Report is matched by msgID only; its level may be lower than the
-        # request's. It must echo the request's user, and name the request's engine unless it
-        # reports unknownEngineIDs. An authenticated Report (notInTimeWindows) is verified with
-        # the keys of the request's engine, never with keys derived for an engine it names.
+        # request's. It must echo the request's user. One that names another engine than the
+        # request went to is not verified and only makes the request rediscover (_other_engine).
+        # An authenticated Report (notInTimeWindows) is verified with the keys of the request's
+        # engine, never with keys derived for an engine it names.
         kind = _report_kind(s)
         eid = m.usm.engine_id
         if m.usm.user != ex.user:
             _drop_auth("report for another user", m.msg_id)
             return
-        if ex.handle != 0 and eid != ex.engine_id and kind != usm.USM_STATS_UNKNOWN_ENGINE_IDS:
-            _drop_auth("report from another engine", m.msg_id)
+        if ex.handle != 0 and eid != ex.engine_id:
+            _other_engine(m, s, ex, kind)
             return
         now = _now()
         authenticated = (m.flags & message.FLAG_AUTH) != 0
         keys = ex.keys if authenticated and eid == ex.engine_id else None
         scoped, record, failure = _process(data, m, keys, usm.LEVEL_NO_AUTH_NO_PRIV, _time_record(eid, now), now)
+        if (scoped is None and failure == usm.USM_STATS_NOT_IN_TIME_WINDOWS
+                and kind == usm.USM_STATS_NOT_IN_TIME_WINDOWS):
+            record = _clock_went_back(data, m, ex, now)
+            if record is not None:
+                scoped = s
         if scoped is not None and record is not None:
             if authenticated:
                 _times[eid] = record
             _on_report(m, s, ex, kind, authenticated, now)
         else:
             _drop_auth(failure, m.msg_id)
+
+    proc def _stale_attempt(ex: _Exchange, id: int) -> bool:
+        # id belongs to an attempt sent before the exchange resynchronised
+        return ex.resync_from > 0 and id in ex.ids[:ex.resync_from]
+
+    proc def _clock_went_back(data: bytes, m: V3Message, ex: _Exchange, now: float) -> ?EngineTime:
+        # The time record to resynchronise from an authenticated notInTimeWindows Report that failed
+        # RFC 3414 3.2 step 7b because the agent's boots or time went back (it restarted without
+        # keeping snmpEngineBoots), or None to drop it as the RFC says. The MAC proves the sender
+        # holds the user's key for the engine the request went to, and the msgID under the MAC is
+        # one of our outstanding random attempt ids, so the Report is neither forged nor replayed.
+        # Allowed once per request, for an attempt sent since the last resynchronisation.
+        if ex.handle == 0 or (m.flags & message.FLAG_AUTH) == 0 or m.usm.engine_id != ex.engine_id:
+            return None
+        if m.usm.boots >= usm.MAX_BOOTS or _stale_attempt(ex, m.msg_id):
+            return None
+        op = _ops.get(ex.handle)
+        keys = ex.keys
+        if op is not None and keys is not None:
+            if op.resync_left > 0 and _mac_failure(data, m, keys) == "":
+                old = _time_record(ex.engine_id, now).estimate(now)
+                _log.info("SNMPv3 engine clock went back, resynchronising from its authenticated Report",
+                          {"engine_id": ex.engine_id.hex(), "boots": m.usm.boots, "time": m.usm.time,
+                           "expected_boots": old.0, "expected_time": old.1})
+                return EngineTime(ex.engine_id, m.usm.boots, m.usm.time, m.usm.time, now, True)
+        return None
+
+    proc def _other_engine(m: V3Message, s: ScopedPdu, ex: _Exchange, kind: str) -> None:
+        # A Report that answers one of the request's attempts but names another engine: a stale
+        # engine ID on our side (snmpd reports unknownEngineIDs, snmpsim unknownUserNames from its
+        # own engine). It cannot be verified, and nothing in it is used: the request discovers the
+        # engine afresh and resends, once (Op.rediscover_left); after that such a Report fails it.
+        op = _ops.get(ex.handle)
+        if op is not None:
+            _reports += 1
+            _log.debug("report from another engine", {"report": kind, "id": m.msg_id,
+                                                       "engine_id": m.usm.engine_id.hex()})
+            if op.rediscover_left > 0:
+                _rediscover(op, ex, "report from another engine")
+                return
+            _end_exchange(ex)
+            _complete(op, None, _report_error(s))
+
+    proc def _rediscover(op: _Op, ex: _Exchange, why: str) -> None:
+        # The request's one rediscovery: forget the engine it went to (unless another request
+        # already replaced it) and send the request again, after a fresh discovery probe
+        op.rediscover_left -= 1
+        _end_exchange(ex)
+        op.exchange = 0
+        cur = _engine_id
+        if cur is not None and cur == ex.engine_id:
+            _forget_engine(why)
+        _next_chunk(op)
 
     proc def _on_report(m: V3Message, s: ScopedPdu, ex: _Exchange, kind: str, authenticated: bool, now: float) -> None:
         # Act on a Report that passed the checks
@@ -1594,9 +1687,15 @@ actor Client(cap: ?net.UDPConnectCap,
                     # Only a hint: it cannot move a clock learned from authenticated messages
                     if not _clock_known(eid):
                         _times[eid] = EngineTime(eid, m.usm.boots, m.usm.time, 0, now)
+                if _stale_attempt(ex, m.msg_id):
+                    # a late or duplicated Report to an attempt before the resynchronisation:
+                    # the resend is under way
+                    _log.debug("notInTimeWindows report to an earlier attempt ignored", {"id": m.msg_id})
+                    return
                 if op.resync_left > 0:
                     op.resync_left -= 1
                     _log.debug("resynchronised with the SNMPv3 engine, resending", {"handle": op.handle})
+                    ex.resync_from = len(ex.ids)
                     _resend(ex)
                     return
                 _end_exchange(ex)
@@ -1606,13 +1705,7 @@ actor Client(cap: ?net.UDPConnectCap,
                 _complete(op, None, _report_error(s))
                 return
             if kind == usm.USM_STATS_UNKNOWN_ENGINE_IDS and op.rediscover_left > 0:
-                op.rediscover_left -= 1
-                _end_exchange(ex)
-                op.exchange = 0
-                cur = _engine_id
-                if cur is not None and cur == ex.engine_id:
-                    _forget_engine("unknownEngineIDs report")
-                _next_chunk(op)
+                _rediscover(op, ex, "unknownEngineIDs report")
                 return
             _end_exchange(ex)
             _complete(op, None, _report_error(s))
@@ -1885,6 +1978,38 @@ actor Client(cap: ?net.UDPConnectCap,
             m = _bulk_reps
         return m if m > 0 else 1
 
+    proc def _bulk_learn(job: _Job, started: int, answered: int) -> None:
+        # An adaptive walk's GETBULK was answered: it started with max-repetitions started and was
+        # answered at answered (smaller when tooBig or timeouts halved it on the way)
+        if answered < started:
+            # it needed fewer repetitions: later walks start there. A doubled value that failed
+            # makes the next doubling wait twice as long (bounded oscillation)
+            if _bulk_reps == 0 or answered < _bulk_reps:
+                if _bulk_trial:
+                    _bulk_need = _bulk_need * 2 if _bulk_need * 2 < BULK_REGROW_AFTER_MAX else BULK_REGROW_AFTER_MAX
+                    _bulk_trial = False
+                _bulk_reps = answered
+                _log.debug("adaptive bulk: max-repetitions lowered", {"max_repetitions": _bulk_reps,
+                                                                       "regrow_after": _bulk_need})
+            _bulk_ok = 0
+            return
+        if _bulk_reps == 0 or started != _bulk_reps:
+            return          # nothing learned, or the walk ran below the learned value (its own Options)
+        _bulk_ok += 1
+        if _bulk_ok < _bulk_need:
+            return
+        _bulk_ok = 0
+        if _bulk_trial:
+            # the doubled value held for _bulk_need responses: the next doubling needs the base count
+            _bulk_trial = False
+            _bulk_need = BULK_REGROW_AFTER
+        top = job.opts.max_repetitions if job.opts.max_repetitions > 0 else 1
+        grown = _bulk_reps * 2 if _bulk_reps * 2 < top else top
+        if grown > _bulk_reps:
+            _bulk_reps = grown
+            _bulk_trial = True
+            _log.debug("adaptive bulk: max-repetitions regrown", {"max_repetitions": _bulk_reps})
+
     proc def _job_request(job: _Job, si: int, kind: int, oids: list[Oid], reps: int) -> None:
         # Queue one request of a job on the Client's own request path. The stream records its
         # handle first: a request can complete inside _pump() (a failed transport).
@@ -1927,6 +2052,8 @@ actor Client(cap: ?net.UDPConnectCap,
             _root_answer(job, r, e)
             return
         if e is not None:
+            if op.kind == pdu.GETBULK and job.adaptive:
+                _bulk_ok = 0
             if isinstance(e, errors.ErrorStatusError):
                 if e.status == pdu.NO_SUCH_NAME and _version == message.SNMP_V1:
                     # SNMPv1 "End of MIB" that the request engine could not pin on one varbind
@@ -1937,11 +2064,8 @@ actor Client(cap: ?net.UDPConnectCap,
             _job_finish(job, e)
             return
         if r is not None:
-            if op.kind == pdu.GETBULK and job.adaptive and op.max_repetitions < st.reps:
-                # this request needed fewer repetitions than it started with: later walks start there
-                if _bulk_reps == 0 or op.max_repetitions < _bulk_reps:
-                    _bulk_reps = op.max_repetitions
-                    _log.debug("adaptive bulk: max-repetitions lowered", {"max_repetitions": _bulk_reps})
+            if op.kind == pdu.GETBULK and job.adaptive:
+                _bulk_learn(job, st.reps, op.max_repetitions)
             failure = _job_take(job, st.sent, r.varbinds)
             if failure is not None:
                 _job_finish(job, failure)

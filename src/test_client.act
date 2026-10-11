@@ -1,23 +1,10 @@
 """Tests for client
 
-Every Client test runs over a transport.MemNet against a scripted responder
-written here: the test actor itself (v1/v2c), which decodes each request
-with the codec and answers exactly as the case needs, or _V3Agent, which
-wraps an engine.AuthoritativeEngine and can be switched into faulty modes
-(silent, forged discovery, forged or unauthenticated responses, crafted
-Reports, reboot, engine ID change). MemNet delivery depends only on message
-order, so the tests are deterministic. Timing enters only where a test is
-about timers (retries, backoff, timeouts): those use timeouts of tens of
-milliseconds and generous tolerances.
-
-The robustness cases cover retries and backoff, fresh ids per attempt,
-late and duplicate replies, wrong id, spoofed source, corrupt datagrams,
-version and PDU type checks, the community check, ICMP unreachable hints,
-tooBig splitting, SNMPv1 normalisation, SNMPv3 discovery (hint strategy
-and fallback), resynchronisation, rediscovery, every Report kind, forged
-responses, cancel and close exactly once, invalid arguments, queueing,
-and the trap, SNMPv1 trap and inform encodings as a receiver decodes
-them.
+The Client talks over MemNet to a scripted responder: the test actor
+itself for SNMPv1/v2c, or _V3Agent, an AuthoritativeEngine that can be
+switched into faulty modes. Only the retry, backoff and timeout tests
+depend on timers, with timeouts of tens of milliseconds and generous
+tolerances.
 """
 
 import logging
@@ -1482,6 +1469,11 @@ ALWAYS_UNKNOWN_ENGINE = 8       # answer every request with an unknownEngineIDs 
 HOLD_FIRST = 9                  # keep the first request; answer it (late) when the second arrives
 WRONG_RID_FIRST = 10            # send an authenticated response with another request-id first
 OTHER_ENGINE_FIRST = 11         # send a response that names another engine ID first
+STALE_ENGINE_USER = 12          # snmpsim: a request naming another engine gets an unauthenticated unknownUserNames
+                                # Report from this engine (requests naming this engine are served)
+OTHER_ENGINE_REPORT = 13        # answer every request with a noAuthNoPriv Report of report_name naming ENGINE2
+CLOCK_BACK = 14                 # restart the engine (boots 1) with its time back_time before each request,
+                                # back_time 300 s lower each time: an agent whose clock keeps going back
 
 def _respond_pdu(p: Pdu) -> Pdu:
     # What _V3Agent answers to an accepted request
@@ -1506,6 +1498,7 @@ actor _V3Agent(srv: ServerTransport, users: list[Usm], engine_id: bytes, pdu_typ
     var report_name = usm.report_oid(usm.USM_STATS_DECRYPTION_ERRORS)
     var log: list[str] = []
     var held: ?(bytes, V3Message) = None
+    var back_time = 700
     salt = SaltCounter(u64(1000))
 
     proc def _probe(data: bytes, m: V3Message, address: str, port: int) -> None:
@@ -1559,6 +1552,21 @@ actor _V3Agent(srv: ServerTransport, users: list[Usm], engine_id: bytes, pdu_typ
             srv.send_to(_crafted_report(m.msg_id, 0, eid, boots, etime, m.usm.user,
                                         usm.report_oid(usm.USM_STATS_UNKNOWN_ENGINE_IDS)), address, port)
             return
+        if mode == STALE_ENGINE_USER and m.usm.engine_id != eid:
+            log.append("stale engine")
+            boots, etime = eng.clock(now)
+            srv.send_to(_crafted_report(m.msg_id, 0, eid, boots, etime, m.usm.user,
+                                        usm.report_oid(usm.USM_STATS_UNKNOWN_USER_NAMES)), address, port)
+            return
+        if mode == OTHER_ENGINE_REPORT:
+            log.append("other engine")
+            boots, etime = eng.clock(now)
+            srv.send_to(_crafted_report(m.msg_id, 0, h(ENGINE2_HEX), boots, etime, m.usm.user, report_name),
+                        address, port)
+            return
+        if mode == CLOCK_BACK:
+            eng = AuthoritativeEngine(eid, 1, now - float(back_time), users, pdu_types)
+            back_time -= 300
         if mode == HOLD_FIRST:
             first = held
             if first is not None:
@@ -1624,7 +1632,7 @@ actor _V3Agent(srv: ServerTransport, users: list[Usm], engine_id: bytes, pdu_typ
         disc_time = etime
 
     def reboot(boots: int) -> None:
-        """Restart the engine with the given boots and time 10"""
+        """Restart the engine with the given boots and time 10 (before: boots 1, time 1000)"""
         eng = AuthoritativeEngine(eid, boots, _now() - 10.0, users, pdu_types)
 
     def change_engine(new_id: bytes) -> None:
@@ -2354,13 +2362,92 @@ actor _test_v3_forged_discovery_cannot_lock_out(t: testing.AsyncT):
     c.get(done, _oids(1))
 
 
-actor _test_v3_boots_went_down_resets(t: testing.AsyncT):
-    """The agent restarts with lower boots (not persisted): its answers fail the time window, the request
-    times out with a hint, the engine state is reset at once and the next request works again"""
+actor _test_v3_boots_went_down_resyncs(t: testing.AsyncT):
+    """The agent restarts with lower boots (it did not keep them): its authenticated notInTimeWindows Report
+    fails RFC 3414 3.2 step 7b, but it answers our outstanding msgID and its MAC verifies, so the Client
+    resynchronises from it and resends: no request is lost"""
     mn = MemNet()
     p = mem_pair(mn)
     agent = _V3Agent(p.server, _users(), _engine_id())
     agent.reboot(5)
+    c = Client(None, AGENT, _shaaes(), t.log_handler, opts=SLOW, transport=p.client)
+
+    def check(r: ?Response, e: ?errors.SnmpError) -> None:
+        resp = _ok(r, e)
+        testing.assertEqual(resp.varbinds, _answer([VarBind(o) for o in _oids(1)]))
+        testing.assertEqual(resp.attempts, 2, "the request and its resend after the resynchronisation")
+        testing.assertEqual(agent.seen(), ["probe", "ok", usm.USM_STATS_NOT_IN_TIME_WINDOWS, "ok"])
+        info = c.engine_info()
+        if info is not None:
+            testing.assertEqual((info.engine_id, info.boots), (_engine_id(), 1))
+            testing.assertTrue(info.time >= 10 and info.time < 20, "time %d" % info.time)
+        else:
+            testing.error("no engine info")
+        s = c.stats()
+        testing.assertEqual((s.reports, s.responses, s.timeouts, s.drops_auth), (2, 2, 0, 0), str(s))
+
+    def second(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        _finish(t, lambda: check(r, e))
+
+    def first(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        try:
+            _ok(r, e)
+        except Exception as ex:
+            t.failure(ex)
+            return
+        agent.reboot(1)
+        c.get(second, _oids(1))
+
+    c.get(first, _oids(1))
+
+
+actor _test_v3_time_went_back_resyncs(t: testing.AsyncT):
+    """The agent restarts with the same boots and its time from (almost) 0 again, as the lab's snmpd does after
+    a docker restart: 990 s back, far outside the window. The Client resynchronises from the authenticated
+    Report and resends"""
+    mn = MemNet()
+    p = mem_pair(mn)
+    agent = _V3Agent(p.server, _users(), _engine_id())
+    c = Client(None, AGENT, _shaaes(), t.log_handler, opts=SLOW, transport=p.client)
+
+    def check(r: ?Response, e: ?errors.SnmpError) -> None:
+        resp = _ok(r, e)
+        testing.assertEqual(resp.attempts, 2)
+        testing.assertEqual(agent.seen(), ["probe", "ok", usm.USM_STATS_NOT_IN_TIME_WINDOWS, "ok"])
+        info = c.engine_info()
+        if info is not None:
+            testing.assertEqual(info.boots, 1)
+            testing.assertTrue(info.time >= 10 and info.time < 20, "time %d" % info.time)
+        else:
+            testing.error("no engine info")
+        s = c.stats()
+        testing.assertEqual((s.timeouts, s.drops_auth), (0, 0), str(s))
+
+    def second(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        _finish(t, lambda: check(r, e))
+
+    def first(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        try:
+            _ok(r, e)
+            info = c.engine_info()
+            if info is not None:
+                testing.assertTrue(info.time >= 1000, "time learned before the restart: %d" % info.time)
+        except Exception as ex:
+            t.failure(ex)
+            return
+        agent.reboot(1)
+        c.get(second, _oids(1))
+
+    c.get(first, _oids(1))
+
+
+actor _test_v3_clock_back_once_per_request(t: testing.AsyncT):
+    """An agent whose clock goes back again after the resynchronisation: the second authenticated
+    notInTimeWindows Report is dropped (one resynchronisation per request), the request times out with the
+    time-window hint and the engine state is reset; the next request rediscovers and succeeds"""
+    mn = MemNet()
+    p = mem_pair(mn)
+    agent = _V3Agent(p.server, _users(), _engine_id())
     c = Client(None, AGENT, _shaaes(), t.log_handler, opts=SLOW, transport=p.client)
     var step = 0
 
@@ -2370,16 +2457,12 @@ actor _test_v3_boots_went_down_resets(t: testing.AsyncT):
             testing.assertEqual(err.hint, "1 datagram failed authentication (1 outside the time window)")
         else:
             testing.error("not a TimeoutError: " + str(err))
-        testing.assertTrue(c.engine_info() is None, "reset after one time-window failure")
+        testing.assertTrue(c.engine_info() is None, "reset after the time-window failure")
 
     def check_last(r: ?Response, e: ?errors.SnmpError) -> None:
         _ok(r, e)
-        testing.assertEqual(agent.seen(), ["probe", "ok", usm.USM_STATS_NOT_IN_TIME_WINDOWS, "probe", "ok"])
-        info = c.engine_info()
-        if info is not None:
-            testing.assertEqual(info.boots, 1)
-        else:
-            testing.error("no engine info")
+        n = usm.USM_STATS_NOT_IN_TIME_WINDOWS
+        testing.assertEqual(agent.seen(), ["probe", "ok", n, n, "probe", "ok"])
 
     def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         step += 1
@@ -2389,7 +2472,7 @@ actor _test_v3_boots_went_down_resets(t: testing.AsyncT):
             except Exception as ex:
                 t.failure(ex)
                 return
-            agent.reboot(1)
+            agent.set_mode(CLOCK_BACK)
             c.get(done, _oids(1), FAST.with_(timeout=0.1))
         elif step == 2:
             try:
@@ -2397,9 +2480,102 @@ actor _test_v3_boots_went_down_resets(t: testing.AsyncT):
             except Exception as ex:
                 t.failure(ex)
                 return
+            agent.set_mode(NORMAL)
             c.get(done, _oids(1))
         else:
             _finish(t, lambda: check_last(r, e))
+
+    c.get(done, _oids(1))
+
+
+actor _test_v3_duplicated_time_window_report(t: testing.AsyncT):
+    """Every answer duplicated by the network: the copy of the notInTimeWindows Report answers an attempt from
+    before the resynchronisation and is ignored (it must not exhaust the budget)"""
+    mn = MemNet(NetFaults(duplicate=True, to_address=MANAGER))
+    p = mem_pair(mn)
+    agent = _V3Agent(p.server, _users(), _engine_id())
+    c = Client(None, AGENT, _shaaes(), t.log_handler, opts=SLOW, transport=p.client)
+    var outcomes: list[str] = []
+
+    def check() -> None:
+        testing.assertEqual(outcomes, ["ok", "ok"], "exactly one callback per request")
+        testing.assertEqual(agent.seen(), ["probe", "ok", usm.USM_STATS_NOT_IN_TIME_WINDOWS, "ok"])
+        info = c.engine_info()
+        if info is not None:
+            testing.assertEqual(info.boots, 2)
+        else:
+            testing.error("no engine info")
+        s = c.stats()
+        # the discovery Report, the notInTimeWindows Report and its copy; the copies of the discovery
+        # Report and of both Responses have unknown msgIDs by then
+        testing.assertEqual((s.reports, s.drops_unknown_id, s.timeouts, s.drops_auth), (3, 3, 0, 0), str(s))
+
+    def second(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        outcomes.append(_describe(e))
+        after now QUIET: _finish(t, check)
+
+    def first(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        outcomes.append(_describe(e))
+        agent.reboot(2)
+        c.get(second, _oids(1))
+
+    c.get(first, _oids(1))
+
+
+actor _test_v3_stale_engine_user_report_rediscovers(t: testing.AsyncT):
+    """snmpsim's answer to a stale engine ID: an unauthenticated unknownUserNames Report that names its own
+    engine. It answers the request's msgID, so the Client rediscovers (a fresh probe; the engine ID in the
+    Report is not used) and resends once"""
+    mn = MemNet()
+    p = mem_pair(mn)
+    agent = _V3Agent(p.server, _users(), _engine_id())
+    agent.set_mode(STALE_ENGINE_USER)
+    seed = EngineInfo(h(ENGINE2_HEX), 1, 1000, _now())
+    c = Client(None, AGENT, _shaaes(), t.log_handler, opts=SLOW, transport=p.client, engine=seed)
+
+    def check(r: ?Response, e: ?errors.SnmpError) -> None:
+        resp = _ok(r, e)
+        testing.assertEqual(resp.attempts, 2)
+        testing.assertEqual(resp.context_engine_id, _engine_id())
+        testing.assertEqual(agent.seen(), ["stale engine", "probe", "ok"])
+        info = c.engine_info()
+        if info is not None:
+            testing.assertEqual(info.engine_id, _engine_id())
+        else:
+            testing.error("no engine info")
+        s = c.stats()
+        testing.assertEqual((s.reports, s.timeouts, s.drops_auth), (2, 0, 0), str(s))
+
+    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        _finish(t, lambda: check(r, e))
+
+    c.get(done, _oids(1))
+
+
+actor _test_v3_other_engine_report_bounded(t: testing.AsyncT):
+    """Reports that keep naming another engine than discovery found: one rediscovery and resend, then the next
+    such Report fails the request with its ReportError instead of looping"""
+    mn = MemNet()
+    p = mem_pair(mn)
+    agent = _V3Agent(p.server, _users(), _engine_id())
+    agent.set_mode(OTHER_ENGINE_REPORT)
+    agent.set_report(usm.report_oid(usm.USM_STATS_UNKNOWN_USER_NAMES))
+    c = Client(None, AGENT, _shaaes(), t.log_handler, opts=SLOW, transport=p.client)
+    var outcomes: list[str] = []
+
+    def check() -> None:
+        testing.assertEqual(len(outcomes), 1, "exactly one callback")
+        testing.assertEqual(outcomes[0], "ReportError " + usm.USM_STATS_UNKNOWN_USER_NAMES)
+        testing.assertEqual(agent.seen(), ["probe", "other engine", "probe", "other engine"])
+        s = c.stats()
+        testing.assertEqual((s.reports, s.timeouts), (4, 0), str(s))
+
+    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        if isinstance(e, errors.ReportError):
+            outcomes.append("ReportError " + e.name)
+        else:
+            outcomes.append("not a ReportError: " + _describe(e))
+        after now QUIET: _finish(t, check)
 
     c.get(done, _oids(1))
 

@@ -1,43 +1,18 @@
-"""Tests for walks and tables: Client.walk, walk_stream and get_table
+"""Tests for Client.walk, walk_stream and get_table
 
-The real Client walks the real Agent (agent.act) over a transport.MemNet;
-a few cases need an agent misbehaving in a way Faults cannot express and
-use a scripted responder instead. Covered:
-
-  * GETNEXT walks (SNMPv1, and use_bulk=False) and GETBULK walks (SNMPv2c
-    and SNMPv3), subtree ends, endOfMibView, SNMPv1 noSuchName, the GET of
-    an empty walk's root;
-  * strictly increasing OIDs, also within one GETBULK response, with the
-    partial result (Faults.non_increasing_at), and the loop guard of
-    check_increasing=False;
-  * GETBULK responses cut anywhere (Faults.truncate_bulk), the empty
-    response that makes no progress, adaptive bulk on tooBig
-    (Faults.too_big_over) and on timeouts (NetFaults), and what the Client
-    remembers of it;
-  * retries in the middle of a walk, error statuses, max_walk_varbinds,
-    cancel() and close() with exactly-once callbacks, walk_stream batches,
-    invalid arguments;
-  * get_table: lock-step columns, sparse columns, rows merged by index,
-    truncated mid-row responses, parallel column groups
-    (max_oids_per_request) within max_in_flight, SNMPv1 tables;
-  * env tests over the lab dataset (interop/dataset/actsnmp.snmprec): full
-    walks for SNMPv1, v2c and v3, GETNEXT and GETBULK, equal to
-    interop/expected/canon/dataset.txt (SNMPv1: dataset-v1.txt) in
-    fmt.canon_varbind form, the 300-row table with its sparse column 7, the
-    string-indexed table and the 2000-row table against their expected
-    files, and the time of a 6000-varbind GETBULK walk (logged; run with
-    --fast --show-log to see it).
-
-Every walk reports through a Sink, which counts its callbacks: the checks
-run QUIET seconds after the last expected callback, so a second callback
-would be seen. MemNet delivery depends only on message order; timers enter
-only in the retry and timeout cases, with generous margins.
+The real Client walks the real Agent over MemNet; a few cases need a
+misbehaving agent that Faults cannot express and use a scripted responder.
+Each walk reports to a Sink that counts callbacks, and checks run QUIET
+seconds after the last expected one, so a second callback would be seen.
+The env tests compare full walks of the lab dataset with
+interop/expected/canon/ and log the time of a large GETBULK walk.
 """
 
 import logging
 import testing
 import time
 
+import client as client_mod
 import errors
 import fmt
 import message
@@ -518,7 +493,9 @@ actor _test_walk_truncated_bulk(t: testing.AsyncT):
 
 actor _test_walk_adaptive_too_big(t: testing.AsyncT):
     """Faults.too_big_over: the walk halves max-repetitions until the answer fits, completes, and the Client
-    remembers the value for later walks; adaptive_bulk=False does not remember"""
+    remembers the value for later walks; it tries the double again after client.BULK_REGROW_AFTER clean
+    responses, which fails here too (and makes the next try wait twice as long); adaptive_bulk=False
+    does not remember"""
     t.timeout(30.0)
     mn = MemNet()
     agent = Agent(mn.server(AGENT, 161), small_view(), config(), None, Faults(too_big_over=1200))
@@ -538,12 +515,14 @@ actor _test_walk_adaptive_too_big(t: testing.AsyncT):
         testing.assertEqual(ok(results["second"], "second"), want)
         testing.assertEqual(ok(results["plain"], "plain"), want)
         testing.assertEqual(ok(results["plain again"], "plain again"), want)
-        # 25 rows of 70 octets do not fit 1200, 12 do: the second walk starts at 12
+        # 25 rows of 70 octets do not fit 1200, 12 do: the second walk starts at 12. The first walk's
+        # last five GETBULKs were clean at 12; three more in the second walk make BULK_REGROW_AFTER (8), so
+        # its fourth tries 24, which is tooBig again and answered at 12
         first = reps["first"]
-        testing.assertEqual(first[:2], [25, 12], "tooBig halves: " + str(first))
+        testing.assertEqual(first, [25, 12, 12, 12, 12, 12, 12], "tooBig halves: " + str(first))
         rest = sent_reps(40001)[len(first):]
-        testing.assertTrue(len(rest) >= 5 and len([m for m in rest if m != 12]) == 0,
-                           "the second walk uses the learned value: " + str(rest))
+        testing.assertEqual(rest, [12, 12, 12, 24, 12, 12, 12],
+                            "the second walk uses the learned value, then tries 24: " + str(rest))
         p = sent_reps(40002)
         testing.assertEqual(p[:3], [25, 12, 25], "adaptive_bulk=False: every request starts at 25: " + str(p))
 
@@ -582,9 +561,10 @@ actor _test_walk_adaptive_timeout(t: testing.AsyncT):
         testing.assertEqual(ok(results["second"], "second"), want)
         testing.assertEqual(ok(results["fixed"], "fixed"), want)
         r = sent_reps(40001)
-        # first walk: 25 (answer lost), 12 (retry), 12, 12, 12, 12 (60 = 12 * 5); second walk: 12 * 5 (+1 to see the end)
-        testing.assertEqual(r[:3], [25, 12, 12], "the retry is halved: " + str(r))
-        testing.assertEqual(len([m for m in r if m == 25]), 1, "the learned value is kept: " + str(r))
+        # first walk: 25 (answer lost), 12 (retry), 12, 12, 12, 12 (60 = 12 * 5), 12 (the end); second walk:
+        # 12, 12, 12, then 24 (eight clean responses at 12: regrown, client.BULK_REGROW_AFTER), 24 (the end)
+        testing.assertEqual(r, [25, 12, 12, 12, 12, 12, 12, 12, 12, 12, 24, 24],
+                            "the retry is halved, the value kept, then regrown: " + str(r))
         f = sent_reps(40002)
         testing.assertEqual(f[:2], [25, 25], "adaptive_bulk=False retries unchanged: " + str(f))
         testing.assertEqual(c.stats().retries, 1)
@@ -632,6 +612,80 @@ actor _test_walk_adaptive_timeout_v3(t: testing.AsyncT):
         c.walk(walked, b([5]))
 
     c.discover(discovered)
+
+
+def regrow_sequence(top: int, low: int, length: int) -> list[int]:
+    """The max-repetitions an adaptive walk sends to an agent that answers tooBig above low rows, starting at
+    top = 2 * low: top (tooBig) and low, then low BULK_REGROW_AFTER times, the doubled try (tooBig) and low,
+    then low twice as often, and so on, the count bounded by BULK_REGROW_AFTER_MAX"""
+    out = [top, low]
+    need = client_mod.BULK_REGROW_AFTER
+    while len(out) < length:
+        out.extend([low for _ in range(need)])
+        out.extend([top, low])
+        need = need * 2 if need * 2 < client_mod.BULK_REGROW_AFTER_MAX else client_mod.BULK_REGROW_AFTER_MAX
+    return out[:length]
+
+actor _test_walk_adaptive_regrow(t: testing.AsyncT):
+    """The learned max-repetitions grows back: tooBig teaches 12, then the agent answers everything; after
+    BULK_REGROW_AFTER clean responses at 12 the walks use 24, after as many at 24 the Options' 25, which stays"""
+    t.timeout(30.0)
+    mn = MemNet()
+    extra = [VarBind(b([6, k, 0]), Integer(k)) for k in range(1, 401)]
+    agent = Agent(mn.server(AGENT, 161), MibView(small_view().varbinds() + extra), config(), None,
+                  Faults(too_big_over=1200))
+    c = client(mn, v2c(), 40001)
+    var results: dict[str, Got] = {}
+
+    def check() -> None:
+        testing.assertEqual(client_mod.BULK_REGROW_AFTER, 8, "the counts below assume 8")
+        testing.assertEqual(ok(results["learn"], "learn"), [VarBind(b([5, n, 0]), big(n)) for n in range(1, 61)])
+        testing.assertEqual(ok(results["regrow"], "regrow"), extra)
+        r = bulk_reps(requests_sent([d.data for d in mn.history() if d.src_port == 40001]))
+        # learn: 25 (tooBig) 12, then five clean at 12 (B.5.13 .. B.5.60 and the end); regrow: three more
+        # clean at 12 (eight), eight at 24, then 25 for the rest of the 400 integers
+        testing.assertEqual(r, [25, 12] + [12 for _ in range(8)] + [24 for _ in range(8)] + [25 for _ in range(7)],
+                            "max-repetitions sent: " + str(r))
+
+    def got(label: str, g: Got) -> None:
+        results[label] = g
+        if label == "learn":
+            agent.set_faults(None)
+            c.walk(Sink("regrow", got).walk_cb, b([6]))
+        else:
+            after now QUIET: report(t, outcome(check))
+
+    c.walk(Sink("learn", got).walk_cb, b([5]))
+
+
+actor _test_walk_adaptive_regrow_backoff(t: testing.AsyncT):
+    """An agent that answers tooBig above 2 rows, walked with max_repetitions 4: each doubling to 4 fails and
+    is answered at 2, and the next one waits twice as long: 8, 16, ... clean responses, at most
+    BULK_REGROW_AFTER_MAX (one failed try per 256 requests: bounded oscillation)"""
+    t.timeout(60.0)
+    mn = MemNet()
+    extra = [VarBind(b([7, k, 0]), big(k)) for k in range(1, 1601)]
+    agent = Agent(mn.server(AGENT, 161), MibView(small_view().varbinds() + extra), config(), None,
+                  Faults(too_big_over=240))
+    c = client(mn, v2c(), 40001, OPTS.with_(max_repetitions=4))
+    var walks: list[Got] = []
+
+    def check() -> None:
+        testing.assertEqual(client_mod.BULK_REGROW_AFTER_MAX, 256, "the counts below assume 256")
+        testing.assertEqual(len(walks), 1, "one callback")
+        testing.assertEqual(ok(walks[0], "walk"), extra)
+        r = bulk_reps(requests_sent([d.data for d in mn.history() if d.src_port == 40001]))
+        # 2 + (8 + 2) + (16 + 2) + ... + (256 + 2) + (256 + 2) = 776 GETBULKs: two gaps of 256 in a row
+        n = 776
+        testing.assertTrue(len(r) > n + 20, "%d GETBULKs" % len(r))
+        testing.assertEqual(r[:n], regrow_sequence(4, 2, n), "max-repetitions sent")
+        testing.assertEqual(r[n:], [2 for _ in range(len(r) - n)], "after the last doubling")
+
+    def walked(cl: Client, vbs: list[VarBind], e: ?errors.SnmpError) -> None:
+        walks.append(Got(vbs, None, len(vbs), [], e))
+        after now QUIET: report(t, outcome(check))
+
+    c.walk(walked, b([7]))
 
 
 actor _test_walk_retries_mid_walk(t: testing.AsyncT):

@@ -814,10 +814,9 @@ actor _V3Users(t: testing.EnvT, a: LabAgent):
     stale = Client(cap, LOCAL4, shaaes, None, port=a.port, opts=OPTS,
                    engine=EngineInfo(a.engine_id, a.boots, 1000000, _now()))
     scripts.append(("stale time", [get_step("get", stale, [b([1, 18, 0])]), info_step("info", stale)]))
-    # snmpd answers unknownEngineIDs: the Client rediscovers and resends. snmpsim answers
-    # unknownUserNames naming its own engine (README, "Implementation differences"): the Client drops a
-    # Report from another engine, times out twice, forgets the engine (RESET_AFTER_TIMEOUTS) and
-    # rediscovers on the third request
+    # snmpd answers unknownEngineIDs, snmpsim unknownUserNames naming its own engine (README,
+    # "Implementation differences"): either Report names another engine than the request went to and
+    # answers its msgID, so the Client rediscovers and resends; no request is lost
     moved = Client(cap, LOCAL4, shaaes, None, port=a.port, opts=Options(timeout=1.0, retries=1),
                    engine=EngineInfo(h("8000000001020399"), 1, 0, _now()))
     scripts.append(("wrong engine ID", [get_step("get", moved, [b([1, 18, 0])]), get_step("get 2", moved, [b([1, 18, 0])]),
@@ -876,20 +875,15 @@ actor _V3Users(t: testing.EnvT, a: LabAgent):
                 elif name == "wrong engine ID":
                     def wrong_engine() -> None:
                         st = outcome_of(got, "info").stats
-                        if a.name == "snmpd":
-                            # the request, unknownEngineIDs, discovery (its own exchange), the resend
-                            r = response(outcome_of(got, "get"), "get")
-                            same_lines(lines(r.varbinds), want_get[:1], "GET")
-                            check(r.attempts == 2, "%d datagrams for the request" % r.attempts)
-                            response(outcome_of(got, "get 2"), "get 2")
-                            if st is not None:
-                                check(st.reports == 2 and st.timeouts == 0, "unknownEngineIDs and discovery: " + str(st))
-                        else:
-                            timed_out(outcome_of(got, "get"), "get")
-                            timed_out(outcome_of(got, "get 2"), "get 2")
-                            if st is not None:
-                                check(st.reports == 1 and st.timeouts == 2 and st.drops_auth == 4,
-                                      "4 Reports from another engine dropped, one discovery: " + str(st))
+                        # the request, the Report from the agent's engine (snmpd: unknownEngineIDs,
+                        # snmpsim: unknownUserNames), discovery (its own exchange), the resend
+                        r = response(outcome_of(got, "get"), "get")
+                        same_lines(lines(r.varbinds), want_get[:1], "GET")
+                        check(r.attempts == 2, "%d datagrams for the request" % r.attempts)
+                        same_lines(got_lines(outcome_of(got, "get 2"), "get 2"), want_get[:1], "GET")
+                        if st is not None:
+                            check(st.reports == 2 and st.timeouts == 0 and st.drops_auth == 0,
+                                  "the Report from the agent's engine and discovery: " + str(st))
                         same_lines(got_lines(outcome_of(got, "get 3"), "get 3"), want_get[:1], "GET")
                         info = outcome_of(got, "info").info
                         if info is not None:
@@ -1424,10 +1418,12 @@ actor _test_snmpsim_large(t: testing.EnvT):
 RESTART_MIN_UPTIME = 165
 
 actor _test_snmpd_restart(t: testing.EnvT):
-    """snmpd restarted (docker restart: engine boots 1 and time 0 again, its persistent state is wiped)
-    under a long-lived SNMPv3 Client: its first request after the restart times out (snmpd's
-    notInTimeWindows Reports fail RFC 3414 3.2 step 7b and are dropped), which resets the engine state;
-    the next request rediscovers the engine and succeeds"""
+    """An snmpd restart under a long-lived SNMPv3 Client loses no request
+
+    After a docker restart snmpd is back at boots 1 and time 0, so it
+    answers with an authenticated notInTimeWindows Report (RFC 3414 3.2
+    step 7b). The Client resynchronises from it and resends.
+    """
     t.timeout(300.0)
     t.require("interop")
     cap = udp_cap(t)
@@ -1445,9 +1441,12 @@ actor _test_snmpd_restart(t: testing.EnvT):
             o = outcome_of(got, "restart")
             check(o.code == 0, "docker restart: %d %s" % (o.code, clip(o.text)))
             response(outcome_of(got, "probe"), "snmpd answers again")
-            e = timed_out(outcome_of(got, "after restart"), "the first request after the restart")
-            hint = e.hint
-            check(hint is not None and "outside the time window" in hint, "hint: " + str(hint))
+            # the request, snmpd's authenticated notInTimeWindows Report (time back by more than 150 s),
+            # the resend with the resynchronised clock
+            r = response(outcome_of(got, "after restart"), "the first request after the restart")
+            same_lines(lines(r.varbinds), [".1.3.6.1.4.1.8072.9999.1.1.18.0 = INTEGER: 2147483647"],
+                       "the first request after the restart")
+            check(r.attempts == 2, "%d datagrams for the first request after the restart" % r.attempts)
             same_lines(got_lines(outcome_of(got, "again"), "again"),
                        [".1.3.6.1.4.1.8072.9999.1.1.18.0 = INTEGER: 2147483647"], "the next request")
             ia = outcome_of(got, "info after").info
@@ -1457,8 +1456,9 @@ actor _test_snmpd_restart(t: testing.EnvT):
                 raise AssertionError("no engine info after the restart")
             st = outcome_of(got, "info after").stats
             if st is not None:
-                # two discoveries; the two dropped notInTimeWindows Reports
-                check(st.reports == 2 and st.timeouts == 1 and st.drops_auth == 2, "counters: " + str(st))
+                # one discovery and the notInTimeWindows Report; no request lost, nothing dropped
+                check(st.reports == 2 and st.timeouts == 0 and st.retries == 0 and st.drops_auth == 0,
+                      "counters: " + str(st))
         report_env(t, outcome(run))
 
     def restart() -> None:
