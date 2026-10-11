@@ -13,10 +13,14 @@ import agent
 import ber
 import cliopts
 import errors
+import file
+import mibcli
+import mib.resolver
 import mibview
 import notify
 import pdu
 import security
+import values
 from actsnmp import Command, TrapPrinter
 from agent import Agent, AgentConfig, Faults
 from client import Client
@@ -135,11 +139,19 @@ class Step(object):
         self.code = code
         self.exact = exact
 
-proc def run_cli(mn: MemNet, port: int, args: list[str], report: action(Result) -> None) -> None:
-    """Run one client command over MemNet from MANAGER:port; parse errors are reported as exit code 1"""
+proc def run_cli(mn: MemNet, port: int, args: list[str], report: action(Result) -> None,
+                 tree: ?mibcli.MibTree=None) -> None:
+    """Run one client command over MemNet from MANAGER:port; parse errors are reported as exit code 1
+
+    With tree the command reads and prints OIDs with those MIBs, as the CLI
+    does after loading the -m modules (cliopts.scan, CliOptions.mib, finish).
+    """
     cap = Capture(report)
     try:
-        o = cliopts.parse(["actsnmp"] + args)
+        o = cliopts.scan(["actsnmp"] + args)
+        o.mib = tree
+        if not (o.help or o.show_version):
+            cliopts.finish(o)
         sec = actsnmp.security_of(o)
         c = actsnmp.new_client(None, o, sec, mn.client(MANAGER, port, o.address, o.port))
         Command(o, c, cap.out, cap.err, cap.done)
@@ -162,8 +174,9 @@ def _mismatch(s: Step, r: Result) -> ?str:
     return ("actsnmp " + " ".join(s.args) + "\n  expected exit %d, out %r, err %r\n  got      exit %d, out %r, err %r"
             % (s.code, s.out, s.err, r.code, r.out, r.err))
 
-actor Script(mn: MemNet, steps: list[Step], first_port: int, report: action(list[str]) -> None):
-    """Runs steps one after the other and reports the mismatches (empty: all passed)"""
+actor Script(mn: MemNet, steps: list[Step], first_port: int, report: action(list[str]) -> None,
+             tree: ?mibcli.MibTree=None):
+    """Runs steps one after the other and reports the mismatches (empty: all passed); tree: the MIBs to use"""
     var _i = 0
     var _failures: list[str] = []
 
@@ -178,7 +191,7 @@ actor Script(mn: MemNet, steps: list[Step], first_port: int, report: action(list
         if _i >= len(steps):
             report(_failures)
         else:
-            run_cli(mn, first_port + _i, steps[_i].args, _step_done)
+            run_cli(mn, first_port + _i, steps[_i].args, _step_done, tree)
 
     _next()
 
@@ -455,6 +468,19 @@ def _test_failure_texts() -> None:
     testing.assertEqual(actsnmp.failure_text(o, disc, True), "snmpget: Timeout\n")
     plain = errors.TimeoutError(2, 2.0, "ICMP port unreachable")
     testing.assertEqual(actsnmp.failure_text(o, plain, True), "Timeout: No Response from udp:nosuch.invalid:161.\n")
+    # with MIBs the "<tool>: <reason>" texts carry the detail a name lookup left behind (snmp_sess_perror);
+    # "Timeout: No Response" and "Unknown host (...)" do not
+    o.mib_detail = "Sub-id not found: (top) -> sysDescr"
+    testing.assertEqual(actsnmp.failure_text(o, disc, True), "snmpget: Timeout (Sub-id not found: (top) -> sysDescr)\n")
+    testing.assertEqual(actsnmp.failure_text(o, other, True),
+                        "snmpget: UDP setup for x:161 failed: no route (Sub-id not found: (top) -> sysDescr)\n")
+    testing.assertEqual(actsnmp.failure_text(o, plain, True), "Timeout: No Response from udp:nosuch.invalid:161.\n")
+    testing.assertEqual(actsnmp.failure_text(o, dns, True), "snmpget: Unknown host (udp:nosuch.invalid:161)\n")
+    v = cliopts.parse(["actsnmp", "trap", "-v3", "-Ci", "h", "", "1.3.6"])
+    testing.assertEqual(actsnmp.session_error_text(v), "snmpinform: No securityName specified\n")
+    v.mib_detail = "Sub-id not found: (top) -> sysContact"
+    testing.assertEqual(actsnmp.session_error_text(v),
+                        "snmpinform: No securityName specified (Sub-id not found: (top) -> sysContact)\n")
 
 def bp(args: list[str]) -> str:
     """actsnmp.build_problem of a command line"""
@@ -664,11 +690,11 @@ def sorted_lines(text: str) -> str:
         lines = lines[:len(lines) - 1]
     return "".join([line + "\n" for line in sorted(lines)])
 
-actor LabWalk(t: testing.EnvT, args: list[str], expected_file: str, sort_lines: bool):
+actor LabWalk(t: testing.EnvT, args: list[str], expected_file: str, sort_lines: bool, tree: ?mibcli.MibTree=None):
     """Serve the lab dataset as `actsnmp agent` does and compare one CLI walk with a recorded file
 
     sort_lines compares the sorted lines (a table printed in row order
-    against a recorded walk in column order).
+    against a recorded walk in column order); tree: the MIBs to print with.
     """
     mn = MemNet()
     o = cliopts.parse(["actsnmp", "agent"])
@@ -692,7 +718,7 @@ actor LabWalk(t: testing.EnvT, args: list[str], expected_file: str, sort_lines: 
                                      % (r.code, r.err, n + 1, got[n] if n < len(got) else "<end>",
                                         want[n] if n < len(want) else "<end>")))
 
-    run_cli(mn, 45000, args, _done)
+    run_cli(mn, 45000, args, _done, tree)
 
 actor _test_lab_bulkwalk(t: testing.EnvT):
     """bulkwalk -v2c of the lab dataset equals interop/expected/netsnmp/snmpd-dataset.On.txt (snmpbulkwalk -On)"""
@@ -726,3 +752,177 @@ actor _test_lab_table_v1(t: testing.EnvT):
     LabWalk(t, ["table", "--canon", "-v1", "-c", "public", AGENT, ".1.3.6.1.4.1.8072.9999.1.11.1.1",
                 ".1.3.6.1.4.1.8072.9999.1.11.1.2", ".1.3.6.1.4.1.8072.9999.1.11.1.3"],
             "interop/expected/canon/strtable.txt", True)
+
+
+# With MIBs ########################################################################################
+
+MIB_TEXT = r"""
+CLI-TEST-MIB DEFINITIONS ::= BEGIN
+IMPORTS
+    MODULE-IDENTITY, OBJECT-TYPE, NOTIFICATION-TYPE, Integer32, Counter64, enterprises FROM SNMPv2-SMI
+    TEXTUAL-CONVENTION, DisplayString FROM SNMPv2-TC;
+cliTest MODULE-IDENTITY
+    LAST-UPDATED "202610110000Z" ORGANIZATION "x" CONTACT-INFO "x" DESCRIPTION "x"
+    ::= { enterprises 8072 9999 1 }
+CliHex ::= TEXTUAL-CONVENTION
+    DISPLAY-HINT "1x:"
+    STATUS current
+    DESCRIPTION "x"
+    SYNTAX OCTET STRING
+cliInt OBJECT-TYPE SYNTAX INTEGER { zero(0), answer(42) } MAX-ACCESS read-only STATUS current DESCRIPTION "x"
+    ::= { cliTest 1 1 }
+cliStr OBJECT-TYPE SYNTAX CliHex MAX-ACCESS read-only STATUS current DESCRIPTION "x" ::= { cliTest 2 1 }
+cliC64 OBJECT-TYPE SYNTAX Counter64 UNITS "octets" MAX-ACCESS read-only STATUS current DESCRIPTION "x"
+    ::= { cliTest 3 1 }
+cliTable OBJECT-TYPE SYNTAX SEQUENCE OF CliEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "x"
+    ::= { cliTest 10 }
+cliEntry OBJECT-TYPE SYNTAX CliEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "x"
+    INDEX { cliIndex } ::= { cliTable 1 }
+CliEntry ::= SEQUENCE { cliIndex Integer32, cliValue Integer32, cliOther Integer32 }
+cliIndex OBJECT-TYPE SYNTAX Integer32 (1..100) MAX-ACCESS read-only STATUS current DESCRIPTION "x"
+    ::= { cliEntry 1 }
+cliValue OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current DESCRIPTION "x" ::= { cliEntry 2 }
+cliOther OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current DESCRIPTION "x" ::= { cliEntry 3 }
+cliWInt OBJECT-TYPE SYNTAX Integer32 (0..100) MAX-ACCESS read-write STATUS current DESCRIPTION "x"
+    ::= { cliTest 20 1 }
+cliWStr OBJECT-TYPE SYNTAX DisplayString (SIZE (0..16)) MAX-ACCESS read-write STATUS current DESCRIPTION "x"
+    ::= { cliTest 20 2 }
+cliNotify NOTIFICATION-TYPE OBJECTS { cliInt } STATUS current DESCRIPTION "x" ::= { cliTest 0 1 }
+END
+"""
+
+SYS_MIB = r"""
+SYS-TEST-MIB DEFINITIONS ::= BEGIN
+IMPORTS MODULE-IDENTITY, OBJECT-TYPE, mib-2 FROM SNMPv2-SMI
+        DisplayString FROM SNMPv2-TC;
+sysTest MODULE-IDENTITY LAST-UPDATED "202610110000Z" ORGANIZATION "x" CONTACT-INFO "x" DESCRIPTION "x"
+    ::= { mib-2 9999 }
+system OBJECT IDENTIFIER ::= { mib-2 1 }
+sysDescr OBJECT-TYPE SYNTAX DisplayString (SIZE (0..255)) MAX-ACCESS read-only STATUS current DESCRIPTION "x"
+    ::= { system 1 }
+END
+"""
+
+def cli_tree() -> mibcli.MibTree:
+    ms = mib.resolver.resolve_texts([MIB_TEXT, SYS_MIB])
+    return mibcli.build_tree(ms, ["CLI-TEST-MIB", "SYS-TEST-MIB"])
+
+def mib_steps() -> list[Step]:
+    pub = ["-v2c", "-c", "public", AGENT]
+    v1 = ["-v1", "-c", "public", AGENT]
+    m = ["-m", "CLI-TEST-MIB"]
+    rows = "".join(["CLI-TEST-MIB::cliValue.%d = INTEGER: %d\n" % (i, 200 + i) for i in range(1, 4)])
+    return [
+        # names in and out, values per the MIB (enumeration, DISPLAY-HINT, UNITS), the other OID styles
+        Step(["get"] + m + pub + ["cliInt.0", "CLI-TEST-MIB::cliStr.0", "cliC64.0", "sysDescr.0", ".1.3.6.1.4.1.8072.9999.1.4.1.0"],
+             "CLI-TEST-MIB::cliInt.0 = INTEGER: answer(42)\nCLI-TEST-MIB::cliStr.0 = STRING: 68:65:6c:6c:6f\n"
+             + "CLI-TEST-MIB::cliC64.0 = Counter64: 18446744073709551615 octets\n"
+             + "SYS-TEST-MIB::sysDescr.0 = STRING: actsnmp test agent\n"
+             + "CLI-TEST-MIB::cliTest.4.1.0 = IpAddress: 192.0.2.1\n", "", 0),
+        Step(["get", "-Os"] + m + pub + ["cliInt.0"], "cliInt.0 = INTEGER: answer(42)\n", "", 0),
+        Step(["get", "-Of", "-Oe"] + m + pub + ["cliInt.0"],
+             ".iso.org.dod.internet.private.enterprises.8072.9999.cliTest.1.cliInt.0 = INTEGER: 42\n", "", 0),
+        Step(["get", "-On", "-OU"] + m + pub + ["cliC64.0"], EP + ".3.1.0 = Counter64: 18446744073709551615\n", "", 0),
+        Step(["get", "-Oqv"] + m + pub + ["cliInt.0"], "answer\n", "", 0),
+        Step(["get", "-Ih"] + m + pub + ["cliStr.0"], "CLI-TEST-MIB::cliStr.0 = STRING: \"hello\"\n", "", 0),
+        # walks and tables: the index after the column's name; exceptions keep net-snmp's texts
+        Step(["walk"] + m + pub + ["cliValue"], rows, "", 0),
+        Step(["bulkwalk", "-Cr2"] + m + pub + ["cliValue"], rows, "", 0),
+        Step(["walk"] + m + pub + ["cliTest.15"], "CLI-TEST-MIB::cliTest.15" + NO_SUCH_OBJECT, "", 0),
+        Step(["getnext"] + m + pub + ["cliIndex.3"], "CLI-TEST-MIB::cliValue.1 = INTEGER: 201\n", "", 0),
+        Step(["table"] + m + pub + ["cliValue", "cliOther"],
+             "".join(["CLI-TEST-MIB::cliValue.%d = INTEGER: %d\nCLI-TEST-MIB::cliOther.%d = INTEGER: %d\n"
+                      % (i, 200 + i, i, 300 + i) for i in range(1, 4)]), "", 0),
+        # errors name the failed object
+        Step(["get"] + m + v1 + ["cliInt.0", "cliTest.99.0"], "CLI-TEST-MIB::cliInt.0 = INTEGER: answer(42)\n",
+             "Error in packet\n" + NO_SUCH_NAME + "Failed object: CLI-TEST-MIB::cliTest.99.0\n\n", 2),
+        Step(["get"] + m + pub + ["nosuch.0", "cliInt.0", "cliValue.x"], "",
+             "nosuch.0: Unknown Object Identifier (Sub-id not found: (top) -> nosuch)\n"
+             + "cliValue.x: Unknown Object Identifier (Index out of range: x (cliIndex))\n", 1),
+        # SET with the MIB's types and checks
+        Step(["set", "-v2c", "-c", "private", AGENT] + m + ["cliWInt.0", "=", "55", "cliWStr.0", "=", "xyz"],
+             "CLI-TEST-MIB::cliWInt.0 = INTEGER: 55\nCLI-TEST-MIB::cliWStr.0 = STRING: xyz\n", "", 0),
+        Step(["set", "-v2c", "-c", "private", AGENT] + m + ["cliWInt.0", "=", "101", "cliWStr.0", "i", "1"], "",
+             "cliWInt.0: Value out of range (101 :: {{(0..100)}})\n"
+             + "cliWStr.0: Bad variable type (Type of attribute is OCTET STRING, not INTEGER)\n", 1),
+        Step(["set", "-v2c", "-c", "private", AGENT] + m + ["cliInt.0", "=", "zero"], "",
+             "Error in packet.\nReason: notWritable (That object does not support modification)\n"
+             + "Failed object: CLI-TEST-MIB::cliInt.0\n\n", 2),
+        # session errors carry the detail of the label lookup that read_objid failed first (snmp_sess_perror)
+        Step(["get", "-v3", "-l", "noAuthNoPriv", "-u", "nobody"] + m + [AGENT, "cliInt.0"], "",
+             "snmpget: Unknown user name (Sub-id not found: (top) -> cliInt)\n", 1),
+        Step(["get", "-v3", "-l", "authNoPriv", "-u", "u_md5"] + m + [AGENT, "CLI-TEST-MIB::cliInt.0"], "",
+             "snmpget: USM authentication failure (incorrect password or key)\n", 1),
+        Step(["walk", "-v3", "-l", "authNoPriv", "-u", "u_md5"] + m + [AGENT, "cliValue"], "",
+             "snmpwalk: USM authentication failure (incorrect password or key) (Sub-id not found: (top) -> cliValue)\n",
+             1),
+    ]
+
+actor _test_with_mibs(t: testing.AsyncT):
+    """get, walk, bulkwalk, table and set with MIBs: names in and out, values as net-snmp prints them with MIBs"""
+    t.timeout(60.0)
+    mn = MemNet()
+    ag = Agent(mn.server(AGENT, 161), make_view(), make_config(), None)
+
+    def done(failures: list[str]) -> None:
+        finish(t, failures)
+
+    Script(mn, mib_steps(), 46000, done, cli_tree())
+
+def _test_mib_texts() -> None:
+    """Error texts and trapd blocks name OIDs per the MIBs; --canon stays numeric"""
+    t = cli_tree()
+    o = cliopts.scan(["actsnmp", "walk", "-m", "CLI-TEST-MIB"])
+    o.mib = t
+    testing.assertEqual(actsnmp.oid_not_increasing(e([10, 1, 2, 3]), e([10, 1, 2, 1]), o),
+                        "Error: OID not increasing: CLI-TEST-MIB::cliValue.3\n >= CLI-TEST-MIB::cliValue.1\n\n")
+    e2 = errors.ErrorStatusError(pdu.NOT_WRITABLE, 1, e([20, 1, 0]).arcs)
+    testing.assertEqual(actsnmp.error_status_text(True, e2, o),
+                        "Error in packet.\nReason: notWritable (That object does not support modification)\n"
+                        + "Failed object: CLI-TEST-MIB::cliWInt.0\n\n")
+    tr = pdu.Pdu(pdu.TRAP_V2, 1, 0, 0, [VarBind(Oid([1, 3, 6, 1, 2, 1, 1, 3, 0]), values.TimeTicks(5)),
+                                        VarBind(Oid([1, 3, 6, 1, 6, 3, 1, 1, 4, 1, 0]), ObjectIdentifier(e([0, 1]))),
+                                        VarBind(e([1, 1, 0]), Integer(42))])
+    n = notify.notification_from_v2c(tr, b"public", "10.0.0.2", 40000)
+    d = cliopts.scan(["actsnmp", "trapd", "-m", "CLI-TEST-MIB"])
+    d.mib = t
+    testing.assertEqual(actsnmp.notification_text(d, n),
+                        "NOTIFICATION v2c TRAP2 from=10.0.0.2:40000 community=\"public\" uptime=5 "
+                        + "trapoid=.1.3.6.1.4.1.8072.9999.1.0.1\nCLI-TEST-MIB::cliInt.0 = INTEGER: answer(42)\nEND\n")
+    c = cliopts.scan(["actsnmp", "trapd", "--canon", "-m", "CLI-TEST-MIB"])
+    c.mib = t
+    testing.assertEqual(actsnmp.notification_text(c, n).split("\n")[1], EP + ".1.1.0 = INTEGER: 42")
+
+actor _test_lab_mib_walk(t: testing.EnvT):
+    """bulkwalk of the lab dataset with ACTSNMP-LAB-MIB (read from interop/mibs) equals net-snmp's walk of snmpd with
+    the same MIBs, interop/expected/netsnmp/snmpd-dataset.lab-mib.txt"""
+    t.timeout(120.0)
+    ld = mibcli.load(file.FileCap(t.env.cap), "interop/mibs/golden/mibs:interop/mibs/lab",
+                     ["ACTSNMP-LAB-MIB", "SNMPv2-MIB", "NET-SNMP-MIB"])
+    LabWalk(t, ["bulkwalk", "-m", "ACTSNMP-LAB-MIB", "-v2c", "-c", "public", AGENT, ".1.3.6.1.4.1.8072.9999.1"],
+            "interop/expected/netsnmp/snmpd-dataset.lab-mib.txt", False, ld.tree)
+
+actor _test_lab_mib_walk_ox(t: testing.EnvT):
+    """bulkwalk -OX with ACTSNMP-LAB-MIB equals interop/expected/netsnmp/snmpd-dataset.lab-mib-OX.txt"""
+    t.timeout(120.0)
+    ld = mibcli.load(file.FileCap(t.env.cap), "interop/mibs/golden/mibs:interop/mibs/lab",
+                     ["ACTSNMP-LAB-MIB", "SNMPv2-MIB", "NET-SNMP-MIB"])
+    LabWalk(t, ["bulkwalk", "-OX", "-m", "ACTSNMP-LAB-MIB", "-v2c", "-c", "public", AGENT, ".1.3.6.1.4.1.8072.9999.1"],
+            "interop/expected/netsnmp/snmpd-dataset.lab-mib-OX.txt", False, ld.tree)
+
+actor _test_load_messages(t: testing.EnvT):
+    """net-snmp's "Cannot find module (X): At line N in (none)": N is 1 after scanning MIB files that start with
+    their module header (interop/mibs/lab), 0 when the path has no file (a missing directory), also for a module
+    only an OID argument names"""
+    fc = file.FileCap(t.env.cap)
+    a = mibcli.load(fc, "interop/mibs/lab", ["NOPE-MIB"])
+    b = mibcli.load(fc, "interop/mibs/no-such-directory", ["NOPE-MIB"])
+    z = b.lazy_loads()
+    note = z.note(b.tree, "NOPE2-MIB::x")
+    if (a.messages == "MIB search path: interop/mibs/lab\nCannot find module (NOPE-MIB): At line 1 in (none)\n"
+            and b.messages == ("MIB search path: interop/mibs/no-such-directory\n"
+                               + "Cannot find module (NOPE-MIB): At line 0 in (none)\n")
+            and note == "Cannot find module (NOPE2-MIB): At line 0 in (none)\n"):
+        t.success()
+    else:
+        t.failure(AssertionError("messages %r, %r, note %r" % (a.messages, b.messages, note)))

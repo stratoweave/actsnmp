@@ -313,8 +313,10 @@ def _test_with_flags():
     testing.assertFalse(d.with_flags("qq").quick)
     big_q = d.with_flags("Q")
     testing.assertTrue(big_q.quick and big_q.quick_equals)
+    # Q sets quick_equals (net-snmp's snmp_out_options) and toggles quick
     qq = d.with_flags("QQ")
-    testing.assertFalse(qq.quick or qq.quick_equals)
+    testing.assertFalse(qq.quick)
+    testing.assertTrue(qq.quick_equals)
     testing.assertTrue(d.with_flags("v").bare_value)
     testing.assertFalse(d.with_flags("vv").bare_value)
     testing.assertTrue(d.with_flags("T").hex_text)
@@ -332,6 +334,28 @@ def _test_with_flags_rejects():
     d = OutputOptions()
     for flags in ["f", "s", "S", "u", "z", "p", " ", "qz", "-q"]:
         value_fails(lambda: d.with_flags(flags), "-O" + flags)
+
+def _test_with_flags_mib_letters():
+    """The letters that matter with MIBs: OID styles (only with names), e U b E X 0 toggle, n sets numeric"""
+    d = OutputOptions()
+    testing.assertEqual(d.oid_style, fmt.OID_DEFAULT)
+    testing.assertEqual(d.with_flags("n").oid_style, fmt.OID_NUMERIC)
+    for f, style in [("f", fmt.OID_FULL), ("s", fmt.OID_SUFFIX), ("S", fmt.OID_MODULE), ("u", fmt.OID_UCD),
+                     ("fn", fmt.OID_NUMERIC), ("nS", fmt.OID_MODULE)]:
+        testing.assertEqual(d.with_flags(f, True).oid_style, style)
+    e = d.with_flags("eUbEX0")
+    testing.assertTrue(e.numeric_enums and e.no_units and e.dont_breakdown and e.escape_quotes and e.extended_index
+                       and e.two_digit_hex)
+    ee = d.with_flags("eUbEX0eUbEX0")
+    testing.assertFalse(ee.numeric_enums or ee.no_units or ee.dont_breakdown or ee.escape_quotes or ee.extended_index
+                        or ee.two_digit_hex)
+    # -OQQq: Q sets quick_equals, so quick output keeps " = " (net-snmp 5.9.4: "OID = value")
+    qqq = d.with_flags("QQq")
+    testing.assertTrue(qqq.quick and qqq.quick_equals)
+    testing.assertEqual(fmt.netsnmp_varbind(vb("1.3.6.1.2.1.1.1.0", Integer(0)), qqq), ".1.3.6.1.2.1.1.1.0 = 0")
+    c = e.copy()
+    testing.assertTrue(c.numeric_enums and c.two_digit_hex)
+    testing.assertEqual(c.oid_style, e.oid_style)
 
 def _test_output_options_repr():
     testing.assertEqual(repr(OutputOptions().with_flags("qx")),

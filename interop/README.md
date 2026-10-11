@@ -42,6 +42,7 @@ initial values and engineBoots restarts at 1.
 | actsnmp agent (under test) | host | udp `127.0.0.1:16163`, `[::1]:16163` | `0x80001f8880616374736e6d7061` ("actsnmpa") |
 | net-snmp trap receiver | `actsnmp-snmptrapd` | udp `127.0.0.1:16164`, udp6 `[::1]:16164` | `0x80001f8880616374736e6d7074` ("actsnmpt") |
 | actsnmp receiver (under test) | host | udp `127.0.0.1:16165` | `0x80001f8880616374736e6d7072` ("actsnmpr") |
+| actsnmp agent serving an snmpd MIB snapshot | host | udp `127.0.0.1:16167` | |
 | closed port for timeout tests | | udp `127.0.0.1:16169` | |
 | tools | `actsnmp-tools` | | idle container for `docker exec` |
 
@@ -205,7 +206,9 @@ The tests in `test_interop` skip themselves when the lab does not answer.
 and through `out/bin/actsnmp` on the host, and compares stdout, stderr and the
 exit code byte for byte. A difference is a FAIL unless the case is marked as
 a known difference with its reason; those are reported as KNOWN, and as
-FIXED? once the outputs agree.
+FIXED? once the outputs agree. The `mib` section loads MIBs in both tools
+from the same directories (the golden set, `mibs/lab/ACTSNMP-LAB-MIB` and
+net-snmp's own directories).
 
 `agentcheck.sh` runs the agent-generic part of `tools/selftest.py`
 (communities, the v3 matrix, negative USM cases, GET/GETNEXT/GETBULK, walks,
@@ -274,8 +277,7 @@ Packet capture:
 * Decryption failures: snmpd drops the request, snmpsim sends a
   `decryptionErrors` report.
 * A request with a stale engine ID: snmpd sends `unknownEngineIDs`, snmpsim
-  an unauthenticated `unknownUserNames` report naming its own engine. The
-  Client takes both as a stale engine ID, rediscovers and resends once.
+  an unauthenticated `unknownUserNames` report naming its own engine.
 * GETBULK returns at most 100 varbinds on snmpd and 64 on snmpsim.
   Max-repetitions 0 gives an empty response on snmpd and no answer on
   snmpsim.
@@ -285,9 +287,7 @@ Packet capture:
   `noSuchInstance` value instead of an error-status.
 * `docker restart actsnmp-snmpd` resets engineBoots to 1 and engineTime to 0,
   so a long-lived manager gets `notInTimeWindows` reports that fail RFC 3414
-  section 3.2 step 7b. The Client still takes such a report when its MAC
-  verifies and it answers one of the request's outstanding msgIDs: it
-  resynchronizes and resends once, so the request succeeds.
+  section 3.2 step 7b.
 * net-snmp `snmptrap` sends the host uptime in hundredths of a second as
   engineTime and cannot send a raw Opaque; snmptrapd drops v3 notifications
   below the user's level without a trace.

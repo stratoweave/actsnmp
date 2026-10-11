@@ -1,0 +1,843 @@
+"""Tests for mibcli
+
+The expected texts are net-snmp 5.9.4's for the same objects. LAB-TEST-MIB
+below is the lab's ACTSNMP-LAB-MIB inlined under enterprises.99999, so the
+tests need no files.
+"""
+
+import testing
+
+import fmt
+import mibcli
+import values
+import mib.resolver
+import mib.source
+from fmt import OutputOptions
+from mibcli import InputOptions, MibTree
+from oid import Oid
+from values import Counter32, Counter64, Gauge32, Integer, IpAddress, ObjectIdentifier, OctetString, Opaque
+from values import TimeTicks, VarBind, NoSuchInstance
+
+LAB_MIB = r"""
+LAB-TEST-MIB DEFINITIONS ::= BEGIN
+IMPORTS
+    MODULE-IDENTITY, OBJECT-TYPE, NOTIFICATION-TYPE, Integer32, Unsigned32, Counter64, Gauge32, TimeTicks,
+    IpAddress, enterprises
+        FROM SNMPv2-SMI
+    TEXTUAL-CONVENTION, DisplayString, RowPointer
+        FROM SNMPv2-TC;
+
+labTestMIB MODULE-IDENTITY
+    LAST-UPDATED "202610110000Z"
+    ORGANIZATION "actsnmp"
+    CONTACT-INFO "actsnmp"
+    DESCRIPTION  "Test types."
+    ::= { enterprises 99999 }
+
+LabHex ::= TEXTUAL-CONVENTION
+    DISPLAY-HINT "x"
+    STATUS       current
+    DESCRIPTION  "Hex."
+    SYNTAX       Integer32
+
+LabCenti ::= TEXTUAL-CONVENTION
+    DISPLAY-HINT "d-2"
+    STATUS       current
+    DESCRIPTION  "Hundredths."
+    SYNTAX       Integer32
+
+LabBinary ::= TEXTUAL-CONVENTION
+    DISPLAY-HINT "b"
+    STATUS       current
+    DESCRIPTION  "Binary."
+    SYNTAX       Integer32
+
+LabTriState ::= TEXTUAL-CONVENTION
+    STATUS       current
+    DESCRIPTION  "Three states."
+    SYNTAX       INTEGER { minusOne(-1), zero(0), one(1) }
+
+LabColonHex ::= TEXTUAL-CONVENTION
+    DISPLAY-HINT "1x:"
+    STATUS       current
+    DESCRIPTION  "Colon hex."
+    SYNTAX       OCTET STRING (SIZE (0..64))
+
+LabFlags ::= TEXTUAL-CONVENTION
+    STATUS       current
+    DESCRIPTION  "Flags."
+    SYNTAX       BITS { b0(0), b1(1), b2(2), b3(3), b7(7), b8(8), b15(15), b16(16), b31(31) }
+
+LabAliasName ::= TEXTUAL-CONVENTION
+    STATUS       current
+    DESCRIPTION  "A TC on a TC."
+    SYNTAX       DisplayString
+
+labScalars OBJECT IDENTIFIER ::= { labTestMIB 1 }
+
+labIntHex OBJECT-TYPE
+    SYNTAX      LabHex
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Hex."
+    ::= { labScalars 1 }
+
+labIntCenti OBJECT-TYPE
+    SYNTAX      LabCenti
+    UNITS       "degrees"
+    MAX-ACCESS  read-write
+    STATUS      current
+    DESCRIPTION "Hundredths."
+    ::= { labScalars 2 }
+
+labIntBinary OBJECT-TYPE
+    SYNTAX      LabBinary
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Binary."
+    ::= { labScalars 3 }
+
+labIntEnum OBJECT-TYPE
+    SYNTAX      LabTriState
+    MAX-ACCESS  read-write
+    STATUS      current
+    DESCRIPTION "An enumeration."
+    DEFVAL      { zero }
+    ::= { labScalars 4 }
+
+labIntKeywords OBJECT-TYPE
+    SYNTAX      INTEGER { current(1), mandatory(2), deprecated(3) }
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Labels that are keywords of net-snmp's parser."
+    ::= { labScalars 5 }
+
+labStrHex OBJECT-TYPE
+    SYNTAX      LabColonHex
+    MAX-ACCESS  read-write
+    STATUS      current
+    DESCRIPTION "Colon hex."
+    DEFVAL      { '00ff'H }
+    ::= { labScalars 6 }
+
+labStrFlags OBJECT-TYPE
+    SYNTAX      LabFlags
+    MAX-ACCESS  read-write
+    STATUS      current
+    DESCRIPTION "BITS."
+    ::= { labScalars 7 }
+
+labStrAlias OBJECT-TYPE
+    SYNTAX      LabAliasName
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "No hint (net-snmp)."
+    ::= { labScalars 8 }
+
+labStrDisplay OBJECT-TYPE
+    SYNTAX      DisplayString (SIZE (0..8))
+    MAX-ACCESS  read-write
+    STATUS      current
+    DESCRIPTION "DisplayString."
+    ::= { labScalars 9 }
+
+labGauge OBJECT-TYPE
+    SYNTAX      Gauge32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Gauge32."
+    ::= { labScalars 10 }
+
+labC64 OBJECT-TYPE
+    SYNTAX      Counter64
+    UNITS       "octets"
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Counter64."
+    ::= { labScalars 11 }
+
+labTicks OBJECT-TYPE
+    SYNTAX      TimeTicks
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "TimeTicks."
+    ::= { labScalars 12 }
+
+labPointer OBJECT-TYPE
+    SYNTAX      RowPointer
+    MAX-ACCESS  read-write
+    STATUS      current
+    DESCRIPTION "An OID."
+    ::= { labScalars 13 }
+
+labRange OBJECT-TYPE
+    SYNTAX      Integer32 (0..100)
+    MAX-ACCESS  read-write
+    STATUS      current
+    DESCRIPTION "A range."
+    ::= { labScalars 14 }
+
+labIfTable OBJECT-TYPE
+    SYNTAX      SEQUENCE OF LabIfEntry
+    MAX-ACCESS  not-accessible
+    STATUS      current
+    DESCRIPTION "String index."
+    ::= { labTestMIB 2 }
+
+labIfEntry OBJECT-TYPE
+    SYNTAX      LabIfEntry
+    MAX-ACCESS  not-accessible
+    STATUS      current
+    DESCRIPTION "A row."
+    INDEX       { labIfName }
+    ::= { labIfTable 1 }
+
+LabIfEntry ::= SEQUENCE { labIfName DisplayString, labIfMtu Integer32, labIfAdmin INTEGER }
+
+labIfName OBJECT-TYPE
+    SYNTAX      DisplayString (SIZE (1..64))
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "The name."
+    ::= { labIfEntry 1 }
+
+labIfMtu OBJECT-TYPE
+    SYNTAX      Integer32
+    UNITS       "octets"
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "MTU."
+    ::= { labIfEntry 2 }
+
+labIfAdmin OBJECT-TYPE
+    SYNTAX      INTEGER { up(1), down(2) }
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "State."
+    ::= { labIfEntry 3 }
+
+labBigTable OBJECT-TYPE
+    SYNTAX      SEQUENCE OF LabBigEntry
+    MAX-ACCESS  not-accessible
+    STATUS      current
+    DESCRIPTION "IMPLIED string index."
+    ::= { labTestMIB 3 }
+
+labBigEntry OBJECT-TYPE
+    SYNTAX      LabBigEntry
+    MAX-ACCESS  not-accessible
+    STATUS      current
+    DESCRIPTION "A row."
+    INDEX       { IMPLIED labBigKey }
+    ::= { labBigTable 1 }
+
+LabBigEntry ::= SEQUENCE { labBigKey OCTET STRING, labBigName DisplayString }
+
+labBigKey OBJECT-TYPE
+    SYNTAX      OCTET STRING (SIZE (1..32))
+    MAX-ACCESS  not-accessible
+    STATUS      current
+    DESCRIPTION "The key."
+    ::= { labBigEntry 1 }
+
+labBigName OBJECT-TYPE
+    SYNTAX      DisplayString
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "A name."
+    ::= { labBigEntry 2 }
+
+labAddrTable OBJECT-TYPE
+    SYNTAX      SEQUENCE OF LabAddrEntry
+    MAX-ACCESS  not-accessible
+    STATUS      current
+    DESCRIPTION "Fixed-size, IpAddress and integer indexes."
+    ::= { labTestMIB 4 }
+
+labAddrEntry OBJECT-TYPE
+    SYNTAX      LabAddrEntry
+    MAX-ACCESS  not-accessible
+    STATUS      current
+    DESCRIPTION "A row."
+    INDEX       { labAddrFix, labAddrIp, labAddrNum }
+    ::= { labAddrTable 1 }
+
+LabAddrEntry ::= SEQUENCE { labAddrFix OCTET STRING, labAddrIp IpAddress, labAddrNum LabTriState,
+                            labAddrValue Integer32 }
+
+labAddrFix OBJECT-TYPE
+    SYNTAX      OCTET STRING (SIZE (2))
+    MAX-ACCESS  not-accessible
+    STATUS      current
+    DESCRIPTION "Fixed size."
+    ::= { labAddrEntry 1 }
+
+labAddrIp OBJECT-TYPE
+    SYNTAX      IpAddress
+    MAX-ACCESS  not-accessible
+    STATUS      current
+    DESCRIPTION "An address."
+    ::= { labAddrEntry 2 }
+
+labAddrNum OBJECT-TYPE
+    SYNTAX      LabTriState
+    MAX-ACCESS  not-accessible
+    STATUS      current
+    DESCRIPTION "An enumeration."
+    ::= { labAddrEntry 3 }
+
+labAddrValue OBJECT-TYPE
+    SYNTAX      Integer32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "A value."
+    ::= { labAddrEntry 4 }
+
+labIfXTable OBJECT-TYPE
+    SYNTAX      SEQUENCE OF LabIfXEntry
+    MAX-ACCESS  not-accessible
+    STATUS      current
+    DESCRIPTION "Augments labIfTable."
+    ::= { labTestMIB 5 }
+
+labIfXEntry OBJECT-TYPE
+    SYNTAX      LabIfXEntry
+    MAX-ACCESS  not-accessible
+    STATUS      current
+    DESCRIPTION "A row."
+    AUGMENTS    { labIfEntry }
+    ::= { labIfXTable 1 }
+
+LabIfXEntry ::= SEQUENCE { labIfXAlias DisplayString }
+
+labIfXAlias OBJECT-TYPE
+    SYNTAX      DisplayString
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "An alias."
+    ::= { labIfXEntry 1 }
+
+labTraps OBJECT IDENTIFIER ::= { labTestMIB 0 }
+
+labStateChange NOTIFICATION-TYPE
+    OBJECTS     { labIfAdmin, labIfMtu }
+    STATUS      current
+    DESCRIPTION "A notification."
+    ::= { labTraps 1 }
+
+labLate OBJECT IDENTIFIER ::= { labTestMIB 9 0 1 }
+
+END
+"""
+
+V1_MIB = r"""
+V1-TEST-MIB DEFINITIONS ::= BEGIN
+IMPORTS enterprises FROM RFC1155-SMI
+        OBJECT-TYPE FROM RFC-1212
+        TRAP-TYPE FROM RFC-1215;
+v1Root OBJECT IDENTIFIER ::= { enterprises 99998 }
+v1Obj OBJECT-TYPE SYNTAX INTEGER ACCESS read-only STATUS mandatory ::= { v1Root 1 }
+v1Trap TRAP-TYPE ENTERPRISE v1Root VARIABLES { v1Obj } ::= 3
+END
+"""
+
+D_MIB = r"""
+D-MIB DEFINITIONS ::= BEGIN
+IMPORTS enterprises FROM SNMPv2-SMI;
+dX OBJECT IDENTIFIER ::= { enterprises 99993 }
+END
+"""
+
+E_MIB = r"""
+E-MIB DEFINITIONS ::= BEGIN
+IMPORTS enterprises FROM SNMPv2-SMI;
+eX OBJECT IDENTIFIER ::= { enterprises 99993 }
+eY OBJECT IDENTIFIER ::= { enterprises 99993 }
+eZ OBJECT IDENTIFIER ::= { enterprises 99994 }
+eW OBJECT IDENTIFIER ::= { enterprises 99994 }
+END
+"""
+
+LAB = [1, 3, 6, 1, 4, 1, 99999]
+SCALARS = LAB + [1]
+
+def lab_tree() -> MibTree:
+    ms = mib.resolver.resolve_texts([LAB_MIB, V1_MIB])
+    return mibcli.build_tree(ms, ["LAB-TEST-MIB", "V1-TEST-MIB"])
+
+def opts(flags: str="") -> OutputOptions:
+    return OutputOptions().with_flags(flags, True) if flags != "" else OutputOptions()
+
+def name(t: MibTree, arcs: list[int], flags: str="") -> str:
+    return mibcli.oid_text(t, arcs, opts(flags)).0
+
+def line(t: MibTree, arcs: list[int], v: values.Value, flags: str="", hints: bool=True) -> str:
+    return mibcli.varbind_text(t, VarBind(Oid(arcs), v), opts(flags), hints)
+
+def _s(text: str) -> list[int]:
+    # the arcs of a length-prefixed string index
+    return [len(text)] + [ord(c) for c in text]
+
+
+# Names of OIDs #####################################################################################
+
+def _test_oid_styles() -> None:
+    t = lab_tree()
+    a = SCALARS + [1, 0]
+    testing.assertEqual(name(t, a), "LAB-TEST-MIB::labIntHex.0")
+    testing.assertEqual(name(t, a, "s"), "labIntHex.0")
+    testing.assertEqual(name(t, a, "n"), ".1.3.6.1.4.1.99999.1.1.0")
+    testing.assertEqual(name(t, a, "f"), ".iso.org.dod.internet.private.enterprises.labTestMIB.labScalars.labIntHex.0")
+    testing.assertEqual(name(t, a, "u"), "enterprises.labTestMIB.labScalars.labIntHex.0")
+    # arcs no module names: numbers after the deepest named node, whose module is the prefix
+    testing.assertEqual(name(t, LAB + [77, 1]), "LAB-TEST-MIB::labTestMIB.77.1")
+    testing.assertEqual(name(t, [1, 3, 6, 1, 4, 1, 12345, 1]), "SNMPv2-SMI::enterprises.12345.1")
+    testing.assertEqual(name(t, [1, 3]), "SNMPv2-SMI::org")
+    testing.assertEqual(name(t, [2, 999, 1]), "joint-iso-ccitt.999.1")
+    # an arc only an OID value's middle number creates belongs to that module (net-snmp's anonymous node)
+    testing.assertEqual(name(t, LAB + [9, 0]), "LAB-TEST-MIB::labTestMIB.9.0")
+
+def _test_index_rendering() -> None:
+    t = lab_tree()
+    mtu = LAB + [2, 1, 2]
+    testing.assertEqual(name(t, mtu + _s("eth0")), "LAB-TEST-MIB::labIfMtu.\"eth0\"")
+    testing.assertEqual(name(t, mtu + _s("eth0"), "X"), "LAB-TEST-MIB::labIfMtu[STRING: eth0]")
+    testing.assertEqual(name(t, mtu + _s("eth0"), "b"), "LAB-TEST-MIB::labIfMtu.4.101.116.104.48")
+    testing.assertEqual(name(t, mtu + _s("eth0"), "E"), "LAB-TEST-MIB::labIfMtu.\\\"eth0\\\"")
+    testing.assertEqual(name(t, mtu + _s("eth0"), "f"),
+                        ".iso.org.dod.internet.private.enterprises.labTestMIB.labIfTable.labIfEntry.labIfMtu.\"eth0\"")
+    # the augmenting row takes the INDEX of the row it augments
+    testing.assertEqual(name(t, LAB + [5, 1, 1] + _s("lo")), "LAB-TEST-MIB::labIfXAlias.\"lo\"")
+    # IMPLIED: no length; characters above 254 or not printable as '.'
+    big = LAB + [3, 1, 2]
+    testing.assertEqual(name(t, big + [65]), "LAB-TEST-MIB::labBigName.'A'")
+    testing.assertEqual(name(t, big + [65], "X"), "LAB-TEST-MIB::labBigName['A']")
+    testing.assertEqual(name(t, big + [65], "E"), "LAB-TEST-MIB::labBigName.\\'A\\'")
+    testing.assertEqual(name(t, big + [300, 10]), "LAB-TEST-MIB::labBigName.'..'")
+    # fixed size string, IpAddress, enumeration label
+    v = LAB + [4, 1, 4]
+    testing.assertEqual(name(t, v + [97, 98, 192, 0, 2, 1, 1]), "LAB-TEST-MIB::labAddrValue.'ab'.192.0.2.1.one")
+    testing.assertEqual(name(t, v + [97, 98, 192, 0, 2, 1, 4294967295]),
+                        "LAB-TEST-MIB::labAddrValue.'ab'.192.0.2.1.minusOne")
+    # an index that is too short: the rest numerically
+    testing.assertEqual(name(t, v + [97, 98, 192, 0]), "LAB-TEST-MIB::labAddrValue.'ab'.192.0")
+    testing.assertEqual(name(t, mtu + [9, 97]), "LAB-TEST-MIB::labIfMtu.9.97")
+
+def _test_tree_order() -> None:
+    # net-snmp names an OID that two modules register after the module loaded first; within one module the
+    # later definition (snmptranslate in the lab); a module's anonymous arcs keep their module
+    ms = mib.resolver.resolve_texts([D_MIB, E_MIB])
+    de = mibcli.build_tree(ms, ["D-MIB", "E-MIB"])
+    ed = mibcli.build_tree(ms, ["E-MIB", "D-MIB"])
+    testing.assertEqual(name(de, [1, 3, 6, 1, 4, 1, 99993]), "D-MIB::dX")
+    testing.assertEqual(name(ed, [1, 3, 6, 1, 4, 1, 99993]), "E-MIB::eY")
+    testing.assertEqual(name(de, [1, 3, 6, 1, 4, 1, 99994]), "E-MIB::eW")
+    tp = mibcli.translate(de, [".1.3.6.1.4.1"], OutputOptions(), InputOptions(), False, True, 1000000)
+    testing.assertEqual(tp.out, "+--enterprises(1)\n   |\n   +--dX(99993)\n   |\n   +--eY(99993)\n   |\n"
+                        + "   +--eX(99993)\n   |\n   +--eW(99994)\n   |\n   +--eZ(99994)\n")
+
+def _test_trap_nodes() -> None:
+    # an SMIv1 TRAP-TYPE hangs below "<enterprise>#" (typed TRAP-TYPE); the trap's own node is untyped
+    t = lab_tree()
+    root = [1, 3, 6, 1, 4, 1, 99998]
+    testing.assertEqual(name(t, root + [0]), "V1-TEST-MIB::v1Root#")
+    testing.assertEqual(name(t, root + [0, 3]), "V1-TEST-MIB::v1Trap")
+    r = mibcli.translate(t, [".1.3.6.1.4.1.99998.0", ".1.3.6.1.4.1.99998.0.3"], OutputOptions(), InputOptions(), True,
+                         False, 1000000)
+    testing.assertEqual(r.out, "V1-TEST-MIB::v1Root#\nv1Root# TRAP-TYPE\n  -- FROM\tV1-TEST-MIB\n"
+                        + "::= {{ iso(1) org(3) dod(6) internet(1) private(4) enterprises(1) v1Root(99998) 0 }}\n\n"
+                        + "V1-TEST-MIB::v1Trap\nv1Trap OBJECT-TYPE\n  -- FROM\tV1-TEST-MIB\n  OBJECTS\t{{ v1Obj }}\n"
+                        + "::= {{ iso(1) org(3) dod(6) internet(1) private(4) enterprises(1) v1Root(99998) v1Root#(0) 3 }}\n")
+
+
+# Values ############################################################################################
+
+def _test_integer_values() -> None:
+    t = lab_tree()
+    s = SCALARS
+    testing.assertEqual(line(t, s + [1, 0], Integer(127)), "LAB-TEST-MIB::labIntHex.0 = INTEGER: 7f")
+    testing.assertEqual(line(t, s + [1, 0], Integer(-8388608)), "LAB-TEST-MIB::labIntHex.0 = INTEGER: ffffffffff800000")
+    testing.assertEqual(line(t, s + [2, 0], Integer(-128)), "LAB-TEST-MIB::labIntCenti.0 = INTEGER: -1.28 degrees")
+    testing.assertEqual(line(t, s + [2, 0], Integer(-128), "U"), "LAB-TEST-MIB::labIntCenti.0 = INTEGER: -1.28")
+    testing.assertEqual(line(t, s + [3, 0], Integer(-129)),
+                        "LAB-TEST-MIB::labIntBinary.0 = INTEGER: 11111111111111111111111101111111")
+    testing.assertEqual(line(t, s + [4, 0], Integer(1)), "LAB-TEST-MIB::labIntEnum.0 = INTEGER: one(1)")
+    testing.assertEqual(line(t, s + [4, 0], Integer(-1), "e"), "LAB-TEST-MIB::labIntEnum.0 = INTEGER: -1")
+    testing.assertEqual(line(t, s + [4, 0], Integer(5)), "LAB-TEST-MIB::labIntEnum.0 = INTEGER: 5")
+    testing.assertEqual(line(t, s + [4, 0], Integer(0), "q"), "LAB-TEST-MIB::labIntEnum.0 zero")
+    testing.assertEqual(line(t, s + [4, 0], Integer(0), "Q"), "LAB-TEST-MIB::labIntEnum.0 = zero")
+    testing.assertEqual(line(t, s + [4, 0], Integer(0), "v"), "INTEGER: zero(0)")
+    # labels that are keywords of net-snmp's MIB parser are not labels ("deprecated" is)
+    testing.assertEqual(line(t, s + [5, 0], Integer(1)), "LAB-TEST-MIB::labIntKeywords.0 = INTEGER: 1")
+    testing.assertEqual(line(t, s + [5, 0], Integer(3)), "LAB-TEST-MIB::labIntKeywords.0 = INTEGER: deprecated(3)")
+
+def _test_string_values() -> None:
+    t = lab_tree()
+    s = SCALARS
+    testing.assertEqual(line(t, s + [6, 0], OctetString(b"\x00\x01\x0a\xff")),
+                        "LAB-TEST-MIB::labStrHex.0 = STRING: 0:1:a:ff")
+    testing.assertEqual(line(t, s + [6, 0], OctetString(b"\x00\x01\x0a\xff"), "", False),
+                        "LAB-TEST-MIB::labStrHex.0 = Hex-STRING: 00 01 0A FF ")
+    testing.assertEqual(line(t, s + [6, 0], OctetString(b"\x05"), "0"), "LAB-TEST-MIB::labStrHex.0 = STRING: 05")
+    # a TC defined on DisplayString has no DISPLAY-HINT in net-snmp; DisplayString's own prints the text raw
+    testing.assertEqual(line(t, s + [8, 0], OctetString(b"a\"b")), "LAB-TEST-MIB::labStrAlias.0 = STRING: \"a\\\"b\"")
+    testing.assertEqual(line(t, s + [9, 0], OctetString(b"a\"b")), "LAB-TEST-MIB::labStrDisplay.0 = STRING: a\"b")
+    testing.assertEqual(line(t, s + [9, 0], OctetString(b"")), "LAB-TEST-MIB::labStrDisplay.0 = STRING: ")
+    # BITS: net-snmp's search of the names never rewinds, so a set bit without a name ends the names
+    testing.assertEqual(line(t, s + [7, 0], OctetString(b"\xff\xff\xff\xff")),
+                        "LAB-TEST-MIB::labStrFlags.0 = BITS: FF FF FF FF b0(0) b1(1) b2(2) b3(3) 4 5 6 7 8 9 10 11 12 "
+                        + "13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 ")
+    testing.assertEqual(line(t, s + [7, 0], OctetString(b"\x81\x01")),
+                        "LAB-TEST-MIB::labStrFlags.0 = BITS: 81 01 b0(0) b7(7) b15(15) ")
+    testing.assertEqual(line(t, s + [7, 0], OctetString(b"\x81\x01"), "e"), "LAB-TEST-MIB::labStrFlags.0 = BITS: 81 01 0 7 15 ")
+
+def _test_other_values() -> None:
+    t = lab_tree()
+    s = SCALARS
+    testing.assertEqual(line(t, s + [10, 0], Gauge32(5)), "LAB-TEST-MIB::labGauge.0 = Gauge32: 5")
+    testing.assertEqual(line(t, s + [10, 0], Counter32(5)),
+                        "LAB-TEST-MIB::labGauge.0 = Wrong Type (should be Gauge32 or Unsigned32): Counter32: 5")
+    testing.assertEqual(line(t, s + [10, 0], Counter32(5), "Q"), "LAB-TEST-MIB::labGauge.0 = 5")
+    testing.assertEqual(line(t, s + [11, 0], Counter64(0)), "LAB-TEST-MIB::labC64.0 = Counter64: 0 octets")
+    testing.assertEqual(line(t, s + [12, 0], TimeTicks(8640000)),
+                        "LAB-TEST-MIB::labTicks.0 = Timeticks: (8640000) 1 day, 0:00:00.00")
+    testing.assertEqual(line(t, s + [12, 0], TimeTicks(8640000), "t"), "LAB-TEST-MIB::labTicks.0 = 8640000")
+    testing.assertEqual(line(t, s + [13, 0], ObjectIdentifier(Oid(s + [1, 0]))),
+                        "LAB-TEST-MIB::labPointer.0 = OID: LAB-TEST-MIB::labIntHex.0")
+    testing.assertEqual(line(t, s + [13, 0], ObjectIdentifier(Oid([0, 0])), "n"), ".1.3.6.1.4.1.99999.1.13.0 = OID: .0.0")
+    testing.assertEqual(line(t, s + [13, 0], ObjectIdentifier(Oid(LAB + [3, 1, 2, 65])), "X"),
+                        "LAB-TEST-MIB::labPointer.0 = OID: LAB-TEST-MIB::labBigName['A']")
+    testing.assertEqual(line(t, s + [99, 0], IpAddress(b"\xc0\x00\x02\x01")),
+                        "LAB-TEST-MIB::labScalars.99.0 = IpAddress: 192.0.2.1")
+    testing.assertEqual(line(t, s + [1, 0], NoSuchInstance()),
+                        "LAB-TEST-MIB::labIntHex.0 = No Such Instance currently exists at this OID")
+    testing.assertEqual(line(t, s + [99, 0], Opaque(b"\x9f\x78\x04\x3f\x80\x00\x00")),
+                        "LAB-TEST-MIB::labScalars.99.0 = Opaque: Float: 1.000000")
+
+def _test_octet_hints() -> None:
+    # net-snmp's sprint_realloc_octet_string loop (verified in the lab against libnetsnmp)
+    testing.assertEqual(mibcli.octet_hint(b"\x00\x0a\x0b", "1x:"), "0:a:b")
+    testing.assertEqual(mibcli.octet_hint(b"\x00\x0a\x0b", "1x"), "000a0b")
+    testing.assertEqual(mibcli.octet_hint(b"\x00\x0a\x0b", "1x", True), "000a0b")
+    testing.assertEqual(mibcli.octet_hint(b"\xc0\x00\x02\x01", "1d."), "192.0.2.1")
+    testing.assertEqual(mibcli.octet_hint(b"abcdefg", "3a-"), "abc-def-g")
+    # the separator whenever octets remain, also before the terminator
+    testing.assertEqual(mibcli.octet_hint(b"\x02\x01\x02\x03", "*1x:/"), "1:2:/3")
+    testing.assertEqual(mibcli.octet_hint(b"r\xc3\xa4k", "255t"), "r\u00e4k")
+    testing.assertEqual(mibcli.octet_hint(b"ab", "1q"), None)
+    testing.assertEqual(mibcli.hinted_int(-5, False, "d-2"), "-.05")
+    testing.assertEqual(mibcli.hinted_int(32768, False, "d-5"), ".32768")
+    testing.assertEqual(mibcli.hinted_int(-1, False, "o"), "1777777777777777777777")
+
+
+# Reading OIDs ######################################################################################
+
+def rd(t: MibTree, text: str, inp: InputOptions=InputOptions()) -> str:
+    r = mibcli.read_oid(t, text, inp)
+    if r.ok:
+        return Oid(r.arcs).dotted()
+    return r.message(text)
+
+def _test_read_names() -> None:
+    t = lab_tree()
+    testing.assertEqual(rd(t, "labIntHex.0"), ".1.3.6.1.4.1.99999.1.1.0")
+    testing.assertEqual(rd(t, "LAB-TEST-MIB::labIntHex.0"), ".1.3.6.1.4.1.99999.1.1.0")
+    testing.assertEqual(rd(t, ".iso.org.dod.internet.private.enterprises.labTestMIB"), ".1.3.6.1.4.1.99999")
+    testing.assertEqual(rd(t, "iso.3.6.1.4.1.99999.1.1.0"), ".1.3.6.1.4.1.99999.1.1.0")
+    testing.assertEqual(rd(t, ".1.3.6.1.4.1.99999.1.1.0x10"), ".1.3.6.1.4.1.99999.1.1.16")
+    testing.assertEqual(rd(t, "labIfMtu.\"eth0\""), ".1.3.6.1.4.1.99999.2.1.2.4.101.116.104.48")
+    testing.assertEqual(rd(t, "labIfMtu.4.101.116.104.48"), ".1.3.6.1.4.1.99999.2.1.2.4.101.116.104.48")
+    testing.assertEqual(rd(t, "labBigName.'A'"), ".1.3.6.1.4.1.99999.3.1.2.65")
+    testing.assertEqual(rd(t, "labAddrValue.'ab'.192.0.2.1.minusOne"),
+                        ".1.3.6.1.4.1.99999.4.1.4.97.98.192.0.2.1.4294967295")
+    # the regular expression search when nothing else finds the text: the label, no instance
+    testing.assertEqual(rd(t, "labIfM"), ".1.3.6.1.4.1.99999.2.1.2")
+    inp = InputOptions()
+    inp.regex = True
+    testing.assertEqual(rd(t, "lab.*Admin", inp), ".1.3.6.1.4.1.99999.2.1.3")
+    inp2 = InputOptions()
+    inp2.prefix = "LAB-TEST-MIB::"
+    testing.assertEqual(rd(t, "labIntHex.0", inp2), ".1.3.6.1.4.1.99999.1.1.0")
+    inp3 = InputOptions()
+    inp3.suffix = "0"
+    testing.assertEqual(rd(t, "labIntHex", inp3), ".1.3.6.1.4.1.99999.1.1.0")
+
+def _test_read_errors() -> None:
+    t = lab_tree()
+    testing.assertEqual(rd(t, "nosuch.0"), "nosuch.0: Unknown Object Identifier (Sub-id not found: (top) -> nosuch)")
+    testing.assertEqual(rd(t, "LAB-TEST-MIB::nosuch.1"), "LAB-TEST-MIB::nosuch.1: Unknown Object Identifier")
+    testing.assertEqual(rd(t, "NOPE-MIB::x"), "NOPE-MIB::x: Unknown Object Identifier")
+    testing.assertEqual(rd(t, "labIfMtu.eth0"), "labIfMtu.eth0: Unknown Object Identifier (Index out of range: eth0 (labIfName))")
+    testing.assertEqual(rd(t, "labIfMtu.'eth0'"), "labIfMtu.'eth0': Unknown Object Identifier ('-quote is for fixed length strings)")
+    testing.assertEqual(rd(t, "labBigName.\"A\""), "labBigName.\"A\": Unknown Object Identifier (\"-quote is for variable length strings)")
+    testing.assertEqual(rd(t, "labIfMtu.\"ab\"x"), "labIfMtu.\"ab\"x: Unknown Object Identifier (Index out of range: \"ab (labIfName))")
+    testing.assertEqual(rd(t, "labIfMtu.\"\""), "labIfMtu.\"\": Unknown Object Identifier (Index out of range: \" (labIfName))")
+    testing.assertEqual(rd(t, "labIfMtu.3.97.98.300"), "labIfMtu.3.97.98.300: Unknown Object Identifier (Index out of range: 300 (labIfName))")
+    # (get_node, the last attempt, names only the text after a leaf)
+    testing.assertEqual(rd(t, "labIntEnum.0.x"), "labIntEnum.0.x: Unknown Object Identifier (x)")
+    testing.assertEqual(rd(t, "labIntEnum.0.\"ab\""), ".1.3.6.1.4.1.99999.1.4.0.2.97.98")
+    testing.assertEqual(rd(t, "labAddrValue.'ab'.192.0.2.1.five"),
+                        "labAddrValue.'ab'.192.0.2.1.five: Unknown Object Identifier (Index out of range: five (labAddrNum))")
+    # -Ir: no range checks
+    inp = InputOptions()
+    inp.check_range = False
+    testing.assertEqual(rd(t, "labIfMtu.3.97.98.300", inp), ".1.3.6.1.4.1.99999.2.1.2.3.97.98.300")
+    # -IR: a label anywhere, nothing else
+    inp2 = InputOptions()
+    inp2.random_access = True
+    testing.assertEqual(rd(t, "labIntHex.0", inp2), ".1.3.6.1.4.1.99999.1.1.0")
+    testing.assertEqual(rd(t, ".1.3.6.1", inp2), ".1.3.6.1: Unknown Object Identifier")
+    # a detail a failed attempt leaves on the way to a success (net-snmp prints it with the next error)
+    r = mibcli.read_oid(t, "labIntHex.0", InputOptions())
+    testing.assertEqual(r.stale, "Sub-id not found: (top) -> labIntHex")
+
+# net-snmp 5.9.4's parse_octet_hint (snmptranslate -Ir and snmpset -d in the lab image; a model of it checked against
+# 799 such index inputs): hint, text, the octets in hex ("-": it fails, net-snmp then takes the characters)
+PARSE_HINT_VECTORS: list[(str, str, str)] = [
+    ("1x:", "abcdef", "ef"), ("1x:", "abc", "bc"), ("1x:", "0x1a:2b", "1a2b"), ("1x:", "1a2b:3c", "2b3c"), ("1x:", " 1a:2b", "1a2b"),
+    ("1x:", "1a::2b", "-"), ("1x:", "1a:2b:", "1a2b"), ("1x:", "zz", "-"), ("1x:", "-1", "ff"), ("1x:", "+5:6", "0506"),
+    ("1x:", "1g", "-"), ("1x:", "ffffffffffffffffffff", "ff"), ("1x:", "-ffffffffffffffffffff", "00"), ("1x:", "", ""),
+    ("1x:", "0X1f", "1f"), ("1x:", "300", "00"), ("1x:", "abcd:ef01", "cd01"), ("1x:", "0x", "-"), ("1x:", "07", "07"),
+    ("1x:", "\t5", "05"), ("1x:", "5 ", "-"), ("1d.", "abc", "-"), ("1d.", "0x1a:2b", "-"), ("1d.", "1.2.3.4", "01020304"),
+    ("1d.", "10.0.0.256", "0a000000"), ("1d.", "1.2.", "0102"), ("1d.", "1..2", "-"), ("1d.", "-5.6", "fb06"),
+    ("2x:", "abcdef", "cdef"), ("2x:", "1:2:3", "000100020003"), ("2x:", "abcd:ef01", "abcdef01"), ("1x", "abc", "bc"),
+    ("1x", "1x", "-"), ("*1x:", "abc", "01bc"), ("*1x:", "", ""), ("*1x:", "1:2:3", "03010203"), ("255t", "hello", "-"),
+    ("1o", "08", "-"), ("1o", "777", "ff"), ("4d", "-1", "ffffffff"), ("4d", "1.2.3.4", "-"), ("4d", "300", "0000012c"),
+    ("1d-1d,1a", "1-2,x", "010278"), ("2d-1d-1d,1d:1d:1d.1d,1a1d:1d", "2026-10-11,12:34:56.7,+2:0", "07ea0a0b0c2238072b0200"),
+    ("1x/1d", "ab/12", "ab0c"), ("3a-", "hello", "-"), ("3a-", "ab-cd-ef", "-"), ("1x:2d", "1:2:3", "-"),
+    # where net-snmp loops forever: None
+    ("0a", "abc", "-"), ("1", "abc", "-")]
+
+def _test_parse_octet_hint() -> None:
+    for v in PARSE_HINT_VECTORS:
+        r = mibcli.parse_octet_hint(v.0, v.1)
+        testing.assertEqual(r.hex() if r is not None else "-", v.2, v.0 + " " + repr(v.1))
+
+M_MIB = r"""
+M-MIB DEFINITIONS ::= BEGIN
+IMPORTS MODULE-IDENTITY, OBJECT-TYPE, Integer32, enterprises FROM SNMPv2-SMI MacAddress FROM SNMPv2-TC;
+mMIB MODULE-IDENTITY LAST-UPDATED "202610110000Z" ORGANIZATION "o" CONTACT-INFO "c" DESCRIPTION "d" ::= { enterprises 99989 }
+mTable OBJECT-TYPE SYNTAX SEQUENCE OF MEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "t" ::= { mMIB 1 }
+mEntry OBJECT-TYPE SYNTAX MEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "e" INDEX { mAddr } ::= { mTable 1 }
+MEntry ::= SEQUENCE { mAddr MacAddress, mPort Integer32 }
+mAddr OBJECT-TYPE SYNTAX MacAddress MAX-ACCESS not-accessible STATUS current DESCRIPTION "a" ::= { mEntry 1 }
+mPort OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current DESCRIPTION "p" ::= { mEntry 2 }
+END
+"""
+
+def _test_index_hints() -> None:
+    """A quoted index string is read with net-snmp's lenient parse_octet_hint (BRIDGE-MIB's
+    dot1dTpFdbPort.'abcdef' is one octet 0xef, out of range for the MacAddress's SIZE (6)); the characters only
+    where that parser fails or with -Ih"""
+    t = mibcli.build_tree(mib.resolver.resolve_texts([M_MIB]), ["M-MIB"])
+    testing.assertEqual(rd(t, "M-MIB::mPort.'abcdef'"), "M-MIB::mPort.'abcdef': Unknown Object Identifier (Index out of range: 'abcdef (mAddr))")
+    testing.assertEqual(rd(t, "M-MIB::mPort.'0:1a:2b:3c:4d:5e'"), ".1.3.6.1.4.1.99989.1.1.2.0.26.43.60.77.94")
+    testing.assertEqual(rd(t, "M-MIB::mPort.'1a::2b'"), ".1.3.6.1.4.1.99989.1.1.2.49.97.58.58.50.98")
+    testing.assertEqual(rd(t, "M-MIB::mPort.'zz'"), "M-MIB::mPort.'zz': Unknown Object Identifier (Index out of range: 'zz (mAddr))")
+    ir = InputOptions()
+    ir.check_range = False
+    testing.assertEqual(rd(t, "M-MIB::mPort.'abcdef'", ir), ".1.3.6.1.4.1.99989.1.1.2.239")
+    testing.assertEqual(rd(t, "M-MIB::mPort.'abc'", ir), ".1.3.6.1.4.1.99989.1.1.2.188")
+    testing.assertEqual(rd(t, "M-MIB::mPort.'zz'", ir), ".1.3.6.1.4.1.99989.1.1.2.122.122")
+    ih = InputOptions()
+    ih.use_hints = False
+    testing.assertEqual(rd(t, "M-MIB::mPort.'abcdef'", ih), ".1.3.6.1.4.1.99989.1.1.2.97.98.99.100.101.102")
+
+def _test_hidden_modules() -> None:
+    # modules only an OID argument names are read when an argument names them: until then labels do not see them
+    t = lab_tree()
+    t.hidden.add("LAB-TEST-MIB")
+    testing.assertFalse(mibcli.read_oid(t, "labIntHex.0", InputOptions()).ok)
+    t.hidden.discard("LAB-TEST-MIB")
+    testing.assertTrue(mibcli.read_oid(t, "labIntHex.0", InputOptions()).ok)
+
+
+# translate #########################################################################################
+
+def tr(t: MibTree, names: list[str], flags: str="", details: bool=False, tree: bool=False, width: int=1000000,
+       inp: InputOptions=InputOptions(), find_all: bool=False) -> mibcli.CmdResult:
+    return mibcli.translate(t, names, opts(flags), inp, details, tree, width, find_all)
+
+def _test_translate() -> None:
+    t = lab_tree()
+    r = tr(t, ["LAB-TEST-MIB::labIntHex.0", ".1.3.6.1.4.1.99999.2.1.2"], "n")
+    testing.assertEqual((r.out, r.err, r.code), (".1.3.6.1.4.1.99999.1.1.0\n\n.1.3.6.1.4.1.99999.2.1.2\n", "", 0))
+    r = tr(t, [".1.3.6.1.4.1.99999.1.4"], "", True)
+    testing.assertEqual(r.out, "LAB-TEST-MIB::labIntEnum\nlabIntEnum OBJECT-TYPE\n  -- FROM\tLAB-TEST-MIB\n"
+                        + "  -- TEXTUAL CONVENTION LabTriState\n  SYNTAX\tINTEGER {{minusOne(-1), zero(0), one(1)}} \n"
+                        + "  MAX-ACCESS\tread-write\n  STATUS\tcurrent\n  DESCRIPTION\t\"An enumeration.\"\n"
+                        + "  DEFVAL\t{{ zero }}\n::= {{ iso(1) org(3) dod(6) internet(1) private(4) enterprises(1) "
+                        + "labTestMIB(99999) labScalars(1) 4 }}\n")
+    # DEFVAL: '..'H as net-snmp's tokenizer reads it, a number
+    r = tr(t, ["LAB-TEST-MIB::labStrHex"], "", True, False, 40)
+    testing.assertTrue("  DEFVAL\t{{ 255 }}\n" in r.out, r.out)
+    testing.assertTrue("  DISPLAY-HINT\t\"1x:\"\n" in r.out, r.out)
+    testing.assertTrue("  SYNTAX\tOCTET STRING (0..64) \n" in r.out, r.out)
+    r = tr(t, ["LAB-TEST-MIB::labIfXEntry", "LAB-TEST-MIB::labBigEntry", "LAB-TEST-MIB::labStateChange"], "", True)
+    testing.assertTrue("  AUGMENTS\t{{ labIfEntry }}\n" in r.out, r.out)
+    testing.assertTrue("  INDEX\t\t{{ IMPLIED labBigKey }}\n" in r.out, r.out)
+    testing.assertTrue("labStateChange NOTIFICATION-TYPE\n" in r.out, r.out)
+    testing.assertTrue("  OBJECTS\t{{ labIfAdmin, labIfMtu }}\n" in r.out, r.out)
+    # errors: the names after an error are not translated
+    r = tr(t, ["labIntHex", "nosuch", "labIntBinary"])
+    testing.assertEqual((r.out, r.err, r.code), ("", "labIntHex: Unknown Object Identifier (Sub-id not found: (top) -> labIntHex)\n", 2))
+    inp = InputOptions()
+    inp.random_access = True
+    r = tr(t, ["labIntHex", "nosuch"], "", False, False, 1000000, inp)
+    testing.assertEqual((r.out, r.err, r.code), ("LAB-TEST-MIB::labIntHex\n\n", "Unknown object identifier: nosuch\n", 2))
+    r = tr(t, [])
+    testing.assertEqual(r.code, -1)
+
+def _test_translate_tree() -> None:
+    t = lab_tree()
+    r = tr(t, [".1.3.6.1.4.1.99999.2"], "", False, True)
+    testing.assertEqual(r.out, "+--labIfTable(2)\n   |\n   +--labIfEntry(1)\n      |  Index: labIfName\n      |\n"
+                        + "      +-- -R-- String    labIfName(1)\n      |        Textual Convention: DisplayString\n"
+                        + "      |        Size: 1..64\n      +-- -R-- Integer32 labIfMtu(2)\n"
+                        + "      +-- -R-- EnumVal   labIfAdmin(3)\n               Values: up(1), down(2)\n")
+    r = tr(t, ["nosuch"], "", False, True)
+    testing.assertEqual((r.out, r.err, r.code), ("", "nosuch: Unknown Object Identifier (Sub-id not found: (top) -> nosuch)\n", 2))
+
+A_MIB = r"""
+A-MIB DEFINITIONS ::= BEGIN
+IMPORTS enterprises FROM SNMPv2-SMI;
+aRoot OBJECT IDENTIFIER ::= { enterprises 300 }
+dup OBJECT IDENTIFIER ::= { aRoot 1 }
+aOther OBJECT IDENTIFIER ::= { enterprises 50 }
+dupb OBJECT IDENTIFIER ::= { aOther 1 }
+END
+"""
+
+Z_MIB = r"""
+Z-MIB DEFINITIONS ::= BEGIN
+IMPORTS enterprises FROM SNMPv2-SMI;
+zRoot OBJECT IDENTIFIER ::= { enterprises 100 }
+dup OBJECT IDENTIFIER ::= { zRoot 1 }
+zOther OBJECT IDENTIFIER ::= { enterprises 400 }
+dupb OBJECT IDENTIFIER ::= { zOther 1 }
+END
+"""
+
+def _test_regex_label_twice() -> None:
+    """A label two modules define (NET-SNMP-TC and UCD-SNMP-MIB: linux): net-snmp's get_wild_node reads the
+    matched label with get_node, which takes the newest node of it (the module read last), not the node the
+    search found first. snmptranslate in the lab: -m A-MIB:Z-MIB -TB '^dup$' prints Z-MIB::dup twice,
+    -m Z-MIB:A-MIB A-MIB::dup twice, -Ib ^dup$ the same node's OID."""
+    ms = mib.resolver.resolve_texts([A_MIB, Z_MIB])
+    az = mibcli.build_tree(ms, ["A-MIB", "Z-MIB"])
+    za = mibcli.build_tree(ms, ["Z-MIB", "A-MIB"])
+    testing.assertEqual(tr(az, ["^dup$"], "", False, False, 1000000, InputOptions(), True).out, "Z-MIB::dup\nZ-MIB::dup\n")
+    testing.assertEqual(tr(za, ["^dupb$"], "", False, False, 1000000, InputOptions(), True).out, "A-MIB::dupb\nA-MIB::dupb\n")
+    inp = InputOptions()
+    inp.regex = True
+    testing.assertEqual(tr(za, ["^dup$"], "n", False, False, 1000000, inp).out, ".1.3.6.1.4.1.300.1\n")
+    testing.assertEqual(tr(az, ["^dup$"], "n", False, False, 1000000, inp).out, ".1.3.6.1.4.1.100.1\n")
+
+def _test_translate_regex() -> None:
+    t = lab_tree()
+    r = tr(t, ["labIf.*u", "ignored"], "s", False, False, 1000000, InputOptions(), True)
+    testing.assertEqual((r.out, r.code), ("labIfMtu\n", 0))
+    r = tr(t, ["zzzz"], "", False, False, 1000000, InputOptions(), True)
+    testing.assertEqual((r.err, r.code), ("Unable to find a matching object identifier for \"zzzz\"\n", 1))
+    # -Ib: the nodes one name's search visited are not matched again for the later names (snmptranslate keeps
+    # the tree's reported flags), so the same label is found once
+    inp = InputOptions()
+    inp.regex = True
+    r = tr(t, ["labifmtu", "LABIFMTU"], "s", False, False, 1000000, inp)
+    testing.assertEqual((r.out, r.err, r.code),
+                        ("labIfMtu\n\n", "Unable to find a matching object identifier for \"LABIFMTU\"\n", 1))
+
+
+# Where the MIBs come from ##########################################################################
+
+def _test_search_path() -> None:
+    d = mibcli.DEFAULT_MIBDIRS
+    testing.assertEqual(mibcli.search_path([], None, "/h"), d.replace("$HOME", "/h"))
+    testing.assertEqual(mibcli.search_path(["/a"], None, None), "/a")
+    testing.assertEqual(mibcli.search_path(["/a", "+/b"], None, None), "/a:/b")
+    testing.assertEqual(mibcli.search_path(["-/b"], "/e", None), "/b:/e")
+    testing.assertEqual(mibcli.search_path(["+/b"], "+/e", None), d + ":/e:/b")
+    # snmptranslate: the last -M only, relative to the default
+    testing.assertEqual(mibcli.search_path(["/a", "+/b"], "/e", None, True), d + ":/b")
+
+def _test_module_list() -> None:
+    testing.assertEqual(mibcli.module_list(None, None), [])
+    testing.assertEqual(mibcli.module_list("IF-MIB:SNMPv2-MIB", "X"), ["IF-MIB", "SNMPv2-MIB"])
+    testing.assertEqual(mibcli.module_list(None, "X::Y"), ["X", "Y"])
+    testing.assertEqual(mibcli.module_list("+X", None)[-1], "X")
+    testing.assertEqual(mibcli.module_list("-X", None)[0], "X")
+    testing.assertEqual(len(mibcli.module_list("+X", None)), 35)
+    testing.assertEqual(mibcli.modules_named(["udp6:[::1]:161", "IF-MIB::ifDescr.1", "udp:host", "SNMPv2-MIB::x",
+                                              "IF-MIB::y", "a::b", "X::1"]), ["IF-MIB", "SNMPv2-MIB"])
+    testing.assertEqual(mibcli.module_prefix("udp:host"), "udp")
+    testing.assertEqual(mibcli.module_prefix(".1.3"), "")
+
+def _test_all_modules_order() -> None:
+    # -m ALL: the first module of each file, files in path order and name order, read in the reverse order;
+    # where two directories hold a module, the later directory's file (MibPath gets them reversed)
+    mp = mib.source.MibPath(["/d2", "/d1"], True, False)
+    mp.add_file("/d1/A", D_MIB.encode(), 1)
+    mp.add_file("/d1/B", E_MIB.encode(), 1)
+    mp.add_file("/d2/C", V1_MIB.encode(), 0)
+    mp.add_file("/d2/D", D_MIB.encode(), 0)
+    testing.assertEqual(mibcli.all_modules(mp), ["V1-TEST-MIB", "E-MIB", "D-MIB"])
+    e = mp.find("D-MIB")
+    testing.assertEqual(e.path if e is not None else "", "/d2/D")
+
+def _test_load_order() -> None:
+    ms = mib.resolver.resolve_texts([LAB_MIB, V1_MIB])
+    testing.assertEqual(mibcli.load_order(ms, ["LAB-TEST-MIB"]), ["SNMPv2-SMI", "SNMPv2-TC", "LAB-TEST-MIB"])
+
+
+# The MIB commands ##################################################################################
+
+def loaded() -> mibcli.Loaded:
+    ms = mib.resolver.resolve_texts([LAB_MIB])
+    return mibcli.Loaded(mibcli.build_tree(ms, ["LAB-TEST-MIB"]), ms, "", [], "", mib.source.MibPath([]),
+                         ["LAB-TEST-MIB"])
+
+def _test_mib2yang() -> None:
+    r = mibcli.mib2yang(loaded(), "out", True, False, [], 2)
+    testing.assertEqual(r.code, 0)
+    testing.assertEqual([f.0 for f in r.files], ["out/LAB-TEST-MIB.yang", "out/LAB-TEST-MIB.mibmeta.json"])
+    testing.assertTrue("\nmodule LAB-TEST-MIB {{\n" in r.files[0].1, r.files[0].1[:200])
+    testing.assertTrue("\"module\":\"LAB-TEST-MIB\"" in r.files[1].1, r.files[1].1[:200])
+
+def _test_mibmeta_and_miblint() -> None:
+    r = mibcli.mibmeta(loaded(), 2)
+    testing.assertEqual(r.code, 0)
+    testing.assertTrue(r.out.startswith("{{"), r.out[:40])
+    ms = mib.resolver.resolve_texts([r"""
+BROKEN-MIB DEFINITIONS ::= BEGIN
+IMPORTS enterprises FROM SNMPv2-SMI;
+bRoot OBJECT IDENTIFIER ::= { enterprises 99997 }
+bObj OBJECT-TYPE
+    SYNTAX NoSuchType
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "x"
+    ::= { bRoot 1 }
+END
+"""])
+    ld = mibcli.Loaded(mibcli.build_tree(ms, ["BROKEN-MIB"]), ms, "", [], "", mib.source.MibPath([]), ["BROKEN-MIB"])
+    lint = mibcli.miblint(ld, 3)
+    testing.assertEqual(lint.code, 1)
+    testing.assertTrue("text1.mib:" in lint.out and "NoSuchType" in lint.out, lint.out)
+
+def _test_translate_lazy_modules() -> None:
+    """A module only a name names: its messages where the name is read; its labels hidden until then"""
+    t = lab_tree()
+    z = mibcli.LazyLoads("/d", False, "")
+    z.texts["LAB-TEST-MIB"] = ""
+    z.mods["LAB-TEST-MIB"] = ["LAB-TEST-MIB"]
+    t.hidden.add("LAB-TEST-MIB")
+    inp = InputOptions()
+    inp.random_access = True
+    r = mibcli.translate(t, ["labIntHex", "LAB-TEST-MIB::labIntHex", "labIntHex", "NOPE-MIB::x"], opts("n"), inp, False,
+                         False, 1000000, False, z)
+    testing.assertEqual((r.out, r.err, r.code), ("", "Unknown object identifier: labIntHex\n", 2))
+    r = mibcli.translate(t, ["LAB-TEST-MIB::labIntHex", "labIntHex", "NOPE-MIB::x", "NOPE-MIB::y"], opts("n"), inp,
+                         False, False, 1000000, False, z)
+    testing.assertEqual(r.out, ".1.3.6.1.4.1.99999.1.1\n\n.1.3.6.1.4.1.99999.1.1\n\n")
+    testing.assertEqual(r.err, "MIB search path: /d\nCannot find module (NOPE-MIB): At line 1 in (none)\n"
+                        + "Unknown object identifier: NOPE-MIB::x\n")

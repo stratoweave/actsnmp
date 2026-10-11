@@ -30,8 +30,10 @@ written in Acton. The Acton package name is `snmp`.
 - **MIB compiler:** parses SMIv1/SMIv2 MIB modules, resolves them, and
   emits YANG modules following RFC 6643. It also emits JSON metadata with
   OIDs, types, enumerations, display hints and table index encodings.
-  DISPLAY-HINT rendering and table index decoding are available at
-  runtime.
+- **Typed data from MIB metadata:** at runtime the library can render
+  DISPLAY-HINTs, decode table indexes, convert values to typed form
+  (`snmp.conv`) and assemble walked varbinds into keyed table rows
+  (`snmp.tables`).
 
 ## Building
 
@@ -221,8 +223,42 @@ out/bin/actsnmp trapd --port 1162
 out/bin/actsnmp agent --snmprec data.snmprec --port 1161
 ```
 
-The commands are `get`, `getnext`, `bulkget`, `walk`, `bulkwalk`, `set`,
-`table`, `trap`, `inform`, `trapd` and `agent`.
+The SNMP commands are `get`, `getnext`, `bulkget`, `walk`, `bulkwalk`,
+`set`, `table`, `trap`, `inform`, `trapd` and `agent`.
+
+### MIB files
+
+Like net-snmp, the tool loads MIB modules named with `-m MODULES`, from
+the directories given with `-M DIRS`. The `MIBS` and `MIBDIRS` environment
+variables work too. With MIBs loaded, it accepts symbolic names and prints
+names, enumeration labels and DISPLAY-HINT-formatted values:
+
+```bash
+out/bin/actsnmp walk -v2c -c public -m IF-MIB 192.0.2.1 IF-MIB::ifTable
+```
+
+```bash
+out/bin/actsnmp translate -m IF-MIB -On IF-MIB::ifOperStatus.3
+```
+
+The MIB compiler is available as commands:
+
+```bash
+out/bin/actsnmp mib2yang -M ./mibs -o yang --meta IF-MIB
+```
+
+`mib2yang` writes `IF-MIB.yang` (RFC 6643) and, with `--meta`,
+`IF-MIB.mibmeta.json`.
+
+```bash
+out/bin/actsnmp mibmeta -M ./mibs IF-MIB
+```
+
+```bash
+out/bin/actsnmp miblint -M ./mibs MY-VENDOR-MIB
+```
+
+`miblint` reports problems in a MIB module.
 
 ## Interoperability testing
 

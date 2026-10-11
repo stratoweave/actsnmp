@@ -36,6 +36,7 @@ import cliopts
 import errors
 import fmt
 import message
+import mibcli
 import mibview
 import pdu
 import security
@@ -84,10 +85,21 @@ def tool_name(o: CliOptions) -> str:
     return "snmp" + o.command
 
 def varbind_text(o: CliOptions, vb: VarBind) -> str:
-    """One output line without its newline: net-snmp style with the -O options, or canonical with --canon"""
+    """One output line without its newline: net-snmp style per the -O options, or canonical with --canon"""
     if o.canon:
         return fmt.canon_varbind(vb)
+    t = o.mib
+    if t is not None:
+        return mibcli.varbind_text(t, vb, o.output, o.inp.use_hints)
     return fmt.netsnmp_varbind(vb, o.output)
+
+def oid_text(o: ?CliOptions, oid: Oid) -> str:
+    """An OID in messages (net-snmp's fprint_objid): numeric, or with MIBs loaded named in the -O style"""
+    if o is not None:
+        t = o.mib
+        if t is not None and not o.canon:
+            return mibcli.oid_text(t, oid.arcs, o.output).0
+    return oid.dotted()
 
 def lines_text(o: CliOptions, vbs: list[VarBind]) -> str:
     """varbind_text of every varbind, each followed by a newline"""
@@ -119,18 +131,18 @@ def security_of(o: CliOptions) -> Security:
     community = o.community
     return Community(community if community is not None else "", o.version)
 
-def failed_object(r: ?Response, e: errors.ErrorStatusError) -> str:
+def failed_object(r: ?Response, e: errors.ErrorStatusError, o: ?CliOptions=None) -> str:
     """The text after "Failed object: ": the OID error-index points at in the response, "" if there is none"""
     if r is not None:
         if e.index >= 1 and e.index <= len(r.varbinds):
-            return r.varbinds[e.index - 1].oid.dotted()
+            return oid_text(o, r.varbinds[e.index - 1].oid)
         return ""
     arcs = e.oid
     if arcs is not None:
-        return Oid(arcs).dotted()
+        return oid_text(o, Oid(arcs))
     return ""
 
-def error_status_text(period: bool, e: errors.ErrorStatusError) -> str:
+def error_status_text(period: bool, e: errors.ErrorStatusError, o: ?CliOptions=None) -> str:
     """net-snmp's stderr text for an error-status, with the final newline
 
     period adds the period every tool but snmpget prints after "Error in
@@ -139,40 +151,42 @@ def error_status_text(period: bool, e: errors.ErrorStatusError) -> str:
     """
     text = "Error in packet" + ("." if period else "") + "\nReason: " + pdu.error_status_text(e.status) + "\n"
     if e.index != 0:
-        return text + "Failed object: " + failed_object(error_response(e), e) + "\n\n"
+        return text + "Failed object: " + failed_object(error_response(e), e, o) + "\n\n"
     return text
 
 def failure_text(o: CliOptions, e: errors.SnmpError, period: bool) -> str:
-    """The stderr text of a request that failed without an error-status (with the final newline)
+    """The stderr text of a request that failed without an error-status, with the final newline
 
-    A timeout is net-snmp's "Timeout: No Response from <agent>." (period:
-    snmpget and snmpgetnext), but "<tool>: Timeout" when the SNMPv3 engine
-    discovery timed out (net-snmp discovers when it opens the session); an
-    agent whose name does not resolve is "<tool>: Unknown host (<agent>)";
-    anything else "<tool>: <reason>", with net-snmp's texts for SNMPv3
-    Reports.
+    A timeout is "Timeout: No Response from <agent>" (with a period for
+    snmpget and snmpgetnext), or "<tool>: Timeout" when the SNMPv3 engine
+    discovery timed out, since net-snmp discovers when it opens the session.
+    Other errors are "<tool>: <reason>" with net-snmp's texts for SNMPv3
+    Reports and, with MIBs, the detail a failed name lookup left behind:
+    "snmpget: Unknown user name (Sub-id not found: (top) -> sysDescr)".
     """
+    stale = " (" + o.mib_detail + ")" if o.mib_detail != "" else ""
     if isinstance(e, errors.TimeoutError):
         hint = e.hint
         if hint is not None and hint.startswith(DISCOVERY_HINT):
-            return tool_name(o) + ": Timeout\n"
+            return tool_name(o) + ": Timeout" + stale + "\n"
         return "Timeout: No Response from " + o.peer + ("." if period else "") + "\n"
     if isinstance(e, errors.TransportError) and "DNS lookup" in e.error_message:
         return tool_name(o) + ": Unknown host (" + o.peer + ")\n"
     if isinstance(e, errors.ReportError):
         t = _REPORT_TEXTS.get(e.name)
         if t is not None:
-            return tool_name(o) + ": " + t + "\n"
-    return tool_name(o) + ": " + e.error_message + "\n"
+            return tool_name(o) + ": " + t + stale + "\n"
+    return tool_name(o) + ": " + e.error_message + stale + "\n"
+
+def session_error_text(o: CliOptions) -> str:
+    """CliOptions.session_error as net-snmp prints it when it opens the session, with the final newline"""
+    return o.session_error + (" (" + o.mib_detail + ")" if o.mib_detail != "" else "") + "\n"
 
 def build_problem(o: CliOptions) -> str:
-    """net-snmp's error for an OID it cannot encode, a first sub-identifier above 2 ("" if none)
+    """net-snmp's error for an OID whose first sub-identifier is above 2, or ""
 
-    The text (with the final newline) is what snmp_build and the tool print:
-    "Can't build OID for variable" for a varbind name, "build objid: bad
-    first subidentifier" for an OID value (also the trap OID and the SNMPv1
-    enterprise). actsnmp's encoder refuses such OIDs as well; this gives the
-    refusal net-snmp's words, before anything is sent.
+    Our encoder refuses such OIDs too; this reports them in net-snmp's
+    words before anything is sent.
     """
     head = "snmp_build: unknown failure\n" + tool_name(o) + ": Error building ASN.1 representation ("
     bad_name = head + "Can't build OID for variable)\n"
@@ -192,9 +206,9 @@ def build_problem(o: CliOptions) -> str:
             return bad_value
     return ""
 
-def oid_not_increasing(previous: Oid, received: Oid) -> str:
+def oid_not_increasing(previous: Oid, received: Oid, o: ?CliOptions=None) -> str:
     """net-snmp's walk error for a received OID that is not greater than the previous one"""
-    return "Error: OID not increasing: " + previous.dotted() + "\n >= " + received.dotted() + "\n\n"
+    return "Error: OID not increasing: " + oid_text(o, previous) + "\n >= " + oid_text(o, received) + "\n\n"
 
 def walk_end(o: CliOptions) -> ?Oid:
     """snmpwalk's end of the walk: -CE, else the root with its last arc + 1 (None: no upper bound)"""
@@ -221,7 +235,7 @@ def notification_text(o: CliOptions, n: Notification) -> str:
         head += " " + " ".join(words[3:])
     v1 = n.v1
     vbs = v1.varbinds if v1 is not None else n.varbinds
-    return head + "\n" + "".join([fmt.netsnmp_varbind(vb, o.output) + "\n" for vb in vbs]) + "END\n"
+    return head + "\n" + "".join([varbind_text(o, vb) + "\n" for vb in vbs]) + "END\n"
 
 def agent_communities(o: CliOptions) -> dict[str, bool]:
     """agent -c (read-only) and -w (read-write) communities; without either the lab's public (ro) and private (rw)"""
@@ -314,7 +328,7 @@ actor Command(o: CliOptions, c: Client, out: action(str) -> None, err: action(st
     def _on_get(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         if e is not None:
             if isinstance(e, errors.ErrorStatusError):
-                err(error_status_text(o.command != "get", e))
+                err(error_status_text(o.command != "get", e, o))
                 # snmpgetnext sets its exit code 2 only for an error that names a varbind
                 if o.command == "get" or e.index != 0:
                     _exit = 2
@@ -341,7 +355,7 @@ actor Command(o: CliOptions, c: Client, out: action(str) -> None, err: action(st
                     out("End of MIB.\n")
                     _finish(0)
                     return
-                err(error_status_text(True, e))
+                err(error_status_text(True, e, o))
                 _finish(2)
             else:
                 _fail(e, False)
@@ -413,7 +427,7 @@ actor Command(o: CliOptions, c: Client, out: action(str) -> None, err: action(st
             if not o.dont_check and not (_name < vb.oid):
                 out("".join(buf))
                 buf = []
-                err(oid_not_increasing(_name, vb.oid))
+                err(oid_not_increasing(_name, vb.oid, o))
                 running = False
                 _exit = 1
             elif _repeated(vb):
@@ -434,7 +448,7 @@ actor Command(o: CliOptions, c: Client, out: action(str) -> None, err: action(st
                 if e.status == pdu.NO_SUCH_NAME:
                     out("End of MIB\n")
                 else:
-                    err(error_status_text(True, e))
+                    err(error_status_text(True, e, o))
                     _exit = 2
                 _walk_done(True)
             else:
@@ -467,10 +481,10 @@ actor Command(o: CliOptions, c: Client, out: action(str) -> None, err: action(st
             out(table_text(o, tbl))
         if e is not None:
             if isinstance(e, errors.ErrorStatusError):
-                err(error_status_text(True, e))
+                err(error_status_text(True, e, o))
                 _finish(2)
             elif isinstance(e, errors.OidNotIncreasingError):
-                err(oid_not_increasing(Oid(e.previous), Oid(e.received)))
+                err(oid_not_increasing(Oid(e.previous), Oid(e.received), o))
                 _finish(1)
             else:
                 _fail(e, False)
@@ -505,17 +519,19 @@ actor Command(o: CliOptions, c: Client, out: action(str) -> None, err: action(st
         if e is not None:
             _fail(e, False)
         else:
-            err(o.session_error + "\n")
+            err(session_error_text(o))
             _finish(1)
 
     proc def _run() -> None:
         for w in o.warnings:
             err(w + "\n")
+        for w in o.mib_notes:
+            err(w + "\n")
         if o.session_error != "":
             if o.engine_id is None:
                 c.discover(_on_session_discovery)
             else:
-                err(o.session_error + "\n")
+                err(session_error_text(o))
                 _finish(1)
             return
         problem = build_problem(o)
@@ -752,12 +768,114 @@ actor main(env):
         else:
             _usage_error(tool_name(o) + ": " + r.1, False)
 
-    proc def _main() -> None:
-        r = _parse(env.argv)
-        parsed = r.0
-        if parsed is not None:
-            _start(parsed)
+    proc def _mkdirs(path: str) -> None:
+        # mkdir -p (errors show when the files are written)
+        fs = file.FS(file.FileCap(env.cap))
+        parts = path.split("/")
+        for i in range(1, len(parts) + 1):
+            d = "/".join(parts[:i])
+            if d != "" and d != ".":
+                try:
+                    st = await async fs.stat(d)
+                    if st.is_dir():
+                        continue
+                except Exception:
+                    pass
+                try:
+                    await async fs.mkdir(d)
+                except Exception:
+                    pass
+
+    proc def _write_files(files: list[(str, str)]) -> (str, str):
+        # mib2yang's files: the paths written (stdout) and the errors (stderr)
+        fcap = file.FileCap(env.cap)
+        wcap = file.WriteFileCap(fcap)
+        out: list[str] = []
+        errs: list[str] = []
+        for f in files:
+            try:
+                wf = file.WriteFile(wcap, f.0)
+                wf.write(f.1.encode())
+                await async wf.close()
+                out.append(f.0 + "\n")
+            except Exception as e:
+                errs.append("mib2yang: cannot write " + f.0 + ": " + str(e) + "\n")
+        return ("".join(out), "".join(errs))
+
+    proc def _mib_command(o: CliOptions, ld: mibcli.Loaded) -> None:
+        # translate, mib2yang, mibmeta and miblint
+        r: ?mibcli.CmdResult = None
+        if o.command == "translate":
+            r = mibcli.translate(ld.tree, o.args, o.output, o.inp, o.details, o.print_tree, o.width, o.find_all,
+                                 o.mib_lazy)
+        elif o.command == "mib2yang":
+            r = mibcli.mib2yang(ld, o.outdir, o.meta, o.consistent_status, o.ignore_hints, o.lint_level)
+        elif o.command == "mibmeta":
+            r = mibcli.mibmeta(ld, o.lint_level)
         else:
-            _usage_error(r.1, r.2)
+            r = mibcli.miblint(ld, o.lint_level)
+        res = r!
+        if res.code < 0:
+            _usage_error("", True)
+            return
+        code = res.code
+        out = res.out
+        err = res.err
+        if len(res.files) > 0:
+            if o.outdir != "":
+                _mkdirs(o.outdir)
+            w = _write_files(res.files)
+            out = w.0 + out
+            if w.1 != "":
+                err += w.1
+                code = 1
+        if out != "":
+            write_out(out)
+        if err != "":
+            write_err(err)
+        env.exit(code)
+
+    proc def _load_mibs(o: CliOptions, env_mibs: ?str, env_dirs: ?str) -> mibcli.Loaded:
+        # The MIBs of a command line: -M/MIBDIRS (snmptranslate: the last -M), -m/MIBS and the modules OID
+        # arguments name; mib2yang, mibmeta and miblint load their arguments (modules or files)
+        home = env.getenv("HOME")
+        fcap = file.FileCap(env.cap)
+        translate = o.command == "translate"
+        path = mibcli.search_path(o.mib_dirs_opts, env_dirs, home, translate)
+        if o.command in cliopts.MIB_COMMANDS and not translate:
+            return mibcli.load(fcap, path, o.args, files=True)
+        return mibcli.load(fcap, path, mibcli.module_list(o.mib_modules_opt, env_mibs), mibcli.modules_named(o.oid_words()))
+
+    proc def _main() -> None:
+        env_mibs = env.getenv("MIBS")
+        env_dirs = env.getenv("MIBDIRS")
+        o: ?CliOptions = None
+        try:
+            o = cliopts.scan(env.argv, env_mibs, env_dirs)
+        except CliError as e:
+            _usage_error(e.error_message, e.usage)
+            return
+        opts = o!
+        if opts.help or opts.show_version:
+            _start(opts)
+            return
+        if opts.mib_mode:
+            ld = _load_mibs(opts, env_mibs, env_dirs)
+            opts.mib = ld.tree
+            opts.mib_lazy = ld.lazy_loads()
+            if ld.messages != "" and opts.command not in cliopts.MIB_COMMANDS:
+                write_err(ld.messages)
+            if opts.command in cliopts.MIB_COMMANDS:
+                if opts.command == "translate" and ld.messages != "":
+                    write_err(ld.messages)
+                    ld.messages = ""
+                _mib_command(opts, ld)
+                return
+        try:
+            cliopts.finish(opts)
+        except CliError as e:
+            _usage_error(e.error_message, e.usage)
+            return
+        _start(opts)
 
     _main()

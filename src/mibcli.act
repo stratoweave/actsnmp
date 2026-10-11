@@ -1,0 +1,2937 @@
+"""MIB support of the actsnmp CLI: named OIDs and values, and snmptranslate
+
+The SNMP commands load MIBs when -m, -M, MIBS or MIBDIRS is given or an
+OID argument names a module (`MOD::name`); translate, mib2yang, mibmeta
+and miblint always do. The modules are compiled with our own MIB compiler
+(mib.source, mib.parser, mib.resolver) and then arranged in a MibTree that
+mirrors the tree net-snmp 5.9.4 builds (snmplib/parse.c and mib.c), so
+that names, indexes and values print exactly as net-snmp prints them,
+including its quirks.
+
+oid_text formats an OID in the -O style, breaking the instance down per
+the row's INDEX. value_text formats a value with enum labels, DISPLAY-HINTs,
+UNITS and named bits. read_oid parses OIDs as snmp_parse_oid does, with
+names, module prefixes and symbolic instances. translate implements
+snmptranslate.
+
+Unlike net-snmp, the MIB parser's own error messages are not reproduced,
+and some modules that net-snmp's parser rejects load here.
+"""
+
+import file
+import fmt
+import ber
+import values
+import mib.ast
+import mib.diag
+import mib.meta
+import mib.model
+import mib.parser
+import mib.resolver
+import mib.source
+import mib.yang
+import re
+from oid import Oid
+from values import Value, VarBind, Integer, OctetString, Null, ObjectIdentifier, IpAddress, Counter32, Gauge32
+from values import TimeTicks, Opaque, Counter64, NoSuchObject, NoSuchInstance, EndOfMibView, UnknownValue
+
+# net-snmp's tree node types (TYPE_* of parse.h), which choose the value printer
+T_OTHER = 0
+T_OBJID = 1
+T_OCTETSTR = 2
+T_INTEGER = 3
+T_NETADDR = 4
+T_IPADDR = 5
+T_COUNTER = 6
+T_GAUGE = 7
+T_TIMETICKS = 8
+T_OPAQUE = 9
+T_NULL = 10
+T_COUNTER64 = 11
+T_BITSTRING = 12
+T_NSAPADDRESS = 13
+T_UINTEGER = 14
+T_UNSIGNED32 = 15
+T_INTEGER32 = 16
+
+# net-snmp 5.9.4's built-in MIB search path and module list (net-snmp-config --default-mibdirs/-mibs on
+# Ubuntu 24.04); "+X" in -m/MIBS adds X to the module list, "+DIR" in -M/MIBDIRS DIR to the path
+DEFAULT_MIBDIRS = "$HOME/.snmp/mibs:/usr/share/snmp/mibs:/usr/share/snmp/mibs/iana:/usr/share/snmp/mibs/ietf"
+DEFAULT_MIBS = ("SNMPv2-MIB:IF-MIB:IP-MIB:TCP-MIB:UDP-MIB:HOST-RESOURCES-MIB:NOTIFICATION-LOG-MIB:DISMAN-EVENT-MIB:"
+                + "DISMAN-SCHEDULE-MIB:HOST-RESOURCES-TYPES:MTA-MIB:NETWORK-SERVICES-MIB:UCD-DISKIO-MIB:UCD-DLMOD-MIB:"
+                + "LM-SENSORS-MIB:UCD-SNMP-MIB:UCD-DEMO-MIB:SNMP-TARGET-MIB:NET-SNMP-AGENT-MIB:SNMP-FRAMEWORK-MIB:"
+                + "SNMP-MPD-MIB:SNMP-USER-BASED-SM-MIB:SNMP-VIEW-BASED-ACM-MIB:SNMP-COMMUNITY-MIB:IPV6-ICMP-MIB:"
+                + "IPV6-MIB:IPV6-TCP-MIB:IPV6-UDP-MIB:IP-FORWARD-MIB:NET-SNMP-PASS-MIB:NET-SNMP-EXTEND-MIB:"
+                + "SNMP-NOTIFICATION-MIB:SNMPv2-TM:NET-SNMP-VACM-MIB")
+
+# -Ou strips these prefixes (net-snmp's mib_prefixes; the first is PREFIX, default .1.3.6.1.2.1)
+UCD_PREFIXES: list[str] = [".1.3.6.1.2.1", ".iso.org.dod.internet.mgmt.mib-2", ".iso.org.dod.internet.experimental",
+                           ".iso.org.dod.internet.private", ".iso.org.dod.internet.snmpParties",
+                           ".iso.org.dod.internet.snmpSecrets"]
+
+_MAX_ARCS = 128
+
+# Type names net-snmp's MIB parser reads as keywords (base types, never looked up as TCs)
+_NS_TYPE_KEYWORDS: set[str] = {"INTEGER", "Integer32", "Unsigned32", "Counter", "Counter32", "Counter64", "Gauge",
+                               "Gauge32", "TimeTicks", "IpAddress", "NetworkAddress", "Opaque", "NsapAddress",
+                               "UInteger32", "BITS", "OCTET STRING", "OBJECT IDENTIFIER", "NULL", "BIT STRING"}
+
+# Enumeration and BITS labels net-snmp's parse_enumlist drops: lower-case keywords of its parser other than
+# "deprecated" (which it accepts as a label)
+_NS_DROPPED_LABELS: set[str] = {"obsolete", "optional", "mandatory", "current", "not-accessible", "write-only",
+                                "read-write", "read-create", "read-only", "accessible-for-notify"}
+
+
+# The tree #############################################################################################
+
+class TNode(object):
+    """A node of net-snmp's MIB tree
+
+    label is "" for an arc no loaded module names, which prints as its
+    number. module is the module that created the node ("" for the roots,
+    which print without a MOD:: prefix) and modules every module that
+    defines this label here. kids maps an arc to its nodes, oldest first;
+    the first one names the arc. Two modules may put different labels on
+    the same arc. The other attributes describe how the value prints
+    (ttype is one of T_*) and come from the resolved model.
+    """
+    label: str
+    arc: int
+    module: str
+    modules: list[str]
+    parent: ?TNode
+    kids: dict[int, list[TNode]]
+    seq: int
+    ttype: int
+    enums: list[(str, int)]
+    hint: ?str
+    units: str
+    ranges: list[(int, int)]
+    tc: str
+    tc_module: str
+    indexes: list[(str, bool)]
+    augments: str
+    kind: str
+    node: ?mib.model.MibNode
+    anon: str
+
+    def __init__(self, label: str, arc: int, module: str, parent: ?TNode, seq: int):
+        self.label = label
+        self.arc = arc
+        self.module = module
+        self.modules = [module] if module != "" else []
+        self.parent = parent
+        self.kids = {}
+        self.seq = seq
+        self.ttype = T_OTHER
+        self.enums = []
+        self.hint = None
+        self.units = ""
+        self.ranges = []
+        self.tc = ""
+        self.tc_module = ""
+        self.indexes = []
+        self.augments = ""
+        self.kind = ""
+        self.node = None
+        self.anon = ""
+
+    def shown(self) -> str:
+        """The label -Td and -Tp print: the descriptor, else net-snmp's "anonymous#N" of an unnamed arc"""
+        return self.label if self.label != "" else self.anon
+
+    def kid(self, arc: int) -> ?TNode:
+        """The node that names arc below this one (the first loaded), or None"""
+        lst = self.kids.get(arc)
+        if lst is not None and len(lst) > 0:
+            return lst[0]
+        return None
+
+    def has_kids(self) -> bool:
+        return len(self.kids) > 0
+
+    def children(self) -> list[TNode]:
+        """Every child, by arc, in the order of an arc's list (net-snmp's -Tp order)"""
+        out: list[TNode] = []
+        for a in sorted(list(self.kids.keys())):
+            out.extend(self.kids[a])
+        return out
+
+    def oid(self) -> list[int]:
+        """The arcs from the root to this node"""
+        out: list[int] = []
+        cur: TNode = self
+        while cur.seq >= 0:
+            out.append(cur.arc)
+            p = cur.parent
+            if p is not None:
+                cur = p
+            else:
+                break
+        out.reverse()
+        return out
+
+    def simple(self) -> bool:
+        """An object with a value type (net-snmp: type <= TYPE_SIMPLE_LAST, not TYPE_OTHER)"""
+        return self.ttype != T_OTHER
+
+    def fixed_size(self) -> int:
+        """The length of a fixed-length string (one range with lo == hi), else -1"""
+        if len(self.ranges) == 1 and self.ranges[0].0 == self.ranges[0].1:
+            return self.ranges[0].0
+        return -1
+
+
+def _small(v: bigint) -> int:
+    # a range bound as net-snmp's int keeps it (32 bits, two's complement)
+    m = int(v & bigint(0xffffffff))
+    return m - 4294967296 if m >= 2147483648 else m
+
+
+def _ttype(sx: mib.model.Syntax) -> int:
+    """The tree type of a resolved syntax (net-snmp's translation of the SYNTAX keyword or TC type)"""
+    b = sx.base
+    bn = sx.base_name
+    if b == "INTEGER":
+        return T_INTEGER32 if bn == "Integer32" else T_INTEGER
+    if b == "Unsigned32":
+        if bn == "UInteger32":
+            return T_UINTEGER
+        return T_UNSIGNED32
+    if b == "Gauge32":
+        return T_GAUGE
+    if b == "Counter32":
+        return T_COUNTER
+    if b == "Counter64":
+        return T_COUNTER64
+    if b == "TimeTicks":
+        return T_TIMETICKS
+    if b == "IpAddress":
+        return T_NETADDR if sx.netaddr else T_IPADDR
+    if b == "Opaque":
+        return T_OPAQUE
+    if b == "OCTET STRING":
+        if bn == "NsapAddress":
+            return T_NSAPADDRESS
+        return T_OCTETSTR
+    if b == "OBJECT IDENTIFIER":
+        return T_OBJID
+    if b == "BITS":
+        return T_BITSTRING
+    if b == "NULL":
+        return T_NULL
+    return T_OTHER
+
+
+def _deps(ms: mib.model.MibSet, m: mib.model.MibModule) -> list[str]:
+    # The modules m imports from, in IMPORTS order (as written when loaded, else the symbols' home)
+    out: list[str] = []
+    for imp in m.imports:
+        nm = imp.module if ms.module(imp.module) is not None else imp.home
+        if nm != "" and nm != m.name and nm not in out and ms.module(nm) is not None:
+            out.append(nm)
+    return out
+
+
+def load_order(ms: mib.model.MibSet, requested: list[str]) -> list[str]:
+    """The modules net-snmp would read for requested, in its order: each module's imports first (IMPORTS order)"""
+    out: list[str] = []
+    done: set[str] = set()
+    for r in requested:
+        if r in done or ms.module(r) is None:
+            continue
+        names: list[str] = [r]
+        deps: list[list[str]] = []
+        pos: list[int] = [0]
+        m0 = ms.module(r)
+        deps.append(_deps(ms, m0!))
+        done.add(r)
+        while len(names) > 0:
+            top = len(names) - 1
+            ds = deps[top]
+            if pos[top] < len(ds):
+                d = ds[pos[top]]
+                pos[top] = pos[top] + 1
+                if d not in done:
+                    done.add(d)
+                    md = ms.module(d)
+                    names.append(d)
+                    deps.append(_deps(ms, md!))
+                    pos.append(0)
+            else:
+                out.append(names[top])
+                names.pop()
+                deps.pop()
+                pos.pop()
+    return out
+
+
+class MibTree(object):
+    """net-snmp's MIB tree of a set of loaded modules
+
+    Modules are added in net-snmp's load order, each after its imports.
+    hidden holds modules that only OID arguments name and that net-snmp
+    would not have read yet; label lookups skip their nodes until an
+    argument names the module.
+    """
+    top: TNode
+    ms: mib.model.MibSet
+    mp: ?mib.source.MibPath
+    order: list[str]
+    by_label: dict[str, list[TNode]]
+    count: int
+    anon: int
+    hidden: set[str]
+
+    def __init__(self, ms: mib.model.MibSet, mp: ?mib.source.MibPath=None):
+        self.top = TNode("(top)", -1, "", None, -1)
+        self.ms = ms
+        self.mp = mp
+        self.order = []
+        self.by_label = {}
+        self.count = 0
+        self.anon = 0
+        self.hidden = set()
+        for r in [("iso", 1), ("ccitt", 0), ("joint-iso-ccitt", 2)]:
+            self._new(r.0, r.1, "", self.top)
+
+    def _new(self, label: str, arc: int, module: str, parent: TNode) -> TNode:
+        # A new node at arc below parent. net-snmp's child list holds the nodes of an arc in load order of
+        # their modules and, within one module, the later definition first: a module's new label goes
+        # before the labels it gave this arc already (the first node of an arc names it)
+        t = TNode(label, arc, module, parent, self.count)
+        self.count += 1
+        lst = parent.kids.get(arc)
+        if lst is not None:
+            pos = len(lst)
+            if label != "":
+                for i, k in enumerate(lst):
+                    if k.label != "" and k.module == module:
+                        pos = i
+                        break
+            lst.insert(pos, t)
+        else:
+            parent.kids[arc] = [t]
+        if label != "":
+            bl = self.by_label.get(label)
+            if bl is not None:
+                bl.append(t)
+            else:
+                self.by_label[label] = [t]
+        return t
+
+    def add_module(self, m: mib.model.MibModule) -> None:
+        """Link every named OID of m into the tree, in source order
+
+        As in net-snmp's getoid, the intermediate arcs of a value like
+        { parent 0 1 } become nodes labelled "anonymous#N", numbered across
+        all modules read.
+        """
+        self.order.append(m.name)
+        for n in m.nodes:
+            anon: dict[int, str] = {}
+            ov = n.defn.oid
+            if ov is not None and not isinstance(n.defn, mib.ast.TrapType):
+                comps = ov.components
+                nc = len(comps)
+                if nc > 2 and comps[0].name != "":
+                    k = len(n.oid)
+                    for j in range(1, nc - 1):
+                        if comps[j].name == "":
+                            lbl = "anonymous#%d" % self.anon
+                            self.anon += 1
+                            pos = k - (nc - 1) + (j - 1)
+                            if pos >= 0:
+                                anon[pos] = lbl
+            if n.linked and len(n.oid) > 0:
+                self.add_node(n, anon)
+
+    def _named(self, cur: TNode, a: int, label: str, module: str) -> (TNode, bool):
+        # The node labelled label at arc a below cur (another module defining it is added to its modules),
+        # an unnamed node there given the label, or a new node; and whether it is new
+        lst = cur.kids.get(a)
+        if lst is not None:
+            for t in lst:
+                if t.label == label:
+                    if module not in t.modules:
+                        t.modules.append(module)
+                    if t.module == "":
+                        t.module = module
+                    return (t, False)
+            for t in lst:
+                if t.label == "":
+                    # an unnamed arc gets its name (net-snmp merges anonymous nodes)
+                    t.label = label
+                    t.module = module
+                    t.modules = [module]
+                    bl = self.by_label.get(label)
+                    if bl is not None:
+                        bl.append(t)
+                    else:
+                        self.by_label[label] = [t]
+                    return (t, True)
+        return (self._new(label, a, module, cur), True)
+
+    def add_node(self, n: mib.model.MibNode, anon: dict[int, str]={}) -> None:
+        cur = self.top
+        k = len(n.oid)
+        # an SMIv1 TRAP-TYPE hangs below a node "<enterprise>#" at arc 0 of the enterprise (net-snmp's
+        # parse_trapDefinition)
+        trap_hash = (n.macro == "TRAP-TYPE" and n.enterprise != "" and k >= 2 and n.oid[k - 2] == 0)
+        for i in range(k - 1):
+            a = n.oid[i]
+            if trap_hash and i == k - 2:
+                cur = self._named(cur, a, n.enterprise + "#", n.module).0
+                cur.kind = "trap#"      # net-snmp types it as a TRAP-TYPE
+                continue
+            nx = cur.kid(a)
+            if nx is not None:
+                cur = nx
+            else:
+                # an arc no loaded module names yet: anonymous, owned by the module that needs it
+                cur = self._new("", a, n.module, cur)
+            if cur.label == "" and cur.anon == "":
+                cur.anon = anon.get_def(i, "")
+        r = self._named(cur, n.oid[k - 1], n.name, n.module)
+        if r.1:
+            self._describe(r.0, n)
+
+    def _describe(self, t: TNode, n: mib.model.MibNode) -> None:
+        t.node = n
+        t.kind = n.kind
+        t.units = n.units
+        sx = n.syntax
+        if sx is not None and sx.unresolved == "" and n.kind != "row" and n.kind != "table":
+            self._type_of(t, n, sx)
+        if n.kind == "row":
+            d0 = n.defn
+            written_aug = ""
+            if isinstance(d0, mib.ast.ObjectType) and len(d0.augments) > 0:
+                written_aug = d0.augments[0].name
+            if n.augments != "":
+                p = n.augments.find("::")
+                t.augments = n.augments[p + 2:] if p >= 0 else n.augments
+            elif written_aug != "":
+                # an AUGMENTS of a row no loaded module defines: net-snmp keeps the label as written
+                t.augments = written_aug
+            else:
+                written: list[bool] = []
+                d = n.defn
+                if isinstance(d, mib.ast.ObjectType):
+                    written = [it.implied for it in d.index]
+                for i, ip in enumerate(n.index):
+                    imp = written[i] if i < len(written) else ip.implied
+                    t.indexes.append((ip.name, imp))
+
+    def _module_of(self, written: str) -> ?mib.model.MibModule:
+        # a module as IMPORTS names it, through the search path's aliases
+        m = self.ms.module(written)
+        if m is not None:
+            return m
+        mp = self.mp
+        if mp is not None:
+            e = mp.find(written)
+            if e is not None:
+                return self.ms.module(e.name)
+        return None
+
+    def ns_type(self, module: str, name: str, depth: int=0) -> ?mib.model.MibType:
+        """The TC or type assignment `name` as net-snmp's get_tc finds it from `module`, or None
+
+        net-snmp only finds a type defined in the module itself or imported
+        directly from the module that defines it; a re-export does not count.
+        None also when the SYNTAX does not lead to a base type that way.
+        """
+        m_o = self.ms.module(module)
+        if m_o is None:
+            return None
+        m = m_o!
+        ty = m.find_type(name)
+        home = module
+        if ty is None:
+            src = ""
+            for imp in m.imports:
+                if imp.symbol == name:
+                    src = imp.module
+                    break
+            if src == "":
+                return None
+            sm = self._module_of(src)
+            if sm is None:
+                return None
+            ty = sm!.find_type(name)
+            home = sm!.name
+        if ty is None:
+            return None
+        found = ty!
+        if found.kind == "sequence" or found.kind == "choice":
+            return None
+        ref = found.syntax.ref_name
+        if ref != "" and ref not in _NS_TYPE_KEYWORDS:
+            if depth >= 16 or self.ns_type(home, ref, depth + 1) is None:
+                return None
+        return found
+
+    def _type_of(self, t: TNode, n: mib.model.MibNode, sx: mib.model.Syntax) -> None:
+        # The type, enumerations, ranges, TC and DISPLAY-HINT of an object as net-snmp's parser keeps them
+        # (parse_objecttype and get_tc): a SYNTAX that names a TC takes the type, the enumerations or named
+        # bits, the ranges and the DISPLAY-HINT written in that TC only (a TC defined on another TC inherits
+        # none of them), the object's own refinement replacing them; a TC net-snmp cannot find (ns_type)
+        # leaves the type unknown. Enumeration labels that are keywords of net-snmp's parser (current,
+        # mandatory, ...) are left out, as its parse_enumlist skips them.
+        tt = _ttype(sx)
+        size_type = (tt == T_OCTETSTR or tt == T_OPAQUE or tt == T_BITSTRING or tt == T_NSAPADDRESS)
+        own_r = sx.own_sizes if size_type else sx.own_ranges
+        if len(own_r) == 0:
+            own_r = sx.own_ranges if size_type else sx.own_sizes
+        ranges = own_r
+        named = sx.own_named
+        ref = sx.ref_name
+        if ref != "" and ref not in _NS_TYPE_KEYWORDS:
+            ty_o = self.ns_type(n.module, ref)
+            if ty_o is None:
+                tt = T_OTHER
+            else:
+                ty = ty_o!
+                ts = ty.syntax
+                t.tc = ty.name
+                t.tc_module = ty.module
+                if ty.kind == "tc" and ty.display_hint != "":
+                    t.hint = ty.display_hint
+                if len(ranges) == 0:
+                    ranges = ts.own_sizes if len(ts.own_sizes) > 0 else ts.own_ranges
+                if not sx.has_own_named:
+                    named = ts.own_named
+        t.ttype = tt
+        t.enums = [(e.label, e.value) for e in named if e.label not in _NS_DROPPED_LABELS]
+        t.ranges = [(_small(r.lo), _small(r.hi)) for r in ranges]
+
+    def peers(self, t: TNode) -> list[TNode]:
+        """t's children in the order of net-snmp's child list, which its regular-expression searches walk
+
+        Arcs come in the order net-snmp first linked them (modules in load
+        order, each module's definitions last to first), and the nodes of one
+        arc in the reverse of the -Tp order.
+        """
+        if t.seq < 0:
+            # the roots: net-snmp's tree_head lists iso, ccitt, joint-iso-ccitt
+            roots: list[TNode] = []
+            for a in [1, 0, 2]:
+                roots.extend(t.kids.get_def(a, []))
+            return roots
+        keyed: list[(int, int, int)] = []
+        runs: list[list[TNode]] = []
+        for a, lst in t.kids.items():
+            first = lst[0]
+            mi = self.order.index(first.module) if first.module in self.order else -1
+            keyed.append((mi, -first.seq, len(runs)))
+            runs.append(lst)
+        out: list[TNode] = []
+        for k in sorted(keyed):
+            run = runs[k.2]
+            for i in range(len(run)):
+                out.append(run[len(run) - 1 - i])
+        return out
+
+    def visible(self, t: TNode) -> bool:
+        """Whether a label lookup sees t: a module of it is not hidden (see hidden)"""
+        if len(self.hidden) == 0 or t.module == "":
+            return True
+        for m in t.modules:
+            if m not in self.hidden:
+                return True
+        return False
+
+    def find(self, label: str, module: str="") -> ?TNode:
+        """net-snmp's find_tree_node: the newest node with this label (of module, when given)"""
+        lst_o = self.by_label.get(label)
+        if lst_o is None:
+            return None
+        lst = lst_o!
+        i = len(lst) - 1
+        while i >= 0:
+            t = lst[i]
+            if (module == "" or module in t.modules) and self.visible(t):
+                return t
+            i -= 1
+        return None
+
+    def node_at(self, arcs: list[int]) -> ?TNode:
+        """net-snmp's get_tree: the deepest node on the path of arcs (None when the first arc is unknown)"""
+        cur = self.top
+        best: ?TNode = None
+        for a in arcs:
+            k_o = cur.kid(a)
+            if k_o is None:
+                break
+            k = k_o!
+            best = k
+            cur = k
+        return best
+
+    def exact(self, arcs: list[int]) -> ?TNode:
+        """The node at exactly these arcs, or None"""
+        cur = self.top
+        for a in arcs:
+            k_o = cur.kid(a)
+            if k_o is None:
+                return None
+            k = k_o!
+            cur = k
+        return cur if len(arcs) > 0 else None
+
+    def previous_sibling(self, t: TNode) -> ?TNode:
+        """The sibling created just before t (net-snmp's next_peer: a module's children are linked in reverse)"""
+        p = t.parent
+        best: ?TNode = None
+        best_seq = -1
+        if p is not None:
+            for a, lst in p.kids.items():
+                for k in lst:
+                    if k.seq < t.seq and k.seq > best_seq:
+                        best = k
+                        best_seq = k.seq
+        return best
+
+
+def build_tree(ms: mib.model.MibSet, requested: list[str], mp: ?mib.source.MibPath=None) -> MibTree:
+    """The tree of the requested modules and their imports; mp resolves the module aliases of IMPORTS"""
+    t = MibTree(ms, mp)
+    for name in load_order(ms, requested):
+        m = ms.module(name)
+        if m is not None:
+            t.add_module(m)
+    return t
+
+
+# Names of OIDs (net-snmp's _get_realloc_symbol) #########################################################
+
+def _printable(c: int) -> bool:
+    return c >= 0x20 and c < 0x7f
+
+def _oid_string(arcs: list[int], quote: str, escape: bool) -> str:
+    # net-snmp's dump_realloc_oid_to_string: each arc as a character ('.' when above 254 or not printable)
+    if len(arcs) == 0:
+        return ""
+    q = ("\\" + quote) if escape else quote
+    chars = [chr(a) if (a <= 254 and _printable(a)) else "." for a in arcs]
+    return q + "".join(chars) + q
+
+def _inet_text(addr_type: int, arcs: list[int]) -> ?str:
+    # net-snmp's dump_realloc_oid_to_inetaddress: IPv4 "a.b.c.d", IPv6 "fe:80:..." (zones as %N); None: not it
+    for a in arcs:
+        if a > 255:
+            return None
+    n = len(arcs)
+    if (addr_type == 1 and n == 4) or (addr_type == 3 and n == 8):
+        t = "%d.%d.%d.%d" % (arcs[0], arcs[1], arcs[2], arcs[3])
+        if addr_type == 3:
+            t += "%%%d" % ((arcs[4] << 24) | (arcs[5] << 16) | (arcs[6] << 8) | arcs[7])
+        return "\"" + t + "\""
+    if (addr_type == 2 and n == 16) or (addr_type == 4 and n == 20):
+        t = ":".join(["%02x" % arcs[i] for i in range(16)])
+        if addr_type == 4:
+            t += "%%%d" % ((arcs[16] << 24) | (arcs[17] << 16) | (arcs[18] << 8) | arcs[19])
+        return "\"" + t + "\""
+    return None
+
+def _signed32(v: int) -> int:
+    m = v & 0xffffffff
+    return m - 4294967296 if m >= 2147483648 else m
+
+class _Out(object):
+    # The text being built and the offset where the unknown part (the index) starts
+    parts: list[str]
+    length: int
+
+    def __init__(self):
+        self.parts = []
+        self.length = 0
+
+    def add(self, s: str) -> None:
+        self.parts.append(s)
+        self.length += len(s)
+
+    def text(self) -> str:
+        return "".join(self.parts)
+
+    def last(self) -> str:
+        i = len(self.parts) - 1
+        while i >= 0:
+            p = self.parts[i]
+            if p != "":
+                return p[len(p) - 1:]
+            i -= 1
+        return ""
+
+    def drop_last(self) -> None:
+        i = len(self.parts) - 1
+        while i >= 0:
+            p = self.parts[i]
+            if p != "":
+                self.parts[i] = p[:len(p) - 1]
+                self.length -= 1
+                return
+
+            i -= 1
+def _finish(out: _Out, arcs: list[int], i: int) -> None:
+    # net-snmp's _oid_finish_printing: the remaining arcs, numerically
+    if out.last() != ".":
+        out.add(".")
+    for k in range(i, len(arcs)):
+        out.add(str(arcs[k]) + ".")
+    out.drop_last()
+
+def _index_text(tree: MibTree, out: _Out, arcs: list[int], start: int, indexes: list[(str, bool)],
+                o: fmt.OutputOptions) -> None:
+    # The instance suffix broken down per INDEX object, then whatever is left, numerically
+    i = start
+    n = len(arcs)
+    extended = o.extended_index
+    for x in indexes:
+        if i >= n:
+            break
+        tp_o = tree.find(x.0)
+        if tp_o is None:
+            break
+        tp = tp_o!
+        if extended:
+            if out.last() == ".":
+                out.drop_last()
+            out.add("[")
+        tt = tp.ttype
+        left = n - i
+        if tt == T_OCTETSTR:
+            fixed = tp.fixed_size()
+            h = tp.hint
+            if extended and h is not None:
+                numids = 0
+                if x.1:
+                    numids = left
+                elif fixed >= 0:
+                    numids = fixed
+                    if numids > left:
+                        break
+                else:
+                    numids = arcs[i]
+                    if numids >= left:
+                        break
+                    i += 1
+                    left -= 1
+                if numids > left:
+                    break
+                b = bytes([a & 0xff for a in arcs[i:i + numids]])
+                out.add(_octets_text(tree, b, h, "", o))
+                i += numids
+            elif x.1:
+                out.add(_oid_string(arcs[i:], "'", o.escape_quotes))
+                i = n
+            elif fixed >= 0:
+                if fixed > left:
+                    break
+                out.add(_oid_string(arcs[i:i + fixed], "'", o.escape_quotes))
+                i += fixed
+            else:
+                numids = arcs[i] + 1
+                if numids > left:
+                    break
+                if numids == 1:
+                    q = "\\\"" if o.escape_quotes else "\""
+                    out.add(q + q)
+                else:
+                    done = False
+                    peer = tree.previous_sibling(tp)
+                    if peer is not None and tp.tc == "InetAddress" and peer.tc == "InetAddressType" and i > 0:
+                        t = _inet_text(arcs[i - 1], arcs[i + 1:i + numids])
+                        if t is not None:
+                            out.add(t)
+                            done = True
+                    if not done:
+                        out.add(_oid_string(arcs[i + 1:i + numids], "\"", o.escape_quotes))
+                i += numids
+        elif tt == T_INTEGER or tt == T_INTEGER32 or tt == T_UINTEGER or tt == T_UNSIGNED32 or tt == T_GAUGE:
+            label = ""
+            v = _signed32(arcs[i])
+            for e in tp.enums:
+                if e.1 == v:
+                    label = e.0
+                    break
+            out.add(label if label != "" else str(arcs[i]))
+            i += 1
+        elif tt == T_TIMETICKS:
+            if extended:
+                out.add(str(arcs[i]) if o.numeric_timeticks else fmt.uptime_text(arcs[i], o.quick))
+            else:
+                out.add(str(arcs[i]))
+            i += 1
+        elif tt == T_OBJID:
+            numids = left if x.1 else arcs[i] + 1
+            if numids > left:
+                break
+            if extended:
+                sub = arcs[i:i + numids] if x.1 else arcs[i + 1:i + numids]
+                out.add(oid_text(tree, sub, o).0)
+            else:
+                out.add(".".join([str(a) for a in arcs[i:i + numids]]))
+            i += numids
+        elif tt == T_IPADDR:
+            if left < 4:
+                break
+            out.add("%d.%d.%d.%d" % (arcs[i], arcs[i + 1], arcs[i + 2], arcs[i + 3]))
+            i += 4
+        elif tt == T_NETADDR:
+            ntype = arcs[i]
+            i += 1
+            out.add(str(ntype) + ".")
+            if ntype == 1 and n - i >= 4:
+                out.add("%d.%d.%d.%d" % (arcs[i], arcs[i + 1], arcs[i + 2], arcs[i + 3]))
+                i += 4
+            else:
+                break
+        else:
+            break
+        out.add("]" if extended else ".")
+    _finish(out, arcs, i)
+
+def oid_text(tree: MibTree, arcs: list[int], o: fmt.OutputOptions) -> (str, ?TNode):
+    """An OID as net-snmp prints it with MIBs loaded, and the deepest named node on its path
+
+    The style is o's (-OS by default). The instance after the node is
+    formatted per the row's INDEX. The node, None if there is none, is the
+    one whose type value_text uses.
+    """
+    style = o.oid_style if o.oid_style != fmt.OID_DEFAULT else fmt.OID_MODULE
+    numeric = (style == fmt.OID_NUMERIC)
+    out = _Out()
+    out.add(".")
+    cur = tree.top
+    deepest: ?TNode = None
+    indexes: list[(str, bool)] = []
+    n = len(arcs)
+    i = 0
+    end_known = 0
+    while i < n:
+        k_o = cur.kid(arcs[i])
+        if k_o is None:
+            end_known = out.length
+            if cur.has_kids() and len(indexes) > 0:
+                out.add(str(arcs[i]) + ".")
+                i += 1
+            if len(indexes) > 0 and i < n and not numeric and not o.dont_breakdown:
+                _index_text(tree, out, arcs, i, indexes, o)
+            else:
+                _finish(out, arcs, i)
+            break
+        k = k_o!
+        if len(k.indexes) > 0:
+            indexes = k.indexes
+        elif k.augments != "":
+            base = tree.find(k.augments)
+            if base is not None:
+                indexes = base.indexes
+        out.add(str(k.arc) if (k.label == "" or numeric) else k.label)
+        deepest = k
+        i += 1
+        if i < n:
+            out.add(".")
+        cur = k
+    text = out.text()
+    if style == fmt.OID_FULL or style == fmt.OID_NUMERIC:
+        return (text, deepest)
+    if style == fmt.OID_UCD:
+        tlen = len(text)
+        for p in UCD_PREFIXES:
+            if tlen > len(p) and text.startswith(p):
+                return (text[len(p) + 1:], deepest)
+        return (text, deepest)
+    # -Os and -OS: from the label of the deepest known node on
+    cp = len(text)
+    if end_known != 0:
+        cp = end_known - 2
+    else:
+        cp = len(text) - 1
+        while cp >= 0 and not _alpha(text[cp]):
+            cp -= 1
+    while cp >= 0 and text[cp] != ".":
+        cp -= 1
+    cp += 1
+    prefix = ""
+    d = deepest
+    if style == fmt.OID_MODULE and cp > 0 and d is not None and d.module != "":
+        prefix = d.module + "::"
+    return (prefix + text[cp:], deepest)
+
+def _alpha(c: str) -> bool:
+    return (c >= "a" and c <= "z") or (c >= "A" and c <= "Z")
+
+
+# Values (net-snmp's sprint_realloc_* printers) ##########################################################
+
+def _is_digit(c: str) -> bool:
+    return c >= "0" and c <= "9"
+
+def _octal(v: int) -> str:
+    # C's %lo of a long: the 64-bit two's complement of a negative value
+    u = bigint(v)
+    if v < 0:
+        u = u + (bigint(1) << 64)
+    if u == bigint(0):
+        return "0"
+    ds: list[str] = []
+    eight = bigint(8)
+    while u > bigint(0):
+        ds.append(str(u % eight))
+        u = u // eight
+    ds.reverse()
+    return "".join(ds)
+
+def _ascii_escaped(b: bytes) -> str:
+    # net-snmp's sprint_realloc_asciistring: printable octets and white space as they are, '\' and '"'
+    # escaped, everything else as '.'
+    out: list[str] = []
+    for c in b:
+        if _printable(c) or (c >= 9 and c <= 13):
+            if c == 92 or c == 34:
+                out.append("\\")
+            out.append(chr(c))
+        else:
+            out.append(".")
+    return "".join(out)
+
+def octet_hint(b: bytes, hint: str, two_digit: bool=False) -> ?str:
+    """b formatted with an octet-format DISPLAY-HINT as net-snmp does, or None for a hint it rejects
+
+    This ports the hint loop of net-snmp's sprint_realloc_octet_string,
+    including its deviations from RFC 2579: x drops leading zeros in most
+    cases, and the last specification repeats without its repeat
+    indicator. Invalid UTF-8 is decoded as CP1252 where net-snmp would
+    write the raw octets. A numeric field running past the end uses the
+    octets left, where net-snmp reads beyond the value.
+    """
+    out: list[bytes] = []
+    n = len(b)
+    hl = len(hint)
+    h = 0
+    cp = 0
+    width = 1
+    code = "d"
+    separ = ""
+    term = ""
+    while cp < n:
+        repeat = 1
+        if h < hl:
+            if hint[h] == "*":
+                repeat = b[cp]
+                cp += 1
+                h += 1
+            width = 0
+            while h < hl and _is_digit(hint[h]):
+                width = width * 10 + ord(hint[h]) - 48
+                h += 1
+            code = hint[h] if h < hl else ""
+            h += 1
+            ch = hint[h] if h < hl else ""
+            if ch != "" and ch != "*" and not _is_digit(ch) and (width != 0 or (ch != "x" and ch != "d" and ch != "o")):
+                separ = ch
+                h += 1
+            else:
+                separ = ""
+            ch = hint[h] if h < hl else ""
+            if ch != "" and ch != "*" and not _is_digit(ch) and (width != 0 or (ch != "x" and ch != "d" and ch != "o")):
+                term = ch
+                h += 1
+            else:
+                term = ""
+            if width == 0:
+                width = 1
+        while repeat > 0 and cp < n:
+            value = 0
+            if code != "a" and code != "t":
+                for x in range(width):
+                    if cp < n:
+                        value = value * 256 + b[cp]
+                    cp += 1
+            if code == "x":
+                if value < 16 and value >= 0 and width == 1 and (two_digit or (separ == "" and h >= hl)):
+                    out.append(("0%x" % value).encode())
+                else:
+                    out.append(("%x" % value).encode())
+            elif code == "d":
+                out.append(str(value).encode())
+            elif code == "o":
+                out.append(_octal(value).encode())
+            elif code == "t" or code == "a":
+                cnt = width if width < n - cp else n - cp
+                chunk = b[cp:cp + cnt]
+                if 0 in chunk:
+                    out.append(_ascii_escaped(chunk).encode())
+                else:
+                    out.append(chunk)
+                cp += cnt
+            else:
+                return None
+            if cp < n and separ != "":
+                out.append(separ.encode())
+            repeat -= 1
+        if term != "" and cp < n:
+            out.append(term.encode())
+    return mib.source.decode_lenient(b"".join(out))
+
+def hinted_int(val: int, unsigned: bool, hint: str) -> ?str:
+    """An integer formatted with an integer-format DISPLAY-HINT as net-snmp does, or None
+
+    Negative numbers in x and o are two's complement, and b always gives
+    32 digits. None for a hint net-snmp cannot apply.
+    """
+    if hint == "":
+        return None
+    c = hint[0]
+    shift = 0
+    neg = False
+    tmp = ""
+    v = val
+    if c == "d":
+        if len(hint) > 1 and hint[1] == "-":
+            k = 2
+            while k < len(hint) and _is_digit(hint[k]):
+                shift = shift * 10 + ord(hint[k]) - 48
+                k += 1
+        if v < 0:
+            neg = True
+            v = -v
+        tmp = str(v)
+    elif c == "o":
+        tmp = _octal(v)
+    elif c == "x":
+        tmp = "%x" % v
+    elif c == "b":
+        bits: list[str] = []
+        bit = 0x80000000
+        while bit > 0:
+            bits.append("1" if (v & bit) != 0 else "0")
+            bit = bit >> 1
+        tmp = "".join(bits)
+    else:
+        return None
+    if shift != 0:
+        ln = len(tmp)
+        if shift <= ln:
+            tmp = tmp[:ln - shift] + "." + tmp[ln - shift:]
+        elif shift < 255:
+            tmp = "." + "0" * (shift - ln) + tmp
+    return ("-" + tmp) if neg else tmp
+
+def _units(units: str) -> str:
+    return " " + units if units != "" else ""
+
+def _label(o: fmt.OutputOptions, s: str) -> str:
+    return "" if o.quick else s
+
+def _octets_text(tree: MibTree, b: bytes, hint: ?str, units: str, o: fmt.OutputOptions) -> str:
+    # sprint_realloc_octet_string of an OCTET STRING value
+    if hint is not None:
+        r_o = octet_hint(b, hint, o.two_digit_hex)
+        if r_o is None:
+            return "(Bad hint ignored: " + hint + ") " + _octets_text(tree, b, None, "", o)
+        r = r_o!
+        return _label(o, "STRING: ") + r + _units(units)
+    if len(b) == 0:
+        return "\"\""
+    return fmt.netsnmp_value(OctetString(b), o) + _units(units)
+
+def _uint(v: Value) -> ?int:
+    # the value of a UInteger32 (tag 0x47) wire value
+    if isinstance(v, UnknownValue) and v.raw_tag == ber.TAG_UINTEGER32:
+        try:
+            return ber.dec_uint32(v.value, 0, len(v.value))
+        except Exception:
+            return None
+    return None
+
+def _by_type(tree: MibTree, v: Value, enums: list[(str, int)], hint: ?str, units: str, o: fmt.OutputOptions) -> str:
+    # sprint_realloc_by_type: the printer of the value's own type, with the given MIB details
+    if isinstance(v, Integer):
+        return _p_integer(tree, v, enums, hint, units, o, "INTEGER: ")
+    if isinstance(v, OctetString):
+        return _octets_text(tree, v.value, hint, units, o)
+    if isinstance(v, ObjectIdentifier):
+        return _p_objid(tree, v, units, o)
+    if isinstance(v, TimeTicks):
+        return _p_timeticks(v.value, units, o)
+    if isinstance(v, Gauge32):
+        return _p_gauge(v.value, hint, units, o)
+    if isinstance(v, Counter32):
+        return _label(o, "Counter32: ") + str(v.value) + _units(units)
+    if isinstance(v, IpAddress):
+        return fmt.netsnmp_value(v, o)
+    if isinstance(v, Null):
+        return "NULL"
+    if isinstance(v, Counter64):
+        return _label(o, "Counter64: ") + str(v.value) + _units(units)
+    if isinstance(v, Opaque):
+        return _p_opaque(v, units, o)
+    u = _uint(v)
+    if u is not None:
+        return _p_uinteger(u, enums, hint, units, o)
+    return fmt.netsnmp_value(v, o)
+
+def _wrong(tree: MibTree, should: str, v: Value, o: fmt.OutputOptions) -> str:
+    # a value of another type than the MIB's: "Wrong Type (should be X): " (not with -OQ) and its plain form
+    head = "" if o.quick_equals else "Wrong Type (should be " + should + "): "
+    return head + _by_type(tree, v, [], None, "", o)
+
+def _p_integer(tree: MibTree, v: Integer, enums: list[(str, int)], hint: ?str, units: str, o: fmt.OutputOptions,
+               head: str) -> str:
+    label: ?str = None
+    for e in enums:
+        if e.1 == v.value:
+            label = e.0
+            break
+    s = _label(o, head)
+    if label is None or o.numeric_enums:
+        if hint is not None:
+            r_o = hinted_int(v.value, False, hint)
+            if r_o is None:
+                return s + " [TRUNCATED]"
+            r = r_o!
+            s += r
+        else:
+            s += str(v.value)
+    elif o.quick:
+        s += label!
+    else:
+        s += label! + "(" + str(v.value) + ")"
+    return s + _units(units)
+
+def _p_uinteger(u: int, enums: list[(str, int)], hint: ?str, units: str, o: fmt.OutputOptions) -> str:
+    label: ?str = None
+    for e in enums:
+        if e.1 == u:
+            label = e.0
+            break
+    s = ""
+    if label is None or o.numeric_enums:
+        if hint is not None:
+            r_o = hinted_int(u, True, hint)
+            if r_o is None:
+                return " [TRUNCATED]"
+            r = r_o!
+            s = r
+        else:
+            s = str(u)
+    elif o.quick:
+        s = label!
+    else:
+        s = label! + "(" + str(u) + ")"
+    return s + _units(units)
+
+def _p_gauge(g: int, hint: ?str, units: str, o: fmt.OutputOptions) -> str:
+    s = _label(o, "Gauge32: ")
+    if hint is not None:
+        r_o = hinted_int(g, True, hint)
+        if r_o is None:
+            return s + " [TRUNCATED]"
+        r = r_o!
+        return s + r + _units(units)
+    return s + str(g & 0xffffffff) + _units(units)
+
+def _p_timeticks(t: int, units: str, o: fmt.OutputOptions) -> str:
+    if o.numeric_timeticks:
+        return str(t)
+    if o.quick:
+        return fmt.uptime_text(t, True) + _units(units)
+    return "Timeticks: (%d) " % t + fmt.uptime_text(t, False) + _units(units)
+
+def _p_objid(tree: MibTree, v: ObjectIdentifier, units: str, o: fmt.OutputOptions) -> str:
+    arcs = v.value.arcs
+    # net-snmp decodes the empty wire OID (06 00) as the single arc 0
+    name = oid_text(tree, arcs if len(arcs) > 0 else [0], o).0
+    return _label(o, "OID: ") + name + _units(units)
+
+def _p_opaque(v: Opaque, units: str, o: fmt.OutputOptions) -> str:
+    special = values.opaque_special(v)
+    if special is not None:
+        return fmt.netsnmp_value(v, o) + _units(units)
+    return _label(o, "OPAQUE: ") + fmt.hex_text(v.value, o) + _units(units)
+
+def _p_bits(b: bytes, enums: list[(str, int)], o: fmt.OutputOptions) -> str:
+    if o.quick:
+        return "\"" + fmt.hex_text(b, o) + "\""
+    parts: list[str] = ["BITS: ", fmt.hex_text(b, o)]
+    # net-snmp's sprint_realloc_bitstring searches the list of names from where the previous search stopped
+    # (it never rewinds): a bit without a name ends the list for every later bit
+    at = 0
+    for k in range(len(b)):
+        for bit in range(8):
+            if (b[k] & (0x80 >> bit)) != 0:
+                pos = k * 8 + bit
+                label: ?str = None
+                while at < len(enums):
+                    if enums[at].1 == pos:
+                        label = enums[at].0
+                        break
+                    at += 1
+                if label is None or o.numeric_enums:
+                    parts.append("%d " % pos)
+                else:
+                    parts.append(label! + "(%d) " % pos)
+    return "".join(parts)
+
+def value_text(tree: MibTree, node: ?TNode, v: Value, o: fmt.OutputOptions, use_hints: bool=True) -> str:
+    """A value as net-snmp prints it after " = " with MIBs loaded
+
+    node is the one oid_text returned for the OID, and its type selects the
+    format. A value of another type than the MIB's is printed in plain form
+    after "Wrong Type (should be X): ".
+    """
+    if isinstance(v, NoSuchObject) or isinstance(v, NoSuchInstance) or isinstance(v, EndOfMibView):
+        return fmt.netsnmp_value(v, o)
+    t_o = node
+    if t_o is None:
+        return _by_type(tree, v, [], None, "", o)
+    t = t_o!
+    units = "" if o.no_units else t.units
+    hint = t.hint if use_hints else None
+    tt = t.ttype
+    if tt == T_OBJID:
+        if isinstance(v, ObjectIdentifier):
+            return _p_objid(tree, v, units, o)
+        return _wrong(tree, "OBJECT IDENTIFIER", v, o)
+    if tt == T_OCTETSTR:
+        if isinstance(v, OctetString):
+            return _octets_text(tree, v.value, hint, units, o)
+        return _wrong(tree, "OCTET STRING", v, o)
+    if tt == T_INTEGER or tt == T_INTEGER32:
+        if isinstance(v, Integer):
+            return _p_integer(tree, v, t.enums, hint, units, o, "INTEGER: ")
+        return _wrong(tree, "INTEGER", v, o)
+    if tt == T_NETADDR:
+        if isinstance(v, IpAddress):
+            return _label(o, "Network Address: ") + ":".join(["%02X" % c for c in v.value])
+        return _wrong(tree, "NetworkAddress", v, o)
+    if tt == T_IPADDR:
+        if isinstance(v, IpAddress):
+            return fmt.netsnmp_value(v, o)
+        return _wrong(tree, "IpAddress", v, o)
+    if tt == T_COUNTER:
+        if isinstance(v, Counter32):
+            return _label(o, "Counter32: ") + str(v.value) + _units(units)
+        return _wrong(tree, "Counter32", v, o)
+    if tt == T_GAUGE or tt == T_UNSIGNED32:
+        if isinstance(v, Gauge32):
+            return _p_gauge(v.value, hint, units, o)
+        return _wrong(tree, "Gauge32 or Unsigned32", v, o)
+    if tt == T_TIMETICKS:
+        if isinstance(v, TimeTicks):
+            return _p_timeticks(v.value, units, o)
+        return _wrong(tree, "Timeticks", v, o)
+    if tt == T_OPAQUE:
+        if isinstance(v, Opaque):
+            return _p_opaque(v, units, o)
+        return _wrong(tree, "Opaque", v, o)
+    if tt == T_NULL:
+        if isinstance(v, Null):
+            return "NULL"
+        return _wrong(tree, "NULL", v, o)
+    if tt == T_COUNTER64:
+        if isinstance(v, Counter64):
+            return _label(o, "Counter64: ") + str(v.value) + _units(units)
+        if isinstance(v, Opaque):
+            sp = values.opaque_special(v)
+            if sp is not None and sp.kind != "Float" and sp.kind != "Double":
+                return fmt.netsnmp_value(v, o) + _units(units)
+        return _wrong(tree, "Counter64", v, o)
+    if tt == T_BITSTRING:
+        if isinstance(v, OctetString):
+            return _p_bits(v.value, t.enums, o)
+        return _wrong(tree, "BITS", v, o)
+    if tt == T_NSAPADDRESS:
+        if isinstance(v, UnknownValue) and v.raw_tag == 0x45:
+            return _label(o, "NsapAddress: ") + fmt.hex_text(v.value, o)
+        return _wrong(tree, "NsapAddress", v, o)
+    if tt == T_UINTEGER:
+        u = _uint(v)
+        if u is not None:
+            return _p_uinteger(u, t.enums, hint, units, o)
+        return _wrong(tree, "UInteger32", v, o)
+    return _by_type(tree, v, t.enums, hint, units, o)
+
+def varbind_text(tree: MibTree, vb: VarBind, o: fmt.OutputOptions, use_hints: bool=True) -> str:
+    """One output line (without its line break) as net-snmp's print_variable with MIBs loaded"""
+    r = oid_text(tree, vb.oid.arcs, o)
+    value = value_text(tree, r.1, vb.value, o, use_hints)
+    if o.bare_value:
+        return value
+    if o.quick and not o.quick_equals:
+        return r.0 + " " + value
+    return r.0 + " = " + value
+
+
+# Reading OIDs (net-snmp's snmp_parse_oid, read_objid, get_node and _add_strings_to_oid) #################
+
+class InputOptions(object):
+    """net-snmp's -I input options
+
+    random_access is -IR, regex -Ib, ucd -Iu, prefix -IS and suffix -Is.
+    check_range and use_hints are on by default and turned off by -Ir and
+    -Ih.
+    """
+    random_access: bool
+    regex: bool
+    check_range: bool
+    use_hints: bool
+    ucd: bool
+    prefix: str
+    suffix: str
+
+    def __init__(self):
+        self.random_access = False
+        self.regex = False
+        self.check_range = True
+        self.use_hints = True
+        self.ucd = False
+        self.prefix = ""
+        self.suffix = ""
+
+
+class OidRead(object):
+    """The result of reading an OID: arcs when ok, else the detail of the "Unknown Object Identifier" error
+
+    has_detail is False when the message has no "(detail)". stale is a
+    detail set by a failed attempt on the way to a success; net-snmp prints
+    it with the next error that has none of its own.
+    """
+    arcs: list[int]
+    ok: bool
+    detail: str
+    has_detail: bool
+    stale: str
+
+    def __init__(self, arcs: list[int], ok: bool, detail: str, has_detail: bool, stale: str=""):
+        self.arcs = arcs
+        self.ok = ok
+        self.detail = detail
+        self.has_detail = has_detail
+        self.stale = stale
+
+    def message(self, text: str) -> str:
+        """net-snmp's snmp_perror line for text"""
+        if self.has_detail:
+            return text + ": Unknown Object Identifier (" + self.detail + ")"
+        return text + ": Unknown Object Identifier"
+
+
+def _strtoul(s: str) -> int:
+    # C strtoul(s, &end, 0) that must consume all of s (decimal, 0x hex, leading-0 octal); -1 otherwise
+    n = len(s)
+    if n == 0:
+        return -1
+    i = 0
+    base = 10
+    if n > 2 and s[0] == "0" and (s[1] == "x" or s[1] == "X"):
+        base = 16
+        i = 2
+    elif s[0] == "0":
+        base = 8
+    if i >= n:
+        return -1
+    v = 0
+    while i < n:
+        c = s[i]
+        d = 99
+        if c >= "0" and c <= "9":
+            d = ord(c) - 48
+        elif c >= "a" and c <= "f":
+            d = ord(c) - 87
+        elif c >= "A" and c <= "F":
+            d = ord(c) - 55
+        if d >= base:
+            return -1
+        v = v * base + d
+        if v > 4294967296:
+            v = 4294967296
+        i += 1
+    return v
+
+class _Rd(object):
+    # The state of _add_strings: what is left of the text (None: nothing) and the detail of a failure
+    rest: ?str
+    detail: str
+    has_detail: bool
+
+    def __init__(self, rest: ?str):
+        self.rest = rest
+        self.detail = ""
+        self.has_detail = False
+
+    def take(self) -> str:
+        # the next component (up to the next '.'), the rest after it
+        r_o = self.rest
+        if r_o is None:
+            return ""
+        r = r_o!
+        d = r.find(".")
+        if d < 0:
+            self.rest = None
+            return r
+        self.rest = r[d + 1:]
+        return r[:d]
+
+    def rest_text(self) -> str:
+        r = self.rest
+        return r if r is not None else ""
+
+    def fail(self, detail: str) -> bool:
+        # net-snmp formats the detail into a buffer of 256 octets
+        self.detail = detail[:255] if len(detail) > 255 else detail
+        self.has_detail = True
+        return False
+
+def _in_ranges(t: TNode, v: int, signed: bool) -> bool:
+    for r in t.ranges:
+        if signed:
+            if r.0 <= v and v <= r.1:
+                return True
+        elif (r.0 & 0xffffffff) <= v and v <= (r.1 & 0xffffffff):
+            return True
+    return False
+
+_LONG_MAX = bigint("9223372036854775807")
+_LONG_MIN = bigint("-9223372036854775808")
+
+def _digit_value(c: int) -> int:
+    if c >= 48 and c <= 57:
+        return c - 48
+    if c >= 97 and c <= 122:
+        return c - 87
+    if c >= 65 and c <= 90:
+        return c - 55
+    return 99
+
+def _c_strtol(b: bytes, i: int, base: int) -> (int, int):
+    # C strtol(b + i, &end, base) for base 8, 10 or 16: leading white space, a sign, 0x/0X (base 16), the
+    # digits; a value beyond a long is LONG_MAX/LONG_MIN. (value, end); end is i when nothing was converted
+    n = len(b)
+    j = i
+    while j < n and (b[j] == 32 or (b[j] >= 9 and b[j] <= 13)):
+        j += 1
+    neg = False
+    if j < n and (b[j] == 43 or b[j] == 45):
+        neg = b[j] == 45
+        j += 1
+    if base == 16 and j + 2 < n and b[j] == 48 and (b[j + 1] == 120 or b[j + 1] == 88) and _digit_value(b[j + 2]) < 16:
+        j += 2
+    start = j
+    acc = bigint(0)
+    big = bigint(base)
+    while j < n and _digit_value(b[j]) < base:
+        if acc <= _LONG_MAX + bigint(1):
+            acc = acc * big + bigint(_digit_value(b[j]))
+        j += 1
+    if j == start:
+        return (0, i)
+    v = -acc if neg else acc
+    if v > _LONG_MAX:
+        v = _LONG_MAX
+    elif v < _LONG_MIN:
+        v = _LONG_MIN
+    return (int(v), j)
+
+class _HintSpec(object):
+    # net-snmp's struct parse_hints: one octet-format specification and the octets so far
+    length: int
+    repeat: bool
+    fmt: int
+    sep: int
+    term: int
+
+    def __init__(self):
+        self.length = 0
+        self.repeat = False
+        self.fmt = 0
+        self.sep = 0
+        self.term = 0
+
+def _hint_apply(ph: _HintSpec, b: bytes, pos: int, out: list[int]) -> int:
+    # net-snmp's parse_hints_parse: one application of ph (with * repeated while the value lasts) from
+    # b[pos]; the new position, -1 when the value does not fit (or, where net-snmp loops forever, cannot
+    # advance)
+    n = len(b)
+    fix = len(out)
+    if ph.repeat:
+        out.append(0)
+    repeats = 0
+    while True:
+        before = pos
+        if ph.fmt == 120 or ph.fmt == 100 or ph.fmt == 111:
+            r = _c_strtol(b, pos, 16 if ph.fmt == 120 else (10 if ph.fmt == 100 else 8))
+            if r.1 == pos:
+                return -1
+            pos = r.1
+            for i in range(ph.length):
+                out.append((r.0 >> ((8 * (ph.length - 1 - i)) % 64)) & 0xff)
+        elif ph.fmt == 97:
+            i = 0
+            while i < ph.length and pos < n:
+                out.append(b[pos])
+                pos += 1
+                i += 1
+        repeats += 1
+        if ph.sep != 0 and pos < n:
+            if b[pos] == ph.sep:
+                pos += 1
+            else:
+                return -1
+        if ph.term != 0:
+            if pos < n and b[pos] == ph.term:
+                pos += 1
+                break
+        if not (ph.repeat and pos < n):
+            break
+        if pos == before:
+            # a repetition that consumes nothing: net-snmp loops forever
+            return -1
+    if ph.repeat:
+        out[fix] = repeats & 0xff
+    return pos
+
+def parse_octet_hint(hint: str, text: str) -> ?bytes:
+    """The octets of text read with DISPLAY-HINT hint as net-snmp's parse_octet_hint reads them, or None
+
+    This is more lenient than mib.hint.parse_octets: numbers are read with
+    strtol and only their low octets count ('abcdef' is 0xef for 1x:), and
+    a trailing separator is accepted. Where net-snmp would loop forever
+    this returns None.
+    """
+    b = text.encode()
+    h = hint.encode()
+    n = len(b)
+    out: list[int] = []
+    ph = _HintSpec()
+    state = 0
+    pos = 0
+    k = 0
+    while k < len(h) and pos < n and pos >= 0:
+        c = h[k]
+        dig = c >= 48 and c <= 57
+        if state == 0:
+            if c == 42:
+                ph.repeat = True
+                state = 1
+            elif dig:
+                ph.length = ph.length * 10 + c - 48
+                state = 1
+            else:
+                return None
+        elif state == 1:
+            if dig:
+                ph.length = ph.length * 10 + c - 48
+            elif c == 120 or c == 100 or c == 111 or c == 97:
+                ph.fmt = c
+                state = 2
+            else:
+                return None
+        elif c == 42 or dig:
+            pos = _hint_apply(ph, b, pos, out)
+            ph = _HintSpec()
+            if c == 42:
+                ph.repeat = True
+            else:
+                ph.length = c - 48
+            state = 1
+        elif state == 2:
+            ph.sep = c
+            state = 3
+        else:
+            ph.term = c
+            pos = _hint_apply(ph, b, pos, out)
+            ph = _HintSpec()
+            state = 0
+        k += 1
+    while pos >= 0 and pos < n:
+        before = pos
+        pos = _hint_apply(ph, b, pos, out)
+        if pos == before:
+            # the last specification consumes nothing (no format, a length-0 a): net-snmp loops forever
+            return None
+    if pos < 0:
+        return None
+    return bytes(out)
+
+def _unescape(s: str, q: str) -> ?(str, str):
+    # net-snmp's _apply_escapes: s up to the closing quote q, "\x" read as x; and what follows the quote
+    out: list[str] = []
+    i = 0
+    n = len(s)
+    while i < n:
+        c = s[i]
+        if c == "\\" and i + 1 < n:
+            out.append(s[i + 1])
+            i += 2
+            continue
+        if c == q:
+            return ("".join(out), s[i + 1:])
+        out.append(c)
+        i += 1
+    return None
+
+def _add_strings(tree: MibTree, start: ?TNode, rd: _Rd, arcs: list[int], inp: InputOptions) -> bool:
+    # net-snmp's _add_strings_to_oid: labels or numbers below start while it has children, the INDEX of
+    # the row above a leaf, then numbers and quoted strings; False (rd.detail) when something is wrong
+    tp: ?TNode = start
+    fcp = ""
+    indexes: list[(str, bool)] = []
+    k = 0
+    label_of = ""
+    while rd.rest is not None and tp is not None:
+        cur: TNode = tp!
+        if not cur.has_kids():
+            break
+        fcp = rd.take()
+        nxt: ?TNode = None
+        subid = 0
+        if fcp != "" and _is_digit(fcp[0]):
+            u = _strtoul(fcp)
+            if u < 0 or u > 4294967295:
+                return rd.fail("Sub-id not found: " + cur.label + " -> " + fcp)
+            subid = u
+            nxt = cur.kid(subid)
+        else:
+            found: ?TNode = None
+            for a, lst in cur.kids.items():
+                for t in lst:
+                    if t.label == fcp and fcp != "" and tree.visible(t):
+                        found = t
+            if found is None:
+                return rd.fail("Sub-id not found: " + cur.label + " -> " + fcp)
+            subid = found!.arc
+            nxt = cur.kid(subid)
+        if len(arcs) >= _MAX_ARCS:
+            return rd.fail("Sub-id not found: " + cur.label + " -> " + fcp)
+        arcs.append(subid)
+        if nxt is None:
+            break
+        tp = nxt
+    leaf = tp
+    if leaf is not None and not leaf.has_kids():
+        p = leaf.parent
+        if p is not None:
+            if len(p.indexes) > 0:
+                indexes = p.indexes
+            elif p.augments != "":
+                base = tree.find(p.augments)
+                if base is not None:
+                    indexes = base.indexes
+        tp = None
+    while rd.rest is not None and k < len(indexes):
+        label_of = indexes[k].0
+        implied = indexes[k].1
+        it_o = tree.find(label_of)
+        if it_o is None:
+            break
+        it = it_o!
+        tp = it
+        tt = it.ttype
+        stop = False
+        if tt == T_INTEGER or tt == T_INTEGER32 or tt == T_UINTEGER or tt == T_UNSIGNED32 or tt == T_TIMETICKS:
+            fcp = rd.take()
+            subid = 0
+            if fcp != "" and _is_digit(fcp[0]):
+                u = _strtoul(fcp)
+                if u < 0 or u > 4294967295:
+                    return rd.fail("Index out of range: " + fcp + " (" + label_of + ")")
+                subid = u
+            else:
+                found_e = False
+                for e in it.enums:
+                    if e.0 == fcp:
+                        subid = e.1 & 0xffffffff
+                        found_e = True
+                        break
+                if not found_e:
+                    return rd.fail("Index out of range: " + fcp + " (" + label_of + ")")
+            if inp.check_range and len(it.ranges) > 0:
+                if not _in_ranges(it, _signed32(subid) if (tt == T_INTEGER or tt == T_INTEGER32) else subid,
+                                  tt == T_INTEGER or tt == T_INTEGER32):
+                    return rd.fail("Index out of range: " + fcp + " (" + label_of + ")")
+            if len(arcs) >= _MAX_ARCS:
+                return rd.fail("Index out of range: " + fcp + " (" + label_of + ")")
+            arcs.append(subid)
+        elif tt == T_IPADDR:
+            if len(arcs) + 4 > _MAX_ARCS:
+                return rd.fail("Index out of range: " + rd.rest_text() + " (" + label_of + ")")
+            for q in range(4):
+                if rd.rest is None:
+                    break
+                fcp = rd.take()
+                u = _strtoul(fcp)
+                if u < 0 or (inp.check_range and u > 255) or u > 4294967295:
+                    return rd.fail("Index out of range: " + fcp + " (" + label_of + ")")
+                arcs.append(u)
+        elif tt == T_OCTETSTR:
+            fixed = it.fixed_size()
+            r = rd.rest
+            if r is not None and (r.startswith("\"") or r.startswith("'")):
+                q = r[0]
+                body = r[1:]
+                len_index = -1
+                if not implied and fixed < 0:
+                    if q == "'":
+                        return rd.fail("'-quote is for fixed length strings")
+                    if len(arcs) >= _MAX_ARCS:
+                        return rd.fail("Index out of range: " + r + " (" + label_of + ")")
+                    len_index = len(arcs)
+                    arcs.append(0)
+                elif q == "\"":
+                    return rd.fail("\"-quote is for variable length strings")
+                un_o = _unescape(body, q)
+                if un_o is None:
+                    return rd.fail("Index out of range: " + r + " (" + label_of + ")")
+                un = un_o!
+                content = un.0
+                tail_s = un.1
+                # net-snmp's fcp now is the opening quote and the unescaped content (the closing quote became
+                # the string's end)
+                qf = q + content
+                octs = content.encode()
+                h = it.hint
+                if inp.use_hints and h is not None:
+                    # net-snmp's lenient parse_octet_hint; the characters themselves when it fails
+                    po = parse_octet_hint(h, content)
+                    if po is not None:
+                        octs = po
+                for c in octs:
+                    if len(arcs) >= _MAX_ARCS:
+                        return rd.fail("Index out of range: " + qf + " (" + label_of + ")")
+                    arcs.append(c)
+                pos = len(octs)
+                if tail_s == "":
+                    rd.rest = None
+                elif tail_s.startswith("."):
+                    rd.rest = tail_s[1:]
+                else:
+                    return rd.fail("Index out of range: " + qf + " (" + label_of + ")")
+                if inp.check_range:
+                    if fixed < 0:
+                        if not _in_ranges(it, pos, True):
+                            return rd.fail("Index out of range: " + qf + " (" + label_of + ")")
+                        if not implied:
+                            arcs[len_index] = pos
+                    elif pos != fixed:
+                        return rd.fail("Index out of range: " + qf + " (" + label_of + ")")
+                elif fixed < 0 and not implied:
+                    arcs[len_index] = pos
+            else:
+                ln = fixed
+                if not implied and fixed < 0:
+                    fcp = rd.take()
+                    u = _strtoul(fcp)
+                    if u < 0:
+                        return rd.fail("Index out of range: " + fcp + " (" + label_of + ")")
+                    ln = u
+                    if len(arcs) + ln + 1 >= _MAX_ARCS:
+                        return rd.fail("Index out of range: " + fcp + " (" + label_of + ")")
+                    arcs.append(ln)
+                while ln != 0 and rd.rest is not None:
+                    fcp = rd.take()
+                    u = _strtoul(fcp)
+                    if u < 0 or (inp.check_range and u > 255) or u > 4294967295:
+                        return rd.fail("Index out of range: " + fcp + " (" + label_of + ")")
+                    arcs.append(u)
+                    ln -= 1
+        elif tt == T_NETADDR:
+            fcp = rd.take()
+            u = _strtoul(fcp)
+            if u < 0 or u > 4294967295 or len(arcs) + 1 >= _MAX_ARCS:
+                return rd.fail("Index out of range: " + fcp + " (" + label_of + ")")
+            arcs.append(u)
+            if u == 1:
+                for q in range(4):
+                    if rd.rest is None:
+                        break
+                    fcp = rd.take()
+                    v = _strtoul(fcp)
+                    if v < 0 or len(arcs) + 1 >= _MAX_ARCS or (inp.check_range and v > 255) or v > 4294967295:
+                        return rd.fail("Index out of range: " + fcp + " (" + label_of + ")")
+                    arcs.append(v)
+            else:
+                stop = True
+        else:
+            # an OID index (and anything net-snmp cannot break down): the rest is read numerically
+            stop = True
+        if stop:
+            k = len(indexes) + 1
+            break
+        k += 1
+    while rd.rest is not None:
+        r = rd.rest_text()
+        if r != "" and _is_digit(r[0]):
+            fcp = rd.take()
+            u = _strtoul(fcp)
+            if u < 0 or u > 4294967295 or len(arcs) >= _MAX_ARCS:
+                return rd.fail(_bad(tp, fcp, indexes, k))
+            arcs.append(u)
+        elif r.startswith("\"") or r.startswith("'"):
+            q = r[0]
+            body = r[1:]
+            close = body.find(q)
+            if body == "" or close < 0:
+                return rd.fail(_bad(tp, r, indexes, k))
+            chars = body[:close].encode()
+            if q == "\"":
+                arcs.append(len(chars))
+            for c in chars:
+                if len(arcs) >= _MAX_ARCS:
+                    return rd.fail(_bad(tp, r, indexes, k))
+                arcs.append(c)
+            tail_s = body[close + 1:]
+            if tail_s == "":
+                rd.rest = None
+            elif tail_s.startswith("."):
+                rd.rest = tail_s[1:]
+            else:
+                return rd.fail(_bad(tp, r, indexes, k))
+        else:
+            # net-snmp names the whole rest of the text here (its fcp is not cut at the next dot)
+            return rd.fail(_bad(tp, r, indexes, k))
+    return True
+
+def _bad(tp: ?TNode, fcp: str, indexes: list[(str, bool)], k: int) -> str:
+    # bad_id's detail when the trailing numbers are wrong
+    if k < len(indexes):
+        return "Index out of range: " + fcp + " (" + indexes[k].0 + ")"
+    if tp is not None:
+        return "Sub-id not found: " + tp.label + " -> " + fcp
+    return fcp
+
+def _name_end(s: str) -> int:
+    # the index of the first character that is not a letter, digit or '-'
+    i = 0
+    while i < len(s):
+        c = s[i]
+        if not (_alpha(c) or _is_digit(c) or c == "-"):
+            return i
+        i += 1
+    return i
+
+def get_node(tree: MibTree, text: str, inp: InputOptions) -> OidRead:
+    """net-snmp's get_node: LABEL[.instance] anywhere in the tree, or MODULE::LABEL[.instance] in that module"""
+    e = _name_end(text)
+    module = ""
+    rest = text
+    if e < len(text) and text[e] == ":":
+        module = text[:e]
+        rest = text[e + 1:]
+        if rest.startswith(":"):
+            rest = rest[1:]
+    elif text.startswith("."):
+        rest = text[1:]
+    dot = rest.find(".")
+    label = rest if dot < 0 else rest[:dot]
+    tail: ?str = None if dot < 0 else rest[dot + 1:]
+    if module != "" and module not in tree.order:
+        return OidRead([], False, "", False)
+    t_o = tree.find(label, module)
+    if t_o is None:
+        return OidRead([], False, "", False)
+    t = t_o!
+    arcs = t.oid()
+    rd = _Rd(tail)
+    if tail is not None:
+        if not _add_strings(tree, t, rd, arcs, inp):
+            return OidRead([], False, rd.detail, rd.has_detail)
+    return OidRead(arcs, True, "", False)
+
+def read_objid(tree: MibTree, text: str, inp: InputOptions) -> OidRead:
+    """net-snmp's read_objid with MIBs: a path of labels or numbers from the root (a MODULE: name: get_node)"""
+    e = _name_end(text)
+    if e < len(text) and text[e] == ":":
+        return get_node(tree, text, inp)
+    s = text
+    if s.startswith("."):
+        s = s[1:]
+    elif inp.ucd:
+        s = UCD_PREFIXES[0][1:] + "." + s
+    arcs: list[int] = []
+    rd = _Rd(s)
+    if not _add_strings(tree, tree.top, rd, arcs, inp):
+        return OidRead([], False, rd.detail, rd.has_detail)
+    if len(arcs) == 0:
+        return OidRead([], False, "", False)
+    return OidRead(arcs, True, "", False)
+
+_MAX_BAD = 0xffffff
+
+def _match_at(pat: str, label: str) -> int:
+    # net-snmp's compute_match: where the case-insensitive regular expression first matches label, _MAX_BAD
+    # when it does not (or does not compile)
+    try:
+        m = re.match("(?i)" + pat, label)
+        if m is not None:
+            return m.start_pos
+    except Exception:
+        pass
+    return _MAX_BAD
+
+def _find_best(tree: MibTree, pat: str, peers: list[TNode], reported: set[int]) -> (?TNode, int):
+    # net-snmp's find_best_tree_node over a list of peers, depth first: the node whose label matches earliest
+    # (a match at 0 ends the search); every node visited is marked reported and is not matched again. Like
+    # net-snmp, the match of a reported node is the one computed last (its variable is not reset).
+    best: ?TNode = None
+    old_match = _MAX_BAD
+    new_match = _MAX_BAD
+    for tp in peers:
+        if tp.seq not in reported and tp.label != "" and tree.visible(tp):
+            new_match = _match_at(pat, tp.label)
+        reported.add(tp.seq)
+        if new_match < old_match:
+            best = tp
+            old_match = new_match
+        if new_match == 0:
+            break
+        kids = tree.peers(tp)
+        if len(kids) > 0:
+            r = _find_best(tree, pat, kids, reported)
+            new_match = r.1
+            if new_match < old_match:
+                best = r.0
+                old_match = new_match
+            if new_match == 0:
+                break
+    return (best, old_match)
+
+def get_wild_node(tree: MibTree, text: str, reported: ?set[int]=None) -> OidRead:
+    """net-snmp's get_wild_node: match text as a case-insensitive regular expression against labels
+
+    The search is depth first and the earliest match wins. The OID is then
+    looked up by the matched label, so with a label defined by several
+    modules the result is the newest node, not necessarily the one matched.
+    Nodes in reported are skipped and the visited ones added (-TB).
+    """
+    rep: set[int] = reported if reported is not None else set()
+    r = _find_best(tree, text, tree.peers(tree.top), rep)
+    t = r.0
+    if t is not None:
+        n = tree.find(t.label)
+        if n is not None:
+            return OidRead(n.oid(), True, "", False)
+        return OidRead(t.oid(), True, "", False)
+    return OidRead([], False, "", False)
+
+def read_oid(tree: MibTree, text: str, inp: InputOptions) -> OidRead:
+    """net-snmp's snmp_parse_oid with MIBs loaded
+
+    Without -IR or -Ib this tries a path from the root, then a label
+    anywhere, then a regular expression, as net-snmp does. A failure
+    carries the last detail set. A detail set on the way to a success is
+    returned as OidRead.stale, since net-snmp prints it with a later error.
+    """
+    s = text
+    if inp.prefix != "" or inp.suffix != "":
+        sep = "" if (inp.suffix == "" or inp.suffix.startswith(".")) else "."
+        s = inp.prefix + s + sep + inp.suffix
+    if inp.random_access:
+        return get_node(tree, s, inp)
+    if inp.regex:
+        return get_wild_node(tree, s)
+    r = read_objid(tree, s, inp)
+    if r.ok:
+        return r
+    last = r.detail if r.has_detail else ""
+    g = get_node(tree, s, inp)
+    if g.has_detail:
+        last = g.detail
+    if g.ok:
+        return OidRead(g.arcs, True, "", False, last)
+    w = get_wild_node(tree, s)
+    if w.ok:
+        return OidRead(w.arcs, True, "", False, last)
+    if g.has_detail:
+        return g
+    return r
+
+
+# Where the MIBs come from (-M, -m, MIBDIRS, MIBS) and loading them ######################################
+
+def _combine(base: str, v: str) -> str:
+    # net-snmp's netsnmp_set_mib_directory: "+X" appends X, "-X" puts X first, anything else replaces
+    if v.startswith("+"):
+        return base + ":" + v[1:]
+    if v.startswith("-"):
+        return v[1:] + ":" + base
+    return v
+
+def search_path(dirs_opts: list[str], env: ?str, home: ?str, last_wins: bool=False) -> str:
+    """The ':'-separated MIB search path as net-snmp computes it, with "$HOME" replaced
+
+    MIBDIRS (env) and then each -M replace the path, or extend it at the end
+    with a leading "+" or at the start with "-". With last_wins, as in
+    snmptranslate, only the last -M counts.
+    """
+    base = DEFAULT_MIBDIRS
+    if env is not None:
+        base = _combine(DEFAULT_MIBDIRS, env)
+    if last_wins:
+        if len(dirs_opts) > 0:
+            base = _combine(DEFAULT_MIBDIRS, dirs_opts[len(dirs_opts) - 1])
+    else:
+        for v in dirs_opts:
+            base = _combine(base, v)
+    if home is not None:
+        base = base.replace("$HOME", home)
+    return base
+
+def module_list(m_opt: ?str, env: ?str) -> list[str]:
+    """The modules to load: the last -m, else MIBS, else none
+
+    Entries are separated by ':'. A leading "+" appends to the default list
+    and "-" prepends. "ALL" means every module on the search path and an
+    entry with a '/' is a file. The empty default matches the lab's
+    net-snmp, which has `mibs :` in snmp.conf.
+    """
+    v_o = m_opt if m_opt is not None else env
+    if v_o is None:
+        return []
+    t = v_o!
+    if t.startswith("+"):
+        t = DEFAULT_MIBS + ":" + t[1:]
+    elif t.startswith("-"):
+        t = t[1:] + ":" + DEFAULT_MIBS
+    return [e for e in t.split(":") if e != ""]
+
+def modules_named(texts: list[str]) -> list[str]:
+    """The modules that OID arguments name as MOD::label, which net-snmp loads when it reads them
+
+    Agent specifications such as udp:host are not module references.
+    """
+    out: list[str] = []
+    for s in texts:
+        e = _name_end(s)
+        if e > 0 and s[0] >= "A" and s[0] <= "Z" and s[e:e + 2] == "::" and e + 2 < len(s) and _alpha(s[e + 2]):
+            m = s[:e]
+            if m not in out:
+                out.append(m)
+    return out
+
+
+class Loaded(object):
+    """The MIBs loaded for a command
+
+    messages is what net-snmp prints on stderr while it loads the -m
+    modules. Modules named only by OID arguments are loaded up front too,
+    but net-snmp reads them when it parses the argument, so their messages
+    are kept per module in lazy, and the modules they pull in (lazy_mods)
+    stay hidden in the tree until then. See LazyLoads.
+    """
+    tree: MibTree
+    ms: mib.model.MibSet
+    messages: str
+    missing: list[str]
+    path: str
+    mp: mib.source.MibPath
+    requested: list[str]
+    lazy: dict[str, str]
+    lazy_last: dict[str, str]
+    lazy_mods: dict[str, list[str]]
+    last_err: str
+    line: int
+
+    def __init__(self, tree: MibTree, ms: mib.model.MibSet, messages: str, missing: list[str], path: str,
+                 mp: mib.source.MibPath, requested: list[str]):
+        self.tree = tree
+        self.ms = ms
+        self.messages = messages
+        self.missing = missing
+        self.path = path
+        self.mp = mp
+        self.requested = requested
+        self.lazy = {}
+        self.lazy_last = {}
+        self.lazy_mods = {}
+        self.last_err = ""
+        self.line = scan_line(mp)
+
+    def lazy_loads(self) -> LazyLoads:
+        """The LazyLoads of the modules only OID arguments name; hides them in the tree until they are named"""
+        z = LazyLoads(self.path, self.messages != "", self.last_err, self.line)
+        for x, mods in self.lazy_mods.items():
+            z.texts[x] = self.lazy.get_def(x, "")
+            z.last[x] = self.lazy_last.get_def(x, "")
+            z.mods[x] = mods
+            for nm in mods:
+                self.tree.hidden.add(nm)
+        return z
+
+class LazyLoads(object):
+    """Replays what net-snmp prints when an OID argument makes it read a module
+
+    net-snmp reads a module each time a MOD:: prefix names it. A missing
+    module gives "Cannot find module", though not twice in a row; a found
+    one prints its load messages the first time. The first message of the
+    process is preceded by the search path. Reading the module also
+    unhides its nodes in the tree.
+    """
+    path: str
+    texts: dict[str, str]
+    last: dict[str, str]
+    mods: dict[str, list[str]]
+    header_shown: bool
+    last_err: str
+    line: int
+
+    def __init__(self, path: str, header_shown: bool, last_err: str, line: int=1):
+        self.path = path
+        self.texts = {}
+        self.last = {}
+        self.mods = {}
+        self.header_shown = header_shown
+        self.last_err = last_err
+        self.line = line
+
+    def note(self, tree: MibTree, text: str) -> str:
+        """What reading text prints first ("" for nothing); unhides what it loads"""
+        mod = module_prefix(text)
+        if mod == "" or (mod in tree.order and mod not in self.texts):
+            return ""
+        lazy = self.texts.get(mod)
+        out = ""
+        if lazy is not None:
+            if lazy != "":
+                out = lazy
+                self.last_err = self.last.get_def(mod, self.last_err)
+            self.texts[mod] = ""
+            for nm in self.mods.get_def(mod, []):
+                tree.hidden.discard(nm)
+        elif mod not in tree.order:
+            if self.last_err != mod:
+                out = "Cannot find module (" + mod + "): At line %d in (none)\n" % self.line
+            self.last_err = mod
+        if out != "" and not self.header_shown:
+            self.header_shown = True
+            out = "MIB search path: " + self.path + "\n" + out
+        return out
+
+
+proc def _is_dir(fs: file.FS, d: str) -> bool:
+    try:
+        return fs.stat(d).is_dir()
+    except Exception:
+        return False
+
+proc def index_dirs(fcap: file.FileCap, path: str, hash_files: bool=False) -> mib.source.MibPath:
+    """An indexed MibPath over the existing directories of a search path
+
+    The directories are reversed because net-snmp uses the last file found
+    for a module and MibPath uses the first.
+    """
+    fs = file.FS(fcap)
+    use: list[str] = []
+    for d in path.split(":"):
+        if d != "" and d not in use and _is_dir(fs, d):
+            use.append(d)
+    use.reverse()
+    mp = mib.source.MibPath(use, True, hash_files)
+    mib.source.index_path(mp, fcap, mib.diag.Diagnostics(""))
+    return mp
+
+def scan_line(mp: mib.source.MibPath) -> int:
+    """The N in net-snmp's "Cannot find module (X): At line N in (none)": 0 without files, else 1
+
+    net-snmp prints its parser's line counter, left at the second token of
+    the last file it scanned. That is line 1 for any file that starts with
+    its module header.
+    """
+    return 1 if len(mp.files) > 0 else 0
+
+def all_modules(mp: mib.source.MibPath) -> list[str]:
+    """The modules -m ALL loads, in net-snmp's order: the first module of each file, in reverse path order"""
+    n = len(mp.dirs)
+    keyed: list[(int, str, int, int)] = []
+    rows: list[mib.source.ModuleEntry] = []
+    for nm, lst in mp.entries.items():
+        for e in lst:
+            if e.dir_index >= 0:
+                keyed.append((n - 1 - e.dir_index, e.path, e.start, len(rows)))
+                rows.append(e)
+    seen_files: set[str] = set()
+    names: list[str] = []
+    seen: set[str] = set()
+    for k in sorted(keyed):
+        e = rows[k.3]
+        if e.path in seen_files:
+            continue
+        seen_files.add(e.path)
+        if e.name not in seen:
+            seen.add(e.name)
+            names.append(e.name)
+    names.reverse()
+    return names
+
+proc def file_modules(fcap: file.FileCap, mp: mib.source.MibPath, path: str) -> ?list[str]:
+    """Index a MIB file given by path and return its module names, or None if it cannot be read
+
+    Its modules take precedence over those on the search path.
+    """
+    data = b""
+    try:
+        data = mib.source.read_bytes(fcap, path)
+    except Exception:
+        return None
+    names: list[str] = []
+    for e in mp.add_file(path, data, -1):
+        mp.pin(e.name, path)
+        if e.name not in names:
+            names.append(e.name)
+    return names
+
+proc def _is_file(fcap: file.FileCap, p: str) -> bool:
+    try:
+        return file.FS(fcap).stat(p).is_file()
+    except Exception:
+        return False
+
+class _Msgs(object):
+    # net-snmp's load-time messages being collected, with its last_err_module
+    lines: list[str]
+    last_err: str
+
+    def __init__(self, last_err: str):
+        self.lines = []
+        self.last_err = last_err
+
+    def not_found(self, module: str, where: str) -> None:
+        # print_module_not_found: not twice in a row for the same module
+        if module != self.last_err:
+            self.lines.append("Cannot find module (" + module + "): " + where + "\n")
+        self.last_err = module
+
+    def text(self) -> str:
+        return "".join(self.lines)
+
+def _import_messages(ms: mib.model.MibSet, order: list[str], lost: set[str], out: _Msgs) -> None:
+    # per module (in load order): "Cannot find module" for each IMPORTS module that is not found, then "Did not
+    # find 'SYMBOL' in module #-1 (FILE)" for each symbol imported from those
+    for name in order:
+        m_o = ms.module(name)
+        if m_o is None:
+            continue
+        m = m_o!
+        groups = [g for g in m.amod.imports if (name + ":%d" % g.line) in lost]
+        for g in groups:
+            out.not_found(g.module, "At line %d in " % g.line + m.file)
+        for g in groups:
+            for sy in g.symbols:
+                out.lines.append("Did not find '" + sy.name + "' in module #-1 (" + m.file + ")\n")
+
+proc def load(fcap: file.FileCap, path: str, modules: list[str], extra: list[str]=[], hash_files: bool=False,
+              files: bool=False) -> Loaded:
+    """Load modules (the -m entries) and extra (modules named by OID arguments) from a search path
+
+    The tree is built in net-snmp's load order, the extra modules last. An
+    entry with a '/' is a file; with files, so is any entry that names an
+    existing file. A module with errors contributes what resolves.
+    """
+    mp = index_dirs(fcap, path, hash_files)
+    # the -m entries in order: (name, found)
+    entries: list[(str, bool)] = []
+    names: list[str] = []
+    missing: list[str] = []
+    for m in modules:
+        if m.upper() == "ALL":
+            for nm in all_modules(mp):
+                entries.append((nm, True))
+                if nm not in names:
+                    names.append(nm)
+        elif "/" in m or (files and _is_file(fcap, m)):
+            fm = file_modules(fcap, mp, m)
+            if fm is not None:
+                for nm in fm:
+                    entries.append((nm, True))
+                    if nm not in names:
+                        names.append(nm)
+            else:
+                entries.append((m, False))
+                if m not in missing:
+                    missing.append(m)
+        elif mp.find(m) is not None:
+            entries.append((m, True))
+            if m not in names:
+                names.append(m)
+        else:
+            entries.append((m, False))
+            if m not in missing:
+                missing.append(m)
+    xnames: list[str] = []
+    for m in extra:
+        if m not in names and m not in xnames and mp.find(m) is not None:
+            xnames.append(m)
+    ms = mib.resolver.resolve_path(fcap, mp, names + xnames)
+    lost: set[str] = set()
+    for d in ms.diags:
+        if d.code == "source.not-found":
+            lost.add(d.module + ":%d" % d.line)
+    done: set[str] = set()
+    out = _Msgs("")
+    for e in entries:
+        if not e.1:
+            out.not_found(e.0, "At line %d in (none)" % scan_line(mp))
+            continue
+        order = [nm for nm in load_order(ms, [e.0]) if nm not in done]
+        for nm in order:
+            done.add(nm)
+        _import_messages(ms, order, lost, out)
+    init = out.text()
+    ld = Loaded(build_tree(ms, names + xnames, mp), ms, ("MIB search path: " + path + "\n" + init) if init != "" else "",
+                missing, path, mp, names)
+    ld.last_err = out.last_err
+    for x in xnames:
+        order = [nm for nm in load_order(ms, [x]) if nm not in done]
+        for nm in order:
+            done.add(nm)
+        xo = _Msgs(out.last_err)
+        _import_messages(ms, order, lost, xo)
+        ld.lazy[x] = xo.text()
+        ld.lazy_last[x] = xo.last_err
+        ld.lazy_mods[x] = order
+    return ld
+
+def module_prefix(text: str) -> str:
+    """The module prefix of an OID argument as net-snmp's get_node reads it ("" if none)"""
+    e = _name_end(text)
+    if e > 0 and e < len(text) and text[e] == ":":
+        return text[:e]
+    return ""
+
+
+# snmptranslate: -Td details and -Tp trees ###############################################################
+
+# net-snmp's type numbers of the other macros (parse.h), for -Td and -Tp
+_TYPE_TRAPTYPE = 20
+_TYPE_NOTIFTYPE = 21
+_TYPE_OBJGROUP = 22
+_TYPE_NOTIFGROUP = 23
+_TYPE_MODID = 24
+_TYPE_AGENTCAP = 25
+_TYPE_MODCOMP = 26
+_TYPE_OBJIDENTITY = 27
+
+def full_type(t: TNode) -> int:
+    """net-snmp's tree type of a node: the value type (T_*) of an object, else its macro's type"""
+    k = t.kind
+    if k == "trap#":
+        return _TYPE_TRAPTYPE
+    if k == "notification":
+        n = t.node
+        if n is not None and n.macro == "TRAP-TYPE":
+            # net-snmp gives the TRAP-TYPE to the "<enterprise>#" node above the trap; the trap's own node
+            # has no type (-Td prints it as an OBJECT-TYPE)
+            return T_OTHER
+        return _TYPE_NOTIFTYPE
+    if k == "object-group":
+        return _TYPE_OBJGROUP
+    if k == "notification-group":
+        return _TYPE_NOTIFGROUP
+    if k == "module-identity":
+        return _TYPE_MODID
+    if k == "capabilities":
+        return _TYPE_AGENTCAP
+    if k == "compliance":
+        return _TYPE_MODCOMP
+    if k == "object-identity":
+        return _TYPE_OBJIDENTITY
+    return t.ttype
+
+def _syntax_name(tt: int) -> str:
+    if tt == T_OBJID:
+        return "OBJECT IDENTIFIER"
+    if tt == T_OCTETSTR:
+        return "OCTET STRING"
+    if tt == T_INTEGER:
+        return "INTEGER"
+    if tt == T_NETADDR:
+        return "NetworkAddress"
+    if tt == T_IPADDR:
+        return "IpAddress"
+    if tt == T_COUNTER:
+        return "Counter32"
+    if tt == T_GAUGE:
+        return "Gauge32"
+    if tt == T_TIMETICKS:
+        return "TimeTicks"
+    if tt == T_OPAQUE:
+        return "Opaque"
+    if tt == T_NULL:
+        return "NULL"
+    if tt == T_COUNTER64:
+        return "Counter64"
+    if tt == T_BITSTRING:
+        return "BITS"
+    if tt == T_NSAPADDRESS:
+        return "NsapAddress"
+    if tt == T_UINTEGER:
+        return "UInteger32"
+    if tt == T_UNSIGNED32:
+        return "Unsigned32"
+    if tt == T_INTEGER32:
+        return "Integer32"
+    return ""
+
+def _range_text(tt: int, r: (int, int)) -> str:
+    # net-snmp's print_range_value: %d for INTEGER and Integer32, %u for the unsigned types and sizes
+    if tt == T_INTEGER or tt == T_INTEGER32:
+        return str(r.0) if r.0 == r.1 else "%d..%d" % (r.0, r.1)
+    if tt == T_UNSIGNED32 or tt == T_OCTETSTR or tt == T_GAUGE or tt == T_UINTEGER:
+        lo = r.0 & 0xffffffff
+        hi = r.1 & 0xffffffff
+        return str(lo) if lo == hi else "%d..%d" % (lo, hi)
+    return ""
+
+def _access(t: TNode) -> str:
+    n_o = t.node
+    if n_o is None or full_type(t) > T_INTEGER32:
+        return ""
+    n = n_o!
+    if n.access_raw == "write-only":
+        return "write-only"
+    return n.access
+
+def _status(t: TNode) -> str:
+    # net-snmp keeps STATUS of OBJECT-TYPE only
+    n_o = t.node
+    if n_o is None or full_type(t) > T_INTEGER32 or n_o!.macro != "OBJECT-TYPE":
+        return ""
+    n = n_o!
+    raw = n.status_raw
+    return raw if raw != "" else n.status
+
+def _quote_number(body: str, radix: str) -> ?str:
+    # net-snmp's get_token for '...'H and '...'B: the digits as an unsigned long (wrapping), printed as %ld;
+    # None when they are not all digits of that radix (the token is then the label '...')
+    v = bigint(0)
+    base = bigint(16) if radix == "h" else bigint(2)
+    for c in body:
+        d = -1
+        if c >= "0" and c <= "9":
+            d = ord(c) - 48
+        elif c >= "a" and c <= "f":
+            d = ord(c) - 87
+        elif c >= "A" and c <= "F":
+            d = ord(c) - 55
+        if d < 0 or bigint(d) >= base:
+            return None
+        v = (v * base + bigint(d)) & bigint(0xffffffffffffffff)
+    if v >= bigint(0x8000000000000000):
+        v = v - (bigint(1) << 64)
+    return str(v)
+
+def _defval(n: mib.model.MibNode) -> str:
+    # DEFVAL as net-snmp keeps it (parse.c, case DEFVAL): the tokens between the braces, each followed by a
+    # blank, strings as \"..\", '..'H and '..'B as the number they spell (else the label '..'), at most 511
+    # characters, the last one (the final blank) dropped
+    dv_o = n.defval
+    if dv_o is None:
+        return ""
+    dv = dv_o!
+    s = dv.text.strip()
+    out: list[str] = []
+    i = 0
+    while i < len(s):
+        c = s[i]
+        if c == " " or c == "\t" or c == "\n" or c == "\r":
+            i += 1
+            continue
+        if c == "\"":
+            j = s.find("\"", i + 1)
+            if j < 0:
+                j = len(s)
+            out.append("\\\"" + s[i + 1:j] + "\\\" ")
+            i = j + 1
+            continue
+        if c == "'":
+            j = s.find("'", i + 1)
+            if j < 0:
+                out.append(s[i:] + " ")
+                break
+            body = s[i + 1:j]
+            r = s[j + 1:j + 2].lower()
+            num: ?str = None
+            if r == "h" or r == "b":
+                num = _quote_number(body, r)
+            out.append((num if num is not None else "'" + body + "'") + " ")
+            i = j + 2
+            continue
+        if c == "{{" or c == "}}" or c == ",":
+            out.append(c + " ")
+            i += 1
+            continue
+        j = i
+        while j < len(s) and s[j] not in " \t\r\n{{}},\"'":
+            j += 1
+        out.append(s[i:j] + " ")
+        i = j
+    text = "".join(out)
+    if len(text) > 511:
+        text = text[:511]
+    return text[:len(text) - 1] if text != "" else ""
+
+def _description(t: TNode) -> str:
+    n_o = t.node
+    if n_o is None:
+        return ""
+    n = n_o!
+    d = n.description.replace("\r", "")
+    return d[:4095] if len(d) > 4095 else d
+
+def _wrap_list(items: list[str], first_pos: int, width: int, cont: str) -> str:
+    # items joined with ", ", breaking the line before an item that would pass width (net-snmp's -Td lists)
+    out: list[str] = []
+    pos = first_pos
+    for k, s in enumerate(items):
+        if k > 0:
+            out.append(", ")
+        if pos + len(s) + 2 > width:
+            out.append(cont)
+            pos = 18
+        out.append(s)
+        pos += len(s) + 2
+    return "".join(out)
+
+def description(tree: MibTree, arcs: list[int], width: int=1000000) -> ?str:
+    """snmptranslate -Td's text for an OID (net-snmp's sprint_realloc_description), None without a node"""
+    tp_o = tree.node_at(arcs)
+    if tp_o is None:
+        return None
+    tp = tp_o!
+    ft = full_type(tp)
+    head = " OBJECT-TYPE"
+    if ft == _TYPE_TRAPTYPE:
+        head = " TRAP-TYPE"
+    elif ft == _TYPE_NOTIFTYPE:
+        head = " NOTIFICATION-TYPE"
+    elif ft == _TYPE_OBJGROUP:
+        head = " OBJECT-GROUP"
+    elif ft == _TYPE_AGENTCAP:
+        head = " AGENT-CAPABILITIES"
+    elif ft == _TYPE_MODID:
+        head = " MODULE-IDENTITY"
+    elif ft == _TYPE_OBJIDENTITY:
+        head = " OBJECT-IDENTITY"
+    elif ft == _TYPE_MODCOMP:
+        head = " MODULE-COMPLIANCE"
+    elif ft > T_INTEGER32:
+        head = " type_%d" % ft
+    out: list[str] = [tp.shown() + head + "\n"]
+    # -- FROM: the creating module, then the others that define the node
+    mods = tp.modules if len(tp.modules) > 0 else [tp.module]
+    first = tp.module if tp.module != "" else (mods[0] if len(mods) > 0 else "")
+    out.append("  -- FROM\t" + first)
+    pos = 16 + len(first)
+    prev = first
+    for m in mods:
+        if m == first and prev == first:
+            continue
+        if m != prev:
+            if pos + len(m) + 2 > width:
+                out.append(",\n  --\t\t")
+                pos = 16
+            else:
+                out.append(", ")
+                pos += 2
+            out.append(m)
+            pos += len(m)
+        prev = m
+    out.append("\n")
+    if tp.tc != "":
+        out.append("  -- TEXTUAL CONVENTION " + tp.tc + "\n")
+    cp = _syntax_name(tp.ttype)
+    if cp != "":
+        out.append("  SYNTAX\t" + cp)
+    if len(tp.ranges) > 0:
+        rt = [_range_text(tp.ttype, r) for r in tp.ranges]
+        if rt[0] == "":
+            # net-snmp prints no range of other types: its buffer still holds the last module name of the
+            # FROM line, which it prints for every range
+            out.append(" (" + prev * len(rt) + ") ")
+        else:
+            out.append(" (" + " | ".join(rt) + ") ")
+    if len(tp.enums) > 0:
+        out.append(" {{")
+        pos = 16 + len(cp) + 2
+        parts: list[str] = []
+        for k, e in enumerate(tp.enums):
+            s = e.0 + "(" + str(e.1) + ")"
+            if k > 0:
+                parts.append(", ")
+            if pos + len(s) + 2 > width:
+                parts.append("\n\t\t  ")
+                pos = 18
+            parts.append(s)
+            pos += len(s) + 2
+        out.append("".join(parts) + "}} ")
+    if cp != "":
+        out.append("\n")
+    h = tp.hint
+    if h is not None:
+        out.append("  DISPLAY-HINT\t\"" + h + "\"\n")
+    if tp.units != "":
+        out.append("  UNITS\t\t\"" + tp.units + "\"\n")
+    acc = _access(tp)
+    if acc != "":
+        out.append("  MAX-ACCESS\t" + acc + "\n")
+    st = _status(tp)
+    if st != "":
+        out.append("  STATUS\t" + st + "\n")
+    if tp.augments != "":
+        out.append("  AUGMENTS\t{{ " + tp.augments + " }}\n")
+    if len(tp.indexes) > 0:
+        items = [("IMPLIED " if x.1 else "") + x.0 for x in tp.indexes]
+        out.append("  INDEX\t\t{{ " + _wrap_list(items, 18, width, "\n\t\t  ") + " }}\n")
+    n = tp.node
+    if n is not None and tp.kind == "notification" and len(n.objects) > 0:
+        # net-snmp's varbinds (NOTIFICATION-TYPE OBJECTS, TRAP-TYPE VARIABLES); "VARIABLES" only for a node of
+        # type TRAP-TYPE, which a trap's own node never is
+        labels = [o[o.find("::") + 2:] if "::" in o else o for o in n.objects]
+        kw = "  VARIABLES\t{{ " if ft == _TYPE_TRAPTYPE else "  OBJECTS\t{{ "
+        out.append(kw + _wrap_list(labels, 18, width, "\n\t\t  ") + " }}\n")
+    if n is not None and n.defn.description is not None:
+        out.append("  DESCRIPTION\t\"" + _description(tp) + "\"\n")
+    if n is not None:
+        dv = _defval(n)
+        if dv != "":
+            out.append("  DEFVAL\t{{ " + dv + " }}\n")
+    # ::= { label(arc) ... last }
+    out.append("::= {{")
+    pos = 5
+    cur = tree.top
+    i = 0
+    k = len(arcs)
+    while i < k - 1:
+        nx_o = cur.kid(arcs[i])
+        if nx_o is None:
+            break
+        nx = nx_o!
+        s = " " + (nx.label + "(" + str(nx.arc) + ")" if nx.label != "" else str(nx.arc))
+        if pos + len(s) + 2 > width:
+            out.append("\n     ")
+            pos = 5
+        out.append(s)
+        pos += len(s)
+        cur = nx
+        i += 1
+    while i < k - 1:
+        s = " " + str(arcs[i])
+        if pos + len(s) + 2 > width:
+            out.append("\n     ")
+            pos = 5
+        out.append(s)
+        pos += len(s)
+        i += 1
+    s = " " + str(arcs[k - 1]) + " }}"
+    if pos + len(s) + 2 > width:
+        out.append("\n     ")
+    out.append(s)
+    return "".join(out)
+
+
+class _Leaves(object):
+    # net-snmp's print_mib_leaves state: the indent characters and whether the last leaf was simple
+    indent: list[str]
+    was_simple: bool
+    out: list[str]
+    width: int
+
+    def __init__(self, width: int):
+        self.indent = [" "]
+        self.was_simple = True
+        self.out = []
+        self.width = width
+
+    def ind(self) -> str:
+        return "".join(self.indent)
+
+def _tree_type(t: TNode) -> str:
+    tt = t.ttype
+    if tt == T_OBJID:
+        return "ObjID    "
+    if tt == T_OCTETSTR:
+        return "String   "
+    if tt == T_INTEGER:
+        return "EnumVal  " if len(t.enums) > 0 else "INTEGER  "
+    if tt == T_NETADDR:
+        return "NetAddr  "
+    if tt == T_IPADDR:
+        return "IpAddr   "
+    if tt == T_COUNTER:
+        return "Counter  "
+    if tt == T_GAUGE:
+        return "Gauge    "
+    if tt == T_TIMETICKS:
+        return "TimeTicks"
+    if tt == T_OPAQUE:
+        return "Opaque   "
+    if tt == T_NULL:
+        return "Null     "
+    if tt == T_COUNTER64:
+        return "Counter64"
+    if tt == T_BITSTRING:
+        return "BitString"
+    if tt == T_NSAPADDRESS:
+        return "NsapAddr "
+    if tt == T_UNSIGNED32:
+        return "Unsigned "
+    if tt == T_UINTEGER:
+        return "UInteger "
+    if tt == T_INTEGER32:
+        return "Integer32"
+    return "         "
+
+def _tree_access(t: TNode) -> str:
+    a = _access(t)
+    if a == "not-accessible":
+        return "----"
+    if a == "read-only":
+        return "-R--"
+    if a == "write-only":
+        return "--W-"
+    if a == "read-write":
+        return "-RW-"
+    if a == "accessible-for-notify":
+        return "---N"
+    if a == "read-create":
+        return "CR--"
+    return "    "
+
+def _leaves(st: _Leaves, tp: TNode) -> None:
+    ip = len(st.indent) - 1
+    last = st.indent[ip]
+    st.indent[ip] = "+"
+    ft = full_type(tp)
+    if ft == T_OTHER or ft > T_INTEGER32:
+        st.out.append(st.ind() + "--" + tp.shown() + "(" + str(tp.arc) + ")\n")
+        if len(tp.indexes) > 0:
+            st.indent[ip] = last
+            ind = st.ind()
+            cmax = st.width - len(ind) - 12
+            cpos = 0
+            parts: list[str] = [ind + "  |  Index: "]
+            for k, x in enumerate(tp.indexes):
+                if k > 0:
+                    parts.append(", ")
+                ln = len(x.0) + 2
+                cpos += ln
+                if cpos > cmax:
+                    parts.append("\n" + ind + "  |         ")
+                    cpos = ln
+                parts.append(x.0)
+            st.out.append("".join(parts) + "\n")
+            st.indent[ip] = "+"
+    else:
+        st.out.append(st.ind() + "-- " + _tree_access(tp) + " " + _tree_type(tp) + " " + tp.shown() + "("
+                      + str(tp.arc) + ")\n")
+        st.indent[ip] = last
+        ind = st.ind()
+        if tp.tc != "":
+            st.out.append(ind + "        Textual Convention: " + tp.tc + "\n")
+        if len(tp.enums) > 0:
+            cmax = st.width - len(ind) - 16
+            cpos = 0
+            parts: list[str] = [ind + "        Values: "]
+            for k, e in enumerate(tp.enums):
+                if k > 0:
+                    parts.append(", ")
+                b = e.0 + "(" + str(e.1) + ")"
+                bw = len(b) + 2
+                cpos += bw
+                if cpos >= cmax:
+                    parts.append("\n" + ind + "                ")
+                    cpos = bw
+                parts.append(b)
+            st.out.append("".join(parts) + "\n")
+        if len(tp.ranges) > 0:
+            size = (tp.ttype == T_OCTETSTR or tp.ttype == T_OPAQUE)
+            st.out.append(ind + ("        Size: " if size else "        Range: ")
+                          + " | ".join([_range_text(tp.ttype, r) for r in tp.ranges]) + "\n")
+    st.indent[ip] = last
+    st.indent.extend([" ", " ", "|"])
+    st.was_simple = ft != T_OTHER
+    kids = tp.children()
+    if len(kids) > 0:
+        for i, k in enumerate(kids):
+            if not st.was_simple or full_type(k) == T_OTHER:
+                st.out.append(st.ind() + "\n")
+            if i == len(kids) - 1:
+                st.indent[ip + 3] = " "
+            _leaves(st, k)
+        st.was_simple = False
+    st.indent = st.indent[:ip + 1]
+
+def mib_tree_text(tree: MibTree, t: TNode, width: int=1000000) -> str:
+    """snmptranslate -Tp's tree below t (net-snmp's print_mib_tree)"""
+    st = _Leaves(width)
+    _leaves(st, t)
+    return "".join(st.out)
+
+
+# The MIB commands: translate, mib2yang, mibmeta, miblint ################################################
+
+class CmdResult(object):
+    """The output of a MIB command: stdout and stderr text, the exit code and the (path, text) files to write"""
+    out: str
+    err: str
+    code: int
+    files: list[(str, str)]
+
+    def __init__(self, out: str, err: str, code: int, files: list[(str, str)]=[]):
+        self.out = out
+        self.err = err
+        self.code = code
+        self.files = files
+
+def translate(tree: MibTree, names: list[str], o: fmt.OutputOptions, inp: InputOptions, details: bool,
+              print_tree: bool, width: int, find_all: bool=False, lazy: ?LazyLoads=None) -> CmdResult:
+    """snmptranslate: each name as an OID in o's style, with -Td details or -Tp as a tree
+
+    -TB (find_all) prints every label the first name matches as a regular
+    expression. Processing stops at the first name that fails, with
+    snmptranslate's message and exit code. Without names, -Tp prints the
+    whole tree; otherwise the result has code -1 to ask for the usage text.
+    """
+    out: list[str] = []
+    if len(names) == 0:
+        if print_tree:
+            iso = tree.top.kid(1)
+            if iso is not None:
+                out.append(mib_tree_text(tree, iso, width))
+            return CmdResult("".join(out), "", 0)
+        return CmdResult("", "", -1)
+    notes: list[str] = []
+    # snmptranslate -Ib calls get_wild_node without clearing the tree's reported flags, so the nodes one
+    # name's search visited are not matched for the names after it
+    wild_reported: set[int] = set()
+    for k, name in enumerate(names):
+        if lazy is not None:
+            notes.append(lazy.note(tree, name))
+        r = OidRead([], False, "", False)
+        if inp.random_access:
+            r = get_node(tree, name, inp)
+            if not r.ok:
+                return CmdResult("".join(out), "".join(notes) + "Unknown object identifier: " + name + "\n", 2)
+        elif find_all:
+            reported: set[int] = set()
+            count = 0
+            while True:
+                w = get_wild_node(tree, name, reported)
+                if not w.ok:
+                    break
+                count += 1
+                out.append(oid_text(tree, w.arcs, o).0 + "\n")
+                if details:
+                    d = description(tree, w.arcs, width)
+                    if d is not None:
+                        out.append(d + "\n")
+            if count == 0:
+                return CmdResult("".join(out), "".join(notes) + "Unable to find a matching object identifier for \"" + name + "\"\n", 1)
+            return CmdResult("".join(out), "".join(notes), 0)
+        elif inp.regex:
+            r = get_wild_node(tree, name, wild_reported)
+            if not r.ok:
+                return CmdResult("".join(out), "".join(notes) + "Unable to find a matching object identifier for \"" + name + "\"\n", 1)
+        else:
+            r = read_objid(tree, name, inp)
+            if not r.ok:
+                return CmdResult("".join(out), "".join(notes) + r.message(name) + "\n", 2)
+        if print_tree:
+            tp_o = tree.node_at(r.arcs)
+            if tp_o is None:
+                return CmdResult("".join(out), "".join(notes) + "Unable to find a matching object identifier for \"" + name + "\"\n", 1)
+            tp = tp_o!
+            out.append(mib_tree_text(tree, tp, width))
+        else:
+            out.append(oid_text(tree, r.arcs, o).0 + "\n")
+            if details:
+                d = description(tree, r.arcs, width)
+                if d is not None:
+                    out.append(d + "\n")
+        if k < len(names) - 1:
+            out.append("\n")
+    return CmdResult("".join(out), "".join(notes), 0)
+
+def _diag_text(ds: list[mib.diag.Diagnostic], modules: list[str], level: int) -> str:
+    keyed = [((d.file, d.line, d.col, i), i) for i, d in enumerate(ds) if d.level <= level and d.module in modules]
+    return "".join([str(ds[k.1]) + "\n" for k in sorted(keyed)])
+
+def mib2yang(ld: Loaded, outdir: str, meta: bool, consistent_status: bool, ignore_hints: list[str],
+             level: int) -> CmdResult:
+    """Translate every requested module to <MODULE>.yang (RFC 6643), and with meta to <MODULE>.mibmeta.json
+
+    The files are returned in CmdResult.files for the caller to write to
+    outdir. Diagnostics up to level go to stderr. The exit code is 1 when a
+    module is missing or cannot be translated.
+    """
+    opts = mib.yang.Options()
+    opts.consistent_status = consistent_status
+    for h in ignore_hints:
+        opts.ignore_display_hint.add(h)
+    tr = mib.yang.Translator(ld.ms, opts)
+    files: list[(str, str)] = []
+    err: list[str] = [ld.messages]
+    code = 1 if len(ld.missing) > 0 else 0
+    diags: list[mib.diag.Diagnostic] = list(ld.ms.diags)
+    failed: list[str] = []
+    for name in ld.requested:
+        r_o = tr.module(name)
+        if r_o is None:
+            err.append("mib2yang: module " + name + " is not loaded\n")
+            code = 1
+            continue
+        r = r_o!
+        diags.extend(r.diags)
+        if not r.ok:
+            failed.append(name)
+            code = 1
+            continue
+        path = file.join_path([outdir, name + ".yang"]) if outdir != "" else name + ".yang"
+        files.append((path, r.text))
+        if meta:
+            mm = mib.meta.module_meta(ld.ms, name, tr)
+            if mm is not None:
+                mpath = file.join_path([outdir, name + ".mibmeta.json"]) if outdir != "" else name + ".mibmeta.json"
+                files.append((mpath, mib.meta.to_json(mm)))
+    err.append(_diag_text(diags, ld.requested, level))
+    for name in failed:
+        err.append("mib2yang: " + name + ": the translation failed\n")
+    return CmdResult("", "".join(err), code, files)
+
+def mibmeta(ld: Loaded, level: int) -> CmdResult:
+    """The mibmeta JSON of the requested modules: a module document for one, a bundle for several"""
+    tr = mib.yang.Translator(ld.ms)
+    mods: list[mib.meta.ModuleMeta] = []
+    err: list[str] = [ld.messages]
+    code = 1 if len(ld.missing) > 0 else 0
+    for name in ld.requested:
+        mm = mib.meta.module_meta(ld.ms, name, tr)
+        if mm is not None:
+            mods.append(mm)
+        else:
+            err.append("mibmeta: module " + name + " is not loaded\n")
+            code = 1
+    err.append(_diag_text(ld.ms.diags, ld.requested, level))
+    text = ""
+    if len(mods) == 1:
+        text = mib.meta.to_json(mods[0])
+    elif len(mods) > 1:
+        text = mib.meta.bundle_to_json(mib.meta.MibBundle(mods))
+    return CmdResult(text, "".join(err), code)
+
+def miblint(ld: Loaded, level: int) -> CmdResult:
+    """The parser and resolver diagnostics of the requested modules up to level, in smilint style
+
+    The exit code is 1 when any of them is an error (level 1 or 2).
+    """
+    text = _diag_text(ld.ms.diags, ld.requested, level)
+    bad = False
+    for d in ld.ms.diags:
+        if d.level <= 2 and d.level <= level and d.module in ld.requested:
+            bad = True
+    code = 1 if (bad or len(ld.missing) > 0) else 0
+    return CmdResult(text, ld.messages, code)

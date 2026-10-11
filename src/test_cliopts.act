@@ -7,6 +7,8 @@ same command lines.
 import testing
 import cliopts
 import fmt
+import mibcli
+import mib.resolver
 import message
 import usm
 from cliopts import CliError, CliOptions, parse, parse_value, parse_agent
@@ -747,3 +749,238 @@ def _test_repr_hides_secrets() -> None:
     testing.assertFalse("secretpass" in r)
     c = p(["get", "-c", "topsecret", "h", "1.3"])
     testing.assertFalse("topsecret" in repr(c))
+
+
+# MIBs ##############################################################################################
+
+MIB_TEXT = r"""
+OPT-TEST-MIB DEFINITIONS ::= BEGIN
+IMPORTS
+    MODULE-IDENTITY, OBJECT-TYPE, Integer32, Gauge32, TimeTicks, IpAddress, enterprises FROM SNMPv2-SMI
+    TEXTUAL-CONVENTION, DisplayString FROM SNMPv2-TC;
+optTest MODULE-IDENTITY
+    LAST-UPDATED "202610110000Z" ORGANIZATION "x" CONTACT-INFO "x" DESCRIPTION "x"
+    ::= { enterprises 99996 }
+OptFlags ::= TEXTUAL-CONVENTION
+    STATUS current
+    DESCRIPTION "x"
+    SYNTAX BITS { b0(0), b1(1), b9(9) }
+OptMac ::= TEXTUAL-CONVENTION
+    DISPLAY-HINT "1x:"
+    STATUS current
+    DESCRIPTION "x"
+    SYNTAX OCTET STRING (SIZE (6))
+optInt OBJECT-TYPE SYNTAX Integer32 (0..100) MAX-ACCESS read-write STATUS current DESCRIPTION "x" ::= { optTest 1 }
+optEnum OBJECT-TYPE SYNTAX INTEGER { up(1), down(2), current(3) } MAX-ACCESS read-write STATUS current
+    DESCRIPTION "x" ::= { optTest 2 }
+optStr OBJECT-TYPE SYNTAX DisplayString (SIZE (0..4)) MAX-ACCESS read-write STATUS current DESCRIPTION "x"
+    ::= { optTest 3 }
+optFlags OBJECT-TYPE SYNTAX OptFlags MAX-ACCESS read-write STATUS current DESCRIPTION "x" ::= { optTest 4 }
+optMac OBJECT-TYPE SYNTAX OptMac MAX-ACCESS read-write STATUS current DESCRIPTION "x" ::= { optTest 5 }
+optGauge OBJECT-TYPE SYNTAX Gauge32 MAX-ACCESS read-write STATUS current DESCRIPTION "x" ::= { optTest 6 }
+optTicks OBJECT-TYPE SYNTAX TimeTicks MAX-ACCESS read-write STATUS current DESCRIPTION "x" ::= { optTest 7 }
+optAddr OBJECT-TYPE SYNTAX IpAddress MAX-ACCESS read-write STATUS current DESCRIPTION "x" ::= { optTest 8 }
+optOid OBJECT-TYPE SYNTAX OBJECT IDENTIFIER MAX-ACCESS read-write STATUS current DESCRIPTION "x"
+    ::= { optTest 9 }
+END
+"""
+
+OPT = [1, 3, 6, 1, 4, 1, 99996]
+
+def mib_tree() -> mibcli.MibTree:
+    return mibcli.build_tree(mib.resolver.resolve_texts([MIB_TEXT]), ["OPT-TEST-MIB"])
+
+def pm(args: list[str]) -> CliOptions:
+    """scan, the MIBs of MIB_TEXT, finish: what the CLI does with -m"""
+    o = cliopts.scan(["actsnmp"] + args)
+    o.mib = mib_tree()
+    cliopts.finish(o)
+    return o
+
+def pm_fails(args: list[str], text: str) -> None:
+    try:
+        pm(args)
+    except CliError as e:
+        testing.assertEqual(e.error_message, text, "message for " + repr(args))
+        return
+    raise AssertionError("no CliError for " + repr(args))
+
+def _test_mib_mode() -> None:
+    """-m, -M, MIBS, MIBDIRS or an OID that names a module (MOD::) turn MIB mode on; agent specifications do not"""
+    testing.assertFalse(cliopts.scan(["actsnmp", "get", "-c", "x", "udp6:[::1]:161", "1.3"]).mib_mode)
+    testing.assertFalse(cliopts.scan(["actsnmp", "get", "-c", "x", "udp:h", "1.3"]).mib_mode)
+    testing.assertTrue(cliopts.scan(["actsnmp", "get", "-m", "IF-MIB", "-c", "x", "h", "1.3"]).mib_mode)
+    testing.assertTrue(cliopts.scan(["actsnmp", "get", "-M", "/d", "-c", "x", "h", "1.3"]).mib_mode)
+    testing.assertTrue(cliopts.scan(["actsnmp", "get", "-c", "x", "h", "IF-MIB::ifDescr.1"]).mib_mode)
+    testing.assertTrue(cliopts.scan(["actsnmp", "get", "-c", "x", "h", "1.3"], "IF-MIB").mib_mode)
+    testing.assertTrue(cliopts.scan(["actsnmp", "get", "-c", "x", "h", "1.3"], None, "/d").mib_mode)
+    # a value that looks like MOD::name names no module (net-snmp never loads a module for it);
+    # only OID arguments count, and a value of type o
+    for argv in [["set", "-c", "x", "h", "1.3.6.1.2.1.1.5.0", "s", "Foo::bar"],
+                 ["set", "-c", "x", "h", "1.3.6.1.2.1.1.5.0", "s", "C++ Foo::Bar", "1.3.6.1.2.1.1.6.0", "=", "Ops::NOC"],
+                 ["trap", "-c", "x", "h", "", "1.3.6.1.6.3.1.1.5.1", "1.3.6.1.2.1.1.5.0", "s", "Foo::bar"],
+                 ["inform", "-c", "x", "h", "", "1.3.6.1.6.3.1.1.5.1", "1.3.6.1.2.1.1.5.0", "s", "Foo::bar"],
+                 ["trap", "-v1", "-c", "x", "h", "1.3.6.1.4.1.8072", "Agent::Addr", "6", "1", "", "1.3.6.1.2.1.1.5.0", "s", "Foo::bar"],
+                 ["walk", "-c", "x", "h", "1.3", "IF-MIB::ignored"],
+                 ["get", "-c", "x", "Host::Name", "1.3"]]:
+        testing.assertFalse(cliopts.scan(["actsnmp"] + argv).mib_mode, " ".join(argv))
+    for argv in [["set", "-c", "x", "h", "IF-MIB::ifAlias.1", "s", "x"],
+                 ["set", "-c", "x", "h", "1.3.6.1.2.1.1.5.0", "s", "x", "1.3.6.1.4.1.1.0", "o", "IF-MIB::ifDescr"],
+                 ["trap", "-c", "x", "h", "", "IF-MIB::linkUp"],
+                 ["trap", "-c", "x", "h", "", "1.3.6.1.6.3.1.1.5.1", "IF-MIB::ifIndex.1", "i", "1"],
+                 ["trap", "-v1", "-c", "x", "h", "NET-SNMP-MIB::netSnmp", "10.0.0.1", "6", "1", ""],
+                 ["walk", "-c", "x", "-CE", "IF-MIB::ifTable", "h", "1.3"],
+                 ["bulkget", "-c", "x", "h", "1.3", "IF-MIB::ifDescr"]]:
+        testing.assertTrue(cliopts.scan(["actsnmp"] + argv).mib_mode, " ".join(argv))
+    testing.assertEqual(cliopts.oid_words_of("set", ["h", "1.3", "s", "A::b", "1.4", "o", "B::c", "1.5", "x"], False), ["1.3", "1.4", "B::c", "1.5"])
+    testing.assertEqual(cliopts.oid_words_of("trap", ["h", "E::x", "A::b", "6", "1", "", "1.3", "s", "C::d"], True), ["E::x", "1.3"])
+    testing.assertEqual(cliopts.oid_words_of("trap", ["h", "", "T::x", "1.3", "s", "C::d"], False), ["T::x", "1.3"])
+    testing.assertEqual(cliopts.oid_words_of("walk", ["h", "1.3", "1.4"], False, ["E::x"]), ["E::x", "1.3"])
+    testing.assertEqual(cliopts.oid_words_of("get", ["h"], False), [])
+    testing.assertEqual(cliopts.scan(["actsnmp", "set", "-m", "X", "-c", "x", "h", "1.3", "s", "A::b"]).oid_words(), ["1.3"])
+    o = cliopts.scan(["actsnmp", "walk", "-M", "/a", "-M", "+/b", "-m", "X:Y", "-Of", "-IR", "-Ih", "-c", "x", "h"])
+    testing.assertEqual(o.mib_dirs_opts, ["/a", "+/b"])
+    testing.assertEqual(o.mib_modules_opt, "X:Y")
+    testing.assertEqual(o.output.oid_style, fmt.OID_FULL)
+    testing.assertTrue(o.inp.random_access)
+    testing.assertFalse(o.inp.use_hints)
+    for f, style in [("s", fmt.OID_SUFFIX), ("S", fmt.OID_MODULE), ("u", fmt.OID_UCD), ("n", fmt.OID_NUMERIC)]:
+        testing.assertEqual(cliopts.scan(["actsnmp", "get", "-m", "X", "-O" + f]).output.oid_style, style)
+    i = cliopts.scan(["actsnmp", "get", "-m", "X", "-Irb", "-IsSUF", "-ISPRE::", "-Iu"]).inp
+    testing.assertFalse(i.check_range)
+    testing.assertTrue(i.regex)
+    testing.assertTrue(i.ucd)
+    testing.assertEqual((i.prefix, i.suffix), ("PRE::", "SUF"))
+    # -Is and -IS without a value take the next argument (snmp_in_options), also after other letters
+    s = cliopts.scan(["actsnmp", "get", "-m", "X", "-Is", ".0", "-c", "x", "h", "sysDescr", "-IRS", "SNMPv2-MIB::"])
+    testing.assertEqual((s.inp.prefix, s.inp.suffix, s.inp.random_access), ("SNMPv2-MIB::", ".0", True))
+    testing.assertEqual(s.args, ["h", "sysDescr"])
+    tr = cliopts.scan(["actsnmp", "translate", "-m", "X", "-IS", "IF-MIB::", "-On", "ifDescr.1"])
+    testing.assertEqual((tr.inp.prefix, tr.args), ("IF-MIB::", ["ifDescr.1"]))
+    for cmd in ["get", "translate"]:
+        try:
+            cliopts.scan(["actsnmp", cmd, "-m", "X", "h", "1.3", "-Is"])
+            raise AssertionError("no CliError for -Is without a value")
+        except CliError as e:
+            testing.assertEqual(e.error_message, ("snmptranslate" if cmd == "translate" else "snmpget")
+                                + ": option requires an argument -- 'I'")
+    try:
+        cliopts.scan(["actsnmp", "get", "-m", "X", "-Iz", "-c", "x", "h", "1.3"])
+        raise AssertionError("no CliError for -Iz")
+    except CliError as e:
+        testing.assertEqual(e.error_message, "Unknown input option passed to -I: z.")
+        testing.assertTrue(e.usage)
+    # without MIBs the OID styles stay refused and -I is ignored
+    fails(["get", "-Os", "-c", "x", "h", "1.3"], "Unknown output option passed to -O: s.")
+    testing.assertEqual(p(["get", "-Iz", "-c", "x", "h", "1.3"]).oids, [Oid([1, 3])])
+    testing.assertEqual(cliopts.scan(["actsnmp", "get", "-Is", ".0", "-c", "x", "h", "1.3"]).args, [".0", "h", "1.3"])
+
+def _test_mib_oids() -> None:
+    o = pm(["get", "-c", "x", "h", "optInt.0", "OPT-TEST-MIB::optEnum.0", ".1.3.6.1.4.1.99996.3.0"])
+    testing.assertEqual(o.oids, [Oid(OPT + [1, 0]), Oid(OPT + [2, 0]), Oid(OPT + [3, 0])])
+    # every bad OID, as snmpget reports them; a detail left by a successful read goes with the next error
+    pm_fails(["get", "-c", "x", "h", "nosuch.0", "optInt.0", "OPT-TEST-MIB::nosuch"],
+             "nosuch.0: Unknown Object Identifier (Sub-id not found: (top) -> nosuch)\n"
+             + "OPT-TEST-MIB::nosuch: Unknown Object Identifier (Sub-id not found: (top) -> optInt)")
+    w = pm(["walk", "-c", "x", "-CE", "optStr", "h", "optTest"])
+    testing.assertEqual(w.oids, [Oid(OPT)])
+    testing.assertEqual(w.end_oid, Oid(OPT + [3]))
+    pm_fails(["walk", "-c", "x", "h", "nosuch"], "nosuch: Unknown Object Identifier (Sub-id not found: (top) -> nosuch)")
+
+def _test_mib_set_values() -> None:
+    """snmp_add_var with MIBs: = takes the object's type; labels, bit names, DISPLAY-HINTs; ranges; type checks"""
+    o = pm(["set", "-c", "x", "h", "optInt.0", "=", "5", "optEnum.0", "=", "down", "optEnum.0", "i", "up",
+            "optStr.0", "=", "ab", "optFlags.0", "=", "b0 b9", "optFlags.0", "b", "1,b1", "optMac.0", "=", "0:1:a:b:c:ff",
+            "optGauge.0", "=", "7", "optTicks.0", "=", "100", "optAddr.0", "=", "10.1.2.3", "optOid.0", "=", "optInt.0"])
+    testing.assertEqual([vb.value for vb in o.varbinds],
+                        [Integer(5), Integer(2), Integer(1), OctetString(b"ab"), OctetString(b"\x80\x40"),
+                         OctetString(b"\x40\x00"), OctetString(b"\x00\x01\x0a\x0b\x0c\xff"), Gauge32(7), TimeTicks(100),
+                         IpAddress(b"\x0a\x01\x02\x03"), ObjectIdentifier(Oid(OPT + [1, 0]))])
+    # -Ih: the string as it is
+    h = cliopts.scan(["actsnmp", "set", "-Ih", "-m", "X", "-c", "x", "h", "optMac.0", "=", "abcdef"])
+    h.mib = mib_tree()
+    cliopts.finish(h)
+    testing.assertEqual(h.varbinds[0].value, OctetString(b"abcdef"))
+    pm_fails(["set", "-c", "x", "h", "optStr.0", "i", "5", "optInt.0", "s", "x", "optInt.0", "i", "101",
+              "optStr.0", "=", "abcde", "optEnum.0", "i", "bogus", "optEnum.0", "=", "current", "optFlags.0", "b", "nosuch",
+              "optTicks.0", "=", "1:2"],
+             "optStr.0: Bad variable type (Type of attribute is OCTET STRING, not INTEGER)\n"
+             + "optInt.0: Bad variable type (Type of attribute is Integer32, not OCTET STRING)\n"
+             + "optInt.0: Value out of range (101 :: {{(0..100)}})\n"
+             + "optStr.0: Value out of range (Value does not match DISPLAY-HINT :: {{(0..4)}})\n"
+             + "optEnum.0: Value out of range (bogus)\n"
+             + "optEnum.0: Value out of range (current)\n"
+             + "optFlags.0: Value out of range (nosuch)\n"
+             + "optTicks.0: Bad value notation (1:2)")
+    # -Ir: no type and range checks
+    r = cliopts.scan(["actsnmp", "set", "-Ir", "-m", "X", "-c", "x", "h", "optStr.0", "i", "5", "optInt.0", "i", "101"])
+    r.mib = mib_tree()
+    cliopts.finish(r)
+    testing.assertEqual([vb.value for vb in r.varbinds], [Integer(5), Integer(101)])
+    # net-snmp's lenient parse_octet_hint (snmpset -d in the lab image): strtol numbers whose low octets count,
+    # the text itself when the hint does not fit
+    lv = pm(["set", "-c", "x", "h", "optMac.0", "s", "1a::2b"])
+    testing.assertEqual(lv.varbinds[0].value, OctetString(b"1a::2b"))
+    pm_fails(["set", "-c", "x", "h", "optMac.0", "s", "abcdef", "optMac.0", "s", "zz"],
+             "optMac.0: Value out of range (Value does not match DISPLAY-HINT :: {{(6)}})\n"
+             + "optMac.0: Value out of range (Bad string length :: {{(6)}})")
+    li = cliopts.scan(["actsnmp", "set", "-Ir", "-m", "X", "-c", "x", "h", "optMac.0", "s", "abcdef", "optMac.0", "s", "1a2b:3c",
+                       "optMac.0", "s", "0x1a:2b", "optMac.0", "s", "zz", "optMac.0", "s", "-1", "optMac.0", "s", "1a:2b:"])
+    li.mib = mib_tree()
+    cliopts.finish(li)
+    testing.assertEqual([vb.value for vb in li.varbinds], [OctetString(b"\xef"), OctetString(b"\x2b\x3c"), OctetString(b"\x1a\x2b"),
+                                                            OctetString(b"zz"), OctetString(b"\xff"), OctetString(b"\x1a\x2b")])
+
+def _test_mib_trap() -> None:
+    o = pm(["trap", "-v2c", "-c", "x", "h", "", "optTest", "optEnum.0", "=", "up"])
+    testing.assertEqual(o.trap_oid, Oid(OPT))
+    testing.assertEqual(o.varbinds, [VarBind(Oid(OPT + [2, 0]), Integer(1))])
+    pm_fails(["trap", "-v2c", "-c", "x", "h", "", "nosuchtrap"],
+             "nosuchtrap: Unknown Object Identifier (Sub-id not found: (top) -> nosuchtrap)")
+
+def _test_mib_lazy_notes() -> None:
+    """What loading a module only an OID names prints comes where that OID is read"""
+    o = cliopts.scan(["actsnmp", "get", "-M", "/d", "-c", "x", "h", "NOPE-MIB::x", "optInt.0", "NOPE-MIB::y", "NOPE2::z"])
+    o.mib = mib_tree()
+    o.mib_lazy = mibcli.LazyLoads("/d", False, "")
+    try:
+        cliopts.finish(o)
+        raise AssertionError("no CliError")
+    except CliError as e:
+        testing.assertEqual(e.error_message, "MIB search path: /d\nCannot find module (NOPE-MIB): At line 1 in (none)\n"
+                            + "NOPE-MIB::x: Unknown Object Identifier\n"
+                            + "NOPE-MIB::y: Unknown Object Identifier (Sub-id not found: (top) -> optInt)\n"
+                            + "Cannot find module (NOPE2): At line 1 in (none)\nNOPE2::z: Unknown Object Identifier")
+
+def _test_mib_commands() -> None:
+    t = cliopts.scan(["actsnmp", "translate", "-m", "ALL", "-M", "/d", "-Td", "-Tp", "-TB", "-w", "40", "-IR", "-On",
+                      "x", "y"])
+    testing.assertEqual((t.details, t.print_tree, t.find_all, t.width), (True, True, True, 40))
+    testing.assertTrue(t.inp.random_access)
+    testing.assertEqual(t.output.oid_style, fmt.OID_NUMERIC)
+    testing.assertEqual(t.args, ["x", "y"])
+    testing.assertEqual((t.mib_modules_opt, t.mib_dirs_opts), ("ALL", ["/d"]))
+    def tfails(args: list[str], text: str) -> None:
+        try:
+            cliopts.scan(["actsnmp"] + args)
+            raise AssertionError("no CliError for " + repr(args))
+        except CliError as e:
+            testing.assertEqual(e.error_message, text, repr(args))
+    tfails(["translate", "-Tx", "a"], "Invalid -T<lostpad> character: x")
+    tfails(["translate", "-w", "0", "a"], "Invalid width specification: 0")
+    tfails(["translate", "-OZ", "a"], "Unknown OID option to -O: Z.")
+    tfails(["translate", "-Iz", "a"], "Unknown OID option to -I: z.")
+    tfails(["translate", "-k", "a"], "snmptranslate: invalid option -- 'k'\ninvalid option: -?")
+    y = cliopts.scan(["actsnmp", "mib2yang", "-M", "/d", "-o", "out", "--meta", "--consistent-status",
+                      "--ignore-display-hint", "A::B,C::D", "-l", "4", "IF-MIB", "x/FILE"])
+    testing.assertEqual((y.outdir, y.meta, y.consistent_status, y.ignore_hints, y.lint_level, y.args),
+                        ("out", True, True, ["A::B", "C::D"], 4, ["IF-MIB", "x/FILE"]))
+    testing.assertEqual(cliopts.scan(["actsnmp", "miblint", "X"]).lint_level, 3)
+    testing.assertEqual(cliopts.scan(["actsnmp", "mibmeta", "X"]).lint_level, 2)
+    tfails(["mib2yang", "-M", "/d"], "Missing module name")
+    tfails(["mib2yang", "--ignore-display-hint", "X", "M"], "--ignore-display-hint takes MODULE::TC: X")
+    tfails(["miblint", "-l", "x", "M"], "Invalid level after -l: x")
+    tfails(["mibmeta", "--bogus", "M"], "unrecognized option '--bogus'")
+    tfails(["miblint", "-q", "M"], "actsnmp miblint: invalid option -- 'q'")
+    for c in cliopts.MIB_COMMANDS:
+        testing.assertTrue(cliopts.usage(c).startswith("USAGE: actsnmp " + c), c)

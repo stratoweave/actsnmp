@@ -27,7 +27,8 @@ usage: clicheck.py [--cli PATH] [--quick] [--filter REGEX] [--section LIST] [--l
   --cli PATH      the CLI to test (default: out/bin/actsnmp of this repository)
   --quick         skip the slow whole-dataset GETNEXT walks
   --filter REGEX  only cases whose "section/name" matches
-  --section LIST  only these sections (comma separated)
+  --section LIST  only these sections (comma separated): dataset, output, walk-options, address, timeout,
+                  v3-errors, error-status, pathological, local-errors, set, mib
   --list          print the cases and exit
   --report FILE   also write the markdown report to FILE
   --jobs N        cases of read-only sections run N at a time (default 4)
@@ -89,8 +90,8 @@ U_MD5_AES192 = v3("u_md5_aes192", "authPriv", "MD5", "AES-192")
 U_RO = v3("u_ro_sha_aes", "authPriv", "SHA", "AES")
 
 # Reasons of the documented differences (Case.known)
-K_NAMES = ("net-snmp without -On prints OID names from its MIB tree (no MIBs: iso.3.6...); actsnmp has no MIBs "
-           "and prints numeric OIDs")
+K_NAMES = ("net-snmp without -On prints OID names from its MIB tree (no MIBs: iso.3.6...); actsnmp without "
+           "-m/-M/MIBS/MIBDIRS loads no MIBs and prints numeric OIDs")
 K_LOOP = "net-snmp loops forever on this agent behaviour; actsnmp ends the walk with exit 1"
 K_STRICT = ("net-snmp sends a value outside the type's range as typed (INTEGER above Integer32 as a 5-octet "
             "INTEGER, wrapping unsigned values); actsnmp's encoders are strict and refuse it")
@@ -114,7 +115,7 @@ K_CE_LAST = "-CE as the last argument crashes snmpwalk (SIGSEGV); actsnmp report
 
 class Case:
     def __init__(self, section, name, tool, args, known=None, cmp="exact", serial=False,
-                 net_tool=None, net_args=None, normalize=(), timeout=120, quick=True):
+                 net_tool=None, net_args=None, normalize=(), timeout=120, quick=True, env=None):
         self.section = section
         self.name = name
         self.tool = tool
@@ -127,6 +128,7 @@ class Case:
         self.normalize = normalize
         self.timeout = timeout
         self.quick = quick
+        self.env = env or {}
 
     def key(self):
         return "%s/%s" % (self.section, self.name)
@@ -201,7 +203,7 @@ def output_cases():
     flagsets = ["", "-Oq", "-OQ", "-Ov", "-Ot", "-OT", "-Oa", "-Ox", "-Oqv", "-Oqt", "-OvT", "-OQx", "-OxT", "-Oqq",
                 "-OtQ", "-Oe", "-On", "-OU", "-Ob", "-OE", "-OX", "-O0", "-Oxq", "-Oaq", "-OaT", "-OTq", "-OQv",
                 "-Oq -Oq", "-Ox -Oa", "-Ox --hexOutputLength=0", "--hexOutputLength=8", "--hexOutputLength=1",
-                "-OT --hexOutputLength=4", "-Oq --hexOutputLength=0", "--hexOutputLength=0", "-OQ -OT"]
+                "-OT --hexOutputLength=4", "-Oq --hexOutputLength=0", "--hexOutputLength=0", "-OQ -OT", "-OQQq"]
     for f in flagsets:
         fl = f.split() if f else []
         case(sec, "walk B.1-B.9 %s" % (f or "(default)"), "walk", ["-On"] + fl + V2 + ["-CE", B + ".10", S, B])
@@ -325,6 +327,8 @@ def v3_error_cases():
         case(sec, "%s -E context engine ID" % ag, "get",
              ["-On", "-E", SNMPD_ENGINE if ag == "snmpd" else SNMPSIM_ENGINE] + U_SHA + [a, B + ".1.1.0"])
     case(sec, "snmpd read-only user SET", "set", ["-On"] + U_RO + [D, B + ".20.1.0", "i", "1"], serial=True)
+    case(sec, "snmpd trap -Ci no user (snmpinform's name)", "trap", ["-v3", "-l", "authNoPriv", "-A", AUTH, "-Ci"]
+         + QUICK_FAIL + [D, "", B + ".1.1.0"])
     case(sec, "snmpsim context pathological", "get", ["-On", "-n", "pathological"] + U_SHA + [S, P + ".1.1.0"])
     case(sec, "snmpsim context pathological genErr", "get", ["-On", "-n", "pathological"] + U_SHA + [S, P + ".3.1.0"])
 
@@ -653,6 +657,400 @@ def build_cases():
     pathological_cases()
     local_error_cases()
     set_cases()
+    mib_cases()
+
+
+# ------------------------------------------------------------------ MIBs ---
+#
+# The "mib" section runs both tools with MIBs loaded: the same -M directories (copied into the tools container at
+# the same absolute paths, so file names in messages agree) and the same -m lists:
+#
+#   GOLDEN   interop/mibs/golden/mibs (the committed IETF/IANA/net-snmp golden modules)
+#   LABMIBS  interop/mibs/lab (ACTSNMP-LAB-MIB: types, hints, enumerations, BITS and indexes for the lab dataset B)
+#   NSMIBS   interop/results/mibs-netsnmp/{mibs,iana,ietf}: the MIB directories of the lab image's net-snmp
+#            (net-snmp's own modules and snmp-mibs-downloader's IETF/IANA set), copied out of the container
+#
+# snmpd serves volatile data (interfaces, ip, host resources, counters): the section takes a snapshot of its whole
+# MIB (snmpbulkwalk -On -Oe -Ox, converted to snmprec) and serves it with `actsnmp agent` on SNAP (16167), so both
+# tools walk identical values; only sysUpTime.0 (the agent's own) changes, its lines are dropped (UPTIME_LINES).
+# The lab dataset B is static in snmpd and snmpsim and is walked there with ACTSNMP-LAB-MIB.
+
+GOLDEN = os.path.join(REPO, "interop", "mibs", "golden", "mibs")
+LABMIBS = os.path.join(REPO, "interop", "mibs", "lab")
+NSMIBS = os.path.join(REPO, "interop", "results", "mibs-netsnmp")
+NSPATH = ":".join(os.path.join(NSMIBS, d) for d in ("mibs", "mibs/iana", "mibs/ietf"))
+LABPATH = GOLDEN + ":" + LABMIBS
+SNAP_FILE = os.path.join(REPO, "interop", "results", "mib-snapshot.snmprec")
+SNAP_PORT = 16167
+SNAP = "127.0.0.1:%d" % SNAP_PORT
+GOLDEN_MODS = ("SNMPv2-MIB:IF-MIB:IP-MIB:HOST-RESOURCES-MIB:UCD-SNMP-MIB:NET-SNMP-MIB:TCP-MIB:UDP-MIB:"
+               "SNMP-FRAMEWORK-MIB:SNMP-VIEW-BASED-ACM-MIB:SNMP-USER-BASED-SM-MIB:SNMP-TARGET-MIB:IP-FORWARD-MIB")
+LAB_MODS = "ACTSNMP-LAB-MIB:SNMPv2-MIB:NET-SNMP-MIB:IF-MIB"
+MG = ["-M", GOLDEN, "-m", GOLDEN_MODS]
+ML = ["-M", LABPATH, "-m", LAB_MODS]
+MN = ["-M", NSPATH, "-m", "ALL"]
+
+# sysUpTime.0 of the snapshot agent (any OID style) is the only value that changes between the two runs
+UPTIME_LINES = [(r"(?m)^.*(?:sysUpTime|\.1\.3\.6\.1\.2\.1\.1\.3\.0|iso\.3\.6\.1\.2\.1\.1\.3\.0|system\.3\.0).*\n", "")]
+# net-snmp's MIB parser reports syntax it does not like (actsnmp's compiler accepts it, `actsnmp miblint` lists
+# its own diagnostics): these lines are dropped from both outputs
+NS_PARSER = [(r"(?m)^(?:Bad operator|Bad month in timestamp|Expected |Warning: |Unlinked OID|Undefined identifier"
+              r"|Cannot adopt OID|Bad parse of|Unknown token|.* \(is a reserved word\)).*: At line \d+ in .*\n", "")]
+
+K_NS_PARSER = ("net-snmp's MIB parser differs: it links no object of DPI20-MIB (no message), gives the children "
+               "of ISDN-MIB's isdnMibTrapPrefix (registered at the same OID as isdnMibConformance) to "
+               "isdnMibConformance, and numbers its anonymous nodes (anonymous#N, shown by -Tp and -Td) in an order "
+               "actsnmp does not reproduce")
+K_NS_CRASH = ("snmptranslate crashes (SIGSEGV) on -IS or -Is followed by a separate argument (snmp_in_options reads "
+              "a NULL argv); actsnmp takes the argument as the prefix or suffix, which translate then ignores as "
+              "snmptranslate ignores -ISPREFIX")
+K_INDEX_WRAP = ("with -Ir net-snmp takes an index sub-identifier above 4294967295 and sends it modulo 2^32; "
+                "actsnmp refuses it (its encoders are strict)")
+
+# OIDs whose -Td or -OS output differs for the reasons of K_NS_PARSER (net-snmp's MIB directories, -m ALL)
+NS_KNOWN_OIDS = [".1.3.6.1.2.1.10.94.1.2.1.0", ".1.3.6.1.2.1.10.94.1.2.2.0", ".1.3.6.1.2.1.22.0",
+                 ".1.3.6.1.2.1.10.20.2.0", ".1.3.6.1.2.1.10.20.2.0.1", ".1.3.6.1.4.1.2"]
+
+MIB_LISTS = {}
+
+
+def _docker(*args, check=True):
+    return subprocess.run(["docker"] + list(args), capture_output=True, check=check)
+
+
+def _copy_into_container(path):
+    # the host directory at the same absolute path in the tools container (readable by its user)
+    _docker("exec", "-u", "root", TOOLS_CONTAINER, "rm", "-rf", path)
+    _docker("exec", "-u", "root", TOOLS_CONTAINER, "mkdir", "-p", os.path.dirname(path))
+    _docker("cp", path, "%s:%s" % (TOOLS_CONTAINER, path))
+    _docker("exec", "-u", "root", TOOLS_CONTAINER, "chmod", "-R", "a+rX", path)
+
+
+def _canon_to_snmprec(lines):
+    # interop canonical lines (tools/netsnmp2canon.py) to snmprec records, sorted by OID
+    recs = []
+    for line in lines:
+        m = re.match(r"^\.([0-9.]+) = (.*)$", line)
+        if not m:
+            continue
+        oid, v = m.group(1), m.group(2)
+
+        def hx(t):
+            return "".join(t.split()).lower()
+        if v.startswith("INTEGER: "):
+            recs.append("%s|2|%s" % (oid, v[9:]))
+        elif v == 'STRING: ""':
+            recs.append("%s|4x|" % oid)
+        elif v.startswith('STRING: "'):
+            body = v[9:-1].replace('\\"', '"').replace("\\\\", "\\")
+            recs.append("%s|4x|%s" % (oid, body.encode("latin-1").hex()))
+        elif v.startswith("Hex-STRING: "):
+            recs.append("%s|4x|%s" % (oid, hx(v[12:])))
+        elif v.startswith("OID: "):
+            recs.append("%s|6|%s" % (oid, v[5:].lstrip(".")))
+        elif v.startswith("IpAddress: "):
+            recs.append("%s|64x|%s" % (oid, bytes(int(x) for x in v[11:].split(".")).hex()))
+        elif v.startswith("Opaque: "):
+            recs.append("%s|68x|%s" % (oid, "" if v[8:] == '""' else hx(v[8:])))
+        elif v == "NULL":
+            recs.append("%s|5|" % oid)
+        else:
+            for t, tag in (("Counter32", 65), ("Gauge32", 66), ("Timeticks", 67), ("Counter64", 70)):
+                if v.startswith(t + ": "):
+                    recs.append("%s|%d|%s" % (oid, tag, v[len(t) + 2:]))
+    recs.sort(key=lambda r: [int(x) for x in r.split("|")[0].split(".")])
+    return recs
+
+
+def mib_setup(cli):
+    """Prepare the "mib" section: MIB directories in the tools container, the OID lists for translate, the
+    snapshot of snmpd and `actsnmp agent` serving it (returned, the caller stops it)"""
+    os.makedirs(NSMIBS, exist_ok=True)
+    if not os.path.isdir(os.path.join(NSMIBS, "mibs", "ietf")):
+        tmp = os.path.join(NSMIBS, "mibs")
+        if os.path.exists(tmp):
+            subprocess.run(["rm", "-rf", tmp], check=True)
+        _docker("cp", "%s:/usr/share/snmp/mibs" % TOOLS_CONTAINER, tmp)
+        for d in ("iana", "ietf"):
+            link = os.path.join(tmp, d)
+            if os.path.islink(link):
+                os.unlink(link)
+            _docker("cp", "%s:/var/lib/mibs/%s" % (TOOLS_CONTAINER, d), link)
+    for d in (GOLDEN, LABMIBS, NSMIBS):
+        _copy_into_container(d)
+
+    def oids(path, report):
+        p = _docker("exec", TOOLS_CONTAINER, "snmptranslate", "-M", path, "-m", "ALL", report, check=False)
+        return [x for x in p.stdout.decode("utf-8", "replace").split("\n") if x.startswith(".")]
+    MIB_LISTS["golden"] = oids(GOLDEN, "-To")
+    MIB_LISTS["golden-sym"] = oids(GOLDEN, "-Ts")
+    MIB_LISTS["netsnmp"] = [o for o in oids(NSPATH, "-To") if o not in NS_KNOWN_OIDS]
+    # the snapshot of snmpd: net-snmp's own walk, canonical, as snmprec
+    sys.path.insert(0, os.path.join(HERE, "tools"))
+    import netsnmp2canon
+    p = _docker("exec", TOOLS_CONTAINER, "snmpbulkwalk", "-On", "-Oe", "-Ox", "--hexOutputLength=0", "-Cr50",
+                "-v2c", "-c", "public", D, ".1.3")
+    canon = []
+    for line in p.stdout.decode("latin-1").split("\n"):
+        if line.strip():
+            try:
+                c = netsnmp2canon.convert_line(line)
+            except ValueError:
+                c = None
+            if c:
+                canon.append(c)
+    with open(SNAP_FILE, "w") as f:
+        f.write("\n".join(_canon_to_snmprec(canon)) + "\n")
+    agent = subprocess.Popen([cli, "agent", "--snmprec", SNAP_FILE, "--port", str(SNAP_PORT)],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    t0 = time.time()
+    while time.time() - t0 < 30:
+        r = run(["docker", "exec", TOOLS_CONTAINER, "snmpget", "-v2c", "-c", "public", "-r0", "-t1", SNAP,
+                 ".1.3.6.1.2.1.1.1.0"], 5)
+        if r.rc == 0:
+            break
+        time.sleep(0.5)
+    MIB_LISTS["walk-names"] = []
+    return agent
+
+
+def _chunks(lst, n):
+    return [lst[i:i + n] for i in range(0, len(lst), n)]
+
+
+def mib_cases():
+    sec = "mib"
+    W = B + ".20"
+    tr = "translate"
+    nt = "snmptranslate"
+    # translate (snmptranslate) over every OID net-snmp knows with the golden modules
+    gold = MIB_LISTS.get("golden", [])
+    if gold:
+        for o in ("-On", "-OS", "-Of", "-Os", "-Ou", "-Td"):
+            case(sec, "translate golden ALL, %d OIDs %s" % (len(gold), o), tr, ["-M", GOLDEN, "-m", "ALL", o] + gold,
+                 net_tool=nt, normalize=NS_PARSER)
+        case(sec, "translate golden ALL, %d names -On" % len(MIB_LISTS["golden-sym"]), tr,
+             ["-M", GOLDEN, "-m", "ALL", "-On"] + MIB_LISTS["golden-sym"], net_tool=nt, normalize=NS_PARSER)
+    case(sec, "translate golden ALL -Tp", tr, ["-M", GOLDEN, "-m", "ALL", "-Tp"], net_tool=nt, normalize=NS_PARSER)
+    # ... and with the MIB directories of net-snmp itself (about 370 modules)
+    ns = MIB_LISTS.get("netsnmp", [])
+    for k, ch in enumerate(_chunks(ns, 3000)):
+        for o in ("-OS", "-Td"):
+            case(sec, "translate net-snmp ALL, OIDs %d-%d %s" % (k * 3000 + 1, k * 3000 + len(ch), o), tr,
+                 MN + [o] + ch, net_tool=nt, normalize=NS_PARSER, quick=False)
+    case(sec, "translate net-snmp ALL, the OIDs it treats differently -Td", tr, MN + ["-Td"] + NS_KNOWN_OIDS,
+         net_tool=nt, normalize=NS_PARSER, known=K_NS_PARSER)
+    case(sec, "translate net-snmp ALL -Tp", tr, MN + ["-Tp"], net_tool=nt, normalize=NS_PARSER, known=K_NS_PARSER,
+         quick=False)
+    # translate options and errors
+    T = [
+        ("labels -IR", ["-IR", "-On", "sysDescr", "ifInOctets", "labIfMtu", "labStrFlags", "hrStorageDescr"]),
+        ("-Td -w 40", ["-Td", "-w", "40", "labIfEntry", ".1.3.6.1.4.1.8072.9999.1.0.1", "IF-MIB::ifEntry",
+                       "IF-MIB::ifOperStatus", "IF-MIB::ifType"]),
+        ("-Td of the lab MIB's objects", ["-Td", "ACTSNMP-LAB-MIB::labStrFlags", "ACTSNMP-LAB-MIB::labIntKeywords",
+                                          "ACTSNMP-LAB-MIB::labBigEntry", "ACTSNMP-LAB-MIB::labIfXEntry",
+                                          "ACTSNMP-LAB-MIB::labStrAlias", "ACTSNMP-LAB-MIB::labOpaqueFloat"]),
+        ("-Tp -w 30", ["-Tp", "-w", "30", "IF-MIB::ifTable"]),
+        ("-Tp lab MIB", ["-Tp", ".1.3.6.1.4.1.8072.9999.1"]),
+        ("unknown name", ["nosuch"]),
+        ("unknown name -IR", ["-IR", "nosuch"]),
+        ("names, instances, indexes -On", ["-On", "sysDescr.0", "IF-MIB::ifDescr.1", ".iso.org.dod",
+                                           'labIfMtu."eth0"', 'ACTSNMP-LAB-MIB::labIfMtu."eth0"', "labBigName.65"]),
+        ("-Tp unknown name", ["-Tp", "nosuch"]),
+        ("-Tp of a leaf", ["-Tp", ".1.3.6.1.2.1.1.1"]),
+        ("-Ou input", ["-Ou", "-On", "interfaces.ifTable"]),
+        ("-Iu input", ["-Iu", "-On", "interfaces.ifTable"]),
+        ("-Ib regular expression", ["-Ib", "-On", "if.*Descr"]),
+        ("-Ib no match", ["-Ib", "nomatchzzz"]),
+        ("-Ib several names (reported nodes)", ["-Ib", "-On", "ifdescr", "IFDESCR", "sys", "if.*Speed", "sys"]),
+        ("-IR index range and C numbers", ["-IR", "-On", "ifDescr.0x10", "ifDescr.077", "ifDescr.2147483647",
+                                            "ifDescr.0"]),
+        ("-TB", ["-TB", "if.*Descr", "sysDescr"]),
+        ("-TB -Td", ["-TB", "-Td", "lab.*Mtu"]),
+        ("-TB -OS", ["-TB", "-OS", "ifIn"]),
+        ("-TB no match", ["-TB", "zzzz"]),
+        ("-O unknown letter", ["-OZ", "sysDescr.0"]),
+        ("-T unknown letter", ["-Tx", "sysDescr.0"]),
+        ("no OID", []),
+    ]
+    for name, args in T:
+        case(sec, "translate " + name, tr, ML + args, net_tool=nt)
+    # labels that several modules define (NET-SNMP-TC and UCD-SNMP-MIB: linux, unknown, ...): get_wild_node gives the
+    # newest node of the label it matched (get_node of the label), -TB prints that node for every match
+    for args in (["-On", "-Ib", "linux"], ["-On", "-Ib", "unknown"], ["-On", "-Ib", "hpux10"], ["-On", "-Ib", "^lin"],
+                 ["-TB", "linux"], ["-TB", "-OS", "^(linux|win32)$"], ["-TB", "-Td", "^solaris$"]):
+        case(sec, "translate golden ALL " + " ".join(args), tr, ["-M", GOLDEN, "-m", "ALL"] + args, net_tool=nt,
+             normalize=NS_PARSER)
+    # quoted index strings with a DISPLAY-HINT (MacAddress 1x:, SIZE 6): net-snmp's lenient parse_octet_hint, the
+    # characters where it fails; each error ends snmptranslate, so one case per error
+    FDB = "BRIDGE-MIB::dot1dTpFdbPort."
+    MB = ["-M", GOLDEN, "-m", "BRIDGE-MIB", "-On"]
+    case(sec, "translate hinted index forms", tr, MB + [FDB + "'0:1a:2b:3c:4d:5e'", FDB + "'00:1A:2B:3C:4D:5E'",
+                                                       FDB + "'0x0:0x1a: 2b:+3c:4d:5e'", FDB + "'1a::2b'", FDB + "'ffff:1:2:3:4:5'"],
+         net_tool=nt)
+    case(sec, "translate hinted index -Ir", tr, MB + ["-Ir", FDB + "'abcdef'", FDB + "'abc'", FDB + "'zz'", FDB + "'-1:2'",
+                                                       FDB + "'1a2b:3c'", FDB + "'1:2:'", FDB + "''"], net_tool=nt)
+    case(sec, "translate hinted index -Ih", tr, MB + ["-Ih", FDB + "'abcdef'"], net_tool=nt)
+    for v in ("'abcdef'", "'zz'", "'1:2:3'"):
+        case(sec, "translate hinted index error %s" % v, tr, MB + [FDB + v], net_tool=nt)
+    case(sec, "translate -IS prefix", tr, ML + ["-IS", "IF-MIB::", "-On", "ifDescr.1"], net_tool=nt, known=K_NS_CRASH)
+    case(sec, "translate a module not found", tr, ["-M", GOLDEN, "-m", "NOPE-MIB:IF-MIB", "-On", "ifDescr.1"],
+         net_tool=nt)
+    case(sec, "translate no MIB directory (line 0)", tr, ["-M", "/nonexistent-mib-dir", "-m", "IF-MIB", "-On",
+                                                          "ifDescr", "IF-MIB::ifDescr", "NOPE-MIB::x"], net_tool=nt)
+    case(sec, "translate modules named only by the OIDs", tr, ["-M", GOLDEN, "-On", "IF-MIB::ifDescr", "sysDescr.0",
+                                                                "SNMPv2-MIB::sysDescr.0", "NOPE-MIB::x"], net_tool=nt)
+    case(sec, "translate MIBDIRS and MIBS", tr, ["-On", "ifDescr.1", "labIfMtu"], net_tool=nt,
+         env={"MIBDIRS": LABPATH, "MIBS": "IF-MIB:ACTSNMP-LAB-MIB"})
+    # (the default directories differ between the image and the host: every case sets the directories)
+    case(sec, "translate -M twice (the last one counts)", tr, ["-M", "/nonexistent", "-M", GOLDEN, "-m", "IF-MIB",
+                                                               "-On", "IF-MIB::ifDescr.1"], net_tool=nt)
+
+    # walks of the snmpd snapshot with the golden modules, every -O style
+    flagsets = ["", "-Of", "-Ou", "-On", "-Os", "-OS", "-Oe", "-Ob", "-OX", "-OE", "-Oq", "-OQ", "-Ot", "-OU", "-Ox",
+                "-Oa", "-OT", "-O0", "-OXs", "-OXb", "-OEs", "-Oqs", "-OQs", "-Ofn", "-OfX", "-OuX", "-Oxa",
+                "-OQq", "-OQQ"]
+    for f in flagsets:
+        case(sec, "snapshot bulkwalk golden %s" % (f or "(default)"), "bulkwalk",
+             MG + ([f] if f else []) + V2 + ["-Cr50", SNAP, ".1.3"], normalize=UPTIME_LINES)
+    case(sec, "snapshot bulkwalk golden -Ov (from interfaces)", "bulkwalk",
+         MG + ["-Ov"] + V2 + ["-Cr50", SNAP, ".1.3.6.1.2.1.2"])
+    case(sec, "snapshot walk golden ifTable", "walk", MG + V2 + [SNAP, "IF-MIB::ifTable"])
+    case(sec, "snapshot bulkwalk golden ALL", "bulkwalk", ["-M", GOLDEN, "-m", "ALL"] + V2 + ["-Cr50", SNAP, ".1.3"],
+         normalize=UPTIME_LINES + NS_PARSER)
+    case(sec, "snapshot bulkwalk net-snmp ALL", "bulkwalk", MN + V2 + ["-Cr50", SNAP, ".1.3"],
+         normalize=UPTIME_LINES + NS_PARSER, quick=False)
+    case(sec, "snapshot getnext and bulkget names", "getnext", MG + V2 + [SNAP, "sysDescr", "ifTable", "ifDescr.999",
+                                                                         "hrStorageDescr"])
+    case(sec, "snapshot bulkget -Cn1 -Cr3", "bulkget", MG + ["-Cn1", "-Cr3"] + V2 + [SNAP, "sysDescr", "ifDescr"])
+    G = [
+        ("names and instances", ["sysDescr.0", "SNMPv2-MIB::sysName.0", "ifDescr.1", "IF-MIB::ifOperStatus.2",
+                                 ".1.3.6.1.2.1.1.5.0", "iso.3.6.1.2.1.1.6.0"]),
+        ("string and enum indexes", ['SNMP-VIEW-BASED-ACM-MIB::vacmAccessReadViewName."grp_public"."".0.noAuthNoPriv',
+                                     'vacmAccessReadViewName."grp_public"."".0.1',
+                                     'IP-MIB::ipAddressPrefixOrigin.1.ipv4."127.0.0.0".8',
+                                     'ipAddressPrefixOrigin[1][ipv4]["127.0.0.0"][8]']),
+        ("-IR", ["-IR", "sysDescr.0", "ifInOctets.1", "hrStorageDescr.1"]),
+        ("bad names (stale detail)", ["nosuchname.0", "sysDescr.0", "IF-MIB::nosuch.1", "NOPE-MIB::x",
+                                      "ifDescr.notanumber", 'ifDescr."x"', "NOPE-MIB::y", "NOPE2-MIB::z",
+                                      "NOPE-MIB::w"]),
+        ("regular expression last resort", ["ifD", "sysUp", "if.*Descr"]),
+        ("-Ib", ["-Ib", "ifDescr", "if.*Speed"]),
+        ("C numbers in instances", ["ifDescr.0x3", "ifDescr.010", "ifDescr.1.2"]),
+    ]
+    for name, args in G:
+        opts = [a for a in args if a.startswith("-I")]
+        oids_ = [a for a in args if not a.startswith("-I")]
+        case(sec, "snapshot get " + name, "get", MG + opts + V2 + [SNAP] + oids_)
+    case(sec, "snapshot get -Is and -IS with separate arguments", "get",
+         MG + ["-Is", ".0"] + V2 + [SNAP, "sysDescr", "sysName", "-IRS", "SNMPv2-MIB::"])
+    case(sec, "snapshot getnext -Is with a separate argument", "getnext", MG + V2 + ["-Is", "1", SNAP, "ifDescr"])
+    case(sec, "snapshot get, modules named only by the OIDs", "get",
+         ["-M", GOLDEN] + V2 + [SNAP, "sysDescr.0", "SNMPv2-MIB::sysDescr.0", "IF-MIB::ifDescr.1", "NOPE-MIB::x",
+                                "ifDescr.2", "RMON2-MIB::probeDateTime.0"])
+    case(sec, "snapshot get, no MIB directory (line 0)", "get", ["-M", "/nonexistent-mib-dir"] + V2
+         + [SNAP, "IF-MIB::ifDescr.1", "NOPE-MIB::x", ".1.3.6.1.2.1.1.1.0"])
+    case(sec, "snapshot walk of a module not found", "walk", ["-M", GOLDEN, "-m", "NOPE:IF-MIB"] + V2
+         + [SNAP, "NOPE-MIB::x"])
+    case(sec, "snapshot getnext, modules named only by the OIDs", "getnext",
+         ["-M", GOLDEN] + V2 + [SNAP, "IF-MIB::ifDescr", "RMON-MIB::etherStatsTable"])
+    case(sec, "snapshot get MIBS and MIBDIRS", "get", V2 + [SNAP, "sysDescr.0", "ifDescr.1"],
+         env={"MIBDIRS": GOLDEN, "MIBS": "SNMPv2-MIB:IF-MIB"})
+    case(sec, "snapshot get MIBS=+IF-MIB (net-snmp's default list)", "get", V2 + [SNAP, "ifDescr.1"],
+         env={"MIBDIRS": GOLDEN, "MIBS": "+IF-MIB"})
+    case(sec, "snapshot get MIBDIRS and -M +DIR", "get", ["-M", "+" + LABMIBS, "-m", "IF-MIB:ACTSNMP-LAB-MIB"] + V2
+         + [SNAP, "ifDescr.1", "labIfMtu"], env={"MIBDIRS": GOLDEN})
+    case(sec, "snapshot get MIBDIRS=+DIR and -M -DIR", "get", ["-M", "-" + LABMIBS, "-m", "IF-MIB:ACTSNMP-LAB-MIB"]
+         + V2 + [SNAP, "ifDescr.1"], env={"MIBDIRS": GOLDEN})
+    case(sec, "snapshot table ifDescr (sorted, vs snmpbulkwalk)", "table", MG + V2 + [SNAP, "IF-MIB::ifDescr"],
+         cmp="sorted", net_tool="snmpbulkwalk", net_args=MG + V2 + [SNAP, "IF-MIB::ifDescr"])
+    case(sec, "lab table labIfMtu (sorted, vs snmpbulkwalk)", "table", ML + ["-OX"] + V2 + [D, "labIfMtu"],
+         cmp="sorted", net_tool="snmpbulkwalk", net_args=ML + ["-OX"] + V2 + [D, "labIfMtu"])
+
+    # the lab dataset with ACTSNMP-LAB-MIB on snmpd and snmpsim
+    for ag, a in (("snmpd", D), ("snmpsim", S)):
+        for f in ("", "-Of", "-On", "-Oe", "-Ob", "-OX", "-OE", "-Oq", "-OQ", "-Ov", "-Ot", "-OU", "-Ox", "-Oa",
+                  "-OT", "-O0", "-Os", "-OXs", "-OqX", "-Ox0", "-OxT", "-OeU", "-Ih", "-Ih -OX"):
+            case(sec, "%s lab dataset %s" % (ag, f or "(default)"), "bulkwalk", ML + f.split() + V2 + ["-Cr50", a, B])
+        case(sec, "%s lab dataset walk v1" % ag, "walk", ML + V1 + [a, B + ".2"])
+        case(sec, "%s lab get indexes" % ag, "get", ML + V2 + [a] + [
+            'labIfMtu."eth0"', "labIfMtu.4.101.116.104.49", 'ACTSNMP-LAB-MIB::labIfAdmin."ge-0/0/3"',
+            'labIfMtu."nosuch"', "labName.7", "labName.0", "labBigName.65", "labIntEnum.0", "labStrFlags.0",
+            "labNotifications", "labStateChange"])
+        case(sec, "%s lab get index errors" % ag, "get", ML + V2 + [a] + [
+            "labIfMtu.eth0", "labIfMtu.'eth0'", "labBigName.'A'", 'labBigName."A"', 'labIfMtu."ab"x',
+            'labIfMtu."a\\"b"', 'labIfMtu."unterminated', 'labIfMtu.""', 'labName."x"', "labIfMtu.3.97.98",
+            "labIfMtu.3.97.98.300", "labName.-1", "labIntEnum.0.1", 'labIfXAlias."eth0"', "labIfAdmin.up",
+            'labIfMtu."nosuchname-that-is-much-longer-than-sixty-four-characters-in-total-xxxxxxxxx"'])
+        case(sec, "%s lab get -Ir" % ag, "get", ML + ["-Ir"] + V2 + [a] + [
+            'labIfMtu."nosuchname-that-is-much-longer-than-sixty-four-characters-in-total-xxxxxxxxx"',
+            "labIfMtu.3.97.98.300", 'labName."x"'])
+        case(sec, "%s lab get -Ir index above 2^32-1" % ag, "get", ML + ["-Ir"] + V2 + [a, "labName.4294967296"],
+             known=K_INDEX_WRAP)
+        case(sec, "%s lab get -OX form input (refused)" % ag, "get", ML + ["-OX"] + V2 + [a, 'labIfMtu["eth0"]', "labName[7]"])
+        sets = [
+            ("typed", [W + ".1.0", "i", "43", "labWString.0", "s", "hello", "labWOid.0", "o", "sysDescr.0",
+                       "labWAddr.0", "a", "10.0.0.1", "labWGauge.0", "u", "5", "labWTicks.0", "t", "100"]),
+            ("=", ["labWInt.0", "=", "44", "labWString.0", "=", "hi", "labWOid.0", "=", "labWInt", "labWAddr.0", "=",
+                   "10.0.0.2", "labWGauge.0", "=", "6", "labWTicks.0", "=", "200"]),
+            ("out of range", ["labWRange.0", "=", "101"]),
+            ("enumeration labels", ["labWRange.0", "i", "50", "labWReadOnly.0", "=", "eight"]),
+            ("enumeration label read-only", ["labWReadOnly.0", "=", "seven"]),
+            ("string too long", ["labWString.0", "=", "y" * 40]),
+            ("wrong types", ["labWString.0", "x", "41 42", "labWInt.0", "s", "bad", "labWAddr.0", "i", "5"]),
+            ("restore", [W + ".1.0", "i", "42", "labWString.0", "s", "initial", "labWOid.0", "o", ".1.3.6.1",
+                         "labWAddr.0", "a", "192.0.2.1", "labWGauge.0", "u", "0", "labWTicks.0", "t", "0",
+                         "labWRange.0", "i", "50"]),
+        ]
+        for name, args in sets:
+            case(sec, "%s lab set %s" % (ag, name), "set", ML + V2W + [a] + args, serial=True)
+        case(sec, "%s lab set -Ir wrong type" % ag, "set", ML + ["-Ir"] + V2W + [a, "labWString.0", "i", "5"],
+             serial=True)
+        case(sec, "%s lab initial values" % ag, "bulkwalk", ML + V2 + [a, W], serial=True)
+    # SNMPv3 session errors after a label lookup: net-snmp's snmp_sess_perror appends the detail read_objid left
+    for t, extra in (("get", ["sysDescr.0", "IF-MIB::ifDescr.1"]), ("walk", ["sysORDescr"]),
+                     ("bulkget", ["sysDescr", "ifDescr"]), ("set", ["sysContact.0", "s", "x"])):
+        case(sec, "snmpd v3 unknown user, %s by name" % t, t, MG + v3("u_nosuch", "noAuthNoPriv") + QUICK_FAIL + [D]
+             + extra, serial=(t == "set"))
+        case(sec, "snmpd v3 wrong auth password, %s by name" % t, t, MG + v3("u_sha", "authNoPriv", "SHA",
+                                                                               authpass="wrongpass1") + QUICK_FAIL
+             + [D] + extra, serial=(t == "set"))
+    case(sec, "snmpd v3 no user, getnext by name", "getnext", MG + ["-v3", "-l", "authNoPriv", "-A", AUTH]
+         + QUICK_FAIL + [D, "sysDescr"])
+    case(sec, "snmpd v3 no auth pass phrase, bulkwalk by name", "bulkwalk", MG + ["-v3", "-u", "u_sha", "-l",
+                                                                                  "authNoPriv"] + QUICK_FAIL + [D, "system"])
+    case(sec, "v3 discovery timeout, get by name", "get", MG + U_SHA + QUICK_FAIL + [X, "sysDescr.0"])
+    case(sec, "v3 discovery timeout, MOD::name only", "walk", MG + U_SHA + QUICK_FAIL + [X, "SNMPv2-MIB::system"])
+    case(sec, "v2c timeout by name", "get", MG + V2 + QUICK_FAIL + [X, "sysDescr.0"])
+    case(sec, "snmpd v3 trap -Ci no auth pass phrase by name", "trap", MG + ["-v3", "-u", "u_sha", "-l", "authNoPriv",
+                                                                             "-Ci"] + QUICK_FAIL
+         + [D, "", "coldStart", "sysContact.0", "s", "x"])
+    # snmpd's own writable objects by name (restored)
+    case(sec, "snmpd set sysContact by name", "set", MG + V2W + [D, "SNMPv2-MIB::sysContact.0", "=", "mib contact"],
+         serial=True)
+    case(sec, "snmpd set errors by name", "set", MG + V2W + [D, "sysContact.0", "i", "5", "sysServices.0", "i", "999"],
+         serial=True)
+    case(sec, "snmpd set noAccess by name", "set", MG + V2W + [D, "ifAdminStatus.1", "i", "up"], serial=True)
+    case(sec, "snmpd set sysContact restore", "set", MG + V2W + [D, "sysContact.0", "s", "actsnmp-contact"],
+         serial=True)
+    # trap and inform arguments by name (to the lab snmptrapd)
+    TR = [
+        ("v2c names and = values", ["''", "labStateChange", 'labIfAdmin."eth0"', "=", "up", 'labIfMtu."eth0"', "i",
+                                    "1500"]),
+        ("bad enumeration label", ["''", "ACTSNMP-LAB-MIB::labStateChange", 'labIfAdmin."eth0"', "=", "bogus"]),
+        ("unknown trap OID", ["''", "nosuchtrap"]),
+        ("bad index", ["''", "labStateChange", "labIfAdmin.nosuch", "i", "1"]),
+        ("BITS by name", ["''", "labStateChange", "labStrFlags.0", "=", "b0 b31"]),
+        ("unknown bit name", ["''", "labStateChange", "labStrFlags.0", "b", "b0 nosuchbit"]),
+        ("DISPLAY-HINT value", ["''", "labStateChange", "labStrNul.0", "=", "0a"]),
+    ]
+    for name, args in TR:
+        args = ["" if x == "''" else x for x in args]
+        case(sec, "trap " + name, "trap", ML + V2 + [TRAPD] + args, serial=True)
+    case(sec, "trap v1 by name", "trap", ML + V1 + [TRAPD, "actsnmpLabMIB", "127.0.0.1", "6", "1", "", "sysDescr.0",
+                                                    "s", "hi"], serial=True)
+    case(sec, "inform by name", "inform", ML + V2 + [TRAPD, "", "labStateChange", 'labIfAdmin."eth0"', "=", "up"],
+         serial=True)
 
 
 # ---------------------------------------------------------------- running ---
@@ -662,10 +1060,11 @@ class Run:
         self.rc, self.out, self.err, self.secs = rc, out, err, secs
 
 
-def run(cmd, timeout):
+def run(cmd, timeout, env=None):
     t0 = time.time()
     try:
-        p = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout)
+        p = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout,
+                           env=dict(os.environ, **env) if env else None)
         return Run(p.returncode, p.stdout.decode("utf-8", "replace"), p.stderr.decode("utf-8", "replace"),
                    time.time() - t0)
     except subprocess.TimeoutExpired as e:
@@ -715,15 +1114,18 @@ def compare(c, net, ours):
 
 
 def run_case(c, cli):
-    net_cmd = ["docker", "exec", TOOLS_CONTAINER, c.net_tool] + c.net_args
+    envargs = []
+    for k, v in sorted(c.env.items()):
+        envargs += ["-e", "%s=%s" % (k, v)]
+    net_cmd = ["docker", "exec"] + envargs + [TOOLS_CONTAINER, c.net_tool] + c.net_args
     our_cmd = [cli, c.tool] + c.args
     if c.serial:
         net = run(net_cmd, c.timeout)
-        ours = run(our_cmd, c.timeout)
+        ours = run(our_cmd, c.timeout, c.env)
     else:
         with concurrent.futures.ThreadPoolExecutor(2) as ex:
             fn = ex.submit(run, net_cmd, c.timeout)
-            fo = ex.submit(run, our_cmd, c.timeout)
+            fo = ex.submit(run, our_cmd, c.timeout, c.env)
             net, ours = fn.result(), fo.result()
     diffs = compare(c, net, ours)
     if not diffs:
@@ -778,6 +1180,26 @@ def main(argv):
             sys.stderr.write("unknown argument %s\n" % a)
             return 2
         i += 1
+    want_mib = sections is None or "mib" in sections
+    agent = None
+    if want_mib and not listing:
+        agent = mib_setup(cli)
+    try:
+        return run_all(cli, quick, filt, sections, listing, report, jobs, verbose)
+    finally:
+        if agent is not None:
+            agent.terminate()
+            try:
+                agent.wait(5)
+            except subprocess.TimeoutExpired:
+                agent.kill()
+
+
+SECTIONS = ("dataset", "output", "walk-options", "address", "timeout", "v3-errors", "error-status", "pathological",
+            "local-errors", "set", "mib")
+
+
+def run_all(cli, quick, filt, sections, listing, report, jobs, verbose):
     build_cases()
     cases = [c for c in CASES if (not quick or c.quick) and (sections is None or c.section in sections)
              and (filt is None or filt.search(c.key()))]

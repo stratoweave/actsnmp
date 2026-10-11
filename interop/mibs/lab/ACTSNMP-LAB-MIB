@@ -1,0 +1,901 @@
+ACTSNMP-LAB-MIB DEFINITIONS ::= BEGIN
+
+-- A MIB for the interop lab's shared dataset (interop/dataset/actsnmp_dataset.py,
+-- BASE = netSnmpExperimental.1 = .1.3.6.1.4.1.8072.9999.1), served by snmpd, snmpsim
+-- and `actsnmp agent`. It gives the fixed values types, textual conventions,
+-- DISPLAY-HINTs, UNITS, enumerations, BITS and table indexes, so that
+-- interop/clicheck.py can compare how net-snmp's tools and actsnmp print them
+-- with MIBs loaded. Some objects deliberately declare a type other than the one
+-- the agents send (net-snmp's "Wrong Type" output), and the big table an IMPLIED
+-- string index its integer index arcs do not fit. Written for this project;
+-- not a model of good MIB design.
+
+IMPORTS
+    MODULE-IDENTITY, OBJECT-TYPE, NOTIFICATION-TYPE, Integer32, Unsigned32,
+    Counter32, Counter64, Gauge32, TimeTicks, IpAddress, Opaque
+        FROM SNMPv2-SMI
+    TEXTUAL-CONVENTION, DisplayString, TruthValue, RowStatus, RowPointer,
+    AutonomousType, TimeStamp, TimeInterval
+        FROM SNMPv2-TC
+    SnmpAdminString
+        FROM SNMP-FRAMEWORK-MIB
+    InterfaceIndex
+        FROM IF-MIB
+    netSnmpExperimental
+        FROM NET-SNMP-MIB;
+
+actsnmpLabMIB MODULE-IDENTITY
+    LAST-UPDATED "202610110000Z"
+    ORGANIZATION "actsnmp"
+    CONTACT-INFO "The actsnmp project."
+    DESCRIPTION  "Types for the interop lab dataset (see the module comment)."
+    REVISION     "202610110000Z"
+    DESCRIPTION  "First version."
+    ::= { netSnmpExperimental 1 }
+
+-- Textual conventions
+
+LabHex ::= TEXTUAL-CONVENTION
+    DISPLAY-HINT "x"
+    STATUS       current
+    DESCRIPTION  "An integer in hexadecimal."
+    SYNTAX       Integer32
+
+LabOctal ::= TEXTUAL-CONVENTION
+    DISPLAY-HINT "o"
+    STATUS       current
+    DESCRIPTION  "An integer in octal."
+    SYNTAX       Integer32
+
+LabBinary ::= TEXTUAL-CONVENTION
+    DISPLAY-HINT "b"
+    STATUS       current
+    DESCRIPTION  "An integer in binary."
+    SYNTAX       Integer32
+
+LabCenti ::= TEXTUAL-CONVENTION
+    DISPLAY-HINT "d-2"
+    STATUS       current
+    DESCRIPTION  "Hundredths."
+    SYNTAX       Integer32
+
+LabTenths ::= TEXTUAL-CONVENTION
+    DISPLAY-HINT "d-1"
+    STATUS       current
+    DESCRIPTION  "Tenths."
+    SYNTAX       Integer32
+
+LabFrac ::= TEXTUAL-CONVENTION
+    DISPLAY-HINT "d-5"
+    STATUS       current
+    DESCRIPTION  "Five decimals."
+    SYNTAX       Integer32
+
+LabMilli ::= TEXTUAL-CONVENTION
+    DISPLAY-HINT "d-3"
+    STATUS       current
+    DESCRIPTION  "Thousandths."
+    SYNTAX       Unsigned32
+
+LabGaugeHex ::= TEXTUAL-CONVENTION
+    DISPLAY-HINT "x"
+    STATUS       current
+    DESCRIPTION  "A gauge in hexadecimal."
+    SYNTAX       Gauge32
+
+LabTriState ::= TEXTUAL-CONVENTION
+    STATUS       current
+    DESCRIPTION  "Three states."
+    SYNTAX       INTEGER { minusOne(-1), zero(0), one(1) }
+
+LabColonHex ::= TEXTUAL-CONVENTION
+    DISPLAY-HINT "1x:"
+    STATUS       current
+    DESCRIPTION  "Octets in hex, colon separated."
+    SYNTAX       OCTET STRING
+
+LabDotted ::= TEXTUAL-CONVENTION
+    DISPLAY-HINT "1d."
+    STATUS       current
+    DESCRIPTION  "Octets in decimal, dot separated."
+    SYNTAX       OCTET STRING
+
+LabTriples ::= TEXTUAL-CONVENTION
+    DISPLAY-HINT "3a-"
+    STATUS       current
+    DESCRIPTION  "Text in groups of three."
+    SYNTAX       OCTET STRING
+
+LabWords ::= TEXTUAL-CONVENTION
+    DISPLAY-HINT "2x"
+    STATUS       current
+    DESCRIPTION  "Two-octet words in hex."
+    SYNTAX       OCTET STRING
+
+LabRepeat ::= TEXTUAL-CONVENTION
+    DISPLAY-HINT "*1x:/"
+    STATUS       current
+    DESCRIPTION  "A repeat count, then octets in hex."
+    SYNTAX       OCTET STRING
+
+LabOneHex ::= TEXTUAL-CONVENTION
+    DISPLAY-HINT "1x"
+    STATUS       current
+    DESCRIPTION  "Octets in hex without separator."
+    SYNTAX       OCTET STRING
+
+LabAliasName ::= TEXTUAL-CONVENTION
+    STATUS       current
+    DESCRIPTION  "A TC defined on another TC (net-snmp keeps none of its hint or size)."
+    SYNTAX       DisplayString
+
+LabFlags ::= TEXTUAL-CONVENTION
+    STATUS       current
+    DESCRIPTION  "Flags."
+    SYNTAX       BITS { b0(0), b1(1), b2(2), b3(3), b7(7), b8(8), b15(15), b16(16), b31(31) }
+
+LabFloat ::= TEXTUAL-CONVENTION
+    STATUS       current
+    DESCRIPTION  "net-snmp's Opaque Float (as UCD-SNMP-MIB's Float)."
+    SYNTAX       Opaque (SIZE (7))
+
+-- Scalars
+
+labIntegers OBJECT IDENTIFIER ::= { actsnmpLabMIB 1 }
+labStrings  OBJECT IDENTIFIER ::= { actsnmpLabMIB 2 }
+labOids     OBJECT IDENTIFIER ::= { actsnmpLabMIB 3 }
+labAddrs    OBJECT IDENTIFIER ::= { actsnmpLabMIB 4 }
+labCounters OBJECT IDENTIFIER ::= { actsnmpLabMIB 5 }
+labGauges   OBJECT IDENTIFIER ::= { actsnmpLabMIB 6 }
+labTicks    OBJECT IDENTIFIER ::= { actsnmpLabMIB 7 }
+labCounter64s OBJECT IDENTIFIER ::= { actsnmpLabMIB 8 }
+labOpaques  OBJECT IDENTIFIER ::= { actsnmpLabMIB 9 }
+
+labIntPlain OBJECT-TYPE
+    SYNTAX      Integer32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Plain."
+    ::= { labIntegers 1 }
+
+labIntEnum OBJECT-TYPE
+    SYNTAX      LabTriState
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "An enumeration (one)."
+    ::= { labIntegers 2 }
+
+labIntEnumNeg OBJECT-TYPE
+    SYNTAX      LabTriState
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "An enumeration (minusOne)."
+    ::= { labIntegers 3 }
+
+labIntHex OBJECT-TYPE
+    SYNTAX      LabHex
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Hexadecimal."
+    ::= { labIntegers 4 }
+
+labIntOctal OBJECT-TYPE
+    SYNTAX      LabOctal
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Octal."
+    ::= { labIntegers 5 }
+
+labIntCenti OBJECT-TYPE
+    SYNTAX      LabCenti
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Hundredths of a negative number."
+    ::= { labIntegers 6 }
+
+labIntBinary OBJECT-TYPE
+    SYNTAX      LabBinary
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Binary of a negative number."
+    ::= { labIntegers 7 }
+
+labIntUnits OBJECT-TYPE
+    SYNTAX      Integer32
+    UNITS       "octets"
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "With UNITS."
+    ::= { labIntegers 8 }
+
+labIntNoLabel OBJECT-TYPE
+    SYNTAX      INTEGER { a(1), b(2) }
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "A value the enumeration has no label for."
+    ::= { labIntegers 9 }
+
+labIntRange OBJECT-TYPE
+    SYNTAX      Integer32 (0..65535)
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "A range."
+    ::= { labIntegers 10 }
+
+labIntFrac OBJECT-TYPE
+    SYNTAX      LabFrac
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Fewer digits than decimals."
+    ::= { labIntegers 11 }
+
+labIntTenths OBJECT-TYPE
+    SYNTAX      LabTenths
+    UNITS       "degrees Celsius"
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Tenths with UNITS."
+    ::= { labIntegers 12 }
+
+labIntTruth OBJECT-TYPE
+    SYNTAX      TruthValue
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "A TruthValue outside its enumeration."
+    ::= { labIntegers 13 }
+
+labIntHintD OBJECT-TYPE
+    SYNTAX      InterfaceIndex
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "InterfaceIndex (DISPLAY-HINT d)."
+    ::= { labIntegers 14 }
+
+labIntRowStatus OBJECT-TYPE
+    SYNTAX      RowStatus
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "A RowStatus outside its enumeration."
+    ::= { labIntegers 15 }
+
+labIntHexNeg OBJECT-TYPE
+    SYNTAX      LabHex
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Hexadecimal of a negative number."
+    ::= { labIntegers 16 }
+
+labIntOctalNeg OBJECT-TYPE
+    SYNTAX      LabOctal
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Octal of a negative number."
+    ::= { labIntegers 17 }
+
+labIntMax OBJECT-TYPE
+    SYNTAX      InterfaceIndex
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "The largest Integer32."
+    ::= { labIntegers 18 }
+
+labIntKeywords OBJECT-TYPE
+    SYNTAX      INTEGER { current(1), mandatory(2), deprecated(-2147483648) }
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Labels that are keywords of net-snmp's MIB parser."
+    ::= { labIntegers 19 }
+
+labStrDisplay OBJECT-TYPE
+    SYNTAX      DisplayString
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "DisplayString."
+    ::= { labStrings 1 }
+
+labStrAdminEmpty OBJECT-TYPE
+    SYNTAX      SnmpAdminString
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "SnmpAdminString, empty."
+    ::= { labStrings 2 }
+
+labStrAllOctets OBJECT-TYPE
+    SYNTAX      LabColonHex
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Every octet value."
+    ::= { labStrings 3 }
+
+labStrUtf8 OBJECT-TYPE
+    SYNTAX      SnmpAdminString
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "UTF-8 text."
+    ::= { labStrings 4 }
+
+labStrQuotes OBJECT-TYPE
+    SYNTAX      DisplayString
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Quotes and backslashes."
+    ::= { labStrings 5 }
+
+labStrControl OBJECT-TYPE
+    SYNTAX      DisplayString
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "A tab and a line break."
+    ::= { labStrings 6 }
+
+labStrTriples OBJECT-TYPE
+    SYNTAX      LabTriples
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "127 characters in groups of three."
+    ::= { labStrings 7 }
+
+labStrDotted OBJECT-TYPE
+    SYNTAX      LabDotted
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "128 octets in dotted decimal."
+    ::= { labStrings 8 }
+
+labStrPlain OBJECT-TYPE
+    SYNTAX      OCTET STRING
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "No DISPLAY-HINT."
+    ::= { labStrings 9 }
+
+labStrWords OBJECT-TYPE
+    SYNTAX      LabWords
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "256 characters as two-octet words."
+    ::= { labStrings 10 }
+
+labStrLong OBJECT-TYPE
+    SYNTAX      OCTET STRING (SIZE (0..2000))
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "1000 characters."
+    ::= { labStrings 11 }
+
+labStrRepeat OBJECT-TYPE
+    SYNTAX      LabRepeat
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "1024 octets with a repeat-count hint."
+    ::= { labStrings 12 }
+
+labStrAlias OBJECT-TYPE
+    SYNTAX      LabAliasName
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "4000 characters, a TC on a TC."
+    ::= { labStrings 13 }
+
+labStrNul OBJECT-TYPE
+    SYNTAX      LabOneHex
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "One NUL octet."
+    ::= { labStrings 14 }
+
+labStrFlags OBJECT-TYPE
+    SYNTAX      LabFlags
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Four 0xff octets as BITS."
+    ::= { labStrings 15 }
+
+labStrSpaces OBJECT-TYPE
+    SYNTAX      DisplayString (SIZE (0..64))
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Leading and trailing spaces."
+    ::= { labStrings 16 }
+
+labOidZero OBJECT-TYPE
+    SYNTAX      AutonomousType
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "zeroDotZero."
+    ::= { labOids 1 }
+
+labOidSysObject OBJECT-TYPE
+    SYNTAX      OBJECT IDENTIFIER
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "A sysObjectID."
+    ::= { labOids 2 }
+
+labOidMaxArc OBJECT-TYPE
+    SYNTAX      OBJECT IDENTIFIER
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "The largest sub-identifier."
+    ::= { labOids 3 }
+
+labOidJoint OBJECT-TYPE
+    SYNTAX      OBJECT IDENTIFIER
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Below joint-iso-ccitt."
+    ::= { labOids 4 }
+
+labOidPointer OBJECT-TYPE
+    SYNTAX      RowPointer
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "sysDescr.0."
+    ::= { labOids 5 }
+
+labOidArcs OBJECT-TYPE
+    SYNTAX      OBJECT IDENTIFIER
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Base-128 boundaries below this module."
+    ::= { labOids 6 }
+
+labOidLong OBJECT-TYPE
+    SYNTAX      OBJECT IDENTIFIER
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "128 sub-identifiers."
+    ::= { labOids 7 }
+
+labOidTwoArcs OBJECT-TYPE
+    SYNTAX      OBJECT IDENTIFIER
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Two arcs."
+    ::= { labOids 8 }
+
+labAddrZero OBJECT-TYPE
+    SYNTAX      IpAddress
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "0.0.0.0."
+    ::= { labAddrs 1 }
+
+labAddrLoopback OBJECT-TYPE
+    SYNTAX      IpAddress
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "127.0.0.1."
+    ::= { labAddrs 2 }
+
+labAddrDoc OBJECT-TYPE
+    SYNTAX      LabDotted
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "An IpAddress value of an OCTET STRING object."
+    ::= { labAddrs 3 }
+
+labAddrOnes OBJECT-TYPE
+    SYNTAX      IpAddress
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "255.255.255.255."
+    ::= { labAddrs 4 }
+
+labCounterZero OBJECT-TYPE
+    SYNTAX      Counter32
+    UNITS       "packets"
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Counter32 with UNITS."
+    ::= { labCounters 1 }
+
+labCounterOne OBJECT-TYPE
+    SYNTAX      Counter32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Counter32."
+    ::= { labCounters 2 }
+
+labCounterHalf OBJECT-TYPE
+    SYNTAX      Counter32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Counter32."
+    ::= { labCounters 3 }
+
+labCounterAsGauge OBJECT-TYPE
+    SYNTAX      Gauge32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "A Counter32 value of a Gauge32 object."
+    ::= { labCounters 4 }
+
+labCounterMax OBJECT-TYPE
+    SYNTAX      Counter32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Counter32."
+    ::= { labCounters 5 }
+
+labGaugePlain OBJECT-TYPE
+    SYNTAX      Gauge32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Gauge32."
+    ::= { labGauges 1 }
+
+labGaugeUnits OBJECT-TYPE
+    SYNTAX      Gauge32
+    UNITS       "kbit/s"
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Gauge32 with UNITS."
+    ::= { labGauges 2 }
+
+labGaugeMilli OBJECT-TYPE
+    SYNTAX      LabMilli
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Unsigned32 with d-3."
+    ::= { labGauges 3 }
+
+labGaugeHex OBJECT-TYPE
+    SYNTAX      LabGaugeHex
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Gauge32 with x."
+    ::= { labGauges 4 }
+
+labTicksPlain OBJECT-TYPE
+    SYNTAX      TimeTicks
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "TimeTicks."
+    ::= { labTicks 1 }
+
+labTicksStamp OBJECT-TYPE
+    SYNTAX      TimeStamp
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "TimeStamp."
+    ::= { labTicks 2 }
+
+labTicksInterval OBJECT-TYPE
+    SYNTAX      TimeInterval
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "A TimeTicks value of a TimeInterval (INTEGER) object."
+    ::= { labTicks 3 }
+
+labTicksUnits OBJECT-TYPE
+    SYNTAX      TimeTicks
+    UNITS       "centiseconds"
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "TimeTicks with UNITS."
+    ::= { labTicks 4 }
+
+labC64Zero OBJECT-TYPE
+    SYNTAX      Counter64
+    UNITS       "octets"
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Counter64 with UNITS."
+    ::= { labCounter64s 1 }
+
+labC64One OBJECT-TYPE
+    SYNTAX      Counter64
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Counter64."
+    ::= { labCounter64s 2 }
+
+labC64AsCounter32 OBJECT-TYPE
+    SYNTAX      Counter32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "A Counter64 value of a Counter32 object."
+    ::= { labCounter64s 3 }
+
+labC64Big OBJECT-TYPE
+    SYNTAX      Counter64
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Counter64."
+    ::= { labCounter64s 4 }
+
+labC64Half OBJECT-TYPE
+    SYNTAX      Counter64
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Counter64."
+    ::= { labCounter64s 5 }
+
+labC64Above OBJECT-TYPE
+    SYNTAX      Counter64
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Counter64."
+    ::= { labCounter64s 6 }
+
+labC64Max OBJECT-TYPE
+    SYNTAX      Counter64
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Counter64."
+    ::= { labCounter64s 7 }
+
+labOpaqueRaw OBJECT-TYPE
+    SYNTAX      Opaque
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Raw Opaque."
+    ::= { labOpaques 1 }
+
+labOpaqueFloat OBJECT-TYPE
+    SYNTAX      LabFloat
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "An Opaque Float."
+    ::= { labOpaques 2 }
+
+labOpaqueAsInt OBJECT-TYPE
+    SYNTAX      Integer32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "An Opaque Int64 value of an Integer32 object."
+    ::= { labOpaques 3 }
+
+-- Tables
+
+labTable OBJECT-TYPE
+    SYNTAX      SEQUENCE OF LabEntry
+    MAX-ACCESS  not-accessible
+    STATUS      current
+    DESCRIPTION "300 rows, column 7 sparse."
+    ::= { actsnmpLabMIB 10 }
+
+labEntry OBJECT-TYPE
+    SYNTAX      LabEntry
+    MAX-ACCESS  not-accessible
+    STATUS      current
+    DESCRIPTION "A row."
+    INDEX       { labIndex }
+    ::= { labTable 1 }
+
+LabEntry ::= SEQUENCE {
+    labIndex    Integer32,
+    labName     DisplayString,
+    labCounter  Counter64,
+    labAddr     IpAddress,
+    labGauge    Gauge32,
+    labPointer  RowPointer,
+    labSparse   INTEGER
+}
+
+labIndex OBJECT-TYPE
+    SYNTAX      Integer32 (1..2147483647)
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "The index (also a column)."
+    ::= { labEntry 1 }
+
+labName OBJECT-TYPE
+    SYNTAX      DisplayString
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "A name."
+    ::= { labEntry 2 }
+
+labCounter OBJECT-TYPE
+    SYNTAX      Counter64
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "A counter."
+    ::= { labEntry 3 }
+
+labAddr OBJECT-TYPE
+    SYNTAX      IpAddress
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "An address."
+    ::= { labEntry 4 }
+
+labGauge OBJECT-TYPE
+    SYNTAX      Gauge32
+    UNITS       "milliseconds"
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "A gauge."
+    ::= { labEntry 5 }
+
+labPointer OBJECT-TYPE
+    SYNTAX      RowPointer
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "The row's labIndex."
+    ::= { labEntry 6 }
+
+labSparse OBJECT-TYPE
+    SYNTAX      INTEGER { minusThree(-3), minusSix(-6) }
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Every third row."
+    ::= { labEntry 7 }
+
+labIfTable OBJECT-TYPE
+    SYNTAX      SEQUENCE OF LabIfEntry
+    MAX-ACCESS  not-accessible
+    STATUS      current
+    DESCRIPTION "20 rows indexed by a name."
+    ::= { actsnmpLabMIB 11 }
+
+labIfEntry OBJECT-TYPE
+    SYNTAX      LabIfEntry
+    MAX-ACCESS  not-accessible
+    STATUS      current
+    DESCRIPTION "A row."
+    INDEX       { labIfName }
+    ::= { labIfTable 1 }
+
+LabIfEntry ::= SEQUENCE {
+    labIfName   DisplayString,
+    labIfMtu    Integer32,
+    labIfAdmin  INTEGER
+}
+
+labIfName OBJECT-TYPE
+    SYNTAX      DisplayString (SIZE (1..64))
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "The name (the index)."
+    ::= { labIfEntry 1 }
+
+labIfMtu OBJECT-TYPE
+    SYNTAX      Integer32
+    UNITS       "octets"
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "An MTU."
+    ::= { labIfEntry 2 }
+
+labIfAdmin OBJECT-TYPE
+    SYNTAX      INTEGER { up(1), down(2) }
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "A state."
+    ::= { labIfEntry 3 }
+
+labIfXTable OBJECT-TYPE
+    SYNTAX      SEQUENCE OF LabIfXEntry
+    MAX-ACCESS  not-accessible
+    STATUS      current
+    DESCRIPTION "Augments labIfTable (no data in the lab)."
+    ::= { actsnmpLabMIB 13 }
+
+labIfXEntry OBJECT-TYPE
+    SYNTAX      LabIfXEntry
+    MAX-ACCESS  not-accessible
+    STATUS      current
+    DESCRIPTION "A row."
+    AUGMENTS    { labIfEntry }
+    ::= { labIfXTable 1 }
+
+LabIfXEntry ::= SEQUENCE {
+    labIfXAlias TruthValue
+}
+
+labIfXAlias OBJECT-TYPE
+    SYNTAX      TruthValue
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "A flag."
+    ::= { labIfXEntry 1 }
+
+labBigTable OBJECT-TYPE
+    SYNTAX      SEQUENCE OF LabBigEntry
+    MAX-ACCESS  not-accessible
+    STATUS      current
+    DESCRIPTION "2000 rows; the lab indexes them with one integer arc, which
+                 this MIB declares an IMPLIED string."
+    ::= { actsnmpLabMIB 12 }
+
+labBigEntry OBJECT-TYPE
+    SYNTAX      LabBigEntry
+    MAX-ACCESS  not-accessible
+    STATUS      current
+    DESCRIPTION "A row."
+    INDEX       { IMPLIED labBigKey }
+    ::= { labBigTable 1 }
+
+LabBigEntry ::= SEQUENCE {
+    labBigKey   OCTET STRING,
+    labBigName  DisplayString
+}
+
+labBigKey OBJECT-TYPE
+    SYNTAX      OCTET STRING (SIZE (1..32))
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "The key; the lab serves integers."
+    ::= { labBigEntry 1 }
+
+labBigName OBJECT-TYPE
+    SYNTAX      DisplayString
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "A name."
+    ::= { labBigEntry 2 }
+
+-- Writable scalars
+
+labWritable OBJECT IDENTIFIER ::= { actsnmpLabMIB 20 }
+
+labWInt OBJECT-TYPE
+    SYNTAX      Integer32
+    MAX-ACCESS  read-write
+    STATUS      current
+    DESCRIPTION "Writable INTEGER."
+    ::= { labWritable 1 }
+
+labWString OBJECT-TYPE
+    SYNTAX      DisplayString (SIZE (0..32))
+    MAX-ACCESS  read-write
+    STATUS      current
+    DESCRIPTION "Writable string."
+    ::= { labWritable 2 }
+
+labWOid OBJECT-TYPE
+    SYNTAX      OBJECT IDENTIFIER
+    MAX-ACCESS  read-write
+    STATUS      current
+    DESCRIPTION "Writable OID."
+    ::= { labWritable 3 }
+
+labWAddr OBJECT-TYPE
+    SYNTAX      IpAddress
+    MAX-ACCESS  read-write
+    STATUS      current
+    DESCRIPTION "Writable address."
+    ::= { labWritable 4 }
+
+labWGauge OBJECT-TYPE
+    SYNTAX      Gauge32
+    MAX-ACCESS  read-write
+    STATUS      current
+    DESCRIPTION "Writable gauge."
+    ::= { labWritable 5 }
+
+labWTicks OBJECT-TYPE
+    SYNTAX      TimeTicks
+    MAX-ACCESS  read-write
+    STATUS      current
+    DESCRIPTION "Writable TimeTicks."
+    ::= { labWritable 6 }
+
+labWReadOnly OBJECT-TYPE
+    SYNTAX      INTEGER { seven(7), eight(8) }
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Read-only in the lab agents."
+    ::= { labWritable 7 }
+
+labWRange OBJECT-TYPE
+    SYNTAX      Integer32 (0..100)
+    MAX-ACCESS  read-write
+    STATUS      current
+    DESCRIPTION "Writable, 0..100."
+    ::= { labWritable 8 }
+
+-- Notifications
+
+labNotifications OBJECT IDENTIFIER ::= { actsnmpLabMIB 0 }
+
+labStateChange NOTIFICATION-TYPE
+    OBJECTS     { labIfAdmin, labIfMtu }
+    STATUS      current
+    DESCRIPTION "A lab notification."
+    ::= { labNotifications 1 }
+
+END

@@ -54,7 +54,8 @@ hold stays under 15 minutes, and results are written per module.
 | `MIBLAB_BUDGET` | 690 | seconds of new work per lock hold |
 | `MIBLAB_TIMEOUT` | 150 | seconds per module and oracle |
 | `MIBLAB_NIGHT` | 0 | 1 allows runs at night |
-| `MIBLAB_NOKIA_DIR` | `~/para/resources` | directory with the Nokia SR OS archives of `pins/nokia.tsv` |
+| `MIBLAB_NOKIA_DIR` | unset | directory with the Nokia SR OS archives of `pins/nokia.tsv` |
+| `ACTYANG_DIR` | unset | acton-yang checkout, needed by `compare/yang_check.sh` |
 
 ## Corpus
 
@@ -68,11 +69,11 @@ hold stays under 15 minutes, and results are written per module.
 | `juniper`, `juniper-evo` | official for `JUNIPER-*`, `JNX-*` | download URL and sha256 in `pins/juniper.tsv` |
 | `nokia` | official for `TIMETRA-*`, `ALCATEL-*`, `ALU-*`, `NOKIA-*` | local archives, sha256 in `pins/nokia.tsv`; optional |
 
-The Nokia bundles are only available from Nokia's support portal. Archives
-missing from `MIBLAB_NOKIA_DIR` are skipped, and without them the corpus has
-no Nokia source. Older Nokia releases are indexed as history sources but
-never chosen. Juniper and Nokia MIB texts must never be committed; only pins,
-hashes and statistics are.
+The Nokia bundles are only available from Nokia's support portal. Without
+`MIBLAB_NOKIA_DIR` they are skipped and the corpus has no Nokia source. Older
+Nokia releases are indexed as history sources but never chosen. Juniper and
+Nokia MIB texts must never be committed; only pins, hashes and statistics
+are.
 
 `index.py` finds modules lexically (a file may hold several), records hashes,
 imports, `LAST-UPDATED` and lexical quirks, and links one winner per module
@@ -154,8 +155,19 @@ up in `golden/mibs/`.
 Both Python scripts write a Markdown report with `--out FILE`; put it under
 `cache/`. `yang_check.sh` without arguments is the gate over the reference
 MIBs and the golden set; `golden-all`, `sample` and `corpus` produce reports
-under `cache/yang/`. The acton-yang step builds `yangcheck/` against a local
-acton-yang checkout, whose path is set in `yangcheck/Build.act`. pyang runs
-in the image `actsnmp-pyang:1` (`pyang.Dockerfile`, built on demand). The
-libsmi 0.5.0 comparisons of the report modes and `libsmi_golden.sh` need an
-image `actsnmp-libsmi-trunk:1` with smidump built from libsmi's git master.
+under `cache/yang/`. It needs `ACTYANG_DIR` and writes `yangcheck/Build.act`
+from `yangcheck/Build.act.in`. pyang runs in the image `actsnmp-pyang:1`
+(`pyang.Dockerfile`, built on demand). The libsmi 0.5.0 comparisons of the
+report modes and `libsmi_golden.sh` need an image `actsnmp-libsmi-trunk:1`
+with smidump built from libsmi's git master.
+
+`yang-examples/` holds the reference material for the YANG gate: nine IETF
+MIBs, libsmi 0.5.0's YANG translation of them, and the IETF YANG modules
+they import (`SHA256SUMS` lists them all).
+
+## Lab MIB
+
+`lab/ACTSNMP-LAB-MIB` describes the interop lab's dataset
+(`.1.3.6.1.4.1.8072.9999.1`) with textual conventions, enumerations and
+tables. `interop/clicheck.sh` and the `test_cli` env tests load it and compare
+walks with `interop/expected/netsnmp/snmpd-dataset.lab-mib*.txt`.
