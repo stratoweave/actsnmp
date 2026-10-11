@@ -411,6 +411,20 @@ def _test_notification_from_v1_packet_m() -> None:
     testing.assertEqual(n, Notification(message.SNMP_V1, pdu.TRAP_V1, "192.0.2.99", 50162, 0, 123456,
                                         notify.TRAP_LINK_DOWN, payload, all_vbs, community=b"public", v1=t))
 
+def _test_payload_same_for_v1_and_v2c() -> None:
+    # Notification.payload(): the trap's own varbinds, without the RFC 3584 extras (and so without the
+    # community), the same for a linkDown sent as SNMPv1 and as SNMPv2c
+    m = decode_community(MSG_M)
+    t = m.trap!
+    n1 = notify.notification_from_v1(t, m.community, "192.0.2.99", 50162)
+    testing.assertEqual(n1.payload(), [vb(IF_INDEX_3, Integer(3))])
+    for x in n1.payload():
+        testing.assertFalse(x.oid == notify.SNMP_TRAP_COMMUNITY_0, "no community in the payload")
+    p = Pdu(pdu.TRAP_V2, 7, 0, 0, notify.build_trap_v2(123456, notify.TRAP_LINK_DOWN, [vb(IF_INDEX_3, Integer(3))]))
+    n2 = notify.notification_from_v2c(p, b"public", "192.0.2.99", 50162)
+    testing.assertEqual(n2.payload(), n1.payload())
+    testing.assertEqual(n2.payload(), n2.varbinds)
+
 def _test_notification_from_v1_problems() -> None:
     addr = h("c0 00 02 07")
     cases: list[(TrapV1Pdu, Oid, str)] = [

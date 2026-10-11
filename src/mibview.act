@@ -33,25 +33,25 @@ def _object_of(o: Oid) -> Oid:
 class MibView(object):
     """Variables in OID order, for GET, GETNEXT and SET
 
-    The view has no MIB, so it tells noSuchObject from noSuchInstance with
-    a heuristic: the object of an instance is its OID without the last arc
-    (sysDescr for sysDescr.0, ifDescr for ifDescr.7). get() of a missing OID
-    returns NoSuchInstance when the OID lies at or below the object of some
-    entry, and NoSuchObject otherwise. That reproduces what snmpd answers
-    for scalars and tables with a single-arc index: sysDescr.1,
-    sysDescr (no .0) and sysDescr.0.5 give
-    noSuchInstance, while 1.3.6.1.2.1.1.99.0 and the group 1.3.6.1.2.1.1
-    give noSuchObject. For a table with a multi-arc index only rows that
-    share all but the last index arc count as the same object, so other
-    missing rows give noSuchObject where snmpd may say noSuchInstance; the
-    lab's checks accept either.
+    The view has no MIB, so it tells noSuchObject from noSuchInstance by a
+    heuristic: the object of an instance is its OID without the last arc.
+    get() of a missing OID returns NoSuchInstance when the OID lies at or
+    below the object of some entry, and NoSuchObject otherwise. That matches
+    snmpd for scalars and single-arc table indexes (sysDescr.1, sysDescr and
+    sysDescr.0.5 give noSuchInstance, 1.3.6.1.2.1.1.99.0 gives noSuchObject).
+    For a multi-arc index, other missing rows give noSuchObject where snmpd
+    may say noSuchInstance.
 
-    Exception values stored as data (the pathological dataset has them) are
-    returned like any other value.
+    Exception values stored as data are returned like any other value.
+    get() and get_next() cost O(log n) comparisons; a missing OID's prefixes
+    are checked only up to the deepest object in the view, so a long OID
+    costs about what a short one does.
     """
     _oids: list[Oid]
+    _vals: list[Value]
     _values: dict[Oid, Value]
     _objects: set[Oid]
+    _max_object: int
 
     def __init__(self, entries: list[VarBind]):
         """Build a view from varbinds in any order; of two entries with the same OID the last wins"""
@@ -60,7 +60,14 @@ class MibView(object):
             vals[vb.oid] = vb.value
         self._values = vals
         self._oids = sorted(list(vals.keys()))
+        # _vals[i] is the value of _oids[i]: get_next() need not hash the OID it found
+        self._vals = [vals[o] for o in self._oids]
         self._objects = {_object_of(o) for o in self._oids}
+        top = -1
+        for ob in self._objects:
+            if len(ob.arcs) > top:
+                top = len(ob.arcs)
+        self._max_object = top
 
     def _after(self, oid: Oid) -> int:
         # The index of the first OID of the view that is greater than oid (binary search)
@@ -80,8 +87,11 @@ class MibView(object):
         v = self._values.get(oid)
         if v is not None:
             return v
+        # The prefixes of oid that can be an object: none is longer than the deepest one (each prefix
+        # costs a new Oid and a hash, so without the bound a 128-arc OID cost O(128^2))
         arcs = oid.arcs
-        for n in range(len(arcs) + 1):
+        top = len(arcs) if len(arcs) < self._max_object else self._max_object
+        for n in range(top + 1):
             if Oid(arcs[:n]) in self._objects:
                 return values.NoSuchInstance()
         return values.NoSuchObject()
@@ -95,8 +105,7 @@ class MibView(object):
         """
         i = self._after(oid)
         if i < len(self._oids):
-            o = self._oids[i]
-            return VarBind(o, self._values[o])
+            return VarBind(self._oids[i], self._vals[i])
         return VarBind(oid, values.EndOfMibView())
 
     def set_value(self, oid: Oid, v: Value) -> None:
@@ -104,9 +113,16 @@ class MibView(object):
 
         No rules apply here; see apply_set() for SET requests.
         """
+        i = self._after(oid)
         if oid not in self._values:
-            self._oids.insert(self._after(oid), oid)
-            self._objects.add(_object_of(oid))
+            self._oids.insert(i, oid)
+            self._vals.insert(i, v)
+            ob = _object_of(oid)
+            self._objects.add(ob)
+            if len(ob.arcs) > self._max_object:
+                self._max_object = len(ob.arcs)
+        else:
+            self._vals[i - 1] = v       # _after() gives the index after an OID the view has
         self._values[oid] = v
 
     def size(self) -> int:
@@ -117,7 +133,7 @@ class MibView(object):
         """Return the variables in OID order: all of them, or root and those below it"""
         if root is not None:
             return self._subtree(root)
-        return [VarBind(o, self._values[o]) for o in self._oids]
+        return [VarBind(self._oids[i], self._vals[i]) for i in range(len(self._oids))]
 
     def _subtree(self, root: Oid) -> list[VarBind]:
         i = self._after(root)
@@ -125,8 +141,7 @@ class MibView(object):
             i -= 1
         out: list[VarBind] = []
         while i < len(self._oids) and self._oids[i].startswith(root):
-            o = self._oids[i]
-            out.append(VarBind(o, self._values[o]))
+            out.append(VarBind(self._oids[i], self._vals[i]))
             i += 1
         return out
 
@@ -169,7 +184,9 @@ class MibView(object):
         status, index = self.check_set(varbinds, rules)
         if status == pdu.NO_ERROR:
             for vb in varbinds:
+                # check_set() made sure every OID exists (noCreation otherwise)
                 self._values[vb.oid] = vb.value
+                self._vals[self._after(vb.oid) - 1] = vb.value
         return (status, index)
 
     def _check_varbind(self, vb: VarBind, rules: list[WriteRule]) -> int:

@@ -91,7 +91,8 @@ STATS: list[str] = [
     "truncated",          # GETBULK responses shortened to fit the size limit
     "too_big_dropped",    # answers dropped because not even the tooBig response fit
     "gen_errs",           # genErr responses for values that could not be encoded
-    "fault_drops"]        # answers held back by Faults.drop_first_n
+    "fault_drops",        # answers held back by Faults.drop_first_n
+    "internal_errors"]    # unexpected exceptions while handling a datagram (a bug; nothing is sent)
 
 _REQUEST_TYPES: list[int] = [pdu.GET, pdu.GETNEXT, pdu.GETBULK, pdu.SET]
 _UINT32_MASK = 0xffffffff
@@ -456,6 +457,7 @@ actor Agent(transport: ServerTransport, view: MibView, config: AgentConfig, log_
     the transport.
     """
     _log = logging.Logger(log_handler)
+    _logging = log_handler is not None
     _communities: dict[bytes, bool] = _community_table(config.communities)
     _read_only: set[bytes] = _name_set(config.read_only_users)
     _salts = usm.SaltCounter()
@@ -728,8 +730,9 @@ actor Agent(transport: ServerTransport, view: MibView, config: AgentConfig, log_
         v1 = (c.version == message.SNMP_V1)
         if v1 and p.pdu_type == pdu.GETBULK:
             _count("v1_getbulk")
-        _log.trace("Request", {"from": address, "port": port, "version": c.version,
-                               "type": pdu.pdu_type_name(p.pdu_type), "request_id": p.request_id})
+        if _logging:
+            _log.trace("Request", {"from": address, "port": port, "version": c.version,
+                                   "type": pdu.pdu_type_name(p.pdu_type), "request_id": p.request_id})
         def encode(resp: Pdu) -> bytes:
             return _encode_community(c, resp, _faults)
         a = _handle(p, v1, writable, config.max_msg_size, encode)
@@ -780,8 +783,9 @@ actor Agent(transport: ServerTransport, view: MibView, config: AgentConfig, log_
                                               "port": port})
                 _send([_nitw_report(m, inc, p, now)], address, port, "reports")
                 return
-        _log.trace("Request", {"from": address, "port": port, "version": message.SNMP_V3,
-                               "type": pdu.pdu_type_name(p.pdu_type), "request_id": p.request_id})
+        if _logging:
+            _log.trace("Request", {"from": address, "port": port, "version": message.SNMP_V3,
+                                   "type": pdu.pdu_type_name(p.pdu_type), "request_id": p.request_id})
         writable = m.usm.user not in _read_only
         user = inc.user
         def encode(resp: Pdu) -> bytes:
@@ -806,11 +810,7 @@ actor Agent(transport: ServerTransport, view: MibView, config: AgentConfig, log_
 
     # Public ----------------------------------------------------------------------------------------
 
-    def _on_data(data: bytes, address: str, port: int) -> None:
-        # The transport's receiver: one datagram from address and port
-        if _closed:
-            return
-        _count("received")
+    proc def _handle_datagram(data: bytes, address: str, port: int) -> None:
         c, m, error = _decode(data)
         if error != "":
             _count(_decode_failure(data))
@@ -822,6 +822,20 @@ actor Agent(transport: ServerTransport, view: MibView, config: AgentConfig, log_
             _community(c, address, port)
         elif m is not None:
             _v3(data, m, now, address, port)
+
+    def _on_data(data: bytes, address: str, port: int) -> None:
+        # The transport's receiver: one datagram from address and port
+        if _closed:
+            return
+        _count("received")
+        try:
+            _handle_datagram(data, address, port)
+        except Exception as e:
+            # A bug, not a property of the datagram (decoders raise only DecodeError, handled above):
+            # count and log it, send nothing, and carry on with the next datagram
+            _count("internal_errors")
+            _log.error("internal error while handling a datagram", {"from": address, "port": port,
+                                                                    "error": str(e)})
 
     def stats() -> dict[str, int]:
         """Return a snapshot of the counters: STATS in order, then the SNMPv3 engine's (engine.COUNTERS)

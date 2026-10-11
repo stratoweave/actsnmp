@@ -44,6 +44,12 @@ MAX_ARC = 4294967295
 # BYTE_TABLE[i] == bytes([i]), built once: the cheapest way to get one octet.
 BYTE_TABLE: list[bytes] = [bytes([i]) for i in range(256)]
 
+# Shared int objects for the arcs dec_oid() produces below _ARC_CACHE_SIZE, which covers nearly
+# every arc and table index in practice. _ZEROS is the template of an arcs list.
+_ARC_CACHE_SIZE = 4096
+_ARC_CACHE: list[int] = list(range(4096))
+_ZEROS: list[int] = [0 for _ in range(129)]
+
 
 # Encoding ##########################################################################################
 
@@ -376,7 +382,8 @@ def dec_oid(buf: bytes, start: int, stop: int) -> list[int]:
             n += 1
     if n + 1 > MAX_OID_ARCS:
         raise errors.DecodeError("OID has more than %d arcs" % MAX_OID_ARCS, start)
-    arcs = [0] * (n + 1)        # arcs[0] is set below: the first sub-identifier holds two arcs
+    arcs = _ZEROS[:n + 1]        # arcs[0] is set below: the first sub-identifier holds two arcs
+    cache = _ARC_CACHE
     k: int = 1
     v: int = 0
     for i in range(start, stop):
@@ -385,16 +392,19 @@ def dec_oid(buf: bytes, start: int, stop: int) -> list[int]:
             raise errors.DecodeError("OID sub-identifier exceeds 2^32-1", i)
         v = (v << 7) | (b & 0x7f)
         if b < 0x80:
-            arcs[k] = v
+            if v < _ARC_CACHE_SIZE:
+                arcs[k] = cache[v]
+            else:
+                arcs[k] = v
             k += 1
             v = 0
     first = arcs[1]
     if first >= 80:
-        arcs[0] = 2
+        arcs[0] = cache[2]
         arcs[1] = first - 80
     elif first >= 40:
-        arcs[0] = 1
-        arcs[1] = first - 40
+        arcs[0] = cache[1]
+        arcs[1] = cache[first - 40]
     return arcs
 
 def _dump(buf: bytes, pos: int, end: int, depth: int, lines: list[str]) -> None:

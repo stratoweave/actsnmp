@@ -258,10 +258,10 @@ def table_text(o: CliOptions, t: Table) -> str:
     """The lines of `table`: the rows in index order, each row's values in the order of the columns"""
     out: list[str] = []
     for row in t.rows:
-        for col in t.columns:
-            v = row.values.get(col.arcs[len(col.arcs) - 1])
+        for k in range(len(t.columns)):
+            v = row.cells[k]
             if v is not None:
-                out.append(varbind_text(o, VarBind(col.child(row.index), v)) + "\n")
+                out.append(varbind_text(o, VarBind(t.columns[k].child(row.index), v)) + "\n")
     return "".join(out)
 
 def table_options(o: CliOptions) -> Options:

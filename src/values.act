@@ -531,7 +531,12 @@ def _decode_content(buf: bytes, tag: int, start: int, stop: int) -> Value:
                 return Gauge32(v)
             return TimeTicks(v)
         return _checked_content(buf, tag, start, stop)
-    if tag == ber.TAG_OID or tag == ber.TAG_COUNTER64:
+    if tag == ber.TAG_COUNTER64:
+        # 1 to 8 octets, or 9 with a leading zero, always decode (negative forms are masked)
+        if n >= 1 and (n <= 8 or (n == 9 and buf[start] == 0)):
+            return Counter64(ber.dec_u64(buf, start, stop))
+        return _checked_content(buf, tag, start, stop)
+    if tag == ber.TAG_OID:
         return _checked_content(buf, tag, start, stop)
     if tag == ber.TAG_IPADDRESS:
         return IpAddress(buf[start:stop])

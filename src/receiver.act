@@ -1,65 +1,42 @@
 """The notification receiver: SNMPv1, SNMPv2c and SNMPv3 traps and informs (snmptrapd-like)
 
-NotificationReceiver listens on a ServerTransport, turns every acceptable
-trap and inform into a notify.Notification and passes it to its consumer,
-and acknowledges informs. What arrives, and what happens to it:
+NotificationReceiver listens on a ServerTransport, passes every acceptable
+trap and inform to its consumer as a notify.Notification, and acknowledges
+informs with a Response that echoes the request-id and varbinds (RFC 3416
+section 4.2.7).
 
-  * SNMPv1 Trap-PDU and SNMPv2c SNMPv2-Trap: the community is checked and
-    the notification delivered. No response.
-  * SNMPv2c InformRequest: checked and delivered, then acknowledged with a
-    Response that has the request-id and the varbinds of the inform and
-    error-status 0 (RFC 3416 section 4.2.7).
-  * SNMPv3 messages are routed by msgAuthoritativeEngineID:
-      - our engine ID, or an empty one (engine ID discovery): we are the
-        authoritative engine, as for every InformRequest sent to us. An
-        engine.AuthoritativeEngine (constructed for INFORM only) answers
-        discovery and refusals with Reports, as an agent does; an accepted
-        inform is delivered and acknowledged with a Response.
-      - any other engine ID: the sender is authoritative, as for every
-        SNMPv2-Trap (RFC 3414 section 1.5.1). The trap is checked as a
-        non-authoritative engine checks a message (see _TrapUsm): sender
-        engine ID and user before any key work; the MAC with the
-        authentication key alone; only then the privacy key, which may cost
-        a whole password-to-key round; then
-        usm.process_incoming with the user's level, which applies the
-        timeliness check (RFC 3414 section 3.2 step 7b) against the time
-        record kept for the user and sender engine. A trap never draws a
-        Report. An InformRequest (or other Confirmed-class PDU) that names
-        another engine is the one exception: it goes to the authoritative
-        engine, which answers it with a usmStatsUnknownEngineIDs Report so
-        that the sender rediscovers our engine ID. An encrypted message
-        that names another engine and sets the reportableFlag (an inform,
-        or a trap from a sender that wrongly sets the flag) is tried on the
-        trap path first; only if it is not an acceptable trap does the
-        engine answer it.
-  * Everything else is dropped and counted, never answered: undecodable
-    datagrams, PDUs that are not notifications of the message's version
-    (an SNMPv1 Trap-PDU in SNMPv2c, an SNMPv2 PDU in SNMPv1, requests,
-    responses, reports), communities not configured, and SNMPv3 messages
-    that fail security processing. The memory kept per sender (key sets,
-    time records, dedup entries) is bounded, and a datagram costs bounded
-    work.
+SNMPv3 messages are routed by msgAuthoritativeEngineID. Our own engine ID,
+or an empty one (discovery), goes to an engine.AuthoritativeEngine, which
+handles informs as an agent handles requests, Reports included. Any other
+engine ID means the sender is authoritative, as for every SNMPv2-Trap
+(RFC 3414 section 1.5.1), and the trap is checked the way a
+non-authoritative engine checks a message (_TrapUsm): sender engine ID and
+user first, then the MAC with the authentication key alone, and only then
+the privacy key, which may cost a full password-to-key round. A trap never
+draws a Report. An inform that names another engine is answered with a
+usmStatsUnknownEngineIDs Report so that the sender rediscovers us; an
+encrypted message with the reportableFlag set is tried as a trap first.
 
-Security levels are exact: a user's credentials
-(noAuthNoPriv, authNoPriv or authPriv) are the level its messages must
-have; a lower or higher level counts as usmStatsUnsupportedSecLevels. Users
-without authentication (the lab's u_noauth) are accepted unauthenticated.
+Everything else is dropped and counted, never answered: undecodable
+datagrams, PDUs that are not notifications of the message's version,
+unknown communities, and SNMPv3 messages that fail security processing.
+The memory kept per sender is bounded, and so is the work per datagram.
 
-Notifications go to on_notification(receiver, notification), fire and
-forget: the receiver never waits for the consumer. With
-ReceiverConfig.dedup_window above 0, a notification identical to one
-delivered from the same source within the window (an inform retransmitted
-because its Response was lost, or a datagram the network duplicated) is
-counted as a duplicate instead of being delivered again; an inform is
+Security levels are exact: a message must have the level of its user's
+credentials. The credentials of an SNMPv3 trap come from a TrapUser of its
+sender engine if there is one, else from ReceiverConfig.users. Communities
+are compared in constant time.
+
+on_notification(receiver, notification) is fire and forget. With
+ReceiverConfig.dedup_window, a notification identical to one delivered
+from the same source within the window (a retransmitted inform, a
+duplicated datagram) is counted as a duplicate instead; an inform is
 acknowledged either way. Only a SHA-256 fingerprint of each notification
-is kept, so a lookup is one dict probe and an entry costs the same for a
-64 KB notification as for a small one.
+is kept.
 
-Statistics (NotificationReceiver.stats()). Every datagram counts as
-received and then as exactly one of delivered, duplicates, discovery and
-the dropped_* counters, unless it hits a bug (internal_errors, which should
-stay 0). acked, reports and trap_keys_derived count what was done on the
-way:
+stats() counts every datagram as received and then as exactly one of
+delivered, duplicates, discovery or a dropped_* counter (internal_errors
+counts bugs and should stay 0):
 
   received             datagrams from the transport
   delivered            notifications passed to on_notification
@@ -184,39 +161,83 @@ def _check_config(trap_engines: list[bytes], engine_id: bytes, engine_boots: int
         raise ValueError("dedup_window must be 0 to %d seconds" % int(MAX_DEDUP_WINDOW))
 
 
+class TrapUser(object):
+    """SNMPv3 trap credentials for one sender engine (like snmptrapd's createUser -e ENGINEID)
+
+    engine_id is the sender's snmpEngineID (msgAuthoritativeEngineID of
+    its traps, 5 to 32 octets) and usm its credentials. Fleets often give
+    every device the same user name with a password of its own; such a
+    user cannot be in ReceiverConfig.users (one credential per name), but
+    one TrapUser per device can. For a trap, a TrapUser of the sender
+    engine and user name wins over a user of the same name in users.
+    repr() shows no keys.
+    """
+    engine_id: bytes
+    usm: Usm
+
+    def __init__(self, engine_id: bytes, usm: Usm):
+        self.engine_id = engine_id
+        self.usm = usm
+
+    def __repr__(self) -> str:
+        return "TrapUser(engine_id=" + self.engine_id.hex() + ", user=" + repr(self.usm.user) + ")"
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
+
+def _check_users(users: list[Usm], trap_users: list[TrapUser]) -> None:
+    # One credential per user name, and per (sender engine, user name) for engine-specific trap users
+    names: set[str] = set()
+    for u in users:
+        if u.user in names:
+            raise ValueError("user %r is configured twice (per-sender trap credentials go into trap_users)" % u.user)
+        names.add(u.user)
+    pairs: set[(bytes, str)] = set()
+    for tu in trap_users:
+        _check_engine_id(tu.engine_id, "a trap user's engine ID")
+        key = (tu.engine_id, tu.usm.user)
+        if key in pairs:
+            raise ValueError("trap user %r is configured twice for engine %s" % (tu.usm.user, tu.engine_id.hex()))
+        pairs.add(key)
+
+
 class ReceiverConfig(object):
     """What a NotificationReceiver accepts, and its SNMPv3 identity
 
-    communities are the accepted SNMPv1/v2c communities. An empty list
-    accepts none (SNMPv3 only); the entry "*" accepts any community, which
-    lets anyone who can reach the receiver inject SNMPv1/v2c notifications
-    and draw acknowledgements, so use it only on a trusted network. users are the SNMPv3 users, as security.Usm credentials
-    (master keys); each user's credentials fix the security level its
-    notifications must have. trap_engines are the msgAuthoritativeEngineIDs
-    accepted for SNMPv3 traps, whose sender is authoritative (like
-    snmptrapd's `createUser -e`); an empty list accepts any sender engine,
-    and keys are localized to each one when its first trap arrives. Time
-    records are kept per user and sender engine, so that one user's
-    messages cannot move the clock another user's traps are checked
-    against; with an empty list, a holder of valid credentials can still
-    push other engines' records out (see MAX_TRAP_TIME_RECORDS), so list
-    the senders where that matters.
+    communities are the accepted SNMPv1/v2c communities; an empty list
+    accepts none. The entry "*" accepts any community, which lets anyone
+    who can reach the receiver inject notifications, so use it only on a
+    trusted network.
+
+    users are the SNMPv3 users (security.Usm, master keys); a user's
+    credentials fix the security level its notifications must have. Each
+    user name may appear once: it is the credential for informs, whose keys
+    are localized to our own engine, and for traps of any sender.
+    trap_users adds trap credentials per sender engine, for devices that
+    share a user name but not its passwords.
+
+    trap_engines are the sender engine IDs accepted for SNMPv3 traps (like
+    snmptrapd's createUser -e); an empty list accepts any, and keys are
+    localized to each sender when its first trap arrives. Time records are
+    kept per user and sender engine, so one user cannot move the clock that
+    another user's traps are checked against. With an empty list, a holder
+    of valid credentials can still evict other engines' records (see
+    MAX_TRAP_TIME_RECORDS), so list the senders where that matters.
 
     engine_id (5 to 32 octets) and engine_boots (1..2^31-1) are our own
-    snmpEngineID and snmpEngineBoots: we are the authoritative engine for
-    the SNMPv3 informs sent to us. Persist boots and pass boots + 1 on the
-    next start (RFC 3414 section 2.2.2); senders that remember us otherwise
-    reject our Responses.
+    snmpEngineID and snmpEngineBoots, as the authoritative engine for
+    informs. Persist boots and pass boots + 1 on the next start (RFC 3414
+    section 2.2.2), or senders that remember us reject our Responses.
 
-    dedup_window (seconds, 0 to 3600; 0 = off): a notification equal to one
-    delivered from the same source address and port (same version, PDU
-    type, community or user, level and context, request-id and varbinds)
-    within this many seconds is not delivered again (it is counted in
-    duplicates); an inform is still acknowledged.
+    dedup_window (seconds, 0 to 3600, 0 = off) suppresses a notification
+    equal to one delivered from the same source address and port within
+    that time (same version, PDU type, community or user, level, context,
+    request-id and varbinds). An inform is still acknowledged.
 
-    The constructor raises ValueError for engine IDs that are not 5 to 32
-    octets, boots outside 1..2^31-1 or a dedup_window outside 0..3600.
-    repr() shows neither communities nor keys.
+    The constructor raises ValueError for an invalid engine ID, boots or
+    dedup_window, or a user configured twice. repr() shows neither
+    communities nor keys.
     """
     communities: list[str]
     users: list[Usm]
@@ -224,16 +245,19 @@ class ReceiverConfig(object):
     engine_id: bytes
     engine_boots: int
     dedup_window: float
+    trap_users: list[TrapUser]
 
     def __init__(self, communities: list[str], users: list[Usm], trap_engines: list[bytes], engine_id: bytes,
-                 engine_boots: int, dedup_window: float=0.0):
+                 engine_boots: int, dedup_window: float=0.0, trap_users: list[TrapUser]=[]):
         _check_config(trap_engines, engine_id, engine_boots, dedup_window)
+        _check_users(users, trap_users)
         self.communities = communities
         self.users = users
         self.trap_engines = trap_engines
         self.engine_id = engine_id
         self.engine_boots = engine_boots
         self.dedup_window = dedup_window
+        self.trap_users = trap_users
 
     @staticmethod
     def from_users_tsv(text: str, engine_id: bytes, communities: list[str], engine_boots: int=1,
@@ -250,10 +274,13 @@ class ReceiverConfig(object):
         return ReceiverConfig(communities, load_users_tsv(text), trap_engines, engine_id, engine_boots, dedup_window)
 
     def __repr__(self) -> str:
+        extra = ""
+        if len(self.trap_users) > 0:
+            extra = ", trap_users=[" + ", ".join([repr(tu) for tu in self.trap_users]) + "]"
         return ("ReceiverConfig(communities=<%d>, users=[" % len(self.communities)
                 + ", ".join([repr(u.user) for u in self.users]) + "], trap_engines=["
                 + ", ".join([e.hex() for e in self.trap_engines]) + "], engine_id=" + self.engine_id.hex()
-                + ", engine_boots=%d, dedup_window=" % self.engine_boots + str(self.dedup_window) + ")")
+                + ", engine_boots=%d, dedup_window=" % self.engine_boots + str(self.dedup_window) + extra + ")")
 
     def __str__(self) -> str:
         return self.__repr__()
@@ -267,18 +294,18 @@ def _refused(counter: str, level: int) -> Incoming:
 class _TrapUsm(object):
     """USM for SNMPv3 traps, whose sender is the authoritative engine (RFC 3414 section 1.5.1)
 
-    users maps user names to credentials and engines holds the accepted
-    sender engine IDs (none: any). keys caches the keys of a user localized
-    to a sender engine, created only once a message of that user and
-    engine passed the MAC check; times holds the time record (RFC 3414
-    section 2.3) of a sender engine as seen by one user, learned from that
-    user's first authenticated message: keyed by (user, engine), so one
-    user cannot move the clock of another user's traps. Both are LRU
-    caches (key_limit and time_limit entries, see MAX_TRAP_SENDERS); used
-    holds the tick of each entry's last use. derived counts the key sets
-    created (the full keys of a user for an engine).
+    users maps user names to credentials and engine_users (sender engine,
+    user name) to TrapUser credentials, which win. engines holds the
+    accepted sender engine IDs (empty: any). keys caches a user's keys
+    localized to a sender engine, created only once a message of theirs
+    passed the MAC check. times holds the time record (RFC 3414 section
+    2.3) of a sender engine per user, so one user cannot move the clock of
+    another user's traps. Both are LRU caches (key_limit and time_limit
+    entries); the *_used dicts hold each entry's last tick. derived counts
+    the key sets created.
     """
     users: dict[bytes, Usm]
+    engine_users: dict[(bytes, bytes), Usm]
     engines: dict[bytes, bool]
     keys: dict[(bytes, bytes), LocalizedUser]
     keys_used: dict[(bytes, bytes), int]
@@ -289,18 +316,24 @@ class _TrapUsm(object):
     tick: int
     derived: int
 
-    def __init__(self, users: list[Usm], engines: list[bytes]):
+    def __init__(self, users: list[Usm], engines: list[bytes], trap_users: list[TrapUser]=[]):
         self.users = {}
         for u in users:
             self.users[u.user.encode()] = u
+        self.engine_users = {}
+        for tu in trap_users:
+            self.engine_users[(tu.engine_id, tu.usm.user.encode())] = tu.usm
         self.engines = {}
         for e in engines:
             self.engines[e] = True
+        if len(engines) > 0:
+            for tu in trap_users:
+                self.engines[tu.engine_id] = True
         self.keys = {}
         self.keys_used = {}
         self.times = {}
         self.times_used = {}
-        pinned = len(self.users) * len(self.engines)
+        pinned = len(self.users) * len(self.engines) + len(self.engine_users)
         self.key_limit = MAX_TRAP_SENDERS if pinned < MAX_TRAP_SENDERS else pinned
         self.time_limit = MAX_TRAP_TIME_RECORDS if pinned < MAX_TRAP_TIME_RECORDS else pinned
         self.tick = 0
@@ -355,7 +388,9 @@ class _TrapUsm(object):
         if plain is not None:
             if plain.pdu.pdu_type != pdu.TRAP_V2:
                 return _refused(usm.SNMP_UNKNOWN_PDU_HANDLERS, level)
-        u = self.users.get(msg.usm.user)
+        u = self.engine_users.get((eid, msg.usm.user))
+        if u is None:
+            u = self.users.get(msg.usm.user)
         if u is not None:
             if u.level() != level:
                 return _refused(usm.USM_STATS_UNSUPPORTED_SEC_LEVELS, level)
@@ -541,6 +576,18 @@ def _dropped(counter: str) -> str:
         return DROPPED_PDU
     return DROPPED_INVALID
 
+def community_accepted(accepted: list[bytes], community: bytes) -> bool:
+    """Return True if community is one of accepted, comparing in constant time
+
+    Every entry is compared with usmcrypto.ct_equal, so the timing does not
+    reveal how much of a guessed community was right.
+    """
+    found = False
+    for c in accepted:
+        if usmcrypto.ct_equal(c, community):
+            found = True
+    return found
+
 def _pdu_text(m: CommunityMessage) -> str:
     p = m.pdu
     if p is not None:
@@ -619,12 +666,13 @@ actor NotificationReceiver(transport: ServerTransport, config: ReceiverConfig,
     close() closes the transport; stats() returns the counters.
     """
     _log = logging.Logger(log_handler)
+    _logging = log_handler is not None
     var _closed = False
     var _counts: dict[str, int] = {name: 0 for name in STATS}
     var _communities: list[bytes] = [c.encode() for c in config.communities]
     _any_community = "*" in config.communities
     var _engine = AuthoritativeEngine(config.engine_id, config.engine_boots, _now(), config.users, [pdu.INFORM])
-    var _traps = _TrapUsm(config.users, config.trap_engines)
+    var _traps = _TrapUsm(config.users, config.trap_engines, config.trap_users)
     var _dedup = _Dedup(config.dedup_window)
     var _salts = usm.SaltCounter()
 
@@ -633,7 +681,8 @@ actor NotificationReceiver(transport: ServerTransport, config: ReceiverConfig,
 
     proc def _drop(key: str, address: str, port: int, reason: str) -> None:
         _count(key)
-        _log.debug("datagram dropped", {"reason": key, "detail": reason, "source": address, "port": port})
+        if _logging:
+            _log.debug("datagram dropped", {"reason": key, "detail": reason, "source": address, "port": port})
 
     proc def _reply(data: bytes, address: str, port: int, key: str) -> None:
         transport.send_to(data, address, port)
@@ -642,18 +691,21 @@ actor NotificationReceiver(transport: ServerTransport, config: ReceiverConfig,
     proc def _deliver(n: Notification, now: float) -> None:
         if _dedup.repeated(n, now):
             _count(DUPLICATES)
-            _log.debug("duplicate notification suppressed", {"source": n.source_address, "port": n.source_port,
-                                                             "request_id": n.request_id})
+            if _logging:
+                _log.debug("duplicate notification suppressed", {"source": n.source_address, "port": n.source_port,
+                                                                 "request_id": n.request_id})
             return
         _count(DELIVERED)
-        _log.debug("notification", {"version": n.version, "type": pdu.pdu_type_name(n.pdu_type),
-                                    "source": n.source_address, "port": n.source_port,
-                                    "trap_oid": str(n.trap_oid)})
+        if _logging:
+            # the arguments cost more than the rest of a delivery: build them only for a handler
+            _log.debug("notification", {"version": n.version, "type": pdu.pdu_type_name(n.pdu_type),
+                                        "source": n.source_address, "port": n.source_port,
+                                        "trap_oid": str(n.trap_oid)})
         on_notification(self, n)
 
     proc def _community(m: CommunityMessage, address: str, port: int, now: float) -> None:
         # SNMPv1 and SNMPv2c: community, then the PDU type of the version
-        if not _any_community and m.community not in _communities:
+        if not _any_community and not community_accepted(_communities, m.community):
             _drop(DROPPED_COMMUNITY, address, port, "community not accepted")
             return
         if m.version == message.SNMP_V1:

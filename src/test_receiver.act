@@ -30,7 +30,7 @@ from mibview import MibView
 from notify import Notification
 from oid import Oid
 from pdu import Pdu, TrapV1Pdu
-from receiver import NotificationReceiver, ReceiverConfig
+from receiver import NotificationReceiver, ReceiverConfig, TrapUser, community_accepted
 from security import Usm
 from transport import MemNet, ServerTransport, Transport
 from usm import LocalizedUser
@@ -358,6 +358,10 @@ def _test_config_rejects() -> None:
     value_fails(lambda: ReceiverConfig([], [], [], our_engine(), 1, 3600.5), "dedup window above 3600")
     value_fails(lambda: ReceiverConfig([], [], [], our_engine(), 1, float("nan")), "NaN dedup window")
     value_fails(lambda: ReceiverConfig([], [], [], our_engine(), 1, float("inf")), "infinite dedup window")
+    # two users of one name (devices sharing the name "nms" with their own passwords): one of them would
+    # silently lose every notification; per-engine credentials go into trap_users instead
+    value_fails(lambda: ReceiverConfig([], [keyed("u_noauth"), keyed("u_noauth")], [], our_engine(), 1),
+                "two users of the same name")
 
 USERS_HEAD = "# user\tlevel\tauth(net-snmp)\tpriv(net-snmp)\tauth(pysnmp)\tpriv(pysnmp)\tauthpass\tprivpass\tsnmpd\tsnmpsim\n"
 
@@ -907,6 +911,54 @@ actor _test_v3_trap_engines(t: testing.AsyncT):
     b.send(v3_trap(noauth, None, sender_a(), 1, 0, v2_pdu(pdu.TRAP_V2, 3, 3)))
     b.send(v3_trap(noauth, None, sender_b(), 1, 0, v2_pdu(pdu.TRAP_V2, 4, 4)))
     b.finish()
+
+
+actor _test_v3_trap_users_per_engine(t: testing.AsyncT):
+    """Two devices whose trap user has the same name and different keys (a fleet's "u_sha" with one password
+    per device): TrapUser entries per sender engine deliver both, and a third engine falls back to the
+    name-only user of users; each engine's traps are checked with its own keys"""
+    dev_a = keyed("u_sha", 1)
+    dev_b = keyed("u_sha", 2)
+    shared = keyed("u_sha")
+
+    def done(b: Bench) -> None:
+        def check() -> None:
+            got = [(n.engine_id, n.request_id) for n in b.notifications()]
+            testing.assertEqual(got, [(sender_a(), 1), (sender_b(), 2), (sender_c(), 3)])
+            check_stats(b.stats(), {"received": 5, "delivered": 3, "dropped_auth": 2, "usmStatsWrongDigests": 2,
+                                    "trap_keys_derived": 3})
+        report(t, outcome(check))
+
+    cfg = ReceiverConfig(["public"], [shared], [], our_engine(), BOOTS, 0.0,
+                         [TrapUser(sender_a(), dev_a), TrapUser(sender_b(), dev_b)])
+    b = Bench(MemNet(), cfg, t.log_handler, done)
+    b.send(v3_trap(dev_a, dev_a.localized(sender_a()), sender_a(), 1, 0, v2_pdu(pdu.TRAP_V2, 1, 1)))
+    b.send(v3_trap(dev_b, dev_b.localized(sender_b()), sender_b(), 1, 0, v2_pdu(pdu.TRAP_V2, 2, 2)))
+    b.send(v3_trap(shared, shared.localized(sender_c()), sender_c(), 1, 0, v2_pdu(pdu.TRAP_V2, 3, 3)))
+    # device B's keys for device A's engine, and the shared user's for B: wrong digests
+    b.send(v3_trap(dev_b, dev_b.localized(sender_a()), sender_a(), 1, 0, v2_pdu(pdu.TRAP_V2, 4, 4)))
+    b.send(v3_trap(shared, shared.localized(sender_b()), sender_b(), 1, 0, v2_pdu(pdu.TRAP_V2, 5, 5)))
+    b.finish()
+
+def _test_trap_users_config() -> None:
+    a = TrapUser(sender_a(), keyed("u_sha", 1))
+    c = ReceiverConfig([], [], [sender_b()], our_engine(), 1, 0.0, [a])
+    testing.assertEqual(repr(c), "ReceiverConfig(communities=<0>, users=[], trap_engines=[8000000001020305], "
+                        + "engine_id=80001f8880616374736e6d7072, engine_boots=1, dedup_window=0, "
+                        + "trap_users=[TrapUser(engine_id=8000000001020304, user='u_sha')])")
+    value_fails(lambda: ReceiverConfig([], [], [], our_engine(), 1, 0.0, [a, TrapUser(sender_a(), keyed("u_sha", 2))]),
+                "the same user twice for one engine")
+    value_fails(lambda: ReceiverConfig([], [], [], our_engine(), 1, 0.0, [TrapUser(b"abcd", keyed("u_sha"))]),
+                "a trap user's engine ID of 4 octets")
+    ReceiverConfig([], [keyed("u_sha")], [], our_engine(), 1, 0.0, [a, TrapUser(sender_b(), keyed("u_sha", 2))])
+
+def _test_community_accepted() -> None:
+    accepted = [b"public", b"s3cret-community"]
+    testing.assertTrue(community_accepted(accepted, b"public"))
+    testing.assertTrue(community_accepted(accepted, b"s3cret-community"))
+    for wrong in [b"", b"publi", b"publicx", b"Public", b"s3cret-communitx", b"s3cret"]:
+        testing.assertFalse(community_accepted(accepted, wrong), repr(wrong))
+    testing.assertFalse(community_accepted([], b"public"))
 
 
 # SNMPv3 informs ###################################################################################

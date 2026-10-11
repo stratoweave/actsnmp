@@ -121,6 +121,13 @@ class Usm(Security):
         with the hash of the authentication protocol. Everything is checked
         before the (expensive) password-to-key runs. Raises ValueError for
         bad passwords and everything the constructor rejects.
+
+        Each password costs a password-to-key round of 1 MiB of hashing:
+        about 15 ms with SHA-256, so 10,000 devices cost minutes of CPU.
+        Build one Usm per set of credentials and share it between the
+        Clients of every device that uses them (a Usm is immutable);
+        with_context() gives the same credentials for another context
+        without hashing again, and from_keys() takes stored master keys.
         """
         _check_protocols(auth_protocol, priv_protocol)
         if auth_protocol == usm.AUTH_NONE and auth_password != "":
@@ -147,6 +154,16 @@ class Usm(Security):
         Raises ValueError like the constructor.
         """
         return Usm(user, auth_protocol, auth_ku, priv_protocol, priv_ku, context_name.encode(), context_engine_id)
+
+    def with_context(self, context_name: str, context_engine_id: ?bytes=None) -> Usm:
+        """Return these credentials for another context (no password-to-key: the master keys are shared)
+
+        For example the BRIDGE-MIB of one VLAN (context "vlan-10") or a
+        VRF's instance; client.Options.context_name selects a context per
+        request instead.
+        """
+        return Usm(self.user, self.auth_protocol, self.auth_ku, self.priv_protocol, self.priv_ku, context_name.encode(),
+                   context_engine_id)
 
     def level(self) -> int:
         """Return the security level of the credentials as msgFlags bits (message.FLAG_AUTH, FLAG_PRIV)"""

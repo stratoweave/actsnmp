@@ -75,6 +75,106 @@ def normalize_address(address: str) -> str:
             return v4
     return address
 
+def _hex_group(t: str) -> int:
+    # The value of 1 to 4 hex digits, -1 for anything else
+    if len(t) < 1 or len(t) > 4:
+        return -1
+    v = 0
+    for c in t:
+        d = "0123456789abcdef".find(c.lower())
+        if d < 0:
+            return -1
+        v = v * 16 + d
+    return v
+
+def _ipv4_octets(text: str) -> ?bytes:
+    # Dotted decimal, four parts of 1 to 3 digits, each at most 255
+    parts = text.split(".")
+    if len(parts) != 4:
+        return None
+    out: list[int] = []
+    for p in parts:
+        if len(p) < 1 or len(p) > 3 or not (p.isascii() and p.isdecimal()):
+            return None
+        v = int(p)
+        if v > 255:
+            return None
+        out.append(v)
+    return bytes(out)
+
+def _ipv6_groups(text: str, last: bool) -> ?list[int]:
+    # The 16-bit groups of a colon-separated run; an IPv4 tail (last run only) gives two groups
+    out: list[int] = []
+    parts = text.split(":")
+    for i in range(len(parts)):
+        p = parts[i]
+        if last and i == len(parts) - 1 and "." in p:
+            v4 = _ipv4_octets(p)
+            if v4 is not None:
+                out.append(v4[0] * 256 + v4[1])
+                out.append(v4[2] * 256 + v4[3])
+            else:
+                return None
+        else:
+            v = _hex_group(p)
+            if v < 0:
+                return None
+            out.append(v)
+    return out
+
+def _ipv6_octets(text: str) -> ?bytes:
+    # RFC 4291 section 2.2 text: eight groups, "::" for a run of zero groups, an IPv4 tail; a zone
+    # ("%eth0") is ignored
+    zone = text.find("%")
+    t = text[:zone] if zone >= 0 else text
+    halves = t.split("::")
+    if len(halves) > 2:
+        return None
+    head: list[int] = []
+    tail: list[int] = []
+    if halves[0] != "":
+        h = _ipv6_groups(halves[0], len(halves) == 1)
+        if h is not None:
+            head = h
+        else:
+            return None
+    if len(halves) == 2:
+        if halves[1] != "":
+            tl = _ipv6_groups(halves[1], True)
+            if tl is not None:
+                tail = tl
+            else:
+                return None
+        if len(head) + len(tail) > 7:
+            return None
+        head = head + [0 for _ in range(8 - len(head) - len(tail))] + tail
+    elif len(head) != 8:
+        return None
+    out: list[int] = []
+    for g in head:
+        out.append(g >> 8)
+        out.append(g & 0xff)
+    return bytes(out)
+
+def ip_octets(address: str) -> ?bytes:
+    """Return the octets of an IP address in text form, None if it is not one
+
+    IPv4 dotted decimal gives 4 octets and IPv6 (RFC 4291 section 2.2, in
+    any letter case, with or without "::" and an embedded IPv4 tail) 16; an
+    IPv4-mapped IPv6 address (::ffff:192.0.2.1, ::ffff:c000:201) gives the
+    4 octets of its IPv4 address, and an IPv6 zone ("%eth0") is ignored.
+    Compare these rather than the texts: the network reports sources in
+    its own form, which need not be how the user wrote the address.
+    """
+    if ":" not in address:
+        return _ipv4_octets(address)
+    v6 = _ipv6_octets(address)
+    if v6 is not None:
+        if v6[:12] == b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff":
+            return v6[12:]
+        return v6
+    return None
+
 def is_unreachable(error: str) -> bool:
     """Return True if a transport error reports an unreachable peer port
 

@@ -10,7 +10,7 @@ import testing
 import time
 import transport
 from transport import Datagram, MemNet, NetFaults, NetStats, ServerTransport, Transport
-from transport import is_unreachable, mem_pair, normalize_address
+from transport import ip_octets, is_unreachable, mem_pair, normalize_address
 from testutil import pseudo_random, value_fails, outcome, report, report_env
 
 # Seconds a test waits to see that nothing (more) is delivered
@@ -57,6 +57,22 @@ def _test_normalize_address() -> None:
     for a in ["127.0.0.1", "::1", "::", "::ffff:", "::ffff:1.2.3", "::ffff:1.2.3.4.5", "::ffff:fe80::1",
               "fe80::ffff:1.2.3.4", "::ffff:0:1.2.3.4", "", "host.example", "2001:db8::1"]:
         testing.assertEqual(normalize_address(a), a)
+
+def _test_ip_octets() -> None:
+    v6 = bytes([0x20, 0x01, 0x0d, 0xb8] + [0] * 11 + [1])
+    for text in ["2001:db8::1", "2001:DB8::1", "2001:0db8:0000:0000:0000:0000:0000:0001", "2001:db8:0:0::1",
+                 "2001:db8::0:1", "2001:db8::0.0.0.1", "2001:db8::1%eth0"]:
+        testing.assertEqual(ip_octets(text), v6, text)
+    for text in ["192.0.2.1", "::ffff:192.0.2.1", "::FFFF:c000:201", "0:0:0:0:0:ffff:192.0.2.1"]:
+        testing.assertEqual(ip_octets(text), b"\xc0\x00\x02\x01", text)
+    testing.assertEqual(ip_octets("::"), bytes([0] * 16))
+    testing.assertEqual(ip_octets("::1"), bytes([0] * 15 + [1]))
+    testing.assertEqual(ip_octets("fe80::"), bytes([0xfe, 0x80] + [0] * 14))
+    testing.assertEqual(ip_octets("1:2:3:4:5:6:7:8"), bytes([0, 1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0, 7, 0, 8]))
+    testing.assertEqual(ip_octets("::2:3:4:5:6:7:8"), bytes([0, 0, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0, 7, 0, 8]))
+    for bad in ["", "agent.example", "192.0.2", "192.0.2.256", "192.0.2.1.5", "1:2:3:4:5:6:7", "1:2:3:4:5:6:7:8:9",
+                "1::2::3", "12345::1", "g::1", "1:2:3:4:5:6:7::8", "::192.0.2", ":1", "1:", "192.0.2.-1"]:
+        testing.assertNone(ip_octets(bad), bad)
 
 def _test_is_unreachable() -> None:
     testing.assertTrue(is_unreachable(transport.REFUSED))
@@ -861,6 +877,10 @@ actor _test_udp_unreachable_then_usable(t: testing.EnvT):
         report_env(t, error)
 
     def on_client(data: bytes, address: str, rport: int) -> None:
+        if data == b"probe":
+            # a probe sent after the one that was refused, before the refusal arrived, can reach the
+            # second listener and come back: wait for the answer to "again"
+            return
         def check() -> None:
             testing.assertEqual(data, b"again")
             testing.assertEqual([address, str(rport)], ["127.0.0.1", str(port)])

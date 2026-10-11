@@ -70,6 +70,27 @@ def _test_ordering() -> None:
     testing.assertEqual(min([c, a, b], None), a)
     testing.assertEqual(max([c, a, b], None), c)
 
+def _test_order_edges() -> None:
+    # the comparisons loop over the arcs themselves: arcs at both ends of the range, equal prefixes
+    big = 4294967295
+    testing.assertTrue(Oid([1, 3, 0]) < Oid([1, 3, big]))
+    testing.assertFalse(Oid([1, 3, big]) < Oid([1, 3, 0]))
+    testing.assertTrue(Oid([big]) > Oid([0, big, big]))
+    testing.assertTrue(Oid([1, 3]) < Oid([1, 3, 0]), "a prefix first")
+    testing.assertFalse(Oid([1, 3, 0]) < Oid([1, 3]))
+    testing.assertFalse(Oid([]) < Oid([]))
+    testing.assertTrue(Oid([1, 3, big]) == Oid([1, 3, big]))
+    testing.assertFalse(Oid([1, 3, big]) == Oid([1, 3, big, 0]))
+    testing.assertFalse(Oid([1, 3, 0]) == Oid([1, 3]))
+
+def _test_text_edges() -> None:
+    # dotted text from the table of small arcs and from str() above it
+    o = Oid([0, 1, 9, 10, 1023, 1024, 65535, 4294967295])
+    testing.assertEqual(str(o), "0.1.9.10.1023.1024.65535.4294967295")
+    testing.assertEqual(o.dotted(), ".0.1.9.10.1023.1024.65535.4294967295")
+    testing.assertEqual(str(Oid([])), "")
+    testing.assertEqual(Oid.parse(str(o)), o)
+
 def _test_hash_and_dict() -> None:
     d = {op("1.3.6.1.2.1.1.1.0"): "sysDescr", op("1.3.6.1.2.1.1.3.0"): "sysUpTime"}
     testing.assertEqual(d[Oid([1, 3, 6, 1, 2, 1, 1, 1, 0])], "sysDescr")

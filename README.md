@@ -96,6 +96,23 @@ The client discovers the agent's engine ID and time on first use. The
 security protocols are the `snmp.usm.AUTH_*` and `snmp.usm.PRIV_*`
 constants.
 
+Turning a password into a key costs a megabyte of hashing, so create one
+`Usm` per set of credentials and share it between clients.
+`Usm.with_context()` returns the same credentials for another context, and
+`Options(context_name=...)` sets the context of a single request.
+
+### Errors
+
+A failed request passes an `snmp.errors.SnmpError` to the callback. Its
+`transient` attribute is true when the same request may succeed if it is
+tried again later on the same client, for example after a timeout.
+
+### Many devices
+
+Each client has its own UDP socket, so a process that polls many devices
+needs one file descriptor per device. Raise the process's limit on open
+files for large fleets.
+
 ## Command-line tool
 
 `actsnmp` accepts net-snmp's options, for example `-v`, `-c`, `-u`, `-l`,

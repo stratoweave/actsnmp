@@ -8,6 +8,10 @@ and a Collection of its arcs, so len(o) and iterating over the arcs work.
 
 import ber
 
+# The decimal text of the arcs below 1024 (nearly all arcs of real OIDs): str() formats an int anew
+# each time, which made printing OIDs a noticeable part of a CLI walk
+_ARC_TEXT: list[str] = [str(i) for i in range(1024)]
+
 class Oid(object):
     """An OBJECT IDENTIFIER: a list of arcs, each 0..2^32-1
 
@@ -54,7 +58,11 @@ class Oid(object):
 
     def __str__(self) -> str:
         """Return the arcs joined by dots, without a leading dot: "1.3.6.1.2.1.1.1.0" """
-        return ".".join([str(a) for a in self.arcs])
+        text = _ARC_TEXT
+        parts: list[str] = []
+        for a in self.arcs:
+            parts.append(text[a] if a < 1024 else str(a))
+        return ".".join(parts)
 
     def __repr__(self) -> str:
         return "Oid(" + self.__str__() + ")"
@@ -132,10 +140,30 @@ class Oid(object):
 
 extension Oid(Ord):
     def __eq__(self, other: Oid) -> bool:
-        return self.arcs == other.arcs
+        a = self.arcs
+        b = other.arcs
+        n = len(a)
+        if n != len(b):
+            return False
+        for i in range(n):
+            x: int = a[i]
+            y: int = b[i]
+            if x != y:
+                return False
+        return True
 
     def __lt__(self, other: Oid) -> bool:
-        return self.arcs < other.arcs
+        a = self.arcs
+        b = other.arcs
+        na = len(a)
+        nb = len(b)
+        n = na if na < nb else nb
+        for i in range(n):
+            x: int = a[i]
+            y: int = b[i]
+            if x != y:
+                return x < y
+        return na < nb
 
 
 extension Oid(Hashable):

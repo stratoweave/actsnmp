@@ -51,41 +51,32 @@ class Notification(object):
 
     version is message.SNMP_V1, SNMP_V2C or SNMP_V3 and pdu_type is
     pdu.TRAP_V1, TRAP_V2 or INFORM. source_address and source_port are the
-    sender of the datagram.
+    sender of the datagram. community is set for SNMPv1/v2c; user,
+    security_level, engine_id (msgAuthoritativeEngineID), context_engine_id
+    and context_name for SNMPv3. security_level holds the message's
+    FLAG_AUTH|FLAG_PRIV bits, so compare it with the usm.LEVEL_* constants:
+    RFC 3411's SnmpSecurityLevel numbers the same levels 1 to 3
+    (usm.rfc3411_level() converts). request_id is 0 for an SNMPv1 trap.
 
-    community is set for SNMPv1/v2c and empty for SNMPv3. The SNMPv3 fields
-    are user (msgUserName), security_level, engine_id
-    (msgAuthoritativeEngineID), context_engine_id and context_name; they
-    are empty or 0 for SNMPv1/v2c. security_level is the message's
-    FLAG_AUTH|FLAG_PRIV bits, the encoding of every security level in
-    actsnmp: usm.LEVEL_NO_AUTH_NO_PRIV (0), usm.LEVEL_AUTH_NO_PRIV (1) or
-    usm.LEVEL_AUTH_PRIV (3). Compare it with those constants, not with
-    numbers: RFC 3411's SnmpSecurityLevel (SNMP-TARGET-MIB, ietf-snmp
-    YANG) numbers the same levels 1, 2 and 3, and usm.rfc3411_level()
-    converts. request_id is 0 for an SNMPv1 trap, which has none.
+    uptime is sysUpTime.0, or the time-stamp of an SNMPv1 trap, in
+    hundredths of a second, and trap_oid is snmpTrapOID.0, or derived from
+    an SNMPv1 trap (RFC 3584 section 3.1). varbinds are the payload without
+    those two; for SNMPv1 they include the snmpTrapAddress.0,
+    snmpTrapCommunity.0 and snmpTrapEnterprise.0 that RFC 3584 adds.
+    all_varbinds are the varbinds as received (SNMPv2) or converted
+    (SNMPv1), and v1 is the original SNMPv1 Trap-PDU.
 
-    uptime is the value of sysUpTime.0, or the time-stamp of an SNMPv1
-    trap, in hundredths of a second. trap_oid is the value of
-    snmpTrapOID.0, or the one derived from an SNMPv1 trap (RFC 3584 section
-    3.1). varbinds are the payload varbinds without sysUpTime.0 and
-    snmpTrapOID.0; for SNMPv1 they are the trap's varbinds followed by the
-    snmpTrapAddress.0, snmpTrapCommunity.0 and snmpTrapEnterprise.0 that
-    RFC 3584 adds (see v1_to_v2). all_varbinds are the varbinds exactly as
-    received (SNMPv2) or as converted (SNMPv1, sysUpTime.0 and
-    snmpTrapOID.0 first). v1 is the original SNMPv1 Trap-PDU, None
-    otherwise.
-
-    problem is empty for a well-formed notification. Otherwise it says what
+    problem is empty for a well-formed notification and otherwise says what
     is wrong; the notification is still usable. For SNMPv2 that means the
-    first two varbinds are not a Timeticks sysUpTime.0 and an OID-valued
-    snmpTrapOID.0: then uptime is -1 and trap_oid has no arcs unless such
-    varbinds occur elsewhere in the list, and varbinds holds all varbinds
-    (see split_v2). For SNMPv1 it means a generic-trap outside 0..6, an
-    enterprise-specific specific-trap outside 0..2^32-1 or an agent-addr
-    that is not 4 octets (see v1_trap_oid).
+    first two varbinds are not sysUpTime.0 and snmpTrapOID.0 (uptime is
+    then -1 and trap_oid empty unless they occur elsewhere, see split_v2).
+    For SNMPv1 it means a generic-trap, specific-trap or agent-addr out of
+    range (see v1_trap_oid).
 
-    repr() hides the community, which is a credential, also as the value
-    of a snmpTrapCommunity.0 varbind.
+    The varbinds of an SNMPv1 trap hold the community, a credential, as
+    snmpTrapCommunity.0, so do not log or forward them as they are.
+    payload() gives the notification's own varbinds, the same whether a
+    trap was sent as SNMPv1 or SNMPv2c. repr() hides the community.
     """
     version: int
     pdu_type: int
@@ -126,6 +117,19 @@ class Notification(object):
         self.all_varbinds = all_varbinds
         self.v1 = v1
         self.problem = problem
+
+    def payload(self) -> list[VarBind]:
+        """Return the notification's own varbinds: varbinds without the RFC 3584 extras of SNMPv1
+
+        For an SNMPv1 trap the Trap-PDU's varbinds (without the
+        snmpTrapAddress.0, snmpTrapCommunity.0 and snmpTrapEnterprise.0 that
+        v1_to_v2 appends, so without the community); otherwise varbinds.
+        A linkDown sent as SNMPv1 and as SNMPv2c gives the same payload.
+        """
+        t = self.v1
+        if t is not None:
+            return t.varbinds
+        return self.varbinds
 
     def __repr__(self) -> str:
         if self.version == message.SNMP_V3:

@@ -252,6 +252,26 @@ def _test_malformed_values() -> None:
         else:
             testing.error(hx + ": decoded to " + repr(v))
 
+def _test_counter64_every_length() -> None:
+    # Counter64 content of 1 to 8 octets (any first octet) and 9 with a leading 00 decode directly;
+    # the rest takes the checked path: the same results as dec_u64 either way
+    for n in range(1, 10):
+        for first in [0x00, 0x01, 0x7f, 0x80, 0xff]:
+            content = bytes([first]) + b"\x5a" * (n - 1)
+            hx = ("46 %02x " % n) + content.hex()
+            v = value_of(hx)
+            if n <= 8 or first == 0:
+                testing.assertEqual(v, Counter64(ber.dec_u64(content, 0, n)), hx)
+            elif isinstance(v, MalformedValue):
+                testing.assertEqual(v.reason, "Counter64 exceeds 2^64-1" if first < 0x80 else v.reason, hx)
+            else:
+                # a negative 9-octet form is masked like net-snmp
+                testing.assertEqual(v, Counter64(ber.dec_u64(content, 0, n)), hx)
+    testing.assertEqual(value_of("46 09 00 ff ff ff ff ff ff ff ff"), Counter64(18446744073709551615))
+    testing.assertEqual(value_of("46 01 ff"), Counter64(18446744073709551615))
+    testing.assertTrue(isinstance(value_of("46 00"), MalformedValue), "empty")
+    testing.assertTrue(isinstance(value_of("46 0a 00 00 00 00 00 00 00 00 00 01"), MalformedValue), "10 octets")
+
 def _test_integer_beyond_integer32() -> None:
     # INTEGER content of 1 to 9 octets that fits 64 bits is an Integer, also outside
     # Integer32 (agents put unsigned values into INTEGER objects; net-snmp shows them);

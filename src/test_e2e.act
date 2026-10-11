@@ -1092,3 +1092,96 @@ actor _test_logs_never_show_secrets(t: testing.AsyncT):
     n3 = Client(None, RECEIVER, u, handler, port=162, opts=OPTS, transport=mn.client(MANAGER, 42003, RECEIVER, 162))
     n3.trap(trap_done, notify.TRAP_COLD_START, [], 1)
     n3.inform(req_done, notify.TRAP_LINK_DOWN, [VarBind(e([1, 1, 0]), Integer(3))], 2)
+
+
+# Retry timers after a resynchronisation #############################################################
+
+actor _ResyncStaleTimer(t: testing.AsyncT, delay: float, retries: int):
+    """The agent reboots, then answers delay seconds late (timeout 0.25 s): the first request after the reboot
+    draws a notInTimeWindows Report and is resent once; the timer of its first attempt must not count as the
+    resend's (it fired as a current timer and failed or retransmitted the request early)"""
+    u = _sha_aes()
+    mn = MemNet()
+    agent = Agent(mn.server(AGENT, 161), make_view(), agent_config([u]), t.log_handler)
+    c = _client(mn, u, 40001, Options(timeout=0.25, retries=retries), t.log_handler)
+    var started = 0.0
+
+    def second(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+        waited = float(time.monotonic_ns()) / 1e9 - started
+        s = c.stats()
+        def check() -> None:
+            resp = ok(Outcome(r, err), "after the reboot (answers %.2f s late, retries %d, callback after %.3f s)"
+                      % (delay, retries, waited))
+            testing.assertEqual(resp.attempts, 2, "the request and its resynchronisation resend")
+            testing.assertEqual(s.retries, 0, "no retransmission: " + str(s))
+        report(t, outcome(check))
+
+    def first(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+        if err is not None:
+            t.failure(AssertionError("first get: " + str(err)))
+            return
+        agent.reboot()
+        mn.set_faults(NetFaults(delay=delay, to_address=MANAGER))
+        started = float(time.monotonic_ns()) / 1e9
+        c.get(second, [SYS_DESCR])
+
+    c.get(first, [SYS_DESCR])
+
+# The resend goes out when the Report arrives, delay after the request, and its answer comes delay later:
+# after the first attempt's timeout (0.25 s) when delay is 0.15 s, but within the resend's own timeout
+
+actor _test_resync_stale_timer_retries0(t: testing.AsyncT):
+    """A resynchronisation resend gets its own timeout (answers 150 ms late, timeout 250 ms, no retries)"""
+    t.timeout(30.0)
+    x = _ResyncStaleTimer(t, 0.15, 0)
+
+actor _test_resync_stale_timer_retries1(t: testing.AsyncT):
+    """No spurious retransmission after a resynchronisation (answers 150 ms late, timeout 250 ms, one retry)"""
+    t.timeout(30.0)
+    x = _ResyncStaleTimer(t, 0.15, 1)
+
+actor _Gate(inner: ServerTransport, allow: int):
+    """Passes the first allow datagrams an agent sends, then drops the rest (the agent goes silent)"""
+    var sent = 0
+
+    def send_to(data: bytes, address: str, port: int) -> None:
+        sent += 1
+        if sent <= allow:
+            inner.send_to(data, address, port)
+
+def _gated(g: _Gate, inner: ServerTransport) -> ServerTransport:
+    def _send_to(data: bytes, address: str, port: int) -> None:
+        g.send_to(data, address, port)
+    def _set_receiver(on_data: action(bytes, str, int) -> None) -> None:
+        inner.set_receiver(on_data)
+    def _close() -> None:
+        inner.close()
+    return ServerTransport(_send_to, _set_receiver, _close, lambda: 161)
+
+actor _test_resync_then_silence(t: testing.AsyncT):
+    """A notInTimeWindows Report, then the agent goes silent: the request still waits its whole retry budget
+    after the resend (three attempts of 0.2 s), and the retries go out one by one"""
+    t.timeout(30.0)
+    u = _sha_aes()
+    mn = MemNet()
+    srv = mn.server(AGENT, 161)
+    # datagrams the agent sends: the discovery Report, the notInTimeWindows Report, then nothing
+    agent = Agent(_gated(_Gate(srv, 2), srv), make_view(), agent_config([u]), t.log_handler,
+                  Faults(report_not_in_time_window_once=True))
+    c = _client(mn, u, 40001, Options(timeout=0.2, retries=2), t.log_handler)
+
+    def done(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+        s = c.stats()
+        sends = [d.dst_port for d in mn.history() if d.src_port == 40001]
+        def check() -> None:
+            e = err
+            if isinstance(e, errors.TimeoutError):
+                testing.assertEqual(e.attempts, 4, "the request, the resend and two retries")
+                testing.assertTrue(e.elapsed >= 0.55, "gave up after %.3f s, before the resend's budget" % e.elapsed)
+            else:
+                raise AssertionError("expected a TimeoutError, got " + describe(Outcome(r, err)))
+            testing.assertEqual((s.retries, s.timeouts), (2, 1), str(s))
+            testing.assertEqual(len(sends), 5, "probe and four attempts")
+        report(t, outcome(check))
+
+    c.get(done, [SYS_DESCR])

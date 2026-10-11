@@ -5,6 +5,7 @@ interop/expected/canon/dataset.txt.
 """
 
 import testing
+import time
 import ber
 import pdu
 import values
@@ -73,6 +74,75 @@ def _test_get_no_such_object() -> None:
     for s in ["1.3.6.1.2.1.1.99.0", "1.3.6.1.2.1.1", "1.3.6.1.2.1.2.2.1.3.1", "1.3.6.1.2.1.2.2.1", "1.3.6",
               "1.3.6.1.4", "2.999", "0.0", "1.3.6.1.2.1.1.2.0"]:
         testing.assertEqual(v.get(o(s)), NoSuchObject(), s)
+
+def _deep(base: str, n: int) -> Oid:
+    # base followed by arcs 7 up to n arcs in all
+    arcs = Oid.parse(base).arcs.copy()
+    while len(arcs) < n:
+        arcs.append(7)
+    return Oid(arcs)
+
+def _test_get_deep_missing() -> None:
+    # 128-arc OIDs (the decoder's limit) below or beside the view's objects answer as short ones do
+    v = sample()
+    testing.assertEqual(v.get(_deep("1.3.6.1.2.1.1.1", 128)), NoSuchInstance(), "below sysDescr")
+    testing.assertEqual(v.get(_deep("1.3.6.1.2.1.2.2.1.2", 128)), NoSuchInstance(), "below ifDescr")
+    testing.assertEqual(v.get(_deep("1.3.6.1.4.1", 128)), NoSuchInstance(), "below enterprises.16383's object")
+    testing.assertEqual(v.get(_deep("1.3.6.1.2.1.1.99", 128)), NoSuchObject(), "beside the system objects")
+    testing.assertEqual(v.get(_deep("1.4", 128)), NoSuchObject(), "nowhere near")
+    deep = MibView([VarBind(_deep("1.3.6.1.4.1.99", 40), Integer(1))])
+    testing.assertEqual(deep.get(_deep("1.3.6.1.4.1.99", 39)), NoSuchInstance(), "the deep variable's object")
+    testing.assertEqual(deep.get(_deep("1.3.6.1.4.1.99", 128)), NoSuchInstance(), "below the deep variable")
+    testing.assertEqual(deep.get(_deep("1.3.6.1.4.1.98", 128)), NoSuchObject())
+    deep.set_value(_deep("1.3.6.1.4.1.98", 60), Integer(2))
+    testing.assertEqual(deep.get(_deep("1.3.6.1.4.1.98", 128)), NoSuchInstance(), "a deeper variable added later")
+    testing.assertEqual(MibView([]).get(_deep("1.3", 128)), NoSuchObject(), "an empty view")
+
+def _test_values_follow_changes() -> None:
+    # get_next(), varbinds() and get() read the same values after set_value() of new and existing OIDs and
+    # after apply_set()
+    v = sample()
+    v.set_value(o("1.3.6.1.2.1.1.3.0"), TimeTicks(99))
+    v.set_value(o("1.3.6.1.2.1.1.4.0"), OctetString(b"new"))
+    v.set_value(o("1.3.6.1.1"), Integer(0))
+    rules = [WriteRule(o("1.3.6.1.2.1.1.5"), [ber.TAG_OCTET_STRING])]
+    testing.assertEqual(v.apply_set([VarBind(o("1.3.6.1.2.1.1.5.0"), OctetString(b"renamed"))], rules), (0, 0))
+    want = {"1.3.6.1.2.1.1.3.0": TimeTicks(99), "1.3.6.1.2.1.1.4.0": OctetString(b"new"),
+            "1.3.6.1.1": Integer(0), "1.3.6.1.2.1.1.5.0": OctetString(b"renamed")}
+    for k, val in want.items():
+        testing.assertEqual(v.get(o(k)), val, k)
+    vbs = v.varbinds()
+    testing.assertEqual(len(vbs), 9)
+    for i in range(len(vbs)):
+        testing.assertEqual(v.get(vbs[i].oid), vbs[i].value, "varbinds() and get() agree")
+        if i > 0:
+            testing.assertEqual(v.get_next(vbs[i - 1].oid), vbs[i], "get_next() and varbinds() agree")
+    testing.assertEqual(v.get_next(o("1.3.6.1.2.1.1.3.0")), VarBind(o("1.3.6.1.2.1.1.4.0"), OctetString(b"new")))
+    testing.assertEqual(v.varbinds(o("1.3.6.1.2.1.1")),
+                        [VarBind(o("1.3.6.1.2.1.1.1.0"), OctetString(b"sysDescr")),
+                         VarBind(o("1.3.6.1.2.1.1.3.0"), TimeTicks(99)),
+                         VarBind(o("1.3.6.1.2.1.1.4.0"), OctetString(b"new")),
+                         VarBind(o("1.3.6.1.2.1.1.5.0"), OctetString(b"renamed"))])
+
+def _lookup_seconds(v: MibView, oid: Oid, n: int) -> float:
+    best = 1000.0
+    for _ in range(3):
+        t0 = float(time.monotonic_ns()) / 1e9
+        for _ in range(n):
+            v.get(oid)
+        dt = float(time.monotonic_ns()) / 1e9 - t0
+        if dt < best:
+            best = dt
+    return best
+
+def _test_get_deep_missing_cost() -> None:
+    # get() of a missing OID must not build and hash an Oid for every prefix (O(depth^2): one GET of 450
+    # missing 128-arc OIDs would keep the agent busy for half a second): the prefixes stop at the
+    # deepest object of the view, so a 128-arc OID costs about what a short one does.
+    v = sample()
+    short = _lookup_seconds(v, o("1.3.6.1.2.1.1.99.0"), 200)
+    long = _lookup_seconds(v, _deep("1.3.6.1.2.1.1.99", 128), 200)
+    testing.assertTrue(long < short * 8.0 + 0.0005, "200 lookups: %.6f s with 128 arcs, %.6f s with 9" % (long, short))
 
 def _test_get_next() -> None:
     v = sample()

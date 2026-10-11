@@ -18,6 +18,7 @@ import message
 import notify
 import pdu
 import usm
+import client as client_mod
 from client import Client, EngineInfo, Options, Response, Stats, error_response
 from engine import AuthoritativeEngine
 from message import CommunityMessage, ScopedPdu, UsmSecurityParameters, V3Message
@@ -223,7 +224,8 @@ def _test_response_and_stats_repr() -> None:
     testing.assertEqual(repr(r), "Response(RESPONSE, request_id=9, error_status=0, error_index=0, varbinds=[], attempts=2, rtt=0.500000)")
     s = Stats(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 0.0, 0.0)
     testing.assertEqual(repr(s), "Stats(requests=1, retries=2, timeouts=3, responses=4, drops_decode=5, drops_unknown_id=6, "
-                        + "drops_source=7, drops_auth=8, drops_version=9, drops_pdu=10, reports=11, unreachable=12, queued=0, in_flight=0)")
+                        + "drops_source=7, drops_auth=8, drops_version=9, drops_pdu=10, reports=11, unreachable=12, queued=0, in_flight=0, "
+                        + "transport_failures=0)")
     testing.assertEqual(repr(EngineInfo(h("8000000001"), 1, 2, 0.0)), "EngineInfo(engine_id=8000000001, boots=1, time=2)")
 
 
@@ -1322,8 +1324,9 @@ actor _test_transport_failures(t: testing.AsyncT):
     var log: list[str] = []
 
     def name_of(e: ?errors.SnmpError) -> str:
+        # neither Client can ever send (a supplied transport cannot be set up again): not transient
         if isinstance(e, errors.TransportError):
-            return "transport: " + e.error_message
+            return "transport: " + e.error_message + (" (transient)" if e.transient else "")
         if e is not None:
             return "other: " + str(e)
         return "ok"
@@ -1775,7 +1778,8 @@ actor _test_v3_resync_budget(t: testing.AsyncT):
             testing.assertEqual(err.name, usm.USM_STATS_NOT_IN_TIME_WINDOWS)
             testing.assertEqual(err.oid, usm.report_oid(usm.USM_STATS_NOT_IN_TIME_WINDOWS).arcs)
             testing.assertEqual(err.value, 1)
-            testing.assertFalse(err.transient)
+            # the engine state was reset: the next request rediscovers and may well succeed
+            testing.assertTrue(err.transient, "a persistent notInTimeWindows is transient")
         else:
             testing.error("not a ReportError: " + str(err))
         testing.assertEqual(agent.seen(), ["probe", usm.USM_STATS_NOT_IN_TIME_WINDOWS, usm.USM_STATS_NOT_IN_TIME_WINDOWS])
@@ -1834,10 +1838,13 @@ actor _test_v3_report_kinds(t: testing.AsyncT):
     var names: list[str] = []
     var arcs: list[list[int]] = []
 
+    var transient: list[bool] = []
+
     def check() -> None:
         testing.assertEqual(names, [usm.USM_STATS_UNKNOWN_USER_NAMES, usm.USM_STATS_WRONG_DIGESTS,
                                     usm.USM_STATS_UNSUPPORTED_SEC_LEVELS, usm.USM_STATS_DECRYPTION_ERRORS,
                                     "unknown report"])
+        testing.assertEqual(transient, [False, False, False, False, False], "configuration problems are permanent")
         testing.assertEqual(arcs[0], usm.report_oid(usm.USM_STATS_UNKNOWN_USER_NAMES).arcs)
         testing.assertEqual(arcs[4], [1, 3, 6, 1, 4, 1, 99, 99, 0])
 
@@ -1845,6 +1852,7 @@ actor _test_v3_report_kinds(t: testing.AsyncT):
         if isinstance(e, errors.ReportError):
             names.append(e.name)
             arcs.append(e.oid)
+            transient.append(e.transient)
         else:
             names.append("not a ReportError: " + _describe(e))
             arcs.append([])
@@ -2328,6 +2336,7 @@ actor _test_v3_unknown_engine_twice(t: testing.AsyncT):
         err = _failed(r, e)
         if isinstance(err, errors.ReportError):
             testing.assertEqual(err.name, usm.USM_STATS_UNKNOWN_ENGINE_IDS)
+            testing.assertTrue(err.transient, "the next request rediscovers: transient")
         else:
             testing.error("not a ReportError: " + str(err))
         u = usm.USM_STATS_UNKNOWN_ENGINE_IDS
@@ -2565,14 +2574,14 @@ actor _test_v3_other_engine_report_bounded(t: testing.AsyncT):
 
     def check() -> None:
         testing.assertEqual(len(outcomes), 1, "exactly one callback")
-        testing.assertEqual(outcomes[0], "ReportError " + usm.USM_STATS_UNKNOWN_USER_NAMES)
+        testing.assertEqual(outcomes[0], "ReportError " + usm.USM_STATS_UNKNOWN_USER_NAMES + " transient")
         testing.assertEqual(agent.seen(), ["probe", "other engine", "probe", "other engine"])
         s = c.stats()
         testing.assertEqual((s.reports, s.timeouts), (4, 0), str(s))
 
     def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         if isinstance(e, errors.ReportError):
-            outcomes.append("ReportError " + e.name)
+            outcomes.append("ReportError " + e.name + (" transient" if e.transient else " permanent"))
         else:
             outcomes.append("not a ReportError: " + _describe(e))
         after now QUIET: _finish(t, check)
@@ -3068,7 +3077,7 @@ def _test_rv_options_repr_complete() -> None:
     for name in ["timeout", "retries", "backoff", "max_timeout", "max_in_flight", "max_oids_per_request",
                  "max_repetitions", "use_bulk", "adaptive_bulk", "check_increasing", "get_root_if_empty",
                  "max_walk_varbinds", "v1_fix_errors", "strict_response_oids", "check_community", "request_id_bits",
-                 "max_queued", "split_too_big"]:
+                 "max_queued", "split_too_big", "context_name"]:
         testing.assertTrue(name + "=" in r, name + " missing in " + r)
 
 actor _test_rv_max_queued(t: testing.AsyncT):
@@ -3096,3 +3105,242 @@ actor _test_rv_max_queued(t: testing.AsyncT):
         c.get(done, _oids(1))
     s = c.stats()
     c.close()
+
+
+# Discovery waiters, address forms, id exhaustion, contexts, socket setup ############################
+
+actor _test_v3_many_discovery_waiters(t: testing.AsyncT):
+    """20000 requests (0.5 s budget each) wait behind a discovery probe that a request with a 30 s budget
+    started, against a silent agent: each fails alone when its budget passes, and joining and leaving the
+    waiters costs O(1) (a list would make it quadratic: the Client busy for tens of seconds)"""
+    t.timeout(120.0)
+    mn = MemNet()
+    p = mem_pair(mn)
+    c = Client(None, AGENT, _shaaes(), None, opts=Options(timeout=0.5, retries=0, max_in_flight=30000),
+               transport=p.client)
+    var n = 0
+    var wrong = 0
+    var t0 = 0.0
+
+    def on_request(data: bytes, address: str, port: int) -> None:
+        pass
+
+    def first(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        pass
+
+    def check(elapsed: float) -> None:
+        testing.assertEqual(wrong, 0, "callbacks that were not a TimeoutError")
+        testing.assertTrue(elapsed < 8.0, "the last of 20000 callbacks came %.2f s after the first request" % elapsed)
+
+    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        if not isinstance(e, errors.TimeoutError):
+            wrong += 1
+        n += 1
+        if n == 20000:
+            elapsed = _now() - t0
+            c.close()
+            _finish(t, lambda: check(elapsed))
+
+    p.server.set_receiver(on_request)
+    t0 = _now()
+    c.get(first, _oids(1), Options(timeout=30.0, retries=0))
+    for i in range(20000):
+        c.get(done, _oids(1))
+
+actor _test_v3_late_joiner_keeps_budget(t: testing.AsyncT):
+    """A request that joins a running discovery probe late keeps its whole budget (4 s), although the probe
+    was started 0.8 s earlier by a request with a 1 s budget"""
+    t.timeout(30.0)
+    mn = MemNet()
+    p = mem_pair(mn)
+    c = Client(None, AGENT, _shaaes(), None, opts=Options(timeout=1.0, retries=0, max_in_flight=4),
+               transport=p.client)
+    var t_b = 0.0
+    var a_waited = 0.0
+    var t0 = 0.0
+
+    def on_request(data: bytes, address: str, port: int) -> None:
+        pass
+
+    def a_done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        a_waited = _now() - t0
+
+    def check(e: ?errors.SnmpError, waited: float) -> None:
+        testing.assertTrue(isinstance(e, errors.TimeoutError), _describe(e))
+        testing.assertTrue(waited >= 3.9, "B (budget 4 s) failed after %.2f s: " % waited + _describe(e))
+        testing.assertTrue(a_waited >= 0.95 and a_waited < 1.5, "A (budget 1 s) failed after %.2f s" % a_waited)
+
+    def b_done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        waited = _now() - t_b
+        _finish(t, lambda: check(e, waited))
+
+    def start_b() -> None:
+        t_b = _now()
+        c.get(b_done, _oids(1), Options(timeout=2.0, retries=1))
+
+    p.server.set_receiver(on_request)
+    t0 = _now()
+    c.get(a_done, _oids(1))
+    after now 0.8: start_b()
+
+actor _Ipv6Agent(srv: ServerTransport):
+    """Answers every SNMPv2c GET (a v2c responder on an IPv6 address)"""
+    def on_request(data: bytes, address: str, port: int) -> None:
+        c = _cm(data)
+        srv.send_to(_reply(c, _answer(_pdu(c).varbinds)), address, port)
+    srv.set_receiver(on_request)
+
+actor _test_ipv6_address_forms(t: testing.AsyncT):
+    """With a supplied transport the Client checks the source address itself: an IPv6 address written in
+    another legal form than the network reports it (upper case, zeros, an embedded IPv4 tail) is the same address"""
+    mn = MemNet()
+    p = mem_pair(mn, "2001:db8::2", 40000, "2001:db8::1", 161)
+    agent = _Ipv6Agent(p.server)
+    q = mem_pair(mn, "::ffff:a00:2", 40001, "::ffff:a00:1", 161)
+    agent2 = _Ipv6Agent(q.server)
+    var log: list[str] = []
+
+    def check() -> None:
+        testing.assertEqual(sorted(log), ["2001:0DB8:0000:0000:0000:0000:0000:0001 ok", "2001:DB8:0:0::1 ok",
+                                          "2001:db8::0.0.0.1 ok", "::ffff:10.0.0.1 ok"])
+
+    def finish(what: str, r: ?Response, e: ?errors.SnmpError) -> None:
+        log.append(what + (" ok" if e is None else " " + str(e)))
+        if len(log) == 4:
+            _finish(t, check)
+
+    def one(addr: str) -> None:
+        c = Client(None, addr, Community("public"), t.log_handler, opts=SLOW,
+                   transport=mn.client("2001:db8::2", 0, "2001:db8::1", 161))
+        def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            finish(addr, r, e)
+        c.get(done, _oids(1))
+
+    for a in ["2001:DB8:0:0::1", "2001:0DB8:0000:0000:0000:0000:0000:0001", "2001:db8::0.0.0.1"]:
+        one(a)
+    c4 = Client(None, "::ffff:10.0.0.1", Community("public"), t.log_handler, opts=SLOW,
+                transport=mn.client("::ffff:a00:2", 0, "::ffff:a00:1", 161))
+    def done4(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        finish("::ffff:10.0.0.1", r, e)
+    c4.get(done4, _oids(1))
+
+actor _test_id16_exhaustion(t: testing.AsyncT):
+    """request_id_bits=16 with more pending attempts than ids (32767): the attempt that finds no free
+    request-id fails its request with QueueFullError (instead of drawing ids forever,
+    which would hang the Client); the others keep their ids"""
+    t.timeout(120.0)
+    mn = MemNet()
+    p = mem_pair(mn)
+    c = Client(None, AGENT, Community("public"), None,
+               opts=Options(timeout=60.0, retries=0, request_id_bits=16, max_in_flight=40000),
+               transport=p.client)
+    var full: list[str] = []
+    var others = 0
+
+    def on_request(data: bytes, address: str, port: int) -> None:
+        pass
+
+    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        if isinstance(e, errors.QueueFullError):
+            full.append(e.error_message)
+        else:
+            others += 1
+
+    p.server.set_receiver(on_request)
+    for i in range(32768):
+        c.get(done, _oids(1))
+    # a synchronous call: it returns only once every get() above has been handled
+    s = c.stats()
+
+    def check(texts: list[str], n_others: int) -> None:
+        testing.assertEqual(len(texts), 1, "one request without an id")
+        testing.assertTrue(texts[0].startswith("no free request-id"), texts[0])
+        testing.assertEqual(n_others, 0, "no other callback yet")
+        testing.assertEqual((s.in_flight, s.queued), (32767, 0), str(s))
+
+    def finish() -> None:
+        texts = full
+        n_others = others
+        c.close()
+        _finish(t, lambda: check(texts, n_others))
+    after now QUIET: finish()
+
+actor _test_v3_context_per_request(t: testing.AsyncT):
+    """Options.context_name selects the SNMPv3 context of one request (BRIDGE-MIB per VLAN with one Client);
+    Usm.with_context gives the same credentials for another context without a password-to-key"""
+    mn = MemNet()
+    p = mem_pair(mn)
+    agent = _V3Agent(p.server, _users(), _engine_id())
+    u = _shaaes()
+    c = Client(None, AGENT, u, t.log_handler, opts=SLOW, transport=p.client)
+    var got: list[bytes] = []
+
+    def check() -> None:
+        testing.assertEqual(got, [b"", b"vlan-10", b"vlan-20", b"vrf-blue"])
+        v = u.with_context("vrf-blue")
+        testing.assertEqual((v.auth_ku, v.priv_ku, v.user, v.context_name), (u.auth_ku, u.priv_ku, u.user, b"vrf-blue"))
+
+    def one(r: ?Response, e: ?errors.SnmpError) -> None:
+        resp = r
+        got.append(resp.context_name if resp is not None else b"error: " + _describe(e).encode())
+        if len(got) == 4:
+            _finish(t, check)
+
+    def d0(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        one(r, e)
+        c.get(d1, _oids(1), SLOW.with_(context_name=b"vlan-10"))
+
+    def d1(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        one(r, e)
+        c.get(d2, _oids(1), Options(timeout=2.0, retries=0, context_name=b"vlan-20"))
+
+    def d2(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        one(r, e)
+        c2 = Client(None, AGENT, u.with_context("vrf-blue"), t.log_handler, opts=SLOW,
+                    transport=mn.client(MANAGER, 0, AGENT, 161))
+        c2.get(d3, _oids(1))
+
+    def d3(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        one(r, e)
+
+    c.get(d0, _oids(1))
+
+actor _test_transport_set_up_again(t: testing.EnvT):
+    """A Client whose UDP socket could not be set up (a name that does not resolve: a DNS outage, or too
+    many open files) reports transient TransportErrors and sets the socket up again for a request after
+    the retry wait, instead of failing every later request at once forever"""
+    t.timeout(60.0)
+    cap = net.UDPConnectCap(net.UDPCap(net.NetCap(t.env.cap)))
+    c = Client(cap, "no-such-host.invalid", Community("public"), None, opts=Options(timeout=10.0, retries=0))
+    var seen: list[str] = []
+
+    def check(s: Stats) -> None:
+        testing.assertEqual(len(seen), 3)
+        for x in seen:
+            testing.assertTrue(x.startswith("transient "), x)
+        testing.assertEqual(s.transport_failures, 2, "a setup, a failure, a new setup after the wait: " + str(s))
+
+    def third(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        note(e)
+        s = c.stats()
+        _finish_env(t, lambda: check(s))
+
+    def again() -> None:
+        c.get(third, _oids(1))
+
+    def second(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        # right after the failure: fails at once, no new setup yet
+        note(e)
+        after now client_mod.TRANSPORT_RETRY + 0.2: again()
+
+    def first(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        note(e)
+        c.get(second, _oids(1))
+
+    def note(e: ?errors.SnmpError) -> None:
+        if isinstance(e, errors.TransportError):
+            seen.append(("transient " if e.transient else "permanent ") + e.error_message)
+        else:
+            seen.append("not a TransportError: " + _describe(e))
+
+    c.get(first, _oids(1))

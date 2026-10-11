@@ -40,7 +40,20 @@ class SnmpError(Exception):
     """Base class of all actsnmp errors
 
     transient is True when the same operation may succeed if tried again
-    later (no response, a socket error, genErr), False when it will not.
+    later on the same Client (no response, a socket error, genErr), False
+    when it will not without a change of configuration (or, for a Client
+    whose transport cannot work, a new Client). Per class:
+
+      DecodeError, EncodeError, AuthError, InvalidResponseError,
+      OidNotIncreasingError, CancelledError    never
+      TimeoutError, QueueFullError             always
+      TransportError                           unless the Client cannot set its
+                                               transport up again (see there)
+      ErrorStatusError                         genErr and resourceUnavailable
+      ReportError                              notInTimeWindows, unknownEngineIDs and
+                                               Reports from another engine once the
+                                               Client's recovery for the request is
+                                               spent (see there)
     """
     transient: bool
 
@@ -94,9 +107,15 @@ class TimeoutError(SnmpError):
 
 
 class TransportError(SnmpError):
-    """Socket, address resolution or send failure (transient)"""
-    def __init__(self, msg: str):
-        SnmpError.__init__(self, msg, True)
+    """Socket, address resolution or send failure
+
+    transient (the default) when the Client sets its UDP socket up again
+    for a later request (a name that did not resolve, too many open files,
+    a connect timeout); False when it cannot: a transport that was given
+    to it, or neither a capability nor a transport.
+    """
+    def __init__(self, msg: str, transient: bool=True):
+        SnmpError.__init__(self, msg, transient)
 
 
 class QueueFullError(SnmpError):
@@ -137,13 +156,20 @@ class ReportError(SnmpError):
     oid holds the arcs of the reported counter (for example
     1.3.6.1.6.3.15.1.1.3.0), name its name ("usmStatsUnknownUserNames") and
     value the counter value when the report carried an integer.
+
+    transient is True for the Reports that end a request only because its
+    recovery is spent (a second notInTimeWindows, unknownEngineIDs, or a
+    Report from another engine): the Client resets or rediscovers, and the
+    next request usually succeeds. Other Reports (unknownUserNames,
+    wrongDigests, unsupportedSecLevels, decryptionErrors) mean wrong
+    credentials or configuration and are not transient.
     """
     oid: list[int]
     name: str
     value: ?int
 
-    def __init__(self, oid: list[int], name: str, value: ?int=None):
-        SnmpError.__init__(self, _report_msg(oid, name, value))
+    def __init__(self, oid: list[int], name: str, value: ?int=None, transient: bool=False):
+        SnmpError.__init__(self, _report_msg(oid, name, value), transient)
         self.oid = oid
         self.name = name
         self.value = value

@@ -188,6 +188,17 @@ def _test_context() -> None:
     testing.assertEqual(v.context_name, b"vrf-\xc3\xa9")
     testing.assertEqual(v.context_engine_id, engine())
 
+def _test_with_context() -> None:
+    u = Usm.from_passwords("c", usm.AUTH_SHA1, "authpassword", usm.PRIV_AES128, "privpassword", context_name="a")
+    v = u.with_context("vlan-10")
+    testing.assertEqual((v.user, v.auth_protocol, v.priv_protocol), (u.user, u.auth_protocol, u.priv_protocol))
+    testing.assertEqual((v.auth_ku, v.priv_ku), (u.auth_ku, u.priv_ku), "the master keys are shared")
+    testing.assertEqual((v.context_name, v.context_engine_id), (b"vlan-10", None))
+    testing.assertEqual(u.context_name, b"a", "the original is unchanged")
+    w = u.with_context("", engine())
+    testing.assertEqual((w.context_name, w.context_engine_id), (b"", engine()))
+    testing.assertEqual(w.localized(engine()).priv_key, u.localized(engine()).priv_key)
+
 def _test_usm_repr_hides_secrets() -> None:
     u = Usm.from_passwords("shaaes", usm.AUTH_SHA1, "authpassword", usm.PRIV_AES128, "privpassword", "ctx")
     r = repr(u)

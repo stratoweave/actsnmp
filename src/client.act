@@ -26,11 +26,18 @@ The request engine:
     so a late reply to an earlier attempt is accepted. The exception is an
     SNMPv2c InformRequest: its retransmissions keep the request-id, so that
     the receiver's duplicate suppression recognises them.
-  * Timers use `after now` with the attempt number as generation: Acton
-    timers cannot be cancelled, so a timer of a superseded attempt or of a
-    completed request finds nothing to do. Attempt n (from 0) waits
-    timeout * backoff^n seconds, capped at max_timeout (but never below
-    timeout).
+  * Timers use `after now` with the attempt number as generation, copied
+    into locals before the timer is armed (the call after `after` is
+    evaluated when it fires): Acton timers cannot be cancelled, so a timer
+    of a superseded attempt (one before a resynchronisation resend, say)
+    or of a completed request finds nothing to do. Attempt n (from 0)
+    waits timeout * backoff^n seconds, capped at max_timeout (but never
+    below timeout).
+  * A transport whose setup failed fails the pending requests with
+    errors.TransportError; a Client that set up its own UDP socket sets it
+    up again for a request TRANSPORT_RETRY seconds later (doubling up to
+    TRANSPORT_RETRY_MAX), so a DNS outage or a shortage of file
+    descriptors does not leave it dead.
   * A datagram is checked in this order: decode, version, id lookup,
     source address and port, community (with Options.check_community) or
     USM, PDU type, then the shape of the response. One that fails a check
@@ -70,7 +77,7 @@ request. GETBULK is used on SNMPv2c and SNMPv3 (Options.use_bulk), GETNEXT
 on SNMPv1. A walk ends at the first OID outside its root, at an exception
 value (endOfMibView, and noSuchObject/noSuchInstance which some agents
 answer to a GETNEXT), at SNMPv1 noSuchName, after
-Options.max_walk_varbinds varbinds, or when it is cancelled. OIDs must
+Options.max_walk_varbinds varbinds (Table.truncated), or when it is cancelled. OIDs must
 increase strictly, within one GETBULK response too
 (errors.OidNotIncreasingError); with check_increasing=False an OID seen
 before ends the walk with that error instead (a loop guard). A walk that
@@ -78,11 +85,13 @@ found nothing GETs its root (get_root_if_empty), as net-snmp and gosnmp do.
 An empty GETBULK response makes no progress and fails the walk
 (errors.InvalidResponseError). With Options.adaptive_bulk a GETBULK of a
 walk that gets tooBig, or times out, is resent with half the
-max-repetitions (at least 1), and the value that worked is remembered for
-the Client's later walks; it doubles again (up to the walk's
-max_repetitions) after BULK_REGROW_AFTER clean responses at it, and a
-doubling that fails makes the next one wait twice as long (at most
-BULK_REGROW_AFTER_MAX responses).
+max-repetitions (at least 1), and the value of the attempt that was
+answered is remembered for the Client's later walks; it doubles again (up
+to the walk's max_repetitions) after BULK_REGROW_AFTER clean responses at
+it, and a doubling that fails makes the next one wait twice as long (at
+most BULK_REGROW_AFTER_MAX responses). get_table() merges columns of
+tables that share an index (Row.cells) and can be narrowed to the rows of
+a leading index (index_prefix).
 
 Notifications: trap() sends an SNMPv2-Trap (v2c, or v3 where the Client is
 the authoritative engine: local_engine_id, local_engine_boots, time since
@@ -108,7 +117,7 @@ from message import CommunityMessage, ScopedPdu, UsmSecurityParameters, V3Messag
 from oid import Oid
 from pdu import Pdu, TrapV1Pdu
 from security import Community, Security, Usm
-from transport import Transport, is_unreachable, normalize_address, udp_transport
+from transport import Transport, ip_octets, is_unreachable, udp_transport
 from usm import EngineTime, LocalizedUser, SaltCounter
 from values import Counter32, EndOfMibView, NoSuchObject, Value, VarBind, is_exception
 
@@ -125,6 +134,13 @@ RESET_AFTER_TIMEOUTS = 2
 # that drops answers above some size costs at most one retry per BULK_REGROW_AFTER_MAX responses.
 BULK_REGROW_AFTER = 8
 BULK_REGROW_AFTER_MAX = 256
+
+# A Client whose own UDP socket could not be set up (a name that did not resolve, too many open
+# files, a connect timeout) sets it up again for the first request that comes this many seconds
+# after the failure or later; the wait doubles with each failed setup in a row, up to
+# TRANSPORT_RETRY_MAX, and starts over once a datagram arrives
+TRANSPORT_RETRY = 1.0
+TRANSPORT_RETRY_MAX = 60.0
 
 # Enterprise number in the default local engine ID (RFC 3411 format 5,
 # "octets"): net-snmp's 8072, as the actsnmp agent's default engine ID uses
@@ -166,6 +182,9 @@ def _default_engine_id() -> bytes:
 def _plural(n: int, one: str, many: str) -> str:
     return "%d " % n + (one if n == 1 else many)
 
+def _repr_bytes(b: ?bytes) -> str:
+    return repr(b) if b is not None else "None"
+
 def _finite_positive(x: float) -> bool:
     return x > 0.0 and x <= 86400.0
 
@@ -173,58 +192,48 @@ def _finite_positive(x: float) -> bool:
 class Options(object):
     """Tunables of a Client, per Client and per request
 
-    timeout is the time in seconds the first attempt of a request waits for
-    an answer, and retries the number of further attempts. Attempt n (from
-    0) waits timeout * backoff^n seconds, at most max_timeout but never
-    less than timeout (backoff 1.0 waits the same each time, like net-snmp).
-    Retrying a SET is not idempotent in practice (a retried createAndGo can
-    fail although the first attempt succeeded): consider retries=0 for it.
+    timeout is the wait in seconds for the first attempt and retries the
+    number of further attempts. Attempt n (from 0) waits timeout *
+    backoff^n, at most max_timeout but never less than timeout. Retrying a
+    SET is not idempotent in practice (a retried createAndGo can fail
+    although the first attempt succeeded), so consider retries=0 for it.
 
-    max_in_flight is the number of requests that may be outstanding at the
-    agent at the same time; more are queued in order. max_queued bounds
-    that queue (0: no bound): a request beyond it fails at once with
-    errors.QueueFullError (transient), so a poller of a dead device cannot
-    grow memory without limit. Both are read from the Client's own options
-    only, not per request.
+    At most max_in_flight requests are outstanding at once; the rest wait
+    in a queue of at most max_queued (0: unbounded), beyond which a request
+    fails at once with errors.QueueFullError. Both are read from the
+    Client's own options only, not per request.
 
-    max_oids_per_request splits GET and GETNEXT requests with more varbinds
-    into several PDUs (0: never). A SET is never split, because a split
-    SET is not atomic. max_repetitions is the GETBULK default.
-    split_too_big: a tooBig answer to a GET or GETNEXT of several varbinds
-    splits it in half (recursively), and one to a GETBULK halves its
-    max-repetitions; without it tooBig fails the request like any other
-    error-status (errors.ErrorStatusError), as net-snmp's tools report it.
+    max_oids_per_request splits larger GET and GETNEXT requests into
+    several PDUs (0: never). With split_too_big, a tooBig answer splits a
+    GET or GETNEXT in half, recursively, and halves a GETBULK's
+    max-repetitions; without it tooBig is an ordinary
+    errors.ErrorStatusError, as in net-snmp's tools. A SET is never split,
+    since it would no longer be atomic.
 
-    use_bulk, adaptive_bulk, check_increasing, get_root_if_empty and
-    max_walk_varbinds control walks and tables:
-    use_bulk makes them use GETBULK with max_repetitions (at least 1) on
-    SNMPv2c and SNMPv3 (SNMPv1 always uses GETNEXT). With adaptive_bulk a
-    GETBULK of a walk that gets tooBig, or times out, is resent with half
-    the max-repetitions (at least 1, within the request's retries), and
-    the value that worked is kept for the Client's later walks; it doubles
-    again, up to the walk's max_repetitions, after BULK_REGROW_AFTER clean
-    responses at it (a doubling that fails waits twice as long next time,
-    at most BULK_REGROW_AFTER_MAX). check_increasing requires every OID a
-    walk receives to be greater than the previous one of its subtree
-    (errors.OidNotIncreasingError); without it, an OID received a second
-    time ends the walk with that error (a loop guard). get_root_if_empty
-    makes a walk that found nothing GET its root. max_walk_varbinds stops
-    a walk or table, without an error, after that many varbinds.
+    Walks and tables use GETBULK with max_repetitions when use_bulk is set
+    (SNMPv1 always uses GETNEXT). With adaptive_bulk, a walk's GETBULK that
+    gets tooBig or times out is resent with half the max-repetitions; the
+    value that worked is kept for later walks and grows again after
+    BULK_REGROW_AFTER clean responses. check_increasing fails a walk whose
+    OIDs do not increase (errors.OidNotIncreasingError); without it only an
+    OID seen twice does. get_root_if_empty makes a walk that found nothing
+    GET its root. max_walk_varbinds stops a walk or table, without an
+    error, after that many varbinds.
 
-    v1_fix_errors: with SNMPv1, a GET answered with noSuchName drops that
-    varbind, sends the rest again and reports NoSuchObject for it; a GETNEXT
-    reports EndOfMibView (net-snmp's snmpget default; -Cf turns it off).
-    strict_response_oids: a GET, SET or InformRequest response must name
-    the requested OIDs in order. check_community: drop SNMPv1/v2c responses
-    whose community differs from ours (net-snmp does not check).
-    request_id_bits is 31, or 16 for old agents: request-ids then stay in
-    1..32767, like net-snmp's 16-bit id mode.
+    v1_fix_errors makes an SNMPv1 GET answered with noSuchName drop that
+    varbind, resend the rest and report NoSuchObject for it (EndOfMibView
+    for a GETNEXT), like net-snmp's snmpget. strict_response_oids requires
+    a GET, SET or InformRequest response to name the requested OIDs in
+    order. check_community drops SNMPv1/v2c responses with another
+    community (net-snmp does not check). request_id_bits is 31, or 16 for
+    old agents that need ids in 1..32767; at most 32767 attempts can then
+    be pending.
 
-    The constructor raises ValueError for a timeout, backoff or max_timeout
-    that is not a positive number of at most 86400, negative retries,
-    max_in_flight below 1, a negative max_oids_per_request, max_repetitions
-    or max_queued, max_walk_varbinds below 1, or request_id_bits other
-    than 31 and 16. with_() returns a copy with some fields replaced.
+    context_name selects the SNMPv3 context instead of the Usm's, for
+    example b"vlan-10" for one VLAN's BRIDGE-MIB; None takes the Usm's.
+    SNMPv1/v2c ignore it ("public@10" needs a Client of its own).
+
+    The constructor raises ValueError for a value out of range.
     """
     timeout: float
     retries: int
@@ -244,13 +253,14 @@ class Options(object):
     request_id_bits: int
     max_queued: int
     split_too_big: bool
+    context_name: ?bytes
 
     def __init__(self, timeout: float=1.0, retries: int=3, backoff: float=1.0, max_timeout: float=8.0,
                  max_in_flight: int=1, max_oids_per_request: int=32, max_repetitions: int=25,
                  use_bulk: bool=True, adaptive_bulk: bool=True, check_increasing: bool=True,
                  get_root_if_empty: bool=True, max_walk_varbinds: int=1000000, v1_fix_errors: bool=True,
                  strict_response_oids: bool=True, check_community: bool=False, request_id_bits: int=31,
-                 max_queued: int=0, split_too_big: bool=True):
+                 max_queued: int=0, split_too_big: bool=True, context_name: ?bytes=None):
         if not _finite_positive(timeout):
             raise ValueError("Options.timeout must be a positive number of seconds up to 86400")
         if not _finite_positive(backoff):
@@ -289,14 +299,19 @@ class Options(object):
         self.request_id_bits = request_id_bits
         self.max_queued = max_queued
         self.split_too_big = split_too_big
+        self.context_name = context_name
 
     def with_(self, timeout: ?float=None, retries: ?int=None, backoff: ?float=None, max_timeout: ?float=None,
               max_in_flight: ?int=None, max_oids_per_request: ?int=None, max_repetitions: ?int=None,
               use_bulk: ?bool=None, adaptive_bulk: ?bool=None, check_increasing: ?bool=None,
               get_root_if_empty: ?bool=None, max_walk_varbinds: ?int=None, v1_fix_errors: ?bool=None,
               strict_response_oids: ?bool=None, check_community: ?bool=None,
-              request_id_bits: ?int=None, max_queued: ?int=None, split_too_big: ?bool=None) -> Options:
-        """Return a copy with the given fields replaced; raises ValueError like the constructor"""
+              request_id_bits: ?int=None, max_queued: ?int=None, split_too_big: ?bool=None,
+              context_name: ?bytes=None) -> Options:
+        """Return a copy with the given fields replaced; raises ValueError like the constructor
+
+        context_name None keeps the current one (a copy cannot clear it: build new Options for that).
+        """
         return Options(timeout if timeout is not None else self.timeout,
                        retries if retries is not None else self.retries,
                        backoff if backoff is not None else self.backoff,
@@ -314,7 +329,8 @@ class Options(object):
                        check_community if check_community is not None else self.check_community,
                        request_id_bits if request_id_bits is not None else self.request_id_bits,
                        max_queued if max_queued is not None else self.max_queued,
-                       split_too_big if split_too_big is not None else self.split_too_big)
+                       split_too_big if split_too_big is not None else self.split_too_big,
+                       context_name if context_name is not None else self.context_name)
 
     def attempt_timeout(self, n: int) -> float:
         """Return the seconds attempt n (0 = the first) waits: timeout * backoff^n, capped as described above"""
@@ -337,7 +353,7 @@ class Options(object):
                 + "v1_fix_errors=" + str(self.v1_fix_errors) + ", strict_response_oids="
                 + str(self.strict_response_oids) + ", check_community=" + str(self.check_community)
                 + ", request_id_bits=%d, max_queued=%d" % (self.request_id_bits, self.max_queued)
-                + ", split_too_big=" + str(self.split_too_big) + ")")
+                + ", split_too_big=" + str(self.split_too_big) + ", context_name=" + _repr_bytes(self.context_name) + ")")
 
     def __str__(self) -> str:
         return self.__repr__()
@@ -454,6 +470,9 @@ class Stats(object):
         requests being worked on (sent, or waiting for SNMPv3 discovery).
         A caller that submits faster than the agent answers sees queued
         grow and can hold back; Options.max_queued bounds it.
+    transport_failures: transports that failed (a socket that could not
+        be set up: name resolution, too many open files, ...); a Client
+        with its own UDP socket sets it up again (TRANSPORT_RETRY).
     """
     requests: int
     retries: int
@@ -471,10 +490,12 @@ class Stats(object):
     rtt_avg: float
     queued: int
     in_flight: int
+    transport_failures: int
 
     def __init__(self, requests: int, retries: int, timeouts: int, responses: int, drops_decode: int,
                  drops_unknown_id: int, drops_source: int, drops_auth: int, drops_version: int, drops_pdu: int,
-                 reports: int, unreachable: int, rtt_last: float, rtt_avg: float, queued: int=0, in_flight: int=0):
+                 reports: int, unreachable: int, rtt_last: float, rtt_avg: float, queued: int=0, in_flight: int=0,
+                 transport_failures: int=0):
         self.requests = requests
         self.retries = retries
         self.timeouts = timeouts
@@ -491,6 +512,7 @@ class Stats(object):
         self.rtt_avg = rtt_avg
         self.queued = queued
         self.in_flight = in_flight
+        self.transport_failures = transport_failures
 
     def __repr__(self) -> str:
         counts = [("requests", self.requests), ("retries", self.retries), ("timeouts", self.timeouts),
@@ -498,7 +520,8 @@ class Stats(object):
                   ("drops_unknown_id", self.drops_unknown_id), ("drops_source", self.drops_source),
                   ("drops_auth", self.drops_auth), ("drops_version", self.drops_version),
                   ("drops_pdu", self.drops_pdu), ("reports", self.reports), ("unreachable", self.unreachable),
-                  ("queued", self.queued), ("in_flight", self.in_flight)]
+                  ("queued", self.queued), ("in_flight", self.in_flight),
+                  ("transport_failures", self.transport_failures)]
         return "Stats(" + ", ".join([c.0 + "=" + str(c.1) for c in counts]) + ")"
 
     def __str__(self) -> str:
@@ -510,16 +533,23 @@ class Row(object):
 
     index is the row's instance suffix: the arcs after the column OID
     (RFC 2578 section 7.7; how they encode the INDEX objects depends on
-    the table). values maps a column number, the last arc of the column's
-    OID, to the row's value in that column. A column the row has no value
-    in (a sparse table) has no entry.
+    the table), also when get_table() was narrowed by an index_prefix.
+    cells holds the row's value in each column, in the order of
+    Table.columns, None where the row has none (a sparse table). values
+    maps a column number, the last arc of the column's OID, to the row's
+    value in that column; a column the row has no value in has no entry,
+    and neither has a column whose last arc another column of the table
+    shares (ifPhysAddress and ifHCInOctets, of ifEntry and ifXEntry, both
+    end in 6): use cells for those.
     """
     index: list[int]
     values: dict[int, Value]
+    cells: list[?Value]
 
-    def __init__(self, index: list[int], values: dict[int, Value]):
+    def __init__(self, index: list[int], values: dict[int, Value], cells: list[?Value]=[]):
         self.index = index
         self.values = values
+        self.cells = cells
 
     def __repr__(self) -> str:
         cols = sorted(list(self.values.keys()))
@@ -531,17 +561,23 @@ class Row(object):
 
 
 class Table(object):
-    """The result of Client.get_table(): the requested columns and the rows found, sorted by index"""
+    """The result of Client.get_table(): the requested columns and the rows found, sorted by index
+
+    truncated is True when the table stopped at Options.max_walk_varbinds
+    values: there may be more rows, and the last rows may lack columns.
+    """
     columns: list[Oid]
     rows: list[Row]
+    truncated: bool
 
-    def __init__(self, columns: list[Oid], rows: list[Row]):
+    def __init__(self, columns: list[Oid], rows: list[Row], truncated: bool=False):
         self.columns = columns
         self.rows = rows
+        self.truncated = truncated
 
     def __repr__(self) -> str:
         return ("Table(columns=[" + ", ".join([c.dotted() for c in self.columns]) + "], rows=["
-                + ", ".join([repr(r) for r in self.rows]) + "])")
+                + ", ".join([repr(r) for r in self.rows]) + "]" + (", truncated" if self.truncated else "") + ")")
 
     def __str__(self) -> str:
         return self.__repr__()
@@ -573,9 +609,11 @@ class _Op(object):
     resync_left: int
     rediscover_left: int
     wait_gen: int
+    waiting: bool
     job: int
     stream: int
     adaptive: bool
+    answered_reps: int
 
     def __init__(self, handle: int, kind: int, opts: Options, varbinds: list[VarBind], non_repeaters: int,
                  max_repetitions: int, chunks: list[list[int]]):
@@ -597,12 +635,17 @@ class _Op(object):
         self.context_name = b""
         self.resync_left = 1
         self.rediscover_left = 1
+        # waiting: in _disc_waiters, waiting for SNMPv3 discovery; wait_gen tells its expiry timers apart
         self.wait_gen = 0
+        self.waiting = False
         # A request of a walk or table (_Job): the job's handle and the stream it belongs to; 0 for
         # a request of the caller. adaptive: a walk's GETBULK that halves max-repetitions on retries.
+        # answered_reps: the max-repetitions of the GETBULK attempt that was answered (a late answer
+        # to an earlier attempt carries that attempt's, which may be larger than the last one sent).
         self.job = 0
         self.stream = 0
         self.adaptive = False
+        self.answered_reps = max_repetitions
 
     def single(self, positions: list[int]) -> bool:
         # The op is answered by one PDU covering all its varbinds in order
@@ -642,6 +685,7 @@ class _Exchange(object):
     keys: ?LocalizedUser
     time_window_drops: int
     bulk_limit: int
+    bulk_sent: dict[int, int]
     resync_from: int
 
     def __init__(self, serial: int, handle: int, pdu_type: int, positions: list[int], varbinds: list[VarBind],
@@ -672,6 +716,8 @@ class _Exchange(object):
         # The largest max-repetitions any attempt carried (adaptive bulk shrinks it between
         # attempts; a late answer to an earlier attempt may hold that many rows)
         self.bulk_limit = max_repetitions
+        # GETBULK: the max-repetitions each attempt id carried
+        self.bulk_sent = {}
         # len(ids) when the exchange resynchronised (0: never): a notInTimeWindows Report to an
         # attempt before that (ids[:resync_from], a late or duplicated one) is already dealt with
         self.resync_from = 0
@@ -774,16 +820,17 @@ def _mac_failure(data: bytes, m: V3Message, keys: LocalizedUser) -> str:
     except usm.UsmIncomingError as e:
         return e.kind
 
-def _report_error(s: ScopedPdu) -> errors.ReportError:
-    # The ReportError for a Report-PDU: its first varbind names the counter
+def _report_error(s: ScopedPdu, transient: bool=False) -> errors.ReportError:
+    # The ReportError for a Report-PDU: its first varbind names the counter. transient: the request
+    # failed because its recovery (resync, rediscovery) is spent, and the next one starts afresh
     vbs = s.pdu.varbinds
     if len(vbs) == 0:
-        return errors.ReportError([], "report without varbinds")
+        return errors.ReportError([], "report without varbinds", None, transient)
     vb = vbs[0]
     name = usm.report_name(vb.oid)
     v = vb.value
     value: ?int = v.value if isinstance(v, Counter32) else None
-    return errors.ReportError(vb.oid.arcs, name if name is not None else "unknown report", value)
+    return errors.ReportError(vb.oid.arcs, name if name is not None else "unknown report", value, transient)
 
 def _report_kind(s: ScopedPdu) -> str:
     vbs = s.pdu.varbinds
@@ -810,8 +857,10 @@ def _make_transport(cap: ?net.UDPConnectCap, address: str, port: int, supplied: 
         return udp_transport(cap, address, port)
     return None
 
-def _is_ip(address: str) -> bool:
-    return net.is_ipv4(address) or net.is_ipv6(address)
+def _ip_key(address: str) -> bytes:
+    # The octets of an IP address (transport.ip_octets), empty for a host name
+    o = ip_octets(address)
+    return o if o is not None else b""
 
 
 # Walks and tables ###################################################################################
@@ -842,14 +891,19 @@ class _Job(object):
     # A walk or table. opts are the Options of its requests (v1_fix_errors on, so that SNMPv1
     # noSuchName ends a column as EndOfMibView). Per root (index k): cur[k] is the OID the walk
     # continues from (the last one received, at first the root itself) and live[k] is False once
-    # the root's subtree is done; numbers[k] is the last arc of a table column. found holds what a
-    # walk collected (walk_stream: what is not delivered yet), rows what a table did, keyed by
-    # index; seen is the loop guard of check_increasing=False; count counts every varbind taken.
+    # the root's subtree is done. A table's columns[k] is the column of root k (the root is the
+    # column plus the index_prefix), numbers[k] its last arc, and unique[k] tells whether no other
+    # column ends in the same arc (Row.values). found holds what a walk collected (walk_stream:
+    # what is not delivered yet), rows what a table did, keyed by index; seen is the loop guard
+    # of check_increasing=False; count counts every varbind taken, and truncated is set when
+    # max_walk_varbinds ended the job.
     handle: int
     kind: int
     opts: Options
     roots: list[Oid]
+    columns: list[Oid]
     numbers: list[int]
+    unique: list[bool]
     cur: list[Oid]
     live: list[bool]
     bulk: bool
@@ -858,18 +912,21 @@ class _Job(object):
     get_root: bool
     limit: int
     count: int
+    truncated: bool
     found: list[VarBind]
     rows: dict[Oid, Row]
     seen: set[Oid]
     streams: list[_Stream]
 
-    def __init__(self, handle: int, kind: int, opts: Options, roots: list[Oid], bulk: bool, adaptive: bool,
-                 check: bool, get_root: bool, limit: int, streams: list[_Stream]):
+    def __init__(self, handle: int, kind: int, opts: Options, roots: list[Oid], columns: list[Oid], bulk: bool,
+                 adaptive: bool, check: bool, get_root: bool, limit: int, streams: list[_Stream]):
         self.handle = handle
         self.kind = kind
         self.opts = opts
         self.roots = roots
-        self.numbers = [r.arcs[len(r.arcs) - 1] for r in roots]
+        self.columns = columns
+        self.numbers = [c.arcs[len(c.arcs) - 1] for c in columns]
+        self.unique = [len([m for m in self.numbers if m == n]) == 1 for n in self.numbers]
         self.cur = roots.copy()
         self.live = [True for _ in roots]
         self.bulk = bulk
@@ -878,6 +935,7 @@ class _Job(object):
         self.get_root = get_root
         self.limit = limit
         self.count = 0
+        self.truncated = False
         self.found = []
         self.rows = {}
         self.seen = set()
@@ -896,23 +954,26 @@ def _streams(n: int, per_stream: int) -> list[_Stream]:
         i = end
     return out
 
+def _arcs_ok(arcs: list[int]) -> bool:
+    for a in arcs:
+        if a < 0 or a > 4294967295:
+            return False
+    return True
+
 def _table_problem(columns: list[Oid]) -> str:
-    # Why columns cannot be fetched as one table, "" if they can: Row.values is keyed by the last
-    # arc of a column, and a column inside another one would be walked twice
+    # Why columns cannot be fetched as one table, "" if they can: a column inside another one (or
+    # twice) would be walked twice and its rows merged with the wrong index
     for i in range(len(columns)):
         a = columns[i]
         for j in range(i + 1, len(columns)):
             b = columns[j]
             if a.startswith(b) or b.startswith(a):
                 return "table columns must not contain one another: " + a.dotted() + " and " + b.dotted()
-            if a.arcs[len(a.arcs) - 1] == b.arcs[len(b.arcs) - 1]:
-                return ("table columns need distinct last arcs (the keys of Row.values): " + a.dotted() + " and "
-                        + b.dotted())
     return ""
 
 def _table_of(job: _Job) -> Table:
     keys = sorted(list(job.rows.keys()))
-    return Table(job.roots, [job.rows[k] for k in keys])
+    return Table(job.columns, [job.rows[k] for k in keys], job.truncated)
 
 
 actor Client(cap: ?net.UDPConnectCap,
@@ -946,7 +1007,12 @@ actor Client(cap: ?net.UDPConnectCap,
     The source of a response must be address and port. A connected UDP
     socket made from cap already ensures this; with a given transport the
     Client compares the source itself: the port always, the address when
-    address is an IP address (normalized, see transport.normalize_address).
+    address is an IP address (as octets, transport.ip_octets, so any text
+    form of the address matches). An agent that answers from another
+    address than the one queried (a multi-homed router answering from its
+    egress interface) is therefore never heard: with a connected socket
+    the kernel drops its answers, so the request times out with no drop
+    counted and no hint.
     """
     _log = logging.Logger(log_handler)
     _logging = log_handler is not None
@@ -957,12 +1023,20 @@ actor Client(cap: ?net.UDPConnectCap,
     _community = _community_of(security)
     _local_engine_id = local_engine_id if local_engine_id is not None else _default_engine_id()
     _check_port = transport is not None
-    _check_address = transport is not None and _is_ip(address)
-    _peer_address = normalize_address(address)
+    _peer_ip = _ip_key(address)
+    _check_address = transport is not None and len(_peer_ip) > 0
     _salt = SaltCounter()
 
+    # The transport, and its state: _fatal is the error of a transport that cannot send (setup
+    # failed), _transport_gen tells the callbacks of a replaced transport apart. A Client that
+    # set up its own UDP socket (_rebuildable) sets it up again after a failure (_transport_down).
+    _rebuildable = transport is None and cap is not None and port >= 1 and port <= 65535
     var _transport: ?Transport = None
+    var _transport_gen = 0
     var _fatal: ?str = None
+    var _fatal_at = 0.0
+    var _setup_failures = 0
+    var _transport_failures = 0
     var _closed = False
     var _next_handle = 1
     var _next_serial = 1
@@ -991,14 +1065,19 @@ actor Client(cap: ?net.UDPConnectCap,
     var _bulk_trial = False
 
     # SNMPv3 state: the agent's engine ID (None until discovered), the time
-    # records and localized keys per engine ID, the running discovery probe
-    # and the ops waiting for it
+    # records and localized keys per engine ID, the running discovery probe,
+    # the ops waiting for it and until when the longest of them may wait.
+    # _disc_waiters lists the handles in arrival order; an op that leaves
+    # early (its budget passed, cancel) only clears its _Op.waiting, and
+    # _disc_live counts the ops still waiting (lazy deletion, as in _queue).
     var _engine_id: ?bytes = None
     var _times: dict[bytes, EngineTime] = {}
     var _keys: dict[bytes, LocalizedUser] = {}
     var _local_keys: ?LocalizedUser = None
     var _disc_serial = 0
     var _disc_waiters: list[int] = []
+    var _disc_live = 0
+    var _disc_until = 0.0
     var _v3_timeouts = 0
 
     # Counters (Stats) and the last non-fatal send error (TimeoutError.hint)
@@ -1031,11 +1110,19 @@ actor Client(cap: ?net.UDPConnectCap,
         return _MASK15 if o.request_id_bits == 16 else _MASK31
 
     proc def _new_id(mask: int) -> int:
-        # A random attempt id that no pending attempt uses
-        v = _random_id(mask)
-        while v in _ids:
+        # A random attempt id in 1..mask that no pending attempt uses, -1 if there is none. Random
+        # draws first; when they keep colliding (the 32767 ids of request_id_bits=16 nearly all
+        # pending), a scan from a random start, so that a full id space fails instead of spinning.
+        for _ in range(32):
             v = _random_id(mask)
-        return v
+            if v not in _ids:
+                return v
+        start = _random_id(mask) - 1
+        for k in range(mask):
+            v = (start + k) % mask + 1
+            if v not in _ids:
+                return v
+        return -1
 
     proc def _uptime() -> int:
         # Hundredths of a second since the Client started, as TimeTicks
@@ -1044,9 +1131,54 @@ actor Client(cap: ?net.UDPConnectCap,
     proc def _from_peer(src_address: str, src_port: int) -> bool:
         if _check_port and src_port != port:
             return False
-        if _check_address and normalize_address(src_address) != _peer_address:
+        # the source text may be another form of our address (case, zeros, ::ffff:): compare octets
+        if _check_address and src_address != address and _ip_key(src_address) != _peer_ip:
             return False
         return True
+
+    proc def _attach(tr: Transport) -> None:
+        # Register with tr; callbacks of an earlier transport (one replaced by _rebuild) are ignored
+        _transport_gen += 1
+        gen = _transport_gen
+        def on_data(data: bytes, src_address: str, src_port: int) -> None:
+            if gen == _transport_gen:
+                _on_data(data, src_address, src_port)
+        def on_error(text: str, fatal: bool) -> None:
+            if gen == _transport_gen:
+                _on_transport_error(text, fatal)
+        tr.set_receiver(on_data, on_error)
+
+    proc def _retry_wait() -> float:
+        # Seconds after a failed setup before the next try: TRANSPORT_RETRY, doubled per failure in a row
+        w = TRANSPORT_RETRY
+        for _ in range(_setup_failures - 1):
+            w = w * 2.0
+            if w >= TRANSPORT_RETRY_MAX:
+                return TRANSPORT_RETRY_MAX
+        return w
+
+    proc def _transport_down() -> ?str:
+        # The error of a transport that cannot send, None if it can. A Client that set up its own
+        # UDP socket sets it up again (re-resolving the name) once the retry wait has passed.
+        fatal = _fatal
+        if fatal is not None and _rebuildable and _now() >= _fatal_at + _retry_wait():
+            c = cap
+            if c is not None:
+                old = _transport
+                if old is not None:
+                    old.close()
+                _log.info("setting up the UDP socket again", {"address": address, "port": port,
+                                                               "failures": _setup_failures})
+                tr = udp_transport(c, address, port)
+                _transport = tr
+                _fatal = None
+                _attach(tr)
+                return None
+        return fatal
+
+    proc def _transport_error(text: str) -> errors.TransportError:
+        # transient when a later request sets the socket up again
+        return errors.TransportError(text, _rebuildable)
 
     proc def _trace_on() -> bool:
         return _log.output_level >= logging.TRACE
@@ -1119,7 +1251,8 @@ actor Client(cap: ?net.UDPConnectCap,
         if op.active:
             _active -= 1
         # a queued op stays in _queue and a waiting one in _disc_waiters: both skip handles that
-        # are no longer in _ops, so completing many ops costs O(1) each
+        # are no longer in _ops (or no longer waiting), so completing many ops costs O(1) each
+        _unwait(op)
         cb = _cbs.get(h)
         if cb is not None:
             del _cbs[h]
@@ -1181,20 +1314,23 @@ actor Client(cap: ?net.UDPConnectCap,
                          op.context_name)
             _complete(op, r, None)
             return
-        fatal = _fatal
+        fatal = _transport_down()
         if fatal is not None:
-            _complete(op, None, errors.TransportError(fatal))
+            _complete(op, None, _transport_error(fatal))
             return
         u = _usm
         if u is not None:
             if _engine_id is None:
-                if op.handle not in _disc_waiters:
+                if not op.waiting:
+                    op.waiting = True
                     _disc_waiters.append(op.handle)
+                    _disc_live += 1
                     # Each waiting request keeps its own budget: it fails when that has passed,
                     # whoever started the probe (the probe runs as long as its longest waiter)
                     op.wait_gen += 1
                     gen = op.wait_gen
-                    after now _budget(op.opts): _discovery_wait_expired(op.handle, gen)
+                    h = op.handle
+                    after now _budget(op.opts): _discovery_wait_expired(h, gen)
                 _start_discovery(op.opts)
                 return
         try:
@@ -1227,7 +1363,8 @@ actor Client(cap: ?net.UDPConnectCap,
             ex.user = u.user.encode()
             ceid = u.context_engine_id
             ex.context_engine_id = ceid if ceid is not None else eid
-            ex.context_name = u.context_name
+            cname = op.opts.context_name
+            ex.context_name = cname if cname is not None else u.context_name
             ex.request_id = _random_id(_mask(op.opts))
             p = Pdu(wire, ex.request_id, nr, mr, vbs)
             ex.scoped = message.encode_scoped(ScopedPdu(ex.context_engine_id, ex.context_name, p))
@@ -1237,11 +1374,26 @@ actor Client(cap: ?net.UDPConnectCap,
         op.exchange = ex.serial
         _send(ex)
 
+    proc def _unwait(op: _Op) -> None:
+        # op no longer waits for discovery; its handle stays in _disc_waiters until the list is
+        # compacted (when most of it is stale) or the probe ends
+        if not op.waiting:
+            return
+        op.waiting = False
+        _disc_live -= 1
+        if len(_disc_waiters) > 64 and len(_disc_waiters) > 2 * _disc_live:
+            live: list[int] = []
+            for w in _disc_waiters:
+                o = _ops.get(w)
+                if o is not None and o.waiting:
+                    live.append(w)
+            _disc_waiters = live
+
     def _discovery_wait_expired(h: int, gen: int) -> None:
         # A request waited for discovery as long as its Options allow: it times out, the probe goes on
         op = _ops.get(h)
-        if op is not None and op.wait_gen == gen and h in _disc_waiters:
-            _disc_waiters = [w for w in _disc_waiters if w != h]
+        if op is not None and op.wait_gen == gen and op.waiting:
+            _unwait(op)
             hint = "SNMPv3 engine discovery"
             attempts = 0
             probe = _exchanges.get(_disc_serial)
@@ -1254,19 +1406,24 @@ actor Client(cap: ?net.UDPConnectCap,
             _complete(op, None, errors.TimeoutError(attempts, _budget(op.opts), hint))
 
     proc def _start_discovery(o: Options) -> None:
-        # Send the RFC 3414 section 4 probe, unless one is running: a GET without varbinds,
-        # noAuthNoPriv and reportable, with empty engine ID, user and context. Its timeout and
-        # retries are those of o, the Options of the request that needs it (discover(): the
-        # Client's). A request that joins a running probe with a longer budget extends it to
-        # its Options; one with a shorter budget times out by itself (_discovery_wait_expired).
+        # Send the RFC 3414 section 4 probe unless one is running: a reportable noAuthNoPriv GET
+        # without varbinds, with empty engine ID, user and context, timed by o. A request that
+        # joins a running probe with a longer budget extends it (_disc_until), so the probe may
+        # send beyond its own retries; one with a shorter budget times out by itself
+        # (_discovery_wait_expired).
+        until = _now() + _budget(o)
         if _disc_serial != 0:
             running = _exchanges.get(_disc_serial)
-            if running is not None and _budget(o) > _budget(running.opts):
-                running.opts = o
+            if running is not None:
+                if until > _disc_until:
+                    _disc_until = until
+                if _budget(o) > _budget(running.opts):
+                    running.opts = o
             return
-        fatal = _fatal
+        _disc_until = until
+        fatal = _transport_down()
         if fatal is not None:
-            _discovery_failed(errors.TransportError(fatal))
+            _discovery_failed(_transport_error(fatal))
             return
         ex = _Exchange(_next_serial, 0, pdu.GET, [], [], 0, 0, o, _counters())
         _next_serial += 1
@@ -1296,7 +1453,7 @@ actor Client(cap: ?net.UDPConnectCap,
         tr = _transport
         fatal = _fatal
         if fatal is not None:
-            _exchange_failed(ex, errors.TransportError(fatal))
+            _exchange_failed(ex, _transport_error(fatal))
             return
         if tr is not None:
             now = _now()
@@ -1307,6 +1464,10 @@ actor Client(cap: ?net.UDPConnectCap,
                 id = ex.ids[0]
             else:
                 id = _new_id(_MASK31 if _usm is not None else _mask(ex.opts))
+                if id < 0:
+                    _exchange_failed(ex, errors.QueueFullError(
+                        "no free request-id: %d attempts are pending (request_id_bits=16 has 32767 ids)" % len(_ids)))
+                    return
             data = b""
             failure: ?errors.SnmpError = None
             try:
@@ -1323,6 +1484,8 @@ actor Client(cap: ?net.UDPConnectCap,
             if id not in ex.sent_at:
                 ex.ids.append(id)
             ex.sent_at[id] = now
+            if ex.pdu_type == pdu.GETBULK:
+                ex.bulk_sent[id] = ex.max_repetitions
             _ids[id] = ex.serial
             ex.attempt += 1
             op = _ops.get(ex.handle)
@@ -1332,9 +1495,13 @@ actor Client(cap: ?net.UDPConnectCap,
                 _log.debug("sending", {"handle": ex.handle, "pdu": pdu.pdu_type_name(ex.pdu_type), "id": id,
                                        "attempt": ex.attempt})
             tr.send(data)
-            after now ex.opts.attempt_timeout(ex.retries_used): _on_timer(ex.serial, ex.attempt)
+            # The call after `after` is evaluated when the timer fires: an attribute read
+            # there would see a later attempt, and would keep ex alive until then. Take them now.
+            serial = ex.serial
+            generation = ex.attempt
+            after now ex.opts.attempt_timeout(ex.retries_used): _on_timer(serial, generation)
         else:
-            _exchange_failed(ex, errors.TransportError("no transport: neither cap nor transport was given"))
+            _exchange_failed(ex, errors.TransportError("no transport: neither cap nor transport was given", False))
 
     proc def _resend(ex: _Exchange) -> None:
         # An extra attempt for a recovery (resynchronisation); it does not use up a retry
@@ -1344,7 +1511,8 @@ actor Client(cap: ?net.UDPConnectCap,
         ex = _exchanges.get(serial)
         if ex is not None:
             if ex.attempt == attempt:
-                if ex.retries_used < ex.opts.retries:
+                # the discovery probe goes on while a waiting request still has budget left
+                if ex.retries_used < ex.opts.retries or (ex.handle == 0 and _now() + 0.01 < _disc_until):
                     ex.retries_used += 1
                     _retries += 1
                     _shrink_bulk(ex)
@@ -1414,11 +1582,8 @@ actor Client(cap: ?net.UDPConnectCap,
         _engine_cbs = []
         for cb in cbs:
             cb(self, info, None)
-        waiters = _disc_waiters
-        _disc_waiters = []
-        for h in waiters:
-            op = _ops.get(h)
-            if op is not None:
+        for op in _take_waiters():
+            if op.handle in _ops:
                 _next_chunk(op)
 
     proc def _discovery_failed(e: errors.SnmpError) -> None:
@@ -1428,18 +1593,28 @@ actor Client(cap: ?net.UDPConnectCap,
         _disc_serial = 0
         _log.debug("SNMPv3 discovery failed", {"error": e.error_message})
         _fail_engine_cbs(e)
+        for op in _take_waiters():
+            _complete(op, None, e)
+
+    proc def _take_waiters() -> list[_Op]:
+        # The ops waiting for discovery, in arrival order; none of them waits any more afterwards
         waiters = _disc_waiters
         _disc_waiters = []
+        out: list[_Op] = []
         for h in waiters:
             op = _ops.get(h)
-            if op is not None:
-                _complete(op, None, e)
+            if op is not None and op.waiting:
+                op.waiting = False
+                out.append(op)
+        _disc_live = 0
+        return out
 
     # Receiving #####################################################################################
 
     def _on_data(data: bytes, src_address: str, src_port: int) -> None:
         if _closed:
             return
+        _setup_failures = 0          # the transport works
         try:
             _receive(data, src_address, src_port)
         except Exception as e:
@@ -1451,8 +1626,11 @@ actor Client(cap: ?net.UDPConnectCap,
         if fatal:
             if _fatal is None:
                 _log.error("transport failed", {"error": text})
+                _setup_failures += 1
+                _transport_failures += 1
+                _fatal_at = _now()
             _fatal = text
-            err = errors.TransportError(text)
+            err = _transport_error(text)
             for h in list(_ops.keys()):
                 op = _ops.get(h)
                 if op is not None:
@@ -1656,7 +1834,7 @@ actor Client(cap: ?net.UDPConnectCap,
                 _rediscover(op, ex, "report from another engine")
                 return
             _end_exchange(ex)
-            _complete(op, None, _report_error(s))
+            _complete(op, None, _report_error(s, True))
 
     proc def _rediscover(op: _Op, ex: _Exchange, why: str) -> None:
         # The request's one rediscovery: forget the engine it went to (unless another request
@@ -1702,10 +1880,15 @@ actor Client(cap: ?net.UDPConnectCap,
                 cur = _engine_id
                 if cur is not None and cur == ex.engine_id:
                     _forget_engine("repeated notInTimeWindows reports")
-                _complete(op, None, _report_error(s))
+                _complete(op, None, _report_error(s, True))
                 return
-            if kind == usm.USM_STATS_UNKNOWN_ENGINE_IDS and op.rediscover_left > 0:
-                _rediscover(op, ex, "unknownEngineIDs report")
+            if kind == usm.USM_STATS_UNKNOWN_ENGINE_IDS:
+                if op.rediscover_left > 0:
+                    _rediscover(op, ex, "unknownEngineIDs report")
+                    return
+                # the next request rediscovers again
+                _end_exchange(ex)
+                _complete(op, None, _report_error(s, True))
                 return
             _end_exchange(ex)
             _complete(op, None, _report_error(s))
@@ -1726,6 +1909,8 @@ actor Client(cap: ?net.UDPConnectCap,
             op.exchange = 0
             op.request_id = p.request_id
             op.rtt = rtt
+            reps = ex.bulk_sent.get(id)
+            op.answered_reps = reps if reps is not None else ex.max_repetitions
             op.context_engine_id = ceid
             op.context_name = cname
             _on_pdu(op, ex, p)
@@ -1741,8 +1926,10 @@ actor Client(cap: ?net.UDPConnectCap,
                 op.chunks = [ex.positions[:half], ex.positions[half:]] + op.chunks[1:]
                 _next_chunk(op)
                 return
-            if ex.pdu_type == pdu.GETBULK and ex.max_repetitions > 1:
-                op.max_repetitions = ex.max_repetitions // 2
+            if ex.pdu_type == pdu.GETBULK and op.answered_reps > 1:
+                # half of what the answered attempt carried (a late tooBig may answer an earlier,
+                # larger attempt than the last one sent)
+                op.max_repetitions = op.answered_reps // 2
                 _log.debug("tooBig: halving max-repetitions", {"handle": op.handle, "max_repetitions": op.max_repetitions})
                 _next_chunk(op)
                 return
@@ -1926,24 +2113,25 @@ actor Client(cap: ?net.UDPConnectCap,
         if _usm is None:
             cb(self, None, errors.EncodeError("discover() needs SNMPv3 (Usm) security"))
             return
-        fatal = _fatal
+        fatal = _transport_down()
         if fatal is not None:
-            cb(self, None, errors.TransportError(fatal))
+            cb(self, None, _transport_error(fatal))
             return
         _engine_cbs.append(cb)
         _start_discovery(_opts)
 
     # Walks and tables ###############################################################################
 
-    proc def _job_refusal(roots: list[Oid], table: bool) -> ?errors.SnmpError:
-        # Why a walk or table cannot start, None if it can (reported through its callback)
+    proc def _job_refusal(roots: list[Oid], columns: list[Oid], table: bool) -> ?errors.SnmpError:
+        # Why a walk or table cannot start, None if it can (reported through its callback); a
+        # table's roots are its columns, each followed by the index_prefix
         if _closed:
             return errors.CancelledError("client closed")
         if len(roots) == 0:
             return errors.EncodeError("get_table needs at least one column")
         problem = _validate(pdu.GETNEXT, [VarBind(o) for o in roots], 0, 0)
         if problem == "" and table:
-            problem = _table_problem(roots)
+            problem = _table_problem(columns)
         if problem != "":
             return errors.EncodeError(problem)
         queued = len(_ops) - _active
@@ -1951,11 +2139,11 @@ actor Client(cap: ?net.UDPConnectCap,
             return errors.QueueFullError("request queue full: %d requests queued" % queued)
         return None
 
-    proc def _new_job(h: int, kind: int, roots: list[Oid], o: ?Options) -> _Job:
+    proc def _new_job(h: int, kind: int, roots: list[Oid], columns: list[Oid], o: ?Options) -> _Job:
         eff = o if o is not None else _opts
         sub = eff if eff.v1_fix_errors else eff.with_(v1_fix_errors=True)
         per_stream = eff.max_oids_per_request if kind == _JOB_TABLE else 0
-        return _Job(h, kind, sub, roots, eff.use_bulk and _version != message.SNMP_V1, eff.adaptive_bulk,
+        return _Job(h, kind, sub, roots, columns, eff.use_bulk and _version != message.SNMP_V1, eff.adaptive_bulk,
                     eff.check_increasing, eff.get_root_if_empty, eff.max_walk_varbinds,
                     _streams(len(roots), per_stream))
 
@@ -1979,8 +2167,9 @@ actor Client(cap: ?net.UDPConnectCap,
         return m if m > 0 else 1
 
     proc def _bulk_learn(job: _Job, started: int, answered: int) -> None:
-        # An adaptive walk's GETBULK was answered: it started with max-repetitions started and was
-        # answered at answered (smaller when tooBig or timeouts halved it on the way)
+        # An adaptive walk's GETBULK was answered: it started with max-repetitions started, and the
+        # attempt that was answered carried answered (smaller when tooBig or timeouts halved it on
+        # the way, unless a late answer to an earlier, larger attempt came first)
         if answered < started:
             # it needed fewer repetitions: later walks start there. A doubled value that failed
             # makes the next doubling wait twice as long (bounded oscillation)
@@ -2065,12 +2254,15 @@ actor Client(cap: ?net.UDPConnectCap,
             return
         if r is not None:
             if op.kind == pdu.GETBULK and job.adaptive:
-                _bulk_learn(job, st.reps, op.max_repetitions)
+                # the answered attempt's max-repetitions: a late answer to the first, full-size
+                # attempt of a slow agent shows that the agent handles that size
+                _bulk_learn(job, st.reps, op.answered_reps)
             failure = _job_take(job, st.sent, r.varbinds)
             if failure is not None:
                 _job_finish(job, failure)
             elif job.count >= job.limit:
                 _log.debug("walk stopped at max_walk_varbinds", {"handle": job.handle, "varbinds": job.count})
+                job.truncated = True
                 _job_finish(job, None)
             else:
                 _job_flush(job)
@@ -2120,15 +2312,18 @@ actor Client(cap: ?net.UDPConnectCap,
         job.count += 1
         if job.kind == _JOB_TABLE:
             arcs = vb.oid.arcs
-            idx = arcs[len(job.roots[k].arcs):]
+            idx = arcs[len(job.columns[k].arcs):]
             key = Oid(idx)
             row = job.rows.get(key)
+            if row is None:
+                cells: list[?Value] = [None for _ in job.columns]
+                r = Row(idx, {}, cells)
+                job.rows[key] = r
+                row = r
             if row is not None:
-                row.values[job.numbers[k]] = vb.value
-            else:
-                vals: dict[int, Value] = {}
-                vals[job.numbers[k]] = vb.value
-                job.rows[key] = Row(idx, vals)
+                row.cells[k] = vb.value
+                if job.unique[k]:
+                    row.values[job.numbers[k]] = vb.value
         else:
             job.found.append(vb)
 
@@ -2175,6 +2370,11 @@ actor Client(cap: ?net.UDPConnectCap,
         if h not in _jobs:
             return
         del _jobs[h]
+        # No pumping while the job's requests are dropped: completing an active one frees a slot,
+        # and the pump would start (and send) a queued request of this same job before its turn
+        # to be dropped comes. The pump runs once at the end instead.
+        was_pumping = _pumping
+        _pumping = True
         for st in job.streams:
             sub = st.op
             st.op = 0
@@ -2182,6 +2382,7 @@ actor Client(cap: ?net.UDPConnectCap,
                 op = _ops.get(sub)
                 if op is not None:
                     _complete(op, None, errors.CancelledError())
+        _pumping = was_pumping
         if _logging:
             if e is not None:
                 _log.debug("walk failed", {"handle": h, "varbinds": job.count, "error": e.error_message})
@@ -2205,39 +2406,33 @@ actor Client(cap: ?net.UDPConnectCap,
             if tcb is not None:
                 del _table_cbs[h]
                 tcb(self, _table_of(job), e)
+        _pump()
 
     def walk(cb: action(Client, list[VarBind], ?errors.SnmpError) -> None, root: Oid, opts: ?Options=None) -> int:
         """Walk the subtree below root and call cb(c, varbinds, error) once; returns a handle for cancel()
 
-        varbinds are those found in the subtree, in the order received
-        (OID order: check_increasing makes sure of it), without the varbind
-        that ended the walk. error is None when the walk ended normally: an
-        OID outside root, an exception value, SNMPv1 noSuchName, or
-        Options.max_walk_varbinds varbinds collected. Otherwise varbinds
-        holds what was collected before the error: errors.OidNotIncreasingError,
-        errors.InvalidResponseError (a GETBULK response without varbinds),
-        a request's own errors (TimeoutError, ErrorStatusError, ...), or
-        errors.CancelledError from cancel() or close(). A walk that found
-        nothing GETs root and returns its varbind unless it is an exception
-        (Options.get_root_if_empty), so walking a scalar instance works.
-        Invalid arguments (a root that cannot be encoded) give
-        errors.EncodeError with no varbinds, and a full queue
-        errors.QueueFullError (Options.max_queued counts the walk as one
-        request).
+        varbinds are those found in the subtree, in OID order, without the
+        one that ended the walk. error is None when the walk ended normally:
+        at an OID outside root, an exception value, SNMPv1 noSuchName, or
+        after Options.max_walk_varbinds varbinds (the subtree may hold more,
+        so treat a full count as truncated). Otherwise varbinds holds what
+        was collected before the error, which is errors.OidNotIncreasingError,
+        errors.InvalidResponseError (an empty GETBULK response), any request
+        error, or errors.CancelledError. A walk that found nothing GETs root
+        (Options.get_root_if_empty), so walking a scalar instance works. A
+        root that cannot be encoded gives errors.EncodeError, and the walk
+        counts as one request against Options.max_queued.
 
-        GETBULK with Options.max_repetitions is used for SNMPv2c and
-        SNMPv3 when Options.use_bulk is set, GETNEXT otherwise and always
-        for SNMPv1. The other Options (timeouts, retries, ...) apply to
-        every request of the walk.
+        The Options apply to every request of the walk.
         """
         h = _next_handle
         _next_handle += 1
-        refusal = _job_refusal([root], False)
+        refusal = _job_refusal([root], [root], False)
         if refusal is not None:
             cb(self, [], refusal)
             return h
         _walk_cbs[h] = cb
-        _start_job(_new_job(h, _JOB_WALK, [root], opts))
+        _start_job(_new_job(h, _JOB_WALK, [root], [root], opts))
         return h
 
     def walk_stream(on_batch: action(Client, list[VarBind]) -> None, on_done: action(Client, int, ?errors.SnmpError) -> None,
@@ -2248,64 +2443,74 @@ actor Client(cap: ?net.UDPConnectCap,
         order (never an empty list), so a large subtree is never held in
         memory; then on_done(c, count, error) is called exactly once with
         the number of varbinds delivered and the error that ended the walk
-        (None for a normal end, as in walk()). The varbinds a response held
-        before an error are delivered before on_done.
+        (None for a normal end, as in walk(); a count equal to
+        Options.max_walk_varbinds means the walk stopped there). The
+        varbinds a response held before an error are delivered before
+        on_done.
         """
         h = _next_handle
         _next_handle += 1
-        refusal = _job_refusal([root], False)
+        refusal = _job_refusal([root], [root], False)
         if refusal is not None:
             on_done(self, 0, refusal)
             return h
         _batch_cbs[h] = on_batch
         _done_cbs[h] = on_done
-        _start_job(_new_job(h, _JOB_STREAM, [root], opts))
+        _start_job(_new_job(h, _JOB_STREAM, [root], [root], opts))
         return h
 
     def get_table(cb: action(Client, ?Table, ?errors.SnmpError) -> None, columns: list[Oid],
-                  opts: ?Options=None) -> int:
+                  opts: ?Options=None, index_prefix: list[int]=[]) -> int:
         """Fetch table columns and call cb(c, table, error) once; returns a handle for cancel()
 
-        columns are column OIDs (for example ifDescr, ifType, ...). They are
-        walked in lock-step, one varbind per column in each request
-        (GETBULK on SNMPv2c and SNMPv3 with Options.use_bulk, else GETNEXT);
-        a column that leaves its subtree or ends (an exception value) drops
-        out of later requests, so sparse tables work. With more columns than
-        Options.max_oids_per_request, the columns are split into groups
-        walked in parallel (as far as the Client's max_in_flight allows).
-        The values are merged into rows by their index (the OID suffix after
-        the column), sorted by index; Row.values is keyed by the column's
-        last arc. Termination, ordering and errors are as for walk(), per
-        column, and max_walk_varbinds counts the values of all columns.
+        columns are column OIDs of one table, or of tables that share its
+        index (ifEntry and the augmenting ifXEntry). They are walked in
+        lock-step, one varbind per column per request; a column that leaves
+        its subtree drops out of later requests, so sparse tables work. More
+        columns than Options.max_oids_per_request are split into groups
+        walked in parallel, as far as max_in_flight allows. Rows are sorted
+        by index (the OID suffix after the column), and Row.cells is in the
+        order of columns.
 
-        On an error cb gets the rows found so far with it. Invalid
-        arguments give EncodeError with table None: no columns, a column
-        that cannot be encoded, a column inside another one, or two columns
-        with the same last arc.
+        index_prefix narrows the walk to rows whose index starts with these
+        arcs, for example [5] for the ifRcvAddressTable rows of ifIndex 5;
+        Row.index is still the whole index. Termination and errors are as
+        for walk(), per column. max_walk_varbinds counts the values of all
+        columns and sets Table.truncated.
+
+        On an error cb gets the rows found so far. No columns, a column that
+        cannot be encoded, or a column inside another one gives EncodeError
+        with table None.
         """
         h = _next_handle
         _next_handle += 1
-        refusal = _job_refusal(columns, True)
+        roots = columns
+        if len(index_prefix) > 0:
+            if not _arcs_ok(index_prefix):
+                cb(self, None, errors.EncodeError("index_prefix arcs must be 0 to 4294967295"))
+                return h
+            roots = [Oid(c.arcs + index_prefix) for c in columns]
+        refusal = _job_refusal(roots, columns, True)
         if refusal is not None:
             cb(self, None, refusal)
             return h
         _table_cbs[h] = cb
-        _start_job(_new_job(h, _JOB_TABLE, columns, opts))
+        _start_job(_new_job(h, _JOB_TABLE, roots, columns, opts))
         return h
 
     # Notifications #################################################################################
 
     proc def _emit(cb: action(Client, ?errors.SnmpError) -> None, data: bytes) -> None:
         # Hand an unacknowledged notification to the transport
+        fatal = _transport_down()
         tr = _transport
-        fatal = _fatal
         if fatal is not None:
-            cb(self, errors.TransportError(fatal))
+            cb(self, _transport_error(fatal))
         elif tr is not None:
             tr.send(data)
             cb(self, None)
         else:
-            cb(self, errors.TransportError("no transport: neither cap nor transport was given"))
+            cb(self, errors.TransportError("no transport: neither cap nor transport was given", False))
 
     proc def _encode_trap_v3(u: Usm, p: Pdu) -> bytes:
         # We are the authoritative engine of an SNMPv3 trap: our engine ID, boots and time
@@ -2427,7 +2632,7 @@ actor Client(cap: ?net.UDPConnectCap,
         avg = _rtt_sum / float(_responses) if _responses > 0 else 0.0
         return Stats(_requests, _retries, _timeouts, _responses, _drops_decode, _drops_unknown_id, _drops_source,
                      _drops_auth, _drops_version, _drops_pdu, _reports, _unreachable, _rtt_last, avg,
-                     len(_ops) - _active, _active)
+                     len(_ops) - _active, _active, _transport_failures)
 
     def close() -> None:
         """Cancel every pending and queued request, walk and discovery (errors.CancelledError) and close the transport
@@ -2469,6 +2674,6 @@ actor Client(cap: ?net.UDPConnectCap,
                 _log.warning("seeded engine ID ignored: not 5 to 32 octets", {"octets": n})
     tr0 = _transport
     if tr0 is not None:
-        tr0.set_receiver(_on_data, _on_transport_error)
+        _attach(tr0)
     else:
         _fatal = "no transport: neither cap nor transport was given"
