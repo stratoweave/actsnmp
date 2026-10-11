@@ -192,28 +192,42 @@ def revision_date(m: mib.model.MibModule) -> str:
     return k[0:4] + "-" + k[4:6] + "-" + k[6:8]
 
 
-def conv_of(s: mib.model.Syntax, ms: ?mib.model.MibSet = None) -> str:
-    """The value conversion kind of a resolved syntax. With `ms` the hint is the YANG
-    emitter's (SMIv1 informal hints); enumerations YANG cannot express (int64 leaf) convert
-    as `int`."""
-    b = s.base
-    hint = s.hint
+def yang_hint(s: mib.model.Syntax, ms: ?mib.model.MibSet, tr: ?mib.yang.Translator) -> str:
+    """The hint the YANG emitter decides string versus binary by: the translator's (SMIv1
+    informal hints and the options), else the SMIv1 informal hints with the defaults (`ms`),
+    else the resolver's."""
+    if tr is not None:
+        return tr.hint(s)
     if ms is not None:
-        hint = mib.yang.effective_hint(ms, s)
+        return mib.yang.effective_hint(ms, s)
+    return s.hint
+
+
+def conv_of(s: mib.model.Syntax, ms: ?mib.model.MibSet = None, tr: ?mib.yang.Translator = None, hint: ?str = None) -> str:
+    """The value conversion kind of a resolved syntax, matching the YANG type the emitter
+    gives it: with `ms` (or the translator `tr`, whose options apply) the hint is the YANG
+    emitter's (SMIv1 informal hints, `ignore_display_hint`) unless `hint` is given, a TC
+    derived from TruthValue converts as `truthvalue` (its YANG type is boolean), and
+    enumerations YANG cannot express (int64 leaf) convert as `int`."""
+    b = s.base
+    h = hint if hint is not None else yang_hint(s, ms, tr)
     if b == "INTEGER":
         if len(s.enums) > 0:
             if s.tc_name == "TruthValue" and s.tc_module == "SNMPv2-TC":
                 return "truthvalue"
+            if ms is not None and mib.yang.yang_boolean(ms, s):
+                return "truthvalue"
             if mib.yang.enum_expressible(s.enums):
                 return "enum"
             return "int"
-        if hint.startswith("d-"):
+        if h.startswith("d-"):
             return "int-hint"
         return "int"
     if b == "Unsigned32" or b == "Gauge32" or b == "Counter32" or b == "TimeTicks" or b == "Counter64":
         return "uint"
     if b == "BITS":
-        if len(s.bits) == 0 or mib.yang.bits_expressible(s.bits):
+        # BITS without named bits is `binary` in YANG (a `bits` type needs a bit statement)
+        if mib.yang.bits_expressible(s.bits):
             return "bits"
         return "binary"
     if b == "IpAddress":
@@ -228,14 +242,16 @@ def conv_of(s: mib.model.Syntax, ms: ?mib.model.MibSet = None) -> str:
                 return "phys-address"
             if c == "SNMPv2-TC::MacAddress":
                 return "mac-address"
-        if hint != "":
+        if h != "":
             return "string-hint"
         return "binary"
     return ""
 
 
-def syntax_meta(s: mib.model.Syntax, ms: ?mib.model.MibSet = None) -> SyntaxMeta:
-    sm = SyntaxMeta(s.base, s.tc(), conv_of(s, ms), mib.yang.effective_hint(ms, s) if ms is not None else s.hint)
+def syntax_meta(s: mib.model.Syntax, ms: ?mib.model.MibSet = None, tr: ?mib.yang.Translator = None, hint: ?str = None) -> SyntaxMeta:
+    """`hint`: the hint to use instead of the syntax's (a TC's own, `Translator.tdef_hint`)."""
+    h = hint if hint is not None else yang_hint(s, ms, tr)
+    sm = SyntaxMeta(s.base, s.tc(), conv_of(s, ms, tr, h), h)
     sm.ranges = [(r.lo, r.hi) for r in s.ranges]
     sm.sizes = [(r.lo, r.hi) for r in s.sizes]
     sm.enums = [(e.label, e.value) for e in s.enums]
@@ -243,14 +259,14 @@ def syntax_meta(s: mib.model.Syntax, ms: ?mib.model.MibSet = None) -> SyntaxMeta
     return sm
 
 
-def _opt_syntax(s: ?mib.model.Syntax, ms: ?mib.model.MibSet = None) -> ?SyntaxMeta:
+def _opt_syntax(s: ?mib.model.Syntax, ms: ?mib.model.MibSet = None, tr: ?mib.yang.Translator = None, hint: ?str = None) -> ?SyntaxMeta:
     if s is not None:
         if s.unresolved == "" and s.base != "" and s.base != "SEQUENCE" and s.base != "SEQUENCE OF" and s.base != "CHOICE":
-            return syntax_meta(s, ms)
+            return syntax_meta(s, ms, tr, hint)
     return None
 
 
-def node_meta(n: mib.model.MibNode, ms: ?mib.model.MibSet = None) -> NodeMeta:
+def node_meta(n: mib.model.MibNode, ms: ?mib.model.MibSet = None, tr: ?mib.yang.Translator = None) -> NodeMeta:
     nm = NodeMeta(n.name, n.module, n.oid, n.kind)
     nm.access = n.access
     nm.status = n.status
@@ -258,11 +274,11 @@ def node_meta(n: mib.model.MibNode, ms: ?mib.model.MibSet = None) -> NodeMeta:
     dv = n.defval
     if dv is not None:
         nm.defval = dv.smi
-    nm.syntax = _opt_syntax(n.syntax, ms)
+    nm.syntax = _opt_syntax(n.syntax, ms, tr)
     if n.kind == "row":
         if n.augments == "":
             # an augmenting row has no index of its own: the base row's applies
-            nm.index = [IndexPart(p.object(), p.key, p.enc, p.size, _opt_syntax(p.syntax, ms)) for p in n.index]
+            nm.index = [IndexPart(p.object(), p.key, p.enc, p.size, _opt_syntax(p.syntax, ms, tr)) for p in n.index]
         nm.implied = n.implied
         nm.keyless = n.keyless
         nm.augments = n.augments
@@ -290,11 +306,11 @@ def module_meta(ms: mib.model.MibSet, name: str, tr: ?mib.yang.Translator = None
         mm.source_sha256 = m.sha256
         for ty in m.types:
             if ty.kind == "tc" or ty.kind == "type":
-                mm.types.append(TypeMeta(ty.name, ty.parent, ty.status, _opt_syntax(ty.syntax, ms)))
+                mm.types.append(TypeMeta(ty.name, ty.parent, ty.status, _opt_syntax(ty.syntax, ms, t, t.tdef_hint(ty))))
         keyed = [(n.oid, i) for i, n in enumerate(m.nodes) if n.linked]
         for k in sorted(keyed):
             n = m.nodes[k.1]
-            nm = node_meta(n, ms)
+            nm = node_meta(n, ms, t)
             nm.yang = paths.get_def(mib.yang.node_key(n), "")
             if n.kind == "row" and n.augments == "":
                 keys = t.row_keys(n)

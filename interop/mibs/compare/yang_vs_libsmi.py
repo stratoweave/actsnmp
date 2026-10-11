@@ -22,7 +22,7 @@ section 6.1.3 rules), then normalised:
 
 Every remaining difference must be explained by a documented deviation, else it is reported
 as UNEXPLAINED (exit status 1). The deviations are libsmi's L1-L10 and our own decisions
-(D1-D25):
+(D1-D28):
 
 - L1  ``smiv2:max-access "read-write"`` where the MIB says read-create;
 - L2  octet ``length`` on hinted strings (omitted unless ``Na``/``Nt``; lower bound ceil(lo/4));
@@ -78,7 +78,8 @@ as UNEXPLAINED (exit status 1). The deviations are libsmi's L1-L10 and our own d
       container (libsmi emits a leaf for it);
 - D21 the resolver drops what does not fit the syntax: a DEFVAL that does not match
       (``resolve.defval-invalid``), an invalid DISPLAY-HINT (``resolve.hint-invalid``), and IMPLIED
-      on a fixed-size or integer index item (``resolve.index-implied-fixed``);
+      on an index item that is not the last (``resolve.index-implied-not-last``; IMPLIED on a
+      fixed-size or integer last item is emitted, as libsmi does);
 - D22 a notification object without a data leaf in its own module is a typed copy: a column of
       another module's row without AUGMENTS (``yang.column-orphan``; libsmi: a leafref to a path
       that does not exist) or an object whose type does not resolve (no data leaf);
@@ -87,6 +88,15 @@ as UNEXPLAINED (exit status 1). The deviations are libsmi's L1-L10 and our own d
 - D24 a local definition shadows an imported symbol of the same name
       (``resolve.import-shadowed``; libsmi uses the import);
 - D25 a hex DEFVAL stays ``'..'H`` where libsmi prints the octets as text;
+- D26 libsmi's range lies within ours: overlapping range items (``resolve.range-overlap``, a MIB
+      error) are merged where libsmi drops the item that overlaps an earlier one, and a range
+      beyond int64 is clamped (``yang.range-clamped``) where libsmi wraps it;
+- D27 a descriptor first declared by an OID assignment and then defined by an OBJECT-TYPE is
+      the object only (declare-then-define); libsmi also emits an alias for it;
+- D28 a multi-line DEFVAL string or UNITS text: ours writes the DEFVAL's
+      line ends as ``\\n`` and keeps its indentation, and normalises UNITS like a description;
+      libsmi's raw line break loses the indentation on unquoting (the texts agree up to white
+      space);
 
 and libsmi defects the corpus comparison found (the libsmi output is wrong; information only):
 
@@ -100,8 +110,9 @@ and libsmi defects the corpus comparison found (the libsmi output is wrong; info
       the module's nodes unlinked, with the resolver's errors), so everything else differs too;
       also libsmi's ``<unknown>`` access and OID ``0`` for objects it could not resolve;
 - LX5 libsmi's leafref path into another module's table omits the table container;
-- LX6 libsmi emits empty or incomplete statements: a module container without children (we
-      leave it out), an ``augment`` without a target (with the aliases of its table and row) where
+- LX6 libsmi emits empty or incomplete statements: a statement without its argument (a
+      leafref ``path`` for an INDEX item it could not resolve), a module container without
+      children (we leave it out), an ``augment`` without a target (with the aliases of its table and row) where
       the AUGMENTS base row does not resolve (we: a keyless list, ``resolve.augments-not-row``);
 - LX7 libsmi prints garbage DEFVALs (pointer values, ``(null)``);
 - LX8 libsmi drops one trailing character of a text for every backslash it escapes;
@@ -117,6 +128,7 @@ Pure stdlib.
 """
 
 import argparse
+import codecs
 import os
 import re
 import sys
@@ -344,9 +356,19 @@ def norm_args(s, pm):
         norm_args(c, pm)
 
 
+def _cp1252_fallback(err):
+    """Decode the bytes that are not UTF-8 as CP1252, as mib.source reads MIB texts: libsmi
+    copies a MIB's raw bytes into its YANG, ours is UTF-8."""
+    b = err.object[err.start:err.end]
+    return (b.decode("cp1252", errors="replace"), err.end)
+
+
+codecs.register_error("actsnmp-cp1252", _cp1252_fallback)
+
+
 def load(path):
-    with open(path, encoding="utf-8") as f:
-        mod = parse(f.read())
+    with open(path, "rb") as f:
+        mod = parse(f.read().decode("utf-8", errors="actsnmp-cp1252"))
     pm = prefix_map(mod)
     norm_args(mod, pm)
     return mod
@@ -490,6 +512,10 @@ def explain(d, ours, lib):
     par = s.parent
     if d.kind == "only-libsmi" and kw in ("smiv2:max-access", "smiv2:oid") and s.arg in ("<unknown>", "0"):
         return "LX4"
+    if d.kind == "value" and d.lib is not None and d.lib.arg is None and d.ours is not None and d.ours.arg:
+        # libsmi printed the keyword without its argument (`path ;` for an INDEX item it could
+        # not resolve)
+        return "LX6"
     if d.kind == "value" and kw in TEXT_KW and "\\" in d.ours.arg and \
             d.lib.arg == d.ours.arg[:len(d.ours.arg) - d.ours.arg.count("\\")]:
         return "LX8"
@@ -555,6 +581,8 @@ def explain(d, ours, lib):
             lr, orr = range_set(d.lib.arg), range_set(d.ours.arg)
             if all(any(a <= lo and hi <= b for a, b in lr) for lo, hi in orr):
                 return "D17"
+            if kw == "range" and all(any(a <= lo and hi <= b for a, b in orr) for lo, hi in lr):
+                return "D26"
         except ValueError:
             pass
     if d.kind == "value" and kw == "type" and d.lib.arg and ":" in d.lib.arg:
@@ -567,7 +595,7 @@ def explain(d, ours, lib):
             return "D19"
         if lm == "RFC1213-MIB" and ln == "PhysAddress" and d.ours.arg == "ietf-yang-types:phys-address":
             return "D7"
-    if d.kind == "value" and kw == "path" and d.ours.arg.replace("RFC1213-MIB", "IF-MIB") == d.lib.arg.replace("RFC1213-MIB", "IF-MIB"):
+    if d.kind == "value" and kw == "path" and (d.ours.arg or "").replace("RFC1213-MIB", "IF-MIB") == (d.lib.arg or "").replace("RFC1213-MIB", "IF-MIB"):
         return "D7"
     if d.kind == "value" and kw == "smiv2:defval" and re.match(r"^'([0-9a-fA-F]{2})+'H$", d.ours.arg or ""):
         try:
@@ -601,6 +629,9 @@ def explain(d, ours, lib):
         return "D21"
     if d.kind == "value" and kw == "smiv2:defval" and GARBAGE_DEFVAL.match(d.lib.arg or ""):
         return "LX7"
+    if d.kind == "value" and kw in ("smiv2:defval", "units") and ("\n" in (d.ours.arg or "") or "\n" in (d.lib.arg or "")) and \
+            " ".join((d.ours.arg or "").split()) == " ".join((d.lib.arg or "").split()):
+        return "D28"
     if d.kind == "value" and kw == "path":
         segs_o = d.ours.arg.split("/")
         segs_l = d.lib.arg.split("/")
@@ -701,6 +732,8 @@ def explain(d, ours, lib):
             return "L2"
         if kw == "smiv2:alias" and par is lib and any(x.kw == "identity" and x.arg == s.arg for x in ours.subs):
             return "L3"
+        if kw == "smiv2:alias" and any(x.kw in ("leaf", "list", "container") and x.arg == s.arg for x in iter_stmts(ours)):
+            return "D27"
         if kw == "import" and (s.arg is None or s.arg in ("RFC1155-SMI", "RFC-1212", "RFC-1215") or not uses_prefix(lib, s.arg)):
             return "L4"
         if kw == "leaf" and par is not None and par.kw == "container" and par.arg.startswith("object-"):
@@ -817,7 +850,12 @@ def compare_module(ours_path, lib_path):
     compare(ours, lib, diffs)
     broken = libsmi_broken(lib_path)
     for d in diffs:
-        d.why = explain(d, ours, lib)
+        try:
+            d.why = explain(d, ours, lib)
+        except (AttributeError, TypeError, ValueError, IndexError):
+            # a statement without an argument on one side (e.g. a CP1252 text libsmi broke):
+            # no rule applies, the difference stays unexplained
+            d.why = None
         if not d.why and broken and (d.kind == "only-ours" or (d.lib is not None and d.lib.kw in ("revision", "leaf", "list", "container")) or
                                      (d.kind == "value" and d.lib.arg in ("<unknown>", "0"))):
             d.why = "D8"

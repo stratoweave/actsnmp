@@ -1,54 +1,52 @@
 #!/bin/sh
 # Check the RFC 6643 YANG output of src/mib/yang.act.
 #
-#   interop/mibs/compare/yang_check.sh [OUTDIR]                          reference + golden (the gate)
-#   interop/mibs/compare/yang_check.sh golden-all [OUTDIR]               whole golden set incl. vendor
-#   interop/mibs/compare/yang_check.sh sample [OUTDIR] [PARTS]           >= 1000 corpus modules (report)
-#   interop/mibs/compare/yang_check.sh corpus [OUTDIR] [CHUNKS] [PARTS]  the whole corpus (report)
+#   yang_check.sh [OUTDIR]                          reference MIBs + golden set (the gate)
+#   yang_check.sh golden-all [OUTDIR]               whole golden set incl. IEEE/vendor modules
+#   yang_check.sh sample [OUTDIR] [PARTS]           >= 1000 corpus modules (report)
+#   yang_check.sh corpus [OUTDIR] [CHUNKS] [PARTS]  the whole corpus (report)
 #
 # ACTYANG_DIR must point to an acton-yang checkout; Build.act of yangcheck/ is
 # generated from Build.act.in with that path. ACTONYANG=0 skips the acton-yang
 # step in the report modes and then needs no checkout.
 #
-# Gate (default mode), OUTDIR defaults to ${TMPDIR:-/tmp}/actsnmp-yang-check:
-#   1. emit:   MIBYANG_OUT=OUTDIR acton test --module mib.test_yang --name yang_golden
-#              -> OUTDIR/ref/ (9 reference MIBs of interop/mibs/yang-examples/mibs) and
-#                 OUTDIR/golden/ (the 43 modules of interop/mibs/golden/mibs), each with
-#                 <MOD>.yang, <MOD>.diags and <MOD>.mibmeta.json;
-#   2. libsmi: yang_vs_libsmi.py OUTDIR/ref vs interop/mibs/yang-examples/yang-libsmi-0.5.0;
-#              every difference must be a documented deviation (L1-L10, D1-D11);
-#   3. pyang:  pyang 2.6.1 --strict over each set with yang-ietf/ (docker actsnmp-pyang:1,
-#              built from pyang.Dockerfile when missing); no errors allowed (warnings are
-#              listed: "imported module ietf-yang-smiv2 not used" is expected, RFC 6643 §3
-#              always imports it);
-#   4. acton-yang: yangcheck/ (a small Acton program against the acton-yang checkout in
-#              ACTYANG_DIR, built with --fast) compiles each set as one closure with yang-ietf/
-#              and checks it against the mibmeta JSON of the same run (smiv2:oid <-> NodeMeta.yang
-#              paths and mibmeta containers, list keys <-> IndexPart.key).
-# Exit status 1 when a step fails. The libsmi diff of the golden set against
-# OUTDIR/libsmi-golden (if present, made by libsmi_golden.sh) is printed for information.
+# The gate (OUTDIR defaults to ${TMPDIR:-/tmp}/actsnmp-yang-check):
+#   1. emit:   mib.test_yang yang_golden writes OUTDIR/ref/ (the 9 MIBs of
+#              interop/mibs/yang-examples/mibs) and OUTDIR/golden/ (the 43 modules of
+#              interop/mibs/golden/mibs), each as <MOD>.yang, .diags and .mibmeta.json;
+#   2. libsmi: yang_vs_libsmi.py, OUTDIR/ref against yang-examples/yang-libsmi-0.5.0;
+#              every difference must be a documented deviation;
+#   3. pyang:  pyang --strict over each set (image actsnmp-pyang:1, built from
+#              pyang.Dockerfile when missing); warnings are listed, errors fail.
+#              "imported module ietf-yang-smiv2 not used" is expected (RFC 6643
+#              section 3 always imports it);
+#   4. acton-yang: yangcheck/ compiles each set as one closure with yang-ietf/ and
+#              checks it against the mibmeta JSON (smiv2:oid against the NodeMeta
+#              YANG paths, list keys against IndexPart.key);
+#   5. conv:   yang_conv_check.py: every leaf's YANG type fits the value conversion
+#              mibmeta gives its object.
+# Exits 1 when a step fails. If OUTDIR/libsmi-golden exists (libsmi_golden.sh),
+# the libsmi diff of the golden set is printed for information.
 #
-# Report modes (local tier: they need interop/mibs/corpus; output under interop/mibs/cache/yang/
-# by default, which is not committed). Each emits YANG plus mibmeta with a tagged mibcorpus test
-# of mib.test_yang, splits the targets into PARTS (yang_closure.py: each part with its import
-# closure), and per part runs pyang --strict and acton-yang (yangcheck --keep-going plus the
-# mibmeta check), each bounded by 14 minutes; several steps share one bench-lock hold while it
-# is younger than EMIT_BUDGET/PYANG_BUDGET/ACTONYANG_BUDGET seconds (420/480/300). yang_report.py then
-# writes the pass rates per validator and the failure classes to OUTDIR/check/report.md:
-#   golden-all: the 43 IETF-tier golden modules plus the IEEE/vendor golden modules staged from
-#              the corpus (meta_vs_oracles.py --stage-vendor), resolved as one set (1 part);
-#   sample:    the modules yang_sample.py picks (deterministic, vendor-stratified, >= 1000, the
-#              big Cisco/Juniper/Nokia/Huawei/HP modules included), PARTS default 3;
-#   corpus:    every module of interop/mibs/corpus/flat in CHUNKS emit runs (default 8; prefixes
-#              are allocated over the whole corpus, so all chunks write one OUTDIR) and PARTS
-#              check parts (default 16).
-# Switches: ACTONYANG=0 skips acton-yang, PYANG=0 skips pyang, META=0 skips mibmeta (corpus
-# mode), LIBSMI=1 adds libsmi 0.5.0 YANG of the targets (libsmi_yang.sh, resumable within
-# LIBSMI_BUDGET seconds per hold) and yang_vs_libsmi.py (information) in golden-all/sample mode.
-# An OUTDIR is reused: files of earlier runs are overwritten, not removed.
-# Expected pyang errors: BAD_STATUS_REFERENCE where a MIB's current definition refers to a
-# deprecated/obsolete key column, INDEX object or TC of its own module (the emitter keeps MIB
-# statuses and warns with yang.status-reference).
+# The report modes need interop/mibs/corpus and write to interop/mibs/cache/yang/
+# by default. They emit YANG plus mibmeta with a mibcorpus test of mib.test_yang,
+# split the targets into PARTS closures (yang_closure.py), run pyang and
+# acton-yang per part (each bounded to 14 minutes, several per bench-lock hold
+# while the hold is younger than EMIT_BUDGET/PYANG_BUDGET/ACTONYANG_BUDGET
+# seconds, default 420/480/300), and write OUTDIR/check/report.md with
+# yang_report.py:
+#   golden-all: the golden set plus the IEEE/vendor golden modules staged from the
+#              corpus (meta_vs_oracles.py --stage-vendor), as one part;
+#   sample:    the deterministic, vendor-stratified pick of yang_sample.py (PARTS 3);
+#   corpus:    every module of corpus/flat in CHUNKS emit runs (default 8) and
+#              PARTS check parts (default 16).
+# PYANG=0, ACTONYANG=0 and CONV=0 skip a step, META=0 skips mibmeta in corpus
+# mode, LIBSMI=1 adds a libsmi 0.5.0 comparison (information) in golden-all and
+# sample mode. An existing OUTDIR is reused; old files are overwritten, not
+# removed.
+# Expected pyang errors: BAD_STATUS_REFERENCE where a current definition refers
+# to a deprecated or obsolete key column, INDEX object or TC of its own module
+# (the emitter keeps MIB statuses and warns with yang.status-reference).
 #
 # Heavy steps run under the bench lock (~/gcperf/lock100/bench.lock, if it
 # exists); LOCK= disables it.
@@ -98,7 +96,7 @@ yangcheck_build() {
 # run_pyang DIR OUTFILE: pyang --strict over DIR/*.yang; prints the error count
 run_pyang() {
     $LOCK docker run --rm -v "$1":/y:ro -v "$IETF":/ietf:ro "$PYANG_IMAGE" \
-        sh -c 'cd /y && pyang --strict -p /ietf -p /y *.yang' >"$2" 2>&1
+        sh -c 'cd /y && pyang --strict --no-path-recurse -p /ietf -p /y *.yang' >"$2" 2>&1
     grep -c ': error:' "$2"
 }
 
@@ -134,19 +132,24 @@ check_parts() {
     chk="$out/check"
     mkdir -p "$chk"
     python3 "$CMP/yang_closure.py" --dir "$out" --names "$names" --parts "$parts" --weights --out-dir "$chk"
+    # reset only the steps that run now (PYANG=0 or ACTONYANG=0 keeps that step's earlier
+    # results for the report)
     for p in $(cat "$chk/parts.txt"); do
-        printf '' >"$chk/$p.pyang.txt"
-        printf '' >"$chk/$p.actonyang.txt"
-        for x in pyang acton; do
-            [ -e "$chk/$p.$x.done" ] && mv "$chk/$p.$x.done" "$chk/$p.$x.old"
-        done
+        if [ "${PYANG:-1}" = "1" ]; then
+            printf '' >"$chk/$p.pyang.txt"
+            [ -e "$chk/$p.pyang.done" ] && mv "$chk/$p.pyang.done" "$chk/$p.pyang.old"
+        fi
+        if [ "${ACTONYANG:-1}" = "1" ]; then
+            printf '' >"$chk/$p.actonyang.txt"
+            [ -e "$chk/$p.acton.done" ] && mv "$chk/$p.acton.done" "$chk/$p.acton.old"
+        fi
     done
     if [ "${PYANG:-1}" = "1" ]; then
         pyang_image
         printf '' >"$chk/pyang.cmds"
         for p in $(cat "$chk/parts.txt"); do
             sed 's|.*/||' "$chk/$p.files" >"$chk/$p.names"
-            echo "$p.pyang timeout 840 docker run --rm -v $out:/y:ro -v $IETF:/ietf:ro -v $chk:/c:ro $PYANG_IMAGE sh -c 'cd /y && pyang --strict -p /ietf -p /y \$(cat /c/$p.names)' >$chk/$p.pyang.txt 2>&1" >>"$chk/pyang.cmds"
+            echo "$p.pyang timeout 840 docker run --rm -v $out:/y:ro -v $IETF:/ietf:ro -v $chk:/c:ro $PYANG_IMAGE sh -c 'cd /y && pyang --strict --no-path-recurse -p /ietf -p /y \$(cat /c/$p.names)' >$chk/$p.pyang.txt 2>&1" >>"$chk/pyang.cmds"
         done
         batch "$chk" "${PYANG_BUDGET:-480}" "$chk/pyang.cmds"
         for p in $(cat "$chk/parts.txt"); do
@@ -170,6 +173,10 @@ check_parts() {
         for p in $(cat "$chk/parts.txt"); do
             echo "$p acton-yang: $(head -1 "$chk/$p.actonyang.txt" | cut -c1-110); $(grep -c '^PROBLEM' "$chk/$p.actonyang.txt") mibmeta problems"
         done
+    fi
+    if [ "${CONV:-1}" = "1" ]; then
+        $LOCK timeout 840 python3 "$CMP/yang_conv_check.py" "$out" --show 200 >"$chk/conv.txt" 2>&1
+        echo "conv (mibmeta vs YANG type): $(head -1 "$chk/conv.txt") ($chk/conv.txt)"
     fi
     python3 "$CMP/yang_report.py" --out "$out" --check "$chk" --title "$title" --md "$chk/report.md" >/dev/null
     echo "report: $chk/report.md"
@@ -295,6 +302,16 @@ for set in ref golden; do
     else
         echo "$set: FAILED"
         head -40 "$OUT/yangcheck-$set.txt"
+        rc=1
+    fi
+done
+echo "== 5. mibmeta conversion vs YANG type"
+for set in ref golden; do
+    if python3 "$CMP/yang_conv_check.py" "$OUT/$set" >"$OUT/conv-$set.txt" 2>&1; then
+        echo "$set: $(head -1 "$OUT/conv-$set.txt")"
+    else
+        echo "$set: FAILED"
+        head -20 "$OUT/conv-$set.txt"
         rc=1
     fi
 done

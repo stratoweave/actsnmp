@@ -73,6 +73,7 @@ CATALOG: dict[str, (int, str, str)] = {
     "resolve.last-subid-zero": (3, "last-subid-zero", "a registration's last sub-identifier is 0"),
     "resolve.range-swapped": (2, "range-exchanged", "a range has its bounds exchanged; they are swapped"),
     "resolve.range-widened": (2, "", "a refinement is not a subset of its parent's constraint; the intersection is used"),
+    "resolve.range-overlap": (2, "range-overlap", "two ranges or sizes of one constraint overlap (kept; the YANG emitter merges them)"),
     "resolve.range-bounds": (2, "range-bounds", "a range lies outside the base type's value space (kept; the YANG emitter clamps)"),
     "resolve.range-illegal": (2, "subtype-illegal", "a subtype on a type that may not be subtyped (Counter32, TimeTicks, ...); kept"),
     "resolve.range-kind": (2, "", "a range on a string type or a SIZE on an integer type; read as the other kind"),
@@ -104,6 +105,7 @@ CATALOG: dict[str, (int, str, str)] = {
     "resolve.access-scalar-create": (3, "scalar-read-create", "a scalar is read-create"),
     "resolve.notification-not-reversible": (5, "notification-not-reversible", "the next-to-last sub-identifier of a notification is not 0"),
     "resolve.row-misplaced": (2, "", "a row is not directly below a table (RFC 3584 (14))"),
+    "resolve.table-syntax": (2, "", "a table's SYNTAX names its row type instead of SEQUENCE OF it (the row is registered below it); read as a table"),
     "resolve.sequence-missing-column": (3, "sequence-missing-column", "a column of a row is missing from its SEQUENCE type (the OID tree decides)"),
     "resolve.sequence-no-column": (3, "sequence-no-column", "a SEQUENCE item is not a column of the row"),
     "resolve.defval-invalid": (2, "defval-syntax", "a DEFVAL does not match the object's syntax; it is dropped"),
@@ -283,6 +285,25 @@ def _subset(own: list[mib.model.Range], parent: list[mib.model.Range]) -> bool:
         if not ok:
             return False
     return True
+
+
+def _has_index(d: mib.ast.Def) -> bool:
+    """Whether a definition is an OBJECT-TYPE with INDEX or AUGMENTS."""
+    if isinstance(d, mib.ast.ObjectType):
+        return d.has_index or len(d.augments) > 0
+    return False
+
+
+def _overlap(items: list[mib.model.Range]) -> ?(mib.model.Range, mib.model.Range):
+    """Two items of one constraint that share a value (ranges must not overlap; touching or
+    unordered ranges are fine), or None."""
+    for i in range(len(items)):
+        a = items[i]
+        for j in range(i + 1, len(items)):
+            b = items[j]
+            if a.lo <= b.hi and b.lo <= a.hi:
+                return (a, b)
+    return None
 
 
 def _intersect(own: list[mib.model.Range], parent: list[mib.model.Range]) -> list[mib.model.Range]:
@@ -599,6 +620,7 @@ class Resolver(object):
         # column, so a module's model does not depend on unrelated modules of the set (ACC-MIB
         # registers scalars below an OID assignment that ACC-FLASH, which it does not import,
         # defines as a row)
+        self.rows_as_tables()
         rows_at: dict[str, list[mib.model.MibNode]] = {}
         for nm in ms.order:
             for n in ms.modules[nm].nodes:
@@ -647,6 +669,34 @@ class Resolver(object):
         self.defval_oid_names()
         # pass the loader's parse diagnostics on, then ours, all ordered
         ms.diags = order_diags(self.ld.diags, self.diags)
+
+    def rows_as_tables(self) -> None:
+        """A row without INDEX or AUGMENTS that has a row of the same SEQUENCE type registered
+        directly below it, in its own module, is that row's table written without `SEQUENCE OF`
+        (`pmProcAcctTable OBJECT-TYPE SYNTAX PmProcAcctEntry`, PROCESS-MONITOR-SUNMANAGEMENTCENTER-MIB):
+        it is read as a table (level 2 resolve.table-syntax). Otherwise both would be rows, and
+        the YANG would carry its OID twice (a list, and the container of the other row's list)."""
+        rows: dict[str, mib.model.MibNode] = {}
+        for nm in self.ms.order:
+            for n in self.ms.modules[nm].nodes:
+                if n.kind == "row" and n.linked:
+                    rows[n.module + " " + mib.model.oid_str(n.oid)] = n
+        for nm in self.ms.order:
+            for n in self.ms.modules[nm].nodes:
+                if n.kind != "row" or not n.linked or len(n.oid) < 2:
+                    continue
+                p = rows.get(n.module + " " + mib.model.oid_str(n.oid[:-1]))
+                if p is not None:
+                    if p.kind == "row" and not _has_index(p.defn):
+                        ps = p.syntax
+                        ns = n.syntax
+                        if ps is not None and ns is not None:
+                            if ps.row_type != "" and ps.row_type == ns.row_type:
+                                p.kind = "table"
+                                ps.base = "SEQUENCE OF"
+                                self.rep(p.module, "resolve.table-syntax", p.line, p.col,
+                                         "the SYNTAX of " + p.name + " names the row type " + ps.row_type + " instead of SEQUENCE OF " +
+                                         ps.row_type + ", and the row " + n.name + " of that type is registered below it; read as a table")
 
     # --- symbol tables ---
 
@@ -1109,6 +1159,11 @@ class Resolver(object):
                 self.rep(mod, "resolve.range-kind", c.line, c.col, "a range on the string type " + s.base + " is read as SIZE")
                 size = True
             items = self.range_items(mod, c, s.base, size)
+            if len(items) > 1 and len(items) <= 64:
+                ov = _overlap(items)
+                if ov is not None:
+                    self.rep(mod, "resolve.range-overlap", c.line, c.col,
+                             ("SIZE" if size else "range") + " items " + ov.0.dump() + " and " + ov.1.dump() + " overlap (kept)")
             if size:
                 if s.base not in STRING_BASES and s.base != "" and not tagged:
                     self.rep(mod, "resolve.range-illegal", c.line, c.col, "SIZE on " + s.base + " is not allowed (kept)")

@@ -11,8 +11,8 @@ Differential testing for the actsnmp MIB compiler. This directory holds:
   `vendors.tsv`);
 * a golden set (`golden/`) of 96 modules with their expected oracle outputs,
   small enough for unit tests;
-* a script in `compare/` that checks the compiler's parse results against
-  the oracles.
+* scripts in `compare/` that check the compiler's output against the oracles
+  and its RFC 6643 YANG output against libsmi, pyang and acton-yang.
 
 None of this is a dependency of the library. The corpus (`corpus/`, about
 1.4 GB) and the oracle outputs (`cache/`, 2 to 3 GB) are not committed.
@@ -148,5 +148,14 @@ up in `golden/mibs/`.
 | Script | What it checks |
 |---|---|
 | `parse_vs_oracles.py` | the compiler's parse status per module against pysmi, smilint and net-snmp |
+| `meta_vs_oracles.py` | the compiler's metadata, field by field, against pysmi JSON and net-snmp JSONL |
+| `yang_check.sh` | the YANG output: libsmi 0.5.0 diff, `pyang --strict`, acton-yang compile and the mibmeta cross-check |
 
-It writes a Markdown report with `--out FILE`; put it under `cache/`.
+Both Python scripts write a Markdown report with `--out FILE`; put it under
+`cache/`. `yang_check.sh` without arguments is the gate over the reference
+MIBs and the golden set; `golden-all`, `sample` and `corpus` produce reports
+under `cache/yang/`. The acton-yang step builds `yangcheck/` against a local
+acton-yang checkout, whose path is set in `yangcheck/Build.act`. pyang runs
+in the image `actsnmp-pyang:1` (`pyang.Dockerfile`, built on demand). The
+libsmi 0.5.0 comparisons of the report modes and `libsmi_golden.sh` need an
+image `actsnmp-libsmi-trunk:1` with smidump built from libsmi's git master.

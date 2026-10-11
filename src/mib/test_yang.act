@@ -854,6 +854,48 @@ def _test_misplaced_and_twice_defined() -> None:
     testing.assertEqual(len([ln for ln in y.split("\n") if ln.strip() == "container dS {{"]), 1)
 
 
+# a table written with its row type instead of `SEQUENCE OF` (PROCESS-MONITOR-SUNMANAGEMENTCENTER-MIB
+# pmProcAcctTable), and a row registered below a row of another type
+RT_MIB = r"""RT-MIB DEFINITIONS ::= BEGIN
+IMPORTS OBJECT-TYPE, Integer32, enterprises FROM SNMPv2-SMI;
+rG OBJECT IDENTIFIER ::= { enterprises 99986 }
+rTable OBJECT-TYPE SYNTAX REntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "t" ::= { rG 2 }
+rEntry OBJECT-TYPE SYNTAX REntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "e" INDEX { rIdx } ::= { rTable 1 }
+REntry ::= SEQUENCE { rIdx Integer32, rVal Integer32 }
+rIdx OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current DESCRIPTION "i" ::= { rEntry 1 }
+rVal OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current DESCRIPTION "v" ::= { rEntry 2 }
+sRow OBJECT-TYPE SYNTAX SRow MAX-ACCESS not-accessible STATUS current DESCRIPTION "r" ::= { rG 3 }
+SRow ::= SEQUENCE { sA Integer32 }
+sA OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current DESCRIPTION "a" ::= { sRow 2 }
+sEntry OBJECT-TYPE SYNTAX SEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "e" INDEX { sIdx } ::= { sRow 1 }
+SEntry ::= SEQUENCE { sIdx Integer32 }
+sIdx OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current DESCRIPTION "i" ::= { sEntry 1 }
+END
+"""
+
+
+def _test_row_typed_table() -> None:
+    """A row without INDEX whose row type is that of the row below it is that row's table
+    (resolve.table-syntax): one container and one list, each OID once. A row below a row of
+    another type is not placed into a container named after that row (whose OID is already
+    its list's): yang.row-unplaced."""
+    ms = mib.resolver.resolve_texts([RT_MIB])
+    testing.assertIn("resolve.table-syntax", [d.code for d in ms.diags])
+    n = ms.node("RT-MIB", "rTable")
+    testing.assertEqual(n.kind if n is not None else "", "table")
+    r = mib.yang.Translator(ms).module("RT-MIB")
+    testing.assertTrue(r is not None)
+    if r is not None:
+        y = r.text
+        testing.assertIn("list rEntry {{", block(y, "container rTable {{"))
+        testing.assertNotIn("list rTable {{", y)
+        testing.assertEqual(y.count("smiv2:oid \"1.3.6.1.4.1.99986.2\";"), 1)
+        testing.assertEqual(y.count("smiv2:oid \"1.3.6.1.4.1.99986.3\";"), 1)
+        testing.assertNotIn("container sRow {{", y)
+        testing.assertIn("yang.row-unplaced", codes(r))
+        testing.assertEqual([d.code for d in r.diags if d.level == 0], [])
+
+
 # scalar parent conflicts seen in the corpus: an implicit `name(n)` label on the defined arc
 # (RARITANSX-MIB), a notification registered at a scalar group's OID (PowerNet-MIB), scalars
 # registered below a scalar (NV-ATKK-MIB), an OBJECT-GROUP at the parent OID (MSTP-MIB's
@@ -1043,6 +1085,256 @@ def _test_t25_unresolved_index_object() -> None:
     testing.assertIn("yang.index-unresolved", codes(r))
     n = block(r.text, "notification uTrap {{")
     testing.assertIn("    leaf uMissing {{\n      type leafref {{\n        path \"/u-mib:U-MIB/u-mib:uTable/u-mib:uEntry/u-mib:uMissing\";\n", n)
+
+
+# --- RFC 6643 corner cases -----------------------------------------------------------------------
+
+# a cycle of three modules closed by an augment: CYA-MIB uses CYB-MIB's TC, CYB-MIB uses
+# CYC-MIB's TC, CYC-MIB augments CYA-MIB's row
+CY_A = r"""CYA-MIB DEFINITIONS ::= BEGIN
+IMPORTS OBJECT-TYPE, Integer32, enterprises FROM SNMPv2-SMI
+        BTc FROM CYB-MIB;
+cya OBJECT IDENTIFIER ::= { enterprises 99970 }
+cyaTable OBJECT-TYPE SYNTAX SEQUENCE OF CyaEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "t" ::= { cya 1 }
+cyaEntry OBJECT-TYPE SYNTAX CyaEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "e" INDEX { cyaIdx } ::= { cyaTable 1 }
+CyaEntry ::= SEQUENCE { cyaIdx Integer32, cyaVal BTc }
+cyaIdx OBJECT-TYPE SYNTAX Integer32 (1..9) MAX-ACCESS not-accessible STATUS current DESCRIPTION "i" ::= { cyaEntry 1 }
+cyaVal OBJECT-TYPE SYNTAX BTc MAX-ACCESS read-only STATUS current DESCRIPTION "v" ::= { cyaEntry 2 }
+END
+"""
+CY_B = r"""CYB-MIB DEFINITIONS ::= BEGIN
+IMPORTS OBJECT-TYPE, enterprises FROM SNMPv2-SMI
+        TEXTUAL-CONVENTION FROM SNMPv2-TC
+        CTc FROM CYC-MIB;
+BTc ::= TEXTUAL-CONVENTION STATUS current DESCRIPTION "b" SYNTAX CTc
+cyb OBJECT IDENTIFIER ::= { enterprises 99971 }
+cybX OBJECT-TYPE SYNTAX CTc MAX-ACCESS read-only STATUS current DESCRIPTION "x" ::= { cyb 1 }
+END
+"""
+CY_C = r"""CYC-MIB DEFINITIONS ::= BEGIN
+IMPORTS OBJECT-TYPE, Integer32, enterprises FROM SNMPv2-SMI
+        TEXTUAL-CONVENTION FROM SNMPv2-TC
+        cyaEntry FROM CYA-MIB;
+CTc ::= TEXTUAL-CONVENTION STATUS current DESCRIPTION "c" SYNTAX Integer32 (0..7)
+cyc OBJECT IDENTIFIER ::= { enterprises 99972 }
+cycTable OBJECT-TYPE SYNTAX SEQUENCE OF CycEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "t" ::= { cyc 1 }
+cycEntry OBJECT-TYPE SYNTAX CycEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "e" AUGMENTS { cyaEntry } ::= { cycTable 1 }
+CycEntry ::= SEQUENCE { cycVal Integer32 }
+cycVal OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current DESCRIPTION "v" ::= { cycEntry 1 }
+END
+"""
+
+
+def _test_import_cycle_with_augment() -> None:
+    """A cycle of three modules closed by an augment edge: the augment's import must stay, so
+    the cycle is broken at another edge (a pairwise rule would leave
+    CYA -> CYB -> CYC -> CYA in place, which pyang and acton-yang reject). Inside a cycle the
+    modules are ranked so that augment edges go forward (byte order otherwise)."""
+    t = tr([CY_A, CY_B, CY_C])
+    ra = t.module("CYA-MIB")
+    rb = t.module("CYB-MIB")
+    rc = t.module("CYC-MIB")
+    if ra is not None and rb is not None and rc is not None:
+        testing.assertEqual(ra.imports, ["ietf-yang-smiv2"])
+        testing.assertEqual(rb.imports, ["CYC-MIB", "ietf-yang-smiv2"])
+        testing.assertEqual(rc.imports, ["CYA-MIB", "ietf-yang-smiv2"])
+        testing.assertIn("yang.import-cycle", codes(ra))
+        testing.assertIn("  type int32 {{\n    range \"0..7\";\n  }}", block(ra.text, "leaf cyaVal {{"))
+        testing.assertIn("  augment \"/cya-mib:CYA-MIB/cya-mib:cyaTable/cya-mib:cyaEntry\" {{", rc.text)
+        testing.assertIn("  type cyc-mib:CTc;\n", block(rb.text, "leaf cybX {{"))
+    else:
+        testing.error("not translated")
+
+
+IMP_MIB = r"""IMP-MIB DEFINITIONS ::= BEGIN
+IMPORTS OBJECT-TYPE, Integer32, enterprises FROM SNMPv2-SMI
+        MacAddress FROM SNMPv2-TC;
+imp OBJECT IDENTIFIER ::= { enterprises 99977 }
+impTable OBJECT-TYPE SYNTAX SEQUENCE OF ImpEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "t" ::= { imp 1 }
+impEntry OBJECT-TYPE SYNTAX ImpEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "e" INDEX { impId, IMPLIED impMac } ::= { impTable 1 }
+ImpEntry ::= SEQUENCE { impId Integer32, impMac MacAddress, impVal Integer32 }
+impId OBJECT-TYPE SYNTAX Integer32 (1..9) MAX-ACCESS not-accessible STATUS current DESCRIPTION "i" ::= { impEntry 1 }
+impMac OBJECT-TYPE SYNTAX MacAddress MAX-ACCESS not-accessible STATUS current DESCRIPTION "m" ::= { impEntry 2 }
+impVal OBJECT-TYPE SYNTAX Integer32 MAX-ACCESS read-only STATUS current DESCRIPTION "v" ::= { impEntry 3 }
+imp2Table OBJECT-TYPE SYNTAX SEQUENCE OF Imp2Entry MAX-ACCESS not-accessible STATUS current DESCRIPTION "t" ::= { imp 2 }
+imp2Entry OBJECT-TYPE SYNTAX Imp2Entry MAX-ACCESS not-accessible STATUS current DESCRIPTION "e" INDEX { IMPLIED impId, imp2Num } ::= { imp2Table 1 }
+Imp2Entry ::= SEQUENCE { imp2Num Integer32 }
+imp2Num OBJECT-TYPE SYNTAX Integer32 (0..9) MAX-ACCESS not-accessible STATUS current DESCRIPTION "n" ::= { imp2Entry 1 }
+imp3Table OBJECT-TYPE SYNTAX SEQUENCE OF Imp3Entry MAX-ACCESS not-accessible STATUS current DESCRIPTION "t" ::= { imp 3 }
+imp3Entry OBJECT-TYPE SYNTAX Imp3Entry MAX-ACCESS not-accessible STATUS current DESCRIPTION "e" INDEX { IMPLIED imp3Num } ::= { imp3Table 1 }
+Imp3Entry ::= SEQUENCE { imp3Num Integer32 }
+imp3Num OBJECT-TYPE SYNTAX Integer32 (0..9) MAX-ACCESS not-accessible STATUS current DESCRIPTION "n" ::= { imp3Entry 1 }
+END
+"""
+
+
+def _test_t18_implied_written() -> None:
+    """RFC 6643 section 7.3: smiv2:implied whenever the INDEX clause marks its last item IMPLIED, also
+    where it changes no encoding (a fixed-length string, an integer: the resolver ignores it at
+    level 3 and mibmeta keeps `fixed`/`int`); IMPLIED on an item that is not the last is ignored
+    (level 2, no statement)."""
+    y = emit([IMP_MIB], "IMP-MIB").text
+    testing.assertIn("  key \"impId impMac\";\n  smiv2:implied \"impMac\";\n", block(y, "list impEntry {{"))
+    testing.assertNotIn("smiv2:implied", block(y, "list imp2Entry {{"))
+    testing.assertIn("  key \"imp3Num\";\n  smiv2:implied \"imp3Num\";\n", block(y, "list imp3Entry {{"))
+    mm = mib.meta.module_meta(mib.resolver.resolve_texts([IMP_MIB]), "IMP-MIB")
+    encs: list[str] = []
+    if mm is not None:
+        for n in mm.nodes:
+            if n.name == "impEntry" or n.name == "imp3Entry":
+                encs.extend([p.enc for p in n.index])
+    testing.assertEqual(encs, ["int", "fixed", "int"])
+
+
+KR_MIB = r"""KR-MIB DEFINITIONS ::= BEGIN
+IMPORTS OBJECT-TYPE, Integer32, enterprises FROM SNMPv2-SMI;
+kr OBJECT IDENTIFIER ::= { enterprises 99978 }
+krTable OBJECT-TYPE SYNTAX SEQUENCE OF KrEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "t" ::= { kr 1 }
+krEntry OBJECT-TYPE SYNTAX KrEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "e" INDEX { 3idx, _3idx, 3idx } ::= { krTable 1 }
+KrEntry ::= SEQUENCE { 3idx Integer32, _3idx Integer32 }
+3idx OBJECT-TYPE SYNTAX Integer32 (1..9) MAX-ACCESS not-accessible STATUS current DESCRIPTION "i" ::= { krEntry 1 }
+_3idx OBJECT-TYPE SYNTAX Integer32 (1..9) MAX-ACCESS not-accessible STATUS current DESCRIPTION "j" ::= { krEntry 2 }
+END
+"""
+
+
+def _test_key_rewrite() -> None:
+    """Key leaf names: a rewritten name is reported; `_<n>` counts the occurrences of one
+    object (RFC 6643 section 7.3), so another object whose name rewrites to the same identifier gets a
+    collision suffix, reported too, and the repeated object's copy is `<name>_2`."""
+    r = emit([KR_MIB], "KR-MIB")
+    testing.assertIn("  key \"_3idx _3idx_2 _3idx_2_2\";\n", block(r.text, "list krEntry {{"))
+    msgs = [d.message for d in r.diags if d.code == "yang.identifier-rewritten"]
+    testing.assertIn("key 3idx of krEntry is _3idx in the YANG", msgs)
+    testing.assertIn("key _3idx of krEntry is _3idx_2 in the YANG", msgs)
+    testing.assertIn("key 3idx_2 of krEntry is _3idx_2_2 in the YANG", msgs)
+    testing.assertIn("  smiv2:oid \"1.3.6.1.4.1.99978.1.1.2\";\n", block(block(r.text, "list krEntry {{"), "leaf _3idx_2 {{"))
+
+
+QL_MIB = r"""QL-MIB DEFINITIONS ::= BEGIN
+IMPORTS OBJECT-TYPE, enterprises FROM SNMPv2-SMI;
+ql OBJECT IDENTIFIER ::= { enterprises 99979 }
+qlObj OBJECT-TYPE SYNTAX OCTET STRING UNITS "frames seen
+              at this level" MAX-ACCESS read-write STATUS current DESCRIPTION "d"
+    DEFVAL { "line one
+        line two \ end" } ::= { ql 1 }
+END
+"""
+
+
+def _test_quoted_line_breaks() -> None:
+    """A multi-line DEFVAL string keeps its value: a raw line break in a YANG quoted string
+    loses the next line's indentation on unquoting (RFC 6020 section 6.1.3), so line ends are
+    written as `\\n` (ENTERASYS-PWA-MIB, LANtern-MIB); a multi-line UNITS text (ISIS-MIB) is
+    normalised like a description."""
+    l = block(emit([QL_MIB], "QL-MIB").text, "leaf qlObj {{")
+    testing.assertIn("  units \"frames seen\\nat this level\";\n", l)
+    testing.assertIn("  smiv2:defval \"line one\\n        line two \\\\ end\";\n", l)
+    testing.assertEqual(mib.yang.quoted_value("a\r\nb\rc \"q\""), "a\\nb\\nc \\\"q\\\"")
+
+
+def _test_t25_not_accessible_object() -> None:
+    """RFC 2578 section 8.1 forbids not-accessible objects in OBJECTS and RFC 6643 section 9.1
+    does not cover them: object-<k> gets a full leaf, and the emitter says so (level 3)."""
+    r = emit([T_MIB], "T-MIB")
+    msgs = [d.message for d in r.diags if d.code == "yang.notification-not-accessible"]
+    testing.assertEqual(len(msgs), 1)
+    testing.assertIn("T-MIB::tIdx of tTrap is not-accessible", msgs[0])
+
+
+IG_MIB = r"""IG-MIB DEFINITIONS ::= BEGIN
+IMPORTS OBJECT-TYPE, enterprises FROM SNMPv2-SMI
+        TEXTUAL-CONVENTION, MacAddress FROM SNMPv2-TC;
+ig OBJECT IDENTIFIER ::= { enterprises 99976 }
+IgBase ::= TEXTUAL-CONVENTION DISPLAY-HINT "255a" STATUS current DESCRIPTION "b" SYNTAX OCTET STRING (SIZE (0..64))
+IgChild ::= TEXTUAL-CONVENTION DISPLAY-HINT "32a" STATUS current DESCRIPTION "c" SYNTAX IgBase (SIZE (0..32))
+IgPlain ::= TEXTUAL-CONVENTION STATUS current DESCRIPTION "p" SYNTAX IgBase (SIZE (0..16))
+igA OBJECT-TYPE SYNTAX IgBase MAX-ACCESS read-only STATUS current DESCRIPTION "a" ::= { ig 1 }
+igB OBJECT-TYPE SYNTAX IgChild MAX-ACCESS read-only STATUS current DESCRIPTION "b" ::= { ig 2 }
+igC OBJECT-TYPE SYNTAX IgPlain (SIZE (1..8)) MAX-ACCESS read-only STATUS current DESCRIPTION "c" ::= { ig 3 }
+igM OBJECT-TYPE SYNTAX MacAddress MAX-ACCESS read-only STATUS current DESCRIPTION "m" ::= { ig 4 }
+END
+"""
+
+
+def ig(ignore: set[str]) -> (str, dict[str, (str, str)]):
+    """IG-MIB's YANG with `Options.ignore_display_hint`, and its mibmeta (conv, hint) by name."""
+    o = mib.yang.Options()
+    o.ignore_display_hint = ignore
+    ms = mib.resolver.resolve_texts([IG_MIB])
+    t = mib.yang.Translator(ms, o)
+    r = t.module("IG-MIB")
+    y = r.text if r is not None else ""
+    convs: dict[str, (str, str)] = {}
+    mm = mib.meta.module_meta(ms, "IG-MIB", t)
+    if mm is not None:
+        for n in mm.nodes:
+            sx = n.syntax
+            if sx is not None:
+                convs[n.name] = (sx.conv, sx.hint)
+        for ty in mm.types:
+            tsx = ty.syntax
+            if tsx is not None:
+                convs[ty.name] = (tsx.conv, tsx.hint)
+    return (y, convs)
+
+
+def _test_t13_ignore_display_hint() -> None:
+    """RFC 6643 section 2 asks for an option to ignore a DISPLAY-HINT added in a later revision
+    (`Options.ignore_display_hint`). The ignored TC stays binary and loses its
+    smiv2:display-hint; a TC that adds its own hint to it becomes a string of its own; objects
+    of it get binary lengths; a TC below an ignored child takes the next hint up the chain;
+    mibmeta's conv and hint follow the YANG; a well-known TC is not affected."""
+    y0, c0 = ig(set())
+    testing.assertEqual(block(y0, "typedef IgChild {{"), "typedef IgChild {{\n  type ig-mib:IgBase {{\n    length \"0..32\";\n  }}\n  description\n   \"c\";\n  smiv2:display-hint \"32a\";\n}}")
+    testing.assertEqual(c0.get_def("igA", ("", "")), ("string-hint", "255a"))
+    y, c = ig({"IG-MIB::IgBase", "SNMPv2-TC::MacAddress"})
+    testing.assertEqual(block(y, "typedef IgBase {{"), "typedef IgBase {{\n  type binary {{\n    length \"0..64\";\n  }}\n  description\n   \"b\";\n}}")
+    testing.assertEqual(block(y, "typedef IgChild {{"), "typedef IgChild {{\n  type string {{\n    length \"0..32\";\n  }}\n  description\n   \"c\";\n  smiv2:display-hint \"32a\";\n}}")
+    testing.assertEqual(block(y, "typedef IgPlain {{"), "typedef IgPlain {{\n  type ig-mib:IgBase {{\n    length \"0..16\";\n  }}\n  description\n   \"p\";\n}}")
+    testing.assertIn("  type ig-mib:IgPlain {{\n    length \"1..8\";\n  }}", block(y, "leaf igC {{"))
+    testing.assertIn("  type yang:mac-address;\n", block(y, "leaf igM {{"))
+    testing.assertEqual([c.get_def(x, ("", "")) for x in ["igA", "igB", "igC", "igM", "IgBase", "IgChild"]],
+                        [("binary", ""), ("string-hint", "32a"), ("binary", ""), ("mac-address", "1x:"), ("binary", ""), ("string-hint", "32a")])
+    y2, c2 = ig({"IG-MIB::IgChild"})
+    testing.assertEqual(block(y2, "typedef IgChild {{"), "typedef IgChild {{\n  type ig-mib:IgBase {{\n    length \"0..32\";\n  }}\n  description\n   \"c\";\n}}")
+    testing.assertEqual([c2.get_def(x, ("", "")) for x in ["igA", "igB", "IgChild"]],
+                        [("string-hint", "255a"), ("string-hint", "255a"), ("string-hint", "255a")])
+
+
+TV_MIB = r"""TV-MIB DEFINITIONS ::= BEGIN
+IMPORTS OBJECT-TYPE, enterprises FROM SNMPv2-SMI
+        TEXTUAL-CONVENTION, TruthValue FROM SNMPv2-TC;
+tv OBJECT IDENTIFIER ::= { enterprises 99975 }
+MyTruth ::= TEXTUAL-CONVENTION STATUS current DESCRIPTION "m" SYNTAX TruthValue
+tvA OBJECT-TYPE SYNTAX MyTruth MAX-ACCESS read-only STATUS current DESCRIPTION "a" ::= { tv 1 }
+tvB OBJECT-TYPE SYNTAX MyTruth { true(1) } MAX-ACCESS read-only STATUS current DESCRIPTION "b" ::= { tv 2 }
+tvC OBJECT-TYPE SYNTAX TruthValue { true(1) } MAX-ACCESS read-only STATUS current DESCRIPTION "c" ::= { tv 3 }
+tvD OBJECT-TYPE SYNTAX BITS MAX-ACCESS read-only STATUS current DESCRIPTION "no named bits" ::= { tv 4 }
+END
+"""
+
+
+def _test_meta_conv_follows_yang() -> None:
+    """mibmeta's `conv` names the value space of the leaf's YANG type (checked
+    over the corpus by interop/mibs/compare/yang_conv_check.py): a TC derived from TruthValue
+    is boolean (`truthvalue`), a named-number subset of it an inline enumeration
+    (`enum`), TruthValue's own subset still boolean; BITS without named bits is binary."""
+    ms = mib.resolver.resolve_texts([TV_MIB])
+    y = emit([TV_MIB], "TV-MIB").text
+    testing.assertIn("  type boolean;\n", block(y, "typedef MyTruth {{"))
+    testing.assertIn("  type tv-mib:MyTruth;\n", block(y, "leaf tvA {{"))
+    testing.assertIn("  type enumeration {{\n", block(y, "leaf tvB {{"))
+    testing.assertIn("  type boolean;\n", block(y, "leaf tvC {{"))
+    testing.assertIn("  type binary;\n", block(y, "leaf tvD {{"))
+    mm = mib.meta.module_meta(ms, "TV-MIB")
+    convs: list[str] = []
+    if mm is not None:
+        for n in mm.nodes:
+            sx = n.syntax
+            if sx is not None:
+                convs.append(n.name + "=" + sx.conv)
+    testing.assertEqual(convs, ["tvA=truthvalue", "tvB=enum", "tvC=truthvalue", "tvD=binary"])
 
 
 # --- mibmeta YANG paths --------------------------------------------------------------------------

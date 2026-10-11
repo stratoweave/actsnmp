@@ -41,15 +41,22 @@ Decisions beyond the RFC:
   1900..2099 give no revision statement; duplicate dates are merged; revisions are sorted
   newest first.
 - SMI modules may import each other; YANG modules must not. The translator builds every
-  module's statements once without restriction, and inside a cycle of references keeps the
-  import only from the byte-order smaller to the larger module (an augment's import is always
-  kept); the other side inlines its references (typedefs as their resolved types, leafrefs as
-  typed leafs), level-4 `yang.import-cycle`.
+  module's statements once without restriction, ranks the modules of each cycle of references
+  (augment edges forward, else byte order) and keeps an import only from a lower to a higher
+  rank (an augment's import is always kept); the other side inlines its references (typedefs
+  as their resolved types, leafrefs as typed leafs), level-4 `yang.import-cycle`.
+- `smiv2:implied` whenever the INDEX clause marks its last item IMPLIED (RFC 6643 section 7.3), also
+  where the resolver ignores it for the encoding (a fixed-length string, an integer).
+- One-line quoted arguments write line ends as `\\n` (a multi-line DEFVAL keeps its value);
+  a multi-line UNITS text is normalised like a description.
+- `Options.ignore_display_hint` (RFC 6643 section 2) keeps TCs whose DISPLAY-HINT was
+  added in a later revision `binary`; mibmeta's `hint`/`conv` follow the translator's hint.
 
 Layouts (names, keys, data node paths) are computed per module before statements are built,
 so leafrefs, augments and mibmeta paths into other modules use the names those modules emit.
 """
 
+import mib.ast
 import mib.diag
 import mib.model
 import mib.source
@@ -119,6 +126,7 @@ CATALOG: dict[str, (int, str, str)] = {
     "yang.identifier-rewritten": (4, "", "a name that is not a valid or unique YANG identifier is rewritten (prefix '_', illegal characters to '_', numeric suffix)"),
     "yang.index-unresolved": (4, "", "an INDEX object that is not a column or scalar gets a key leaf of type string"),
     "yang.index-no-leaf": (4, "", "an INDEX or notification object has no data leaf to refer to; a typed leaf is emitted instead of a leafref"),
+    "yang.notification-not-accessible": (3, "", "a notification object is not-accessible (RFC 2578 §8.1 forbids it; RFC 6643 §9.1 covers only readable and accessible-for-notify objects): object-<k> carries a full leaf"),
     "yang.notification-object": (3, "", "a notification object that is not a column or scalar (or whose OID is unresolved) gets an empty object-<k> container"),
     "yang.status-reference": (4, "", "a current definition refers to a deprecated or obsolete one in the same module (YANG 1.0 forbids it; pyang reports an error)"),
     "yang.revision-date": (4, "", "a REVISION or LAST-UPDATED date that does not parse (or has a year outside 1900..2099) gives no revision statement"),
@@ -145,30 +153,30 @@ class YangError(Exception):
 
 
 class Options(object):
-    """Emitter options.
-
-    - `smiv1_hints`: T9, SMIv1 informal DisplayString/PhysAddress get the SNMPv2-TC hints.
-    - `scalar_parent_names`: T16, parent OID (dotted) -> the descriptor to use when the OID has
-      several names.
-    - `header`: emit the generated-by comment.
-    - `set_prefixes`: give every module of the `MibSet` one prefix, unique in the set, used as
-      its own prefix and wherever it is imported (`set_prefix_map`). Otherwise prefixes are
-      allocated per module (Appendix B as libsmi: imports first, the module last), and two
-      modules can end up with the same own prefix, which acton-yang cannot compile together.
-    - `consistent_status`: a definition that refers to a deprecated or obsolete definition of
-      its own module (a key leaf, an INDEX object, a TC) takes that status in the YANG, so the
-      module satisfies YANG's status rule (RFC 6020 §7.19.2) and pyang accepts it. Off by
-      default: decision G22 keeps the MIB statuses (`yang.status-reference` warns either way).
-    - `prefix_names`: with `set_prefixes`, allocate the prefixes over these module names (plus
-      the modules of the set) instead of the set alone. A corpus run passes every module name
-      of its search path, so a module's YANG does not depend on which chunk loaded it.
-    """
+    """Emitter options."""
+    # SMIv1 informal DisplayString/PhysAddress get the SNMPv2-TC hints.
     smiv1_hints: bool
+    # Parent OID (dotted) -> the descriptor that names its container when the OID has several.
     scalar_parent_names: dict[str, str]
+    # Emit the generated-by comment.
     header: bool
+    # One prefix per module, unique across the MibSet and used wherever the module is
+    # imported (`set_prefix_map`). Otherwise prefixes are allocated per module as libsmi does,
+    # and two modules can get the same prefix, which acton-yang cannot compile together.
     set_prefixes: bool
+    # A definition referring to a deprecated or obsolete definition of its own module (a key
+    # leaf, an INDEX object, a TC) takes that status, so the module passes YANG's status rule
+    # (RFC 6020 section 7.19.2). Off by default to keep the MIB's statuses; `yang.status-reference`
+    # warns either way.
     consistent_status: bool
+    # With set_prefixes, also allocate over these module names. A corpus run passes every name
+    # on its search path, so a module's YANG does not depend on which chunk loaded it.
     prefix_names: list[str]
+    # TCs (`MODULE::TC`) whose DISPLAY-HINT is ignored, because a hint added in a later revision
+    # must not turn `binary` into `string` (RFC 6643 section 2). The typedef gets no
+    # smiv2:display-hint, and the string/binary decision looks past it to the next hint in the
+    # chain. Well-known TCs map as usual. mibmeta follows, so it agrees with the YANG type.
+    ignore_display_hint: set[str]
 
     def __init__(self):
         self.smiv1_hints = True
@@ -177,6 +185,7 @@ class Options(object):
         self.set_prefixes = True
         self.consistent_status = False
         self.prefix_names = []
+        self.ignore_display_hint = set()
 
 
 def level_of(code: str) -> int:
@@ -434,6 +443,24 @@ def escape(s: str) -> str:
     return s.replace("\\", "\\\\").replace("\"", "\\\"")
 
 
+def quoted_value(s: str) -> str:
+    """A one-line quoted argument (units, smiv2:defval, ...): `\\` and `"` escaped, line ends
+    as `\\n`. A raw line break would let YANG strip the next line's indentation on unquoting
+    (RFC 6020 section 6.1.3), changing a multi-line DEFVAL string."""
+    e = escape(s)
+    if "\n" not in e and "\r" not in e:
+        return e
+    return e.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\\n")
+
+
+def units_text(u: str) -> str:
+    """UNITS as the YANG `units` value: a multi-line text (ISIS-MIB) is normalised like a
+    description; a one-line text stays as written."""
+    if "\n" in u or "\r" in u:
+        return text_value(u)
+    return u
+
+
 # --- statements ----------------------------------------------------------------------------------
 
 class Stmt(object):
@@ -479,7 +506,7 @@ def render(s: Stmt, ind: int, pmap: dict[str, str], out: list[str]) -> None:
     if s.form == F_BARE:
         out.append(" " + subst(s.arg, pmap))
     elif s.form == F_QUOTED:
-        out.append(" \"" + escape(subst(s.arg, pmap)) + "\"")
+        out.append(" \"" + quoted_value(subst(s.arg, pmap)) + "\"")
     elif s.form == F_TEXT:
         out.append("\n" + " " * (ind + 1) + "\"")
         for i, ln in enumerate(s.arg.split("\n")):
@@ -847,6 +874,7 @@ class Translator(object):
     closures: dict[str, set[str]]
     rows: dict[str, mib.model.MibNode]
     raws: dict[str, Emitter]
+    ranks: dict[str, dict[str, int]]
     set_pfx: dict[str, str]
 
     def __init__(self, ms: mib.model.MibSet, opts: ?Options = None):
@@ -858,6 +886,7 @@ class Translator(object):
         self.closures = {}
         self.rows = {}
         self.raws = {}
+        self.ranks = {}
         self.set_pfx = {}
         if self.opts.set_prefixes:
             if len(self.opts.prefix_names) > 0:
@@ -935,14 +964,22 @@ class Translator(object):
         return out
 
     def hint(self, s: mib.model.Syntax) -> str:
-        return effective_hint(self.ms, s, self.opts.smiv1_hints)
+        """The hint that decides string versus binary for syntax `s` (with the options);
+        mibmeta's `hint` and `conv` use it too."""
+        return effective_hint(self.ms, s, self.opts.smiv1_hints, self.opts.ignore_display_hint)
+
+    def own_hint(self, t: mib.model.MibType) -> str:
+        """The `smiv2:display-hint` of a type's typedef (`type_hint` with the options)."""
+        return type_hint(self.ms, t, self.opts.smiv1_hints, self.opts.ignore_display_hint)
 
     def tdef_hint(self, t: mib.model.MibType) -> str:
-        """The effective hint of a type's typedef (its chain, its own hint, T9)."""
-        h = self.hint(t.syntax)
+        """The effective hint of a type's typedef: its own hint (or the SMIv1 informal hint),
+        else its chain's (only its chain's when its own is ignored)."""
+        h = self.own_hint(t)
         if h != "":
             return h
-        return type_hint(self.ms, t, self.opts.smiv1_hints)
+        own_ignored = ignored(mib.model.qual_name(t.module, t.name), self.opts.ignore_display_hint)
+        return effective_hint(self.ms, t.syntax, self.opts.smiv1_hints, self.opts.ignore_display_hint, own_ignored)
 
     # --- layouts ---
 
@@ -1028,10 +1065,63 @@ class Translator(object):
                         todo.append(y)
         return False
 
+    def cycle_rank(self, name: str) -> dict[str, int]:
+        """The rank of each module of the import cycle (strongly connected component of the
+        raw references) that holds `name`: augment edges point from a lower to a higher rank
+        (an augment's import cannot be avoided), ties in byte order. Cached per component."""
+        rk = self.ranks.get(name)
+        if rk is not None:
+            return rk
+        # the component: the modules `name` reaches that reach `name` back
+        seen: set[str] = set()
+        todo = [name]
+        members: list[str] = []
+        while len(todo) > 0:
+            x = todo.pop()
+            if x in seen:
+                continue
+            seen.add(x)
+            if x == name or self.reaches(x, name):
+                members.append(x)
+            e = self.raw(x)
+            if e is not None:
+                for y in e.refs:
+                    if y not in seen and not y.startswith("ietf-"):
+                        todo.append(y)
+        mset = set(members)
+        # Kahn's algorithm over the augment edges inside the component (x augments y: x first)
+        indeg: dict[str, int] = {}
+        for x in members:
+            indeg[x] = 0
+        for x in members:
+            ex = self.raw(x)
+            if ex is not None:
+                for y in ex.aug_refs:
+                    if y in mset and y != x:
+                        indeg[y] = indeg[y] + 1
+        out: dict[str, int] = {}
+        left = sorted(members)
+        while len(left) > 0:
+            pick = left[0]
+            for x in left:
+                if indeg[x] == 0:
+                    pick = x
+                    break
+            out[pick] = len(out)
+            left = [x for x in left if x != pick]
+            ep = self.raw(pick)
+            if ep is not None:
+                for y in ep.aug_refs:
+                    if y in mset and y != pick:
+                        indeg[y] = indeg[y] - 1
+        for x in members:
+            self.ranks[x] = out
+        return out
+
     def drops(self, name: str) -> set[str]:
-        """The modules `name` must not import because they refer back to it. Every edge inside
-        a cycle is kept only from the byte-order smaller to the larger module, except that an
-        augment edge is always kept (and then the opposite edge is the one dropped)."""
+        """The modules `name` must not import because they refer back to it. Inside a cycle an
+        edge is kept only from a lower to a higher `cycle_rank` (byte order unless augments
+        decide), and an augment edge is always kept; that breaks cycles of any length."""
         out: set[str] = set()
         e = self.raw(name)
         if e is not None:
@@ -1040,9 +1130,8 @@ class Translator(object):
                     continue
                 if not self.reaches(y, name):
                     continue
-                ey = self.raw(y)
-                back_aug = ey is not None and name in ey.aug_refs
-                if back_aug or name > y:
+                rk = self.cycle_rank(name)
+                if rk.get_def(name, 0) > rk.get_def(y, 0):
                     out.add(y)
         return out
 
@@ -1117,26 +1206,60 @@ class Translator(object):
         return out
 
 
-def effective_hint(ms: mib.model.MibSet, s: mib.model.Syntax, smiv1_hints: bool = True) -> str:
-    """The DISPLAY-HINT that decides string versus binary (T13): the effective hint, else (T9)
-    the SNMPv2-TC hint of an SMIv1 informal DisplayString/PhysAddress in the type chain."""
-    if s.hint != "" or not smiv1_hints or s.base != "OCTET STRING":
-        return s.hint
+def ignored(q: str, ignore: ?set[str]) -> bool:
+    """Whether the hint of type `MOD::Name` is ignored (`Options.ignore_display_hint`; never a
+    well-known TC, which maps to its YANG type whatever its hint)."""
+    if ignore is not None:
+        return q in ignore and q not in WELL_KNOWN
+    return False
+
+
+def effective_hint(ms: mib.model.MibSet, s: mib.model.Syntax, smiv1_hints: bool = True, ignore: ?set[str] = None, walk: bool = False) -> str:
+    """The DISPLAY-HINT that decides string versus binary: the effective hint, else the
+    SNMPv2-TC hint of an SMIv1 informal DisplayString/PhysAddress in the type chain. The
+    types in `ignore` (`Options.ignore_display_hint`) do not count: the hint is the nearest
+    hint of the chain's other types (`walk`: only the chain's, for a TC's own syntax whose own
+    hint is ignored)."""
+    h = s.hint
+    skip = walk
+    if h != "" and ignore is not None and len(ignore) > 0:
+        for q in s.chain:
+            if ignored(q, ignore):
+                skip = True
+    if skip:
+        # the nearest hint of the chain's types that are not ignored (a TC's own hint is not
+        # in its syntax's chain: `Translator.tdef_hint` looks at it first)
+        h = ""
+        for q in s.chain:
+            if ignored(q, ignore):
+                continue
+            p = split_qname(q)
+            m = ms.module(p.0)
+            if m is not None:
+                t = m.find_type(p.1)
+                if t is not None and t.display_hint != "" and t.syntax.hint == t.display_hint:
+                    h = t.display_hint
+                    break
+    if h != "" or not smiv1_hints or s.base != "OCTET STRING":
+        return h
     for q in s.chain:
         p = split_qname(q)
-        h = SMIV1_HINTS.get(p.1)
-        if h is not None:
+        sh = SMIV1_HINTS.get(p.1)
+        if sh is not None and not ignored(q, ignore):
             m = ms.module(p.0)
             if m is not None:
                 t = m.find_type(p.1)
                 if t is not None and t.kind == "type":
-                    return h
+                    return sh
     return ""
 
 
-def type_hint(ms: mib.model.MibSet, t: mib.model.MibType, smiv1_hints: bool) -> str:
+def type_hint(ms: mib.model.MibSet, t: mib.model.MibType, smiv1_hints: bool, ignore: ?set[str] = None) -> str:
     """The display hint a typedef carries itself (`smiv2:display-hint`): its own valid
-    DISPLAY-HINT, or the T9 hint of an SMIv1 informal DisplayString/PhysAddress."""
+    DISPLAY-HINT, or the SNMPv2-TC hint of an SMIv1 informal DisplayString/PhysAddress ("" for a type
+    in `ignore`)."""
+    if ignored(mib.model.qual_name(t.module, t.name), ignore):
+        return ""
     own = t.display_hint
     if own != "" and t.syntax.hint == own:
         return own
@@ -1145,6 +1268,32 @@ def type_hint(ms: mib.model.MibSet, t: mib.model.MibType, smiv1_hints: bool) -> 
         if h is not None:
             return h
     return ""
+
+
+def yang_boolean(ms: mib.model.MibSet, s: mib.model.Syntax) -> bool:
+    """Whether the YANG type of syntax `s` is `boolean` (TruthValue), as `type_stmt` makes
+    it: the nearest TC is SNMPv2-TC's TruthValue, or a TC whose own syntax is boolean with no
+    named-number subset written on the way (a subset is an inline enumeration). mibmeta
+    converts such values as `truthvalue`."""
+    cur = s
+    for i in range(32):
+        if cur.base != "INTEGER" or len(cur.enums) == 0:
+            return False
+        if cur.tc_module == "SNMPv2-TC" and cur.tc_name == "TruthValue":
+            return True
+        if cur.has_own_named or cur.tc_name == "" or cur.tc_module in LANG_MODULES:
+            return False
+        nx: ?mib.model.Syntax = None
+        m = ms.module(cur.tc_module)
+        if m is not None:
+            t = m.find_type(cur.tc_name)
+            if t is not None and (t.kind == "tc" or t.kind == "type"):
+                nx = t.syntax
+        if nx is not None:
+            cur = nx
+        else:
+            return False
+    return False
 
 
 def row_type_of(n: mib.model.MibNode) -> str:
@@ -1206,6 +1355,18 @@ def written_parent(n: mib.model.MibNode) -> str:
         if len(cs) == 2 and cs[0].name != "" and cs[1].name == "":
             return cs[0].name
     return ""
+
+
+def implied_written(row: mib.model.MibNode) -> bool:
+    """Whether the row's INDEX clause marks its last item IMPLIED as written (RFC 6643 section 7.3
+    "contains the IMPLIED keyword"); `row.implied` is the effective flag, which the resolver
+    clears on a fixed-length or integer item (the encoding does not change)."""
+    if row.implied:
+        return True
+    d = row.defn
+    if isinstance(d, mib.ast.ObjectType):
+        return len(d.index) > 0 and d.index[-1].implied
+    return False
 
 
 def column_has_leaf(n: mib.model.MibNode) -> bool:
@@ -1358,7 +1519,8 @@ def build_layout(tr: Translator, lay: Layout, m: mib.model.MibModule) -> None:
                     tnode = x
         if tnode is None:
             for x in ms.names_at(n.oid[:-1]):
-                if tnode is None or x.module == mod:
+                # a row is a list of its own; it cannot also be the container of another row
+                if x.kind != "row" and (tnode is None or x.module == mod):
                     tnode = x
         if tnode is None:
             _ndiag(lay, ms, "yang.row-unplaced", n, "the row " + n.name + " is not below a named table node; it gets no list")
@@ -1455,12 +1617,16 @@ def layout_list(tr: Translator, lay: Layout, ll: ListL, cols: list[mib.model.Mib
     counts: dict[str, int] = {}
     for i, p in enumerate(parts):
         base = ll.lname + "Index" + str(i + 1) if p.name == "" else rewrite_identifier(p.name)
-        c = counts.get_def(base, 0) + 1
-        counts[base] = c
+        # `_<n>` counts the occurrences of the object (RFC 6643 section 7.3), not of its YANG name
+        okey = p.module + "::" + p.name if p.name != "" else "#" + str(i)
+        c = counts.get_def(okey, 0) + 1
+        counts[okey] = c
         want = base if c == 1 else base + "_" + str(c)
         got = ll.namer.take(want)
-        if got != want:
-            _ndiag(lay, ms, "yang.identifier-rewritten", row, "key " + want + " of " + row.name + " is " + got + " in the YANG")
+        # the `_<n>` of a repeated INDEX object is RFC 6643 section 7.3, not a rewrite
+        written = (p.name if c == 1 else p.name + "_" + str(c)) if p.name != "" else want
+        if got != written:
+            _ndiag(lay, ms, "yang.identifier-rewritten", row, "key " + written + " of " + row.name + " is " + got + " in the YANG")
         ll.keys.append(got)
         ll.key_paths.append(ll.path + [(mod, got)])
     for c in cols:
@@ -1547,8 +1713,7 @@ class Emitter(object):
         rt = self.ref_type(s)
         hint = self.tr.hint(s)
         if tdef is not None:
-            if hint == "":
-                hint = type_hint(self.ms, tdef, self.tr.opts.smiv1_hints)
+            hint = self.tr.tdef_hint(tdef)
             if self.adds_hint(rt, b, hint):
                 # a TC adding a hint to an unhinted parent becomes a string of its own
                 rt = None
@@ -1797,7 +1962,7 @@ class Emitter(object):
         else:
             st.bare("type", "string")
         if n.units != "":
-            st.quoted("units", n.units)
+            st.quoted("units", units_text(n.units))
         self.status(st, self.node_status(n))
         self.describe(st, n.description, n.reference, extra)
         dv = n.defval
@@ -1887,7 +2052,7 @@ class Emitter(object):
                     self.check_status(t.status, rt.status, rt.module, t.line, t.col, t.name, "type " + rt.name)
             self.status(st, self.type_status(t))
             self.describe(st, t.description, t.reference, extra)
-            h = type_hint(self.ms, t, self.tr.opts.smiv1_hints)
+            h = self.tr.own_hint(t)
             if h != "":
                 st.quoted("smiv2:display-hint", h)
             body.append(st)
@@ -1944,7 +2109,7 @@ class Emitter(object):
         st = Stmt("list", ll.lname, F_BARE)
         if len(ll.keys) > 0:
             st.quoted("key", " ".join(ll.keys))
-            if row.implied:
+            if implied_written(row):
                 st.quoted("smiv2:implied", ll.keys[-1])
         self.status(st, self.row_status(row))
         self.describe(st, row.description, row.reference, [])
@@ -2019,8 +2184,9 @@ class Emitter(object):
                     if is_node(o, p.module, p.name, self.ms):
                         continue
                     nm0 = rewrite_identifier(p.name) if p.name != "" else (bl.keys[i] if bl is not None and i < len(bl.keys) else base.name + "Index" + str(i + 1))
-                    cnt = counts.get_def(nm0, 0) + 1
-                    counts[nm0] = cnt
+                    okey = p.module + "::" + p.name if p.name != "" else "#" + str(i)
+                    cnt = counts.get_def(okey, 0) + 1
+                    counts[okey] = cnt
                     nm = names.take(nm0 if cnt == 1 else nm0 + "_" + str(cnt))
                     if p.name == "":
                         if bl is not None and i < len(bl.key_paths) and not self.is_dropped(bl.key_paths[i] if bl is not None and i < len(bl.key_paths) else []):
@@ -2048,6 +2214,9 @@ class Emitter(object):
         if (o.access == "read-only" or o.access == "read-write" or o.access == "read-create") and tp is not None and not self.is_dropped(tp if tp is not None else []):
             self.leafref(c, own, tp, self.ref_status(o))
         else:
+            if o.access == "not-accessible":
+                self.diag("yang.notification-not-accessible", n, "the object " + o.qname() + " of " + n.name +
+                          " is not-accessible, which RFC 2578 §8.1 does not allow in OBJECTS; " + c.arg + " carries a full leaf")
             self.leaf(c, o, own, True, False)
 
     def aliases(self, body: list[Stmt], nodes: list[mib.model.MibNode]) -> None:
