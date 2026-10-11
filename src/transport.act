@@ -1,39 +1,28 @@
 """Datagram transports: UDP sockets, and an in-memory network for tests
 
-A Transport carries datagrams between its owner (a Client) and ONE peer. A
-ServerTransport carries them between its owner (an Agent or a
-NotificationReceiver) and any number of peers. Actors cannot implement
-protocols, so both are classes whose attributes are procs, wrapping an actor
-that does the work (the pipe.Pipe precedent). Anything that provides the
-procs is a transport: a test can wrap one, for example to record or rewrite
-what is sent, by building a new Transport from its own procs and those of
-the wrapped one. A proc that is an action (an actor's method, a def nested
-in an actor) runs as a message to its actor when another actor calls it,
-and a result it returns is lost; build local_port from a plain lambda.
+A Transport carries datagrams between its owner (a Client) and one peer;
+a ServerTransport carries them between its owner (an Agent or a
+NotificationReceiver) and any number of peers. Both are classes of procs
+that wrap an actor doing the work, so anything that provides the procs is
+a transport. A test can wrap one to record or rewrite traffic by building
+a new Transport from its own procs and those of the wrapped one.
 
-Implementations:
+udp_transport() is a connected socket to one agent and
+udp_server_transport() a listening socket. MemNet (with MemNet.client(),
+MemNet.server() and mem_pair()) is a deterministic in-process network with
+packet-level fault injection (NetFaults), for testing retries, late and
+duplicate replies, reordering, corruption and spoofing without sockets.
+dispatcher.Dispatcher.attach() gives many Clients one shared
+ServerTransport.
 
-- udp_transport(): a connected net.UDPConnection to one agent.
-- udp_server_transport(): a net.UDPListener, on an ephemeral port if asked.
-- MemNet, with MemNet.client(), MemNet.server() and mem_pair(): a
-  deterministic in-process datagram network with packet-level fault
-  injection (NetFaults). Retries, late and duplicate replies, reordering,
-  corruption and spoofing can be tested without sockets.
-
-Contract common to all implementations:
-
-- A transport never waits for its owner. Callbacks are asynchronous calls,
-  made in the order in which the datagrams and errors arrived.
-- Datagrams that arrive before a receiver is registered are kept, at most
-  MAX_BUFFERED of them, and handed over in order when one is registered.
-- close() is idempotent. After it, nothing more is delivered and sending
-  does nothing.
-- Errors go to the error callback of a Transport, never raised; each says
-  whether it is fatal (the transport cannot send) or a hint.
-- Source addresses are text as the network reports them: IP addresses for
-  UDP, where an IPv4-mapped IPv6 address (::ffff:192.0.2.1, which a socket
-  bound to "::" reports for IPv4 peers) is given as plain IPv4 (192.0.2.1);
-  see normalize_address().
+All implementations follow the same contract. A transport never waits for
+its owner, and calls back asynchronously in the order in which datagrams
+and errors arrived. Up to MAX_BUFFERED datagrams that arrive before a
+receiver is registered are kept and handed over in order. close() is
+idempotent; afterwards nothing is delivered and sending does nothing.
+Errors go to the error callback, never raised, and say whether they are
+fatal. Source addresses are text as the network reports them, with an
+IPv4-mapped IPv6 address given as plain IPv4 (see normalize_address()).
 """
 
 import logging
@@ -57,6 +46,10 @@ REORDER_HOLD = 0.05
 # The error a connected UDP socket reports for ICMP port unreachable; MemNet
 # reports the same text to a client that sends to an address nobody is bound to
 REFUSED = "UDP receive error: connection refused"
+
+# Prefix of the non-fatal error a shared-socket transport reports when it did not send a request
+# because another Client of the same peer has its id pending; the id follows in decimal (id_in_use()).
+ID_IN_USE = "request id in use by another client of the peer, not sent: "
 
 # MemNet's ephemeral ports, as in the IANA dynamic range
 _EPHEMERAL_FIRST = 49152
@@ -175,6 +168,14 @@ def ip_octets(address: str) -> ?bytes:
         return v6
     return None
 
+def id_in_use(error: str) -> int:
+    """Return the id of an ID_IN_USE error, -1 for any other error"""
+    if error.startswith(ID_IN_USE):
+        digits = error[len(ID_IN_USE):]
+        if len(digits) > 0 and len(digits) <= 10 and digits.isascii() and digits.isdecimal():
+            return int(digits)
+    return -1
+
 def is_unreachable(error: str) -> bool:
     """Return True if a transport error reports an unreachable peer port
 
@@ -222,6 +223,18 @@ class Transport(object):
 
     close() releases the socket. It is idempotent; afterwards nothing is
     delivered and send() does nothing.
+
+    source_checked is True for a transport that delivers only datagrams it
+    has accepted as the peer's (dispatcher.Dispatcher, which routes by
+    source and, with strict_source=False, by request id); the Client then
+    does not compare sources itself. False (the default) for a transport
+    that delivers whatever arrives (MemNet), so the Client checks.
+
+    send_request(data, hold), optional (None for most transports), sends a
+    request whose answer the sender may wait for up to hold seconds. A
+    shared-socket transport (dispatcher.Dispatcher) provides it: it keeps
+    the request's id reserved and routable at least that long. The Client
+    uses it instead of send() when it is there.
     """
     @property
     send: proc(bytes) -> None
@@ -229,14 +242,21 @@ class Transport(object):
     set_receiver: proc(action(bytes, str, int) -> None, action(str, bool) -> None) -> None
     @property
     close: proc() -> None
+    source_checked: bool
+    @property
+    send_request: ?proc(bytes, float) -> None
 
     def __init__(self,
                  send: proc(bytes) -> None,
                  set_receiver: proc(action(bytes, str, int) -> None, action(str, bool) -> None) -> None,
-                 close: proc() -> None):
+                 close: proc() -> None,
+                 source_checked: bool=False,
+                 send_request: ?proc(bytes, float) -> None=None):
         self.send = send
         self.set_receiver = set_receiver
         self.close = close
+        self.source_checked = source_checked
+        self.send_request = send_request
 
 
 class ServerTransport(object):

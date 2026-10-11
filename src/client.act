@@ -1,106 +1,55 @@
 """SNMP manager: the Client actor (command generator and notification originator)
 
-A Client talks to ONE SNMP engine, an agent (or, for notifications, a
-receiver), over a Transport: a connected UDP socket made from a
-net.UDPConnectCap, or any Transport given to it (transport.MemNet in tests,
-a shared-socket dispatcher later). Its Security decides the version:
-security.Community for SNMPv1/v2c, security.Usm for SNMPv3 with USM.
+A Client talks to one SNMP engine (an agent, or a receiver for
+notifications) over a Transport: its own connected UDP socket made from a
+net.UDPConnectCap, or a given one (transport.MemNet in tests,
+dispatcher.Dispatcher to share one socket among many Clients). Its
+Security selects the version: security.Community for SNMPv1/v2c,
+security.Usm for SNMPv3.
 
-Operations take the callback first; the Client itself is the callback's
-first argument (the stratoweave house style, so that callers can tell stale
-clients apart). Every request callback is called exactly once:
+Operations take the callback first, and the Client is the callback's
+first argument so that callers can tell stale clients apart. Every
+request callback is called exactly once: cb(c, r, None) on success,
+cb(c, r, errors.ErrorStatusError) when the agent answered with an
+error-status (error_response(e) returns r), and cb(c, None, e) for any
+other error. Invalid arguments are reported as errors.EncodeError, never
+raised; cancel() and close() deliver errors.CancelledError.
 
-  * cb(c, r, None): success, r.error_status == 0;
-  * cb(c, r, errors.ErrorStatusError): the agent answered with an
-    error-status; r is kept for inspection, also as e.response
-    (error_response(e) narrows it to a Response);
-  * cb(c, None, e) for every other error. Invalid arguments are reported
-    this way as errors.EncodeError, never raised; cancel() and close()
-    deliver errors.CancelledError.
+Each attempt gets a fresh random id (the request-id for SNMPv1/v2c, the
+msgID for SNMPv3), and all ids of a request stay valid until it ends, so a
+late answer to an earlier attempt is accepted. SNMPv2c InformRequest
+retransmissions keep their request-id for the receiver's duplicate
+suppression. A datagram that fails decoding, the version, id, source,
+community or USM check, or carries an unexpected PDU type, is dropped and
+counted in Stats, since it may be spoofed; if the request then times out,
+TimeoutError.hint summarises the drops. A response of the wrong shape
+fails the request with errors.InvalidResponseError. A Client whose own
+socket could not be set up fails its pending requests with
+errors.TransportError and tries again for a later request
+(TRANSPORT_RETRY).
 
-The request engine:
+GET and GETNEXT requests larger than Options.max_oids_per_request are sent
+in parts, and tooBig splits them further (Options.split_too_big). A SET is
+never split. On SNMPv1, GETBULK is sent as GETNEXT. SNMPv3 engine discovery
+is lazy and shared by all requests. The Client resynchronises its clock on
+an authenticated notInTimeWindows Report and rediscovers the engine on
+unknownEngineIDs or a Report from another engine (one resend each), and
+forgets the engine after repeated timeouts. Any other Report fails the
+request with errors.ReportError.
 
-  * Every attempt gets a fresh random id: the request-id for SNMPv1/v2c, the
-    msgID (with a fresh salt and MAC) for SNMPv3, whose request-id stays the
-    same. All attempt ids of a request stay mapped to it until it completes,
-    so a late reply to an earlier attempt is accepted. The exception is an
-    SNMPv2c InformRequest: its retransmissions keep the request-id, so that
-    the receiver's duplicate suppression recognises them.
-  * Timers use `after now` with the attempt number as generation, copied
-    into locals before the timer is armed (the call after `after` is
-    evaluated when it fires): Acton timers cannot be cancelled, so a timer
-    of a superseded attempt (one before a resynchronisation resend, say)
-    or of a completed request finds nothing to do. Attempt n (from 0)
-    waits timeout * backoff^n seconds, capped at max_timeout (but never
-    below timeout).
-  * A transport whose setup failed fails the pending requests with
-    errors.TransportError; a Client that set up its own UDP socket sets it
-    up again for a request TRANSPORT_RETRY seconds later (doubling up to
-    TRANSPORT_RETRY_MAX), so a DNS outage or a shortage of file
-    descriptors does not leave it dead.
-  * A datagram is checked in this order: decode, version, id lookup,
-    source address and port, community (with Options.check_community) or
-    USM, PDU type, then the shape of the response. One that fails a check
-    up to the PDU type is dropped and counted in Stats, because it may be
-    spoofed; if the request then times out, TimeoutError.hint summarises
-    what was dropped while it was pending. A response of the wrong shape
-    fails the request with errors.InvalidResponseError.
-  * GET and GETNEXT requests with more than Options.max_oids_per_request
-    varbinds are sent in parts, and a tooBig answer to one with more than
-    one varbind splits it in half, recursively. A SET is never split (that
-    would not be atomic): it reports tooBig. A tooBig GETBULK is resent
-    with half the max-repetitions. Options.split_too_big=False turns both
-    off: tooBig is then reported like any error-status (the CLI does that,
-    as net-snmp's tools do).
-  * SNMPv1: GETBULK is sent as GETNEXT; with Options.v1_fix_errors a
-    noSuchName answer to a GET drops that varbind, resends the rest and
-    reports NoSuchObject for it (EndOfMibView for a GETNEXT).
-  * SNMPv3: lazy engine discovery shared by all requests, the 2-round-trip
-    time synchronisation with the discovery Report's boots and time as an
-    unauthenticated hint, resynchronisation on an authenticated
-    notInTimeWindows Report (one resend; also when the agent's boots or
-    time went back, because the Report answers one of our outstanding
-    msgIDs and its MAC verified), rediscovery on
-    unknownEngineIDs and on any Report that names another engine than the
-    request went to (one resend), errors.ReportError for every other
-    Report, and a reset of the engine state after repeated timeouts or
-    time-window failures.
+walk() collects a subtree, walk_stream() delivers it one response at a
+time, and get_table() fetches columns in lock-step and merges them into
+rows. They use GETBULK on SNMPv2c and SNMPv3, GETNEXT on SNMPv1, and their
+requests go through the normal request path (queueing, retries, SNMPv3
+recovery). Like a request, a walk calls its callback exactly once and can
+be cancelled.
 
-Walks and tables: walk() collects a subtree,
-walk_stream() hands it over one response at a time, get_table() fetches
-columns in lock-step and merges them into rows. Their requests take the
-Client's own request path (queue, retries, tooBig handling, SNMPv1
-normalisation, SNMPv3 discovery and recovery) and are not visible to the
-caller; each walk has one handle, one callback (walk_stream: on_done) that
-is called exactly once, and cancel() and close() work on it like on a
-request. GETBULK is used on SNMPv2c and SNMPv3 (Options.use_bulk), GETNEXT
-on SNMPv1. A walk ends at the first OID outside its root, at an exception
-value (endOfMibView, and noSuchObject/noSuchInstance which some agents
-answer to a GETNEXT), at SNMPv1 noSuchName, after
-Options.max_walk_varbinds varbinds (Table.truncated), or when it is cancelled. OIDs must
-increase strictly, within one GETBULK response too
-(errors.OidNotIncreasingError); with check_increasing=False an OID seen
-before ends the walk with that error instead (a loop guard). A walk that
-found nothing GETs its root (get_root_if_empty), as net-snmp and gosnmp do.
-An empty GETBULK response makes no progress and fails the walk
-(errors.InvalidResponseError). With Options.adaptive_bulk a GETBULK of a
-walk that gets tooBig, or times out, is resent with half the
-max-repetitions (at least 1), and the value of the attempt that was
-answered is remembered for the Client's later walks; it doubles again (up
-to the walk's max_repetitions) after BULK_REGROW_AFTER clean responses at
-it, and a doubling that fails makes the next one wait twice as long (at
-most BULK_REGROW_AFTER_MAX responses). get_table() merges columns of
-tables that share an index (Row.cells) and can be narrowed to the rows of
-a leading index (index_prefix).
+trap() sends an SNMPv2-Trap, with the Client as the authoritative engine
+for SNMPv3; trap_v1() sends an SNMPv1 Trap-PDU, and inform() an
+InformRequest that is retried like a request.
 
-Notifications: trap() sends an SNMPv2-Trap (v2c, or v3 where the Client is
-the authoritative engine: local_engine_id, local_engine_boots, time since
-the Client started), trap_v1() an SNMPv1 Trap-PDU, inform() an InformRequest that is
-retried like a request (for v3 the receiver is authoritative and is
-discovered like an agent).
-
-Communities, passwords and keys are never logged; trace logging shows
-decoded messages, whose repr() hides the community.
+Communities, passwords and keys are never logged; the repr() of a decoded
+message hides its community.
 """
 
 import logging
@@ -117,7 +66,7 @@ from message import CommunityMessage, ScopedPdu, UsmSecurityParameters, V3Messag
 from oid import Oid
 from pdu import Pdu, TrapV1Pdu
 from security import Community, Security, Usm
-from transport import Transport, ip_octets, is_unreachable, udp_transport
+from transport import Transport, id_in_use, ip_octets, is_unreachable, udp_transport
 from usm import EngineTime, LocalizedUser, SaltCounter
 from values import Counter32, EndOfMibView, NoSuchObject, Value, VarBind, is_exception
 
@@ -128,19 +77,23 @@ MAX_MSG_SIZE = 65507
 # forgotten and discovered again before the next request
 RESET_AFTER_TIMEOUTS = 2
 
-# Adaptive bulk regrowth: the max-repetitions that walks learned doubles (up to the walk's
-# Options.max_repetitions) after this many consecutive clean GETBULK responses at it. A doubled value
-# that fails again doubles the count for the next attempt, up to BULK_REGROW_AFTER_MAX, so an agent
-# that drops answers above some size costs at most one retry per BULK_REGROW_AFTER_MAX responses.
+# Adaptive bulk: the learned max-repetitions doubles (up to the walk's Options.max_repetitions)
+# after this many clean GETBULK responses in a row. Each failed doubling doubles the count, up to
+# BULK_REGROW_AFTER_MAX, so an agent that drops large answers costs at most one retry per
+# BULK_REGROW_AFTER_MAX responses.
 BULK_REGROW_AFTER = 8
 BULK_REGROW_AFTER_MAX = 256
 
-# A Client whose own UDP socket could not be set up (a name that did not resolve, too many open
-# files, a connect timeout) sets it up again for the first request that comes this many seconds
-# after the failure or later; the wait doubles with each failed setup in a row, up to
-# TRANSPORT_RETRY_MAX, and starts over once a datagram arrives
+# A Client whose own UDP socket could not be set up (name resolution, too many open files) tries
+# again for the first request at least this many seconds later. The wait doubles with each failure
+# in a row, up to TRANSPORT_RETRY_MAX, and resets once a datagram arrives.
 TRANSPORT_RETRY = 1.0
 TRANSPORT_RETRY_MAX = 60.0
+
+# A shared-socket transport refuses an attempt whose id another Client of the same peer has pending
+# (transport.ID_IN_USE). The Client redraws the id at once, at most this many times in a row, then
+# fails the request with QueueFullError: the peer's id space is nearly full.
+MAX_REDRAWS = 256
 
 # Enterprise number in the default local engine ID (RFC 3411 format 5,
 # "octets"): net-snmp's 8072, as the actsnmp agent's default engine ID uses
@@ -473,6 +426,10 @@ class Stats(object):
     transport_failures: transports that failed (a socket that could not
         be set up: name resolution, too many open files, ...); a Client
         with its own UDP socket sets it up again (TRANSPORT_RETRY).
+    id_collisions: attempts that a shared-socket transport did not send
+        because another Client of the same peer had their id pending
+        (dispatcher.Dispatcher); each was sent again at once with a fresh
+        id and is not counted as a retry.
     """
     requests: int
     retries: int
@@ -491,11 +448,12 @@ class Stats(object):
     queued: int
     in_flight: int
     transport_failures: int
+    id_collisions: int
 
     def __init__(self, requests: int, retries: int, timeouts: int, responses: int, drops_decode: int,
                  drops_unknown_id: int, drops_source: int, drops_auth: int, drops_version: int, drops_pdu: int,
                  reports: int, unreachable: int, rtt_last: float, rtt_avg: float, queued: int=0, in_flight: int=0,
-                 transport_failures: int=0):
+                 transport_failures: int=0, id_collisions: int=0):
         self.requests = requests
         self.retries = retries
         self.timeouts = timeouts
@@ -513,6 +471,7 @@ class Stats(object):
         self.queued = queued
         self.in_flight = in_flight
         self.transport_failures = transport_failures
+        self.id_collisions = id_collisions
 
     def __repr__(self) -> str:
         counts = [("requests", self.requests), ("retries", self.retries), ("timeouts", self.timeouts),
@@ -521,7 +480,7 @@ class Stats(object):
                   ("drops_auth", self.drops_auth), ("drops_version", self.drops_version),
                   ("drops_pdu", self.drops_pdu), ("reports", self.reports), ("unreachable", self.unreachable),
                   ("queued", self.queued), ("in_flight", self.in_flight),
-                  ("transport_failures", self.transport_failures)]
+                  ("transport_failures", self.transport_failures), ("id_collisions", self.id_collisions)]
         return "Stats(" + ", ".join([c.0 + "=" + str(c.1) for c in counts]) + ")"
 
     def __str__(self) -> str:
@@ -687,6 +646,7 @@ class _Exchange(object):
     bulk_limit: int
     bulk_sent: dict[int, int]
     resync_from: int
+    redraws: int
 
     def __init__(self, serial: int, handle: int, pdu_type: int, positions: list[int], varbinds: list[VarBind],
                  non_repeaters: int, max_repetitions: int, opts: Options, counters: list[int]):
@@ -721,6 +681,8 @@ class _Exchange(object):
         # len(ids) when the exchange resynchronised (0: never): a notInTimeWindows Report to an
         # attempt before that (ids[:resync_from], a late or duplicated one) is already dealt with
         self.resync_from = 0
+        # times the latest attempt was refused by a shared-socket transport and sent with a fresh id
+        self.redraws = 0
 
 
 def _budget(o: Options) -> float:
@@ -857,6 +819,12 @@ def _make_transport(cap: ?net.UDPConnectCap, address: str, port: int, supplied: 
         return udp_transport(cap, address, port)
     return None
 
+def _checks_source(t: ?Transport) -> bool:
+    # The Client compares sources itself for a supplied transport that does not
+    if t is not None:
+        return not t.source_checked
+    return False
+
 def _ip_key(address: str) -> bytes:
     # The octets of an IP address (transport.ip_octets), empty for a host name
     o = ip_octets(address)
@@ -989,30 +957,32 @@ actor Client(cap: ?net.UDPConnectCap,
     """An SNMP manager for the agent at address and port
 
     cap is the capability for a UDP socket connected to address and port;
-    transport, when given, is used instead (cap may then be None). With
-    neither, every request fails with errors.TransportError. security is a
-    security.Community (SNMPv1/v2c) or security.Usm (SNMPv3). opts are the
-    default Options of every request. engine seeds the SNMPv3 engine
-    information (see EngineInfo), skipping discovery. local_engine_id is
-    our snmpEngineID for SNMPv3 traps, where the sender is authoritative
-    (5 to 32 octets; default: a random RFC 3411 format-5 ID), and
-    local_engine_boots our snmpEngineBoots (1..2^31-1); our time counts
-    from the Client's start. A receiver keeps a time record per sender
-    engine and drops traps that go back in time, so a sender with a fixed
-    engine ID (snmptrapd needs one: createUser -e) must persist its boots
-    and pass boots + 1 on every start (RFC 3414 section 2.2.2), as
-    ReceiverConfig.engine_boots does; with the default random engine ID
-    every Client is a new engine and boots 1 is fine.
+    a given transport is used instead (cap may then be None). With neither,
+    every request fails with errors.TransportError. opts are the default
+    Options of every request, and engine seeds the SNMPv3 engine
+    information so that discovery is skipped (see EngineInfo).
 
-    The source of a response must be address and port. A connected UDP
-    socket made from cap already ensures this; with a given transport the
-    Client compares the source itself: the port always, the address when
-    address is an IP address (as octets, transport.ip_octets, so any text
-    form of the address matches). An agent that answers from another
-    address than the one queried (a multi-homed router answering from its
-    egress interface) is therefore never heard: with a connected socket
-    the kernel drops its answers, so the request times out with no drop
-    counted and no hint.
+    local_engine_id and local_engine_boots identify us as the
+    authoritative engine of SNMPv3 traps (5 to 32 octets, default a random
+    RFC 3411 format-5 ID; boots 1..2^31-1); our engine time counts from the
+    Client's start. A receiver drops traps whose time goes back, so a
+    sender with a fixed engine ID (snmptrapd needs one: createUser -e) must
+    persist its boots and pass boots + 1 on every start (RFC 3414 section
+    2.2.2). With the default random ID, boots 1 is fine.
+
+    Responses must come from address and port. A connected socket enforces
+    this in the kernel; with a given transport the Client compares the
+    port, and the address as octets when address is an IP address, unless
+    the transport already checked it (Transport.source_checked). An agent
+    that answers from another address (a multi-homed router answering from
+    its egress interface) is therefore never heard, and with a connected
+    socket the request times out without a hint. A Dispatcher transport
+    attached with strict=False accepts such answers by id and community.
+
+    For many Clients on one UDP socket, give each a transport from
+    dispatcher.Dispatcher.attach(address, port) and cap None. An attempt
+    whose id another Client of the same peer has pending is then sent again
+    at once with a fresh id (Stats.id_collisions), up to MAX_REDRAWS times.
     """
     _log = logging.Logger(log_handler)
     _logging = log_handler is not None
@@ -1022,9 +992,9 @@ actor Client(cap: ?net.UDPConnectCap,
     _usm: ?Usm = _as_usm(security)
     _community = _community_of(security)
     _local_engine_id = local_engine_id if local_engine_id is not None else _default_engine_id()
-    _check_port = transport is not None
+    _check_port = _checks_source(transport)
     _peer_ip = _ip_key(address)
-    _check_address = transport is not None and len(_peer_ip) > 0
+    _check_address = _check_port and len(_peer_ip) > 0
     _salt = SaltCounter()
 
     # The transport, and its state: _fatal is the error of a transport that cannot send (setup
@@ -1096,6 +1066,7 @@ actor Client(cap: ?net.UDPConnectCap,
     var _unreachable = 0
     var _send_errors = 0
     var _send_error = ""
+    var _id_collisions = 0
     var _rtt_last = 0.0
     var _rtt_sum = 0.0
 
@@ -1448,8 +1419,25 @@ actor Client(cap: ?net.UDPConnectCap,
         p = Pdu(ex.pdu_type, id, ex.non_repeaters, ex.max_repetitions, ex.varbinds)
         return message.encode_community(CommunityMessage(_version, _community, p))
 
+    proc def _hold(ex: _Exchange, now: float) -> float:
+        # Seconds the Client may still wait for an answer to an attempt of ex it sends now (every
+        # attempt id stays mapped until the exchange ends): the whole budget plus one more attempt
+        # timeout (a resynchronisation resend); the discovery probe goes on until _disc_until
+        o = ex.opts
+        last = o.attempt_timeout(o.retries)
+        h = _budget(o) + last
+        if ex.handle == 0 and _disc_until - now + last > h:
+            h = _disc_until - now + last
+        return h
+
     proc def _send(ex: _Exchange) -> None:
         # Send one attempt of ex with a fresh id and arm its timer
+        _transmit(ex, True)
+
+    proc def _transmit(ex: _Exchange, new_attempt: bool) -> None:
+        # Send ex's attempt with a fresh id: a new attempt (counted, with its own timer), or the latest
+        # attempt again (new_attempt False: a shared-socket transport refused its id; it keeps its
+        # number and its timer)
         tr = _transport
         fatal = _fatal
         if fatal is not None:
@@ -1487,25 +1475,67 @@ actor Client(cap: ?net.UDPConnectCap,
             if ex.pdu_type == pdu.GETBULK:
                 ex.bulk_sent[id] = ex.max_repetitions
             _ids[id] = ex.serial
-            ex.attempt += 1
-            op = _ops.get(ex.handle)
-            if op is not None:
-                op.attempts += 1
+            if new_attempt:
+                ex.attempt += 1
+                ex.redraws = 0
+                op = _ops.get(ex.handle)
+                if op is not None:
+                    op.attempts += 1
             if _logging:
                 _log.debug("sending", {"handle": ex.handle, "pdu": pdu.pdu_type_name(ex.pdu_type), "id": id,
                                        "attempt": ex.attempt})
-            tr.send(data)
-            # The call after `after` is evaluated when the timer fires: an attribute read
-            # there would see a later attempt, and would keep ex alive until then. Take them now.
-            serial = ex.serial
-            generation = ex.attempt
-            after now ex.opts.attempt_timeout(ex.retries_used): _on_timer(serial, generation)
+            send_request = tr.send_request
+            if send_request is not None:
+                send_request(data, _hold(ex, now))
+            else:
+                tr.send(data)
+            if new_attempt:
+                serial = ex.serial
+                generation = ex.attempt
+                after now ex.opts.attempt_timeout(ex.retries_used): _on_timer(serial, generation)
         else:
             _exchange_failed(ex, errors.TransportError("no transport: neither cap nor transport was given", False))
 
     proc def _resend(ex: _Exchange) -> None:
         # An extra attempt for a recovery (resynchronisation); it does not use up a retry
         _send(ex)
+
+    proc def _redraw_attempt(ex: _Exchange, id: int) -> None:
+        # _redraw for the exchange that sent attempt id
+        n = len(ex.ids)
+        if n == 0 or id not in ex.ids:
+            return
+        last = ex.ids[n - 1]
+        if ex.ids.index(id) < ex.resync_from:
+            ex.resync_from -= 1
+        ex.ids = [i for i in ex.ids if i != id]
+        if id in ex.sent_at:
+            del ex.sent_at[id]
+        if id in ex.bulk_sent:
+            del ex.bulk_sent[id]
+        _id_collisions += 1
+        if _logging:
+            _log.debug("request id in use on the shared socket, sending with a fresh id", {"id": id})
+        if last == id:
+            if ex.redraws >= MAX_REDRAWS:
+                _exchange_failed(ex, errors.QueueFullError(
+                    "no free request-id: %d fresh ids in a row are pending at other clients of the peer"
+                    % (MAX_REDRAWS + 1)))
+                return
+            ex.redraws += 1
+            _transmit(ex, False)
+
+    proc def _redraw(id: int) -> None:
+        # A shared-socket transport did not send attempt id because another Client has that id
+        # pending (transport.ID_IN_USE). If it was the exchange's latest attempt, send it again at
+        # once with a fresh id. That uses no retry and keeps the attempt's timer; after MAX_REDRAWS
+        # in a row the request fails with QueueFullError.
+        serial = _ids.get(id)
+        if serial is not None:
+            del _ids[id]
+            ex = _exchanges.get(serial)
+            if ex is not None:
+                _redraw_attempt(ex, id)
 
     def _on_timer(serial: int, attempt: int) -> None:
         ex = _exchanges.get(serial)
@@ -1636,6 +1666,8 @@ actor Client(cap: ?net.UDPConnectCap,
                 if op is not None:
                     _complete(op, None, err)
             _discovery_failed(err)
+        elif id_in_use(text) >= 0:
+            _redraw(id_in_use(text))
         elif is_unreachable(text):
             _unreachable += 1
             _log.debug("ICMP port unreachable", {"address": address, "port": port})
@@ -2632,7 +2664,7 @@ actor Client(cap: ?net.UDPConnectCap,
         avg = _rtt_sum / float(_responses) if _responses > 0 else 0.0
         return Stats(_requests, _retries, _timeouts, _responses, _drops_decode, _drops_unknown_id, _drops_source,
                      _drops_auth, _drops_version, _drops_pdu, _reports, _unreachable, _rtt_last, avg,
-                     len(_ops) - _active, _active, _transport_failures)
+                     len(_ops) - _active, _active, _transport_failures, _id_collisions)
 
     def close() -> None:
         """Cancel every pending and queued request, walk and discovery (errors.CancelledError) and close the transport

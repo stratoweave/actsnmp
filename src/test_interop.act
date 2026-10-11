@@ -15,11 +15,13 @@ runs in order, then check the Outcomes by label, collecting every failure
 instead of stopping at the first.
 """
 
+import logging
 import net
 import process
 import testing
 import time
 
+import dispatcher
 import errors
 import fmt
 import message
@@ -29,13 +31,14 @@ import pdu
 import security
 import usm
 from client import Client, EngineInfo, Options, Response, Stats, Table, error_response
+from dispatcher import Dispatcher
 from message import ScopedPdu, UsmSecurityParameters, V3Message
 from mibview import MibView
 from notify import Notification
 from oid import Oid
 from pdu import Pdu, TrapV1Pdu
 from receiver import NotificationReceiver, ReceiverConfig
-from security import Community, Usm
+from security import Community, Security, Usm
 from transport import ServerTransport, udp_server_transport
 from values import Counter64, EndOfMibView, Gauge32, Integer, IpAddress, NoSuchInstance, NoSuchObject
 from values import ObjectIdentifier, OctetString, TimeTicks, VarBind
@@ -2210,3 +2213,89 @@ actor _test_receiver_matrix_quick_ipv6(t: testing.EnvT):
     t.timeout(120.0)
     t.require("interop")
     r = _Matrix(t, "--quick", "matrix-quick.txt", LOCAL6)
+
+
+# The shared-socket Dispatcher ######################################################################
+
+proc def via(d: Dispatcher, a: LabAgent, address: str, sec: Security, opts: Options) -> Client:
+    """A Client of agent a at address whose transport the Dispatcher d attached"""
+    return Client(None, address, sec, None, port=a.port, opts=opts, transport=d.attach(address, a.port))
+
+actor _test_dispatcher(t: testing.EnvT):
+    """20 Clients of both agents through ONE Dispatcher socket on "::", all at once: SNMPv1 and SNMPv2c
+    (two communities, GETNEXT and GETBULK, IPv4 and IPv6) and six SNMPv3 users per agent (snmpsim: also a
+    context) walk the dataset and GET the scalars; each compared with expected/canon, nothing unroutable"""
+    t.timeout(120.0)
+    t.require("interop")
+    full = expected(t, "canon/dataset.txt")
+    full_v1 = expected(t, "canon/dataset-v1.txt")
+    scal = expected(t, "canon/scalars.txt")
+    lab = lab_users(t)
+    lcap = net.UDPListenCap(net.UDPCap(net.NetCap(t.env.cap)))
+    v3_users = {"snmpd": ["u_noauth", "u_md5", "u_sha256_aes", "u_md5_aes256", "u_sha512_aes256c", "u_sha_des"],
+                "snmpsim": ["u_noauth", "u_sha", "u_sha256_aes", "u_md5_aes192c", "u_sha_3des", "u_sha224_aes256"]}
+    var disp: ?Dispatcher = None
+    var scripts: list[(str, list[Step])] = []
+
+    def finish(results: dict[str, dict[str, Outcome]]) -> None:
+        d = disp
+        s = d.stats() if d is not None else None
+        if s is not None:
+            logging.Logger(t.log_handler).info("dispatcher", {"clients": len(scripts), "stats": str(s)})
+        def run() -> None:
+            failures: list[str] = []
+            for sn in scripts:
+                name = sn.0
+                got = results[name]
+
+                def one() -> None:
+                    o = outcome_of(got, "walk")
+                    same_lines(lines(walked(o, name)), full_v1 if " v1 " in name else full, "walk of B")
+                    g = got.get("scalars")
+                    if g is not None:
+                        same_lines(got_lines(g, name + " scalars"), v1_get_lines(scal) if " v1 " in name else scal,
+                                   "GET of the scalars")
+                attempt(failures, name, one)
+            if s is not None:
+                def stats_ok() -> None:
+                    check(s.unroutable == 0 and s.collisions == 0 and s.refused == 0 and s.peers == 3
+                          and s.routed >= 2 * len(scripts), "stats: " + str(s))
+                attempt(failures, "dispatcher", stats_ok)
+            all_passed(failures)
+        if d is not None:
+            d.close()
+        report_env(t, outcome(run))
+
+    def disp_ready(d: Dispatcher, error: ?str) -> None:
+        if error is not None:
+            t.failure(AssertionError("dispatcher: " + error))
+            return
+        disp = d
+        o = OPTS.with_(max_repetitions=40)
+        for a in [SNMPD, SNMPSIM]:
+            v1 = via(d, a, LOCAL4, Community("public", message.SNMP_V1), o)
+            scripts.append((a.name + " v1 public", [get_step("scalars", v1, [oid_of(x) for x in scal]),
+                                                     walk_step("walk", v1, BASE)]))
+            v2 = via(d, a, LOCAL4, Community("public"), o)
+            scripts.append((a.name + " v2c public", [get_step("scalars", v2, [oid_of(x) for x in scal]),
+                                                      walk_step("walk", v2, BASE)]))
+            v2n = via(d, a, LOCAL4, Community("private"), o)
+            scripts.append((a.name + " v2c private getnext", [walk_step("walk", v2n, BASE, o.with_(use_bulk=False))]))
+            for name in v3_users[a.name]:
+                c = via(d, a, LOCAL4, find_user(lab, name), o)
+                scripts.append((a.name + " " + name, [get_step("scalars", c, [oid_of(x) for x in scal]),
+                                                       walk_step("walk", c, BASE)]))
+            if a.name == "snmpd":
+                v6 = via(d, a, LOCAL6, Community("public"), o)
+                scripts.append(("snmpd ipv6 v2c", [walk_step("walk", v6, BASE)]))
+            else:
+                cx = via(d, a, LOCAL4, with_context(find_user(lab, "u_sha_aes"), "private"), o)
+                scripts.append(("snmpsim u_sha_aes context private", [walk_step("walk", cx, BASE)]))
+        g = Gather(len(scripts), finish)
+        for sn in scripts:
+            sc = Script(sn.0, sn.1, g.put)
+
+    def go() -> None:
+        dispatcher.udp_dispatcher(lcap, "::", 0, disp_ready, None)
+
+    gate = LabGate(t, go)

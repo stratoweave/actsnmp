@@ -19,6 +19,8 @@ written in Acton. The Acton package name is `snmp`.
   - sending traps and informs;
   - per-request timeouts and retries, SNMPv3 engine discovery, IPv4 and
     IPv6.
+- **Dispatcher:** many clients share one UDP socket, for polling large
+  numbers of devices without one socket per device.
 - **Notification receiver:** SNMPv1/v2c traps, SNMPv2c informs, and SNMPv3
   traps and informs.
 - **Agent:** a small command responder that serves values from an
@@ -107,11 +109,66 @@ A failed request passes an `snmp.errors.SnmpError` to the callback. Its
 `transient` attribute is true when the same request may succeed if it is
 tried again later on the same client, for example after a timeout.
 
-### Many devices
+### Many devices on one socket
 
-Each client has its own UDP socket, so a process that polls many devices
-needs one file descriptor per device. Raise the process's limit on open
-files for large fleets.
+A client created from a `UDPConnectCap` has its own UDP socket, so a
+process needs one file descriptor per device. A `Dispatcher` instead gives
+each client a transport on a single shared UDP socket:
+
+```python
+import net
+import snmp.client
+import snmp.dispatcher
+import snmp.errors
+import snmp.fmt
+import snmp.oid
+import snmp.security
+
+actor main(env):
+    cap = net.UDPListenCap(net.UDPCap(net.NetCap(env.cap)))
+    devices = ["192.0.2.1", "192.0.2.2", "2001:db8::1"]
+    var left = len(devices)
+
+    def got(cl: snmp.client.Client, resp: ?snmp.client.Response, err: ?snmp.errors.SnmpError):
+        if err is not None:
+            print("error:", err.error_message)
+        elif resp is not None:
+            for vb in resp.varbinds:
+                print(snmp.fmt.netsnmp_varbind(vb))
+        cl.close()
+        left -= 1
+        if left == 0:
+            env.exit(0)
+
+    def listening(d: snmp.dispatcher.Dispatcher, err: ?str):
+        if err is not None:
+            print("listen failed:", err)
+            env.exit(1)
+        else:
+            for address in devices:
+                c = snmp.client.Client(None, address, snmp.security.Community("public"), None,
+                                       transport=d.attach(address, 161))
+                c.get(got, [snmp.oid.Oid.parse("1.3.6.1.2.1.1.5.0")])
+
+    snmp.dispatcher.udp_dispatcher(cap, "::", 0, listening)
+```
+
+Addresses given to `attach` must be IP literals, so resolve host names
+first. A socket bound to `"::"` reaches both IPv4 and IPv6 devices; bind a
+specific address or port to choose the source of the requests. Closing a
+client detaches its transport.
+
+Several clients may share a device, for example with different
+communities, SNMPv3 users or contexts. Answers are routed by request-id or
+msgID. Some multi-homed agents answer from another address than the one
+that was queried: `d.attach(address, 161, False)`, or `strict_source=False`
+on `udp_dispatcher`, accepts such answers when the id, and for SNMPv1/v2c
+the community, match a pending request. That gives up the source address
+check, so use it only for the devices that need it.
+
+All answers arrive through one socket, whose kernel receive buffer
+(`net.core.rmem_default`) holds a few hundred of them. Keep the number of
+outstanding requests per Dispatcher below that, or raise the buffer size.
 
 ## Command-line tool
 

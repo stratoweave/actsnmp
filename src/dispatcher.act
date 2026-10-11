@@ -1,0 +1,1028 @@
+"""Shared-socket dispatcher: many Clients over one UDP socket
+
+A Client normally owns a connected UDP socket (transport.udp_transport).
+At fleet scale that costs a file descriptor per device and context, and a
+connected socket can neither choose its source address nor hear an agent
+that answers from another address. A Dispatcher carries the traffic of any
+number of Clients over one ServerTransport: a socket from
+udp_server_transport(), bound to a wildcard or a chosen source address, or
+MemNet.server() in tests.
+
+    udp_dispatcher(cap, "::", 0, on_ready)      # on_ready(d, None) once listening
+    c = Client(None, "192.0.2.7", sec, log, transport=d.attach("192.0.2.7", 161))
+
+attach(address, port) returns an ordinary transport.Transport for one
+Client, and Client.close() detaches it.
+
+Every request a Client sends is recorded under its peer (normalised source
+address and port) and id (request-id for SNMPv1/v2c, msgID for SNMPv3). An
+incoming datagram goes to the transport that recorded its id, so several
+Clients can share a peer (communities, users or contexts of one device). A
+peer with a single transport also gets datagrams that match no record, as
+with a socket of its own. Anything else is counted as unroutable and
+dropped.
+
+A record lives at least id_lifetime seconds, or as long as its Client
+says it waits for the answer (Transport.send_request). A transport keeps
+at most max_ids records of unanswered requests and refuses further ones
+(FULL) rather than forget a request that is still waited for. A request
+whose id another Client of the same peer has recorded is refused with
+transport.ID_IN_USE, and the Client redraws the id. The records of a
+closed transport stay until they expire, so a late answer to it is
+dropped instead of reaching another Client that reuses the id.
+
+With strict_source=False (for the Dispatcher, or per transport with
+attach(..., strict=False)), a datagram from another source is accepted
+when its id names exactly one request of such a transport and, for
+SNMPv1/v2c, carries that request's community. This is what net-snmp does
+plus the community check, and a security trade-off: the source address no
+longer protects against a blind spoofer.
+
+Compared with its own connected socket, a Client loses ICMP port
+unreachable hints, send error reports (udp_server_transport logs them) and
+the entropy of its own ephemeral source port. Addresses must be IP
+addresses without a zone, of a family the socket can reach. The
+Dispatcher does no name resolution: when an address changes, the caller
+resolves it and attaches a new transport. A socket bound to "0.0.0.0"
+reaches IPv4 peers only; bind "::" for both families.
+
+There is no flow control beyond the Clients' Options.max_in_flight and
+the caller's polling schedule. A burst of answers beyond the socket's
+receive buffer (net.core.rmem_default, 212992 octets on Linux, a few
+hundred small answers) is dropped by the kernel and costs a retry, so
+spread large polls. Every datagram to the socket's port goes through one
+actor; separate Dispatchers isolate groups of devices from each other.
+"""
+
+import logging
+import net
+import time
+
+import ber
+import message
+import pdu
+import transport as transport_mod
+from transport import ServerTransport, Transport
+
+# Minimum seconds a request's id stays recorded after it was sent (longer when its Client waits
+# longer, Transport.send_request). Well beyond the default Options' request budget of 4 s, to route
+# late answers.
+ID_LIFETIME = 60.0
+
+# Records of unanswered requests kept per attached transport (and as many of answered ones). A
+# request beyond it is not sent while the oldest unanswered one is still waited for (FULL).
+MAX_IDS = 1024
+
+# Seconds between sweeps of expired records
+SWEEP_INTERVAL = 5.0
+
+# Seconds between two debug log lines about dropped datagrams (the lines count the drops between)
+DROP_LOG_INTERVAL = 1.0
+
+# The fatal error the transports of a closed Dispatcher report
+CLOSED = "the Dispatcher is closed"
+
+# Prefix of the non-fatal error of a transport that did not send a request because max_ids of its
+# requests still wait for answers. The attempt is lost; the Client's retry may find room.
+FULL = "too many requests of this client wait for answers on the shared socket (max_ids), not sent: "
+
+_MASK32 = 0xffffffff
+
+
+def _now() -> float:
+    return float(time.monotonic_ns()) / 1000000000.0
+
+def _key(version: int, id: int) -> int:
+    # The routing key of an id: SNMPv1, SNMPv2c and SNMPv3 ids are separate spaces
+    return (version << 32) | (id & _MASK32)
+
+def _ipv6_text(o: bytes) -> str:
+    # RFC 5952 text of 16 octets: lower-case hex without leading zeros, the longest run of two or
+    # more zero groups (the first of equal runs) written as "::"
+    groups: list[int] = []
+    for i in range(8):
+        groups.append(o[2 * i] * 256 + o[2 * i + 1])
+    best = -1
+    best_len = 0
+    i = 0
+    while i < 8:
+        if groups[i] == 0:
+            j = i
+            while j < 8 and groups[j] == 0:
+                j += 1
+            if j - i > best_len:
+                best = i
+                best_len = j - i
+            i = j
+        else:
+            i += 1
+    if best_len < 2:
+        return ":".join([hex(g)[2:] for g in groups])
+    head = ":".join([hex(g)[2:] for g in groups[:best]])
+    tail = ":".join([hex(g)[2:] for g in groups[best + best_len:]])
+    return head + "::" + tail
+
+def canonical_address(address: str) -> ?str:
+    """Return the canonical text of an IP address, None if address is not one
+
+    IPv4 in dotted decimal; IPv6 as RFC 5952 recommends (lower case, no
+    leading zeros, "::" for the longest run of zero groups), which is how
+    Linux reports sources; an IPv4-mapped IPv6 address gives its IPv4
+    address; an IPv6 zone ("%eth0") is dropped (attach() refuses zones).
+    The Dispatcher routes and sends by this text, so any text form of an
+    address may be attached.
+    """
+    oo = transport_mod.ip_octets(address)
+    if oo is not None:
+        o: bytes = oo
+        if len(o) == 4:
+            return "%d.%d.%d.%d" % (o[0], o[1], o[2], o[3])
+        return _ipv6_text(o)
+    return None
+
+def _family(address: str) -> int:
+    # 4 or 6 for an IP address that is not "::" (4 also for an IPv4-mapped one), 0 for "::" (dual
+    # stack) and for anything else (unknown)
+    oo = transport_mod.ip_octets(address)
+    if oo is not None:
+        o: bytes = oo
+        if len(o) == 4:
+            return 4
+        for x in o:
+            if x != 0:
+                return 6
+    return 0
+
+# The routing keys are read on every datagram: by hand, without raising and without tuples, with
+# exactly the checks of ber.read_tlv, ber.dec_int and message.peek. A content range is packed into
+# one int: (start << 32) | stop.
+
+_BAD = 1 << 40      # not an INTEGER value any caller accepts (all want 32-bit values)
+
+def _tlv(data: bytes, pos: int, end: int, tag: int) -> int:
+    # The content range of the TLV at pos (not beyond end) if its tag is tag, -1 for anything ber.expect_tlv
+    # refuses (no tag or length octet, a length beyond end, the indefinite or a >4-octet length form)
+    if pos + 2 > end or data[pos] != tag:
+        return -1
+    first = data[pos + 1]
+    if first < 0x80:
+        if pos + 2 + first > end:
+            return -1
+        return ((pos + 2) << 32) | (pos + 2 + first)
+    if first == 0x80 or first > 0x84:
+        return -1
+    start = pos + 2 + (first & 0x7f)
+    if start > end:
+        return -1
+    n: int = 0
+    for i in range(pos + 2, start):
+        n = n * 256 + data[i]
+    if start + n > end:
+        return -1
+    return (start << 32) | (start + n)
+
+def _int(data: bytes, r: int) -> int:
+    # The INTEGER content in range r (ber.dec_int: 1 to 9 octets, redundant leading octets allowed), _BAD
+    # where dec_int raises
+    start = r >> 32
+    stop = r & _MASK32
+    n = stop - start
+    if n < 1 or n > 9:
+        return _BAD
+    first = data[start]
+    if n == 9:
+        second = data[start + 1]
+        if not ((first == 0 and second < 0x80) or (first == 0xff and second >= 0x80)):
+            return _BAD
+    v: int = first - 256 if first >= 0x80 else first
+    for i in range(start + 1, stop):
+        v = v * 256 + data[i]
+    return v
+
+def answer_key(data: bytes) -> int:
+    """Return the routing key of an incoming datagram (message.peek's id), -1 if it does not peek
+
+    The same key as (version << 32) | id of message.peek(data), and -1
+    exactly where peek raises (a test compares them); read without raising.
+    """
+    n = len(data)
+    outer = _tlv(data, 0, n, ber.TAG_SEQUENCE)
+    if outer < 0:
+        return -1
+    stop = outer & _MASK32
+    rv = _tlv(data, outer >> 32, stop, ber.TAG_INTEGER)
+    if rv < 0:
+        return -1
+    version = _int(data, rv)
+    ve = rv & _MASK32
+    if version == message.SNMP_V3:
+        if stop != n:
+            return -1
+        rh = _tlv(data, ve, stop, ber.TAG_SEQUENCE)
+        if rh < 0:
+            return -1
+        ri = _tlv(data, rh >> 32, rh & _MASK32, ber.TAG_INTEGER)
+        if ri < 0:
+            return -1
+        msg_id = _int(data, ri)
+        if msg_id < 0 or msg_id > 0x7fffffff:
+            return -1
+        return _key(version, msg_id)
+    if version != message.SNMP_V1 and version != message.SNMP_V2C:
+        return -1
+    rc = _tlv(data, ve, stop, ber.TAG_OCTET_STRING)
+    if rc < 0:
+        return -1
+    ce = rc & _MASK32
+    if ce + 2 > stop:
+        return -1
+    tag = data[ce]
+    if tag != pdu.TRAP_V1 and (tag < pdu.GET or tag > pdu.REPORT):
+        return -1
+    rp = _tlv(data, ce, stop, tag)
+    if rp < 0:
+        return -1
+    if tag == pdu.TRAP_V1:
+        return _key(version, 0)
+    ri = _tlv(data, rp >> 32, rp & _MASK32, ber.TAG_INTEGER)
+    if ri < 0:
+        return -1
+    request_id = _int(data, ri)
+    if request_id < -0x80000000 or request_id > 0x7fffffff:
+        return -1
+    return _key(version, request_id)
+
+def _request_of(data: bytes) -> int:
+    # The routing key of an outgoing confirmed-class request, -1 for anything else; the checks of
+    # ber.expect_tlv and ber.read_integer, read the same way as answer_key
+    n = len(data)
+    outer = _tlv(data, 0, n, ber.TAG_SEQUENCE)
+    if outer < 0:
+        return -1
+    stop = outer & _MASK32
+    rv = _tlv(data, outer >> 32, stop, ber.TAG_INTEGER)
+    if rv < 0:
+        return -1
+    version = _int(data, rv)
+    ve = rv & _MASK32
+    if version == message.SNMP_V3:
+        rh = _tlv(data, ve, stop, ber.TAG_SEQUENCE)
+        if rh < 0:
+            return -1
+        he = rh & _MASK32
+        ri = _tlv(data, rh >> 32, he, ber.TAG_INTEGER)
+        if ri < 0:
+            return -1
+        msg_id = _int(data, ri)
+        if msg_id < 0 or msg_id > 0x7fffffff:
+            return -1
+        rm = _tlv(data, ri & _MASK32, he, ber.TAG_INTEGER)
+        if rm < 0:
+            return -1
+        max_size = _int(data, rm)
+        if max_size < 0 or max_size > 0x7fffffff:
+            return -1
+        rf = _tlv(data, rm & _MASK32, he, ber.TAG_OCTET_STRING)
+        if rf < 0:
+            return -1
+        fs = rf >> 32
+        if (rf & _MASK32) - fs != 1 or (data[fs] & message.FLAG_REPORTABLE) == 0:
+            return -1
+        return _key(version, msg_id)
+    if version != message.SNMP_V1 and version != message.SNMP_V2C:
+        return -1
+    rc = _tlv(data, ve, stop, ber.TAG_OCTET_STRING)
+    if rc < 0:
+        return -1
+    ce = rc & _MASK32
+    if ce + 2 > stop:
+        return -1
+    tag = data[ce]
+    if tag != pdu.GET and tag != pdu.GETNEXT and tag != pdu.GETBULK and tag != pdu.SET and tag != pdu.INFORM:
+        return -1
+    rp = _tlv(data, ce, stop, tag)
+    if rp < 0:
+        return -1
+    ri = _tlv(data, rp >> 32, rp & _MASK32, ber.TAG_INTEGER)
+    if ri < 0:
+        return -1
+    request_id = _int(data, ri)
+    if request_id < -0x80000000 or request_id > 0x7fffffff:
+        return -1
+    return _key(version, request_id)
+
+def request_key(data: bytes) -> int:
+    """Return the routing key of an outgoing datagram that expects an answer, -1 for any other
+
+    A request is an SNMPv1/v2c GetRequest, GetNextRequest, GetBulkRequest,
+    SetRequest or InformRequest, or an SNMPv3 message with the reportable
+    flag (RFC 3412: set for exactly the confirmed-class PDUs, so it is
+    readable even when the scoped PDU is encrypted). The key is
+    (version << 32) | id, the id being the request-id or the msgID; traps,
+    responses, reports and undecodable datagrams give -1.
+    """
+    return _request_of(data)
+
+def _community_of(data: bytes) -> ?bytes:
+    # The community of an SNMPv1/v2c datagram, None if it has none or does not decode that far
+    n = len(data)
+    outer = _tlv(data, 0, n, ber.TAG_SEQUENCE)
+    if outer < 0:
+        return None
+    stop = outer & _MASK32
+    rv = _tlv(data, outer >> 32, stop, ber.TAG_INTEGER)
+    if rv < 0:
+        return None
+    version = _int(data, rv)
+    if version != message.SNMP_V1 and version != message.SNMP_V2C:
+        return None
+    rc = _tlv(data, rv & _MASK32, stop, ber.TAG_OCTET_STRING)
+    if rc < 0:
+        return None
+    return data[rc >> 32:rc & _MASK32]
+
+def _request_community(data: bytes) -> bytes:
+    # The community of an SNMPv1/v2c request (b"" for SNMPv3)
+    c = _community_of(data)
+    return c if c is not None else b""
+
+
+class DispatcherStats(object):
+    """Counters of a Dispatcher (see Dispatcher.stats())
+
+    endpoints: attached transports that are not closed.
+    peers: peers (address and port) with an attached transport or a record.
+    records: request ids recorded now (closed transports' included; expired
+        ones until the next sweep).
+    sent: datagrams handed to the socket.
+    received: datagrams that arrived.
+    routed: datagrams handed to a transport (routed_by_id included).
+    routed_by_id: of those, datagrams from another source than the peer,
+        accepted by their id (strict_source False).
+    unroutable: datagrams dropped: no peer for the source, an id unknown
+        on a shared peer, undecodable on a shared peer, late, ambiguous,
+        another community than the request's (from another source).
+    late: of those, answers to a request of a closed transport.
+    ambiguous: of those, datagrams from another source whose id more
+        than one recorded request has (strict_source False).
+    collisions: requests not sent because another transport of the same
+        peer has their id recorded (the Client sends them again with a
+        fresh id).
+    refused: requests not sent because max_ids requests of their transport
+        still wait for answers (FULL; back-pressure).
+    """
+    endpoints: int
+    peers: int
+    records: int
+    sent: int
+    received: int
+    routed: int
+    routed_by_id: int
+    unroutable: int
+    late: int
+    ambiguous: int
+    collisions: int
+    refused: int
+
+    def __init__(self, endpoints: int, peers: int, records: int, sent: int, received: int, routed: int,
+                 routed_by_id: int, unroutable: int, late: int, ambiguous: int, collisions: int, refused: int):
+        self.endpoints = endpoints
+        self.peers = peers
+        self.records = records
+        self.sent = sent
+        self.received = received
+        self.routed = routed
+        self.routed_by_id = routed_by_id
+        self.unroutable = unroutable
+        self.late = late
+        self.ambiguous = ambiguous
+        self.collisions = collisions
+        self.refused = refused
+
+    def __repr__(self) -> str:
+        counts = [("endpoints", self.endpoints), ("peers", self.peers), ("records", self.records),
+                  ("sent", self.sent), ("received", self.received), ("routed", self.routed),
+                  ("routed_by_id", self.routed_by_id), ("unroutable", self.unroutable), ("late", self.late),
+                  ("ambiguous", self.ambiguous), ("collisions", self.collisions), ("refused", self.refused)]
+        return "DispatcherStats(" + ", ".join([c.0 + "=" + str(c.1) for c in counts]) + ")"
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
+
+class _Rec(object):
+    # One recorded request: key (_key), the endpoint that sent it, when it is forgotten (expires) and
+    # until when its sender may still wait for the answer (held_until); community: the request's
+    # (SNMPv1/v2c, loose endpoints only: answers routed by id from another source must carry it);
+    # answered once a datagram was routed to it; gone once it left the maps. serial tells a record
+    # from a later one of the same key.
+    serial: int
+    key: int
+    ep: _Endpoint
+    expires: float
+    held_until: float
+    community: bytes
+    answered: bool
+    gone: bool
+
+    def __init__(self, serial: int, key: int, ep: _Endpoint, expires: float, held_until: float, community: bytes):
+        self.serial = serial
+        self.key = key
+        self.ep = ep
+        self.expires = expires
+        self.held_until = held_until
+        self.community = community
+        self.answered = False
+        self.gone = False
+
+
+class _Peer(object):
+    # An address (canonical text) and port: its open endpoints, the ids recorded for it (keys to
+    # the live record), and how many of those records belong to closed endpoints (tombstones)
+    serial: int
+    address: str
+    port: int
+    endpoints: list[_Endpoint]
+    ids: dict[int, _Rec]
+    tombs: int
+
+    def __init__(self, serial: int, address: str, port: int):
+        self.serial = serial
+        self.address = address
+        self.port = port
+        self.endpoints = []
+        self.ids = {}
+        self.tombs = 0
+
+
+class _Endpoint(object):
+    # One attached transport: its peer, whether answers from other sources may reach it by id (loose),
+    # its callbacks, the datagrams that came before it registered, and its records: pend in the order
+    # they were sent (from phead; entries that were answered or are gone are skipped), ans in the
+    # order they were answered (from ahead); n_pend and n_ans count the live ones
+    token: int
+    peer: _Peer
+    loose: bool
+    @property
+    on_data: ?action(bytes, str, int) -> None
+    @property
+    on_error: ?action(str, bool) -> None
+    early: list[(bytes, str, int)]
+    closed: bool
+    pend: list[_Rec]
+    phead: int
+    n_pend: int
+    ans: list[_Rec]
+    ahead: int
+    n_ans: int
+
+    def __init__(self, token: int, peer: _Peer, loose: bool):
+        self.token = token
+        self.peer = peer
+        self.loose = loose
+        self.on_data = None
+        self.on_error = None
+        self.early = []
+        self.closed = False
+        self.pend = []
+        self.phead = 0
+        self.n_pend = 0
+        self.ans = []
+        self.ahead = 0
+        self.n_ans = 0
+
+
+def _endpoint_transport(d: Dispatcher, token: int, loose: bool) -> Transport:
+    # The procs are closures built at module level: they run in the caller's actor and
+    # call the Dispatcher asynchronously. The send procs read the request's routing key (and, for a
+    # loose transport, its community) there, so that the Clients, not the Dispatcher, spend the CPU
+    # for it.
+    def _send(data: bytes) -> None:
+        k = request_key(data)
+        d.ep_send(token, data, k, _request_community(data) if loose and k >= 0 else b"", 0.0)
+    def _send_request(data: bytes, hold: float) -> None:
+        k = request_key(data)
+        d.ep_send(token, data, k, _request_community(data) if loose and k >= 0 else b"", hold)
+    def _set_receiver(on_data: action(bytes, str, int) -> None, on_error: action(str, bool) -> None) -> None:
+        d.ep_set_receiver(token, on_data, on_error)
+    def _close() -> None:
+        d.ep_close(token)
+    return Transport(_send, _set_receiver, _close, source_checked=True, send_request=_send_request)
+
+
+actor Dispatcher(server: ServerTransport, log_handler: ?logging.Handler, strict_source: bool=True,
+                 id_lifetime: float=ID_LIFETIME, max_ids: int=MAX_IDS, local_address: str=""):
+    """Many Clients over one ServerTransport (see the module documentation)
+
+    The Dispatcher registers as server's receiver at once, owns it, and
+    closes it in close(). A server whose local_port() is 0 (binding failed)
+    gives a Dispatcher that is closed from the start. strict_source=False
+    makes every attach() accept answers from other sources by their id.
+    id_lifetime (seconds, 0.001..86400) and max_ids (at least 1) are
+    clamped to their ranges. local_address is the address server is bound
+    to, if known; attach() then refuses peers of an address family the
+    socket cannot reach. Unroutable datagrams are logged at debug level, at
+    most one line per DROP_LOG_INTERVAL.
+    """
+    _log = logging.Logger(log_handler)
+    _logging = log_handler is not None
+    _lifetime = id_lifetime if id_lifetime >= 0.001 and id_lifetime <= 86400.0 else (
+        0.001 if id_lifetime < 0.001 else 86400.0)
+    _max_ids = max_ids if max_ids >= 1 else 1
+    _local_family = _family(local_address)
+    _strict_default = strict_source
+
+    var _failure: ?str = None
+    var _next_token = 1
+    var _next_serial = 1
+    var _eps: dict[int, _Endpoint] = {}
+    var _peers: dict[(str, int), _Peer] = {}
+    # The live record of every key over the loose endpoints of all peers, and the keys that more
+    # than one live record of them has (until when)
+    var _by_id: dict[int, _Rec] = {}
+    var _ambiguous_keys: dict[int, float] = {}
+    # closed endpoints whose records are still kept
+    var _closed_eps: list[_Endpoint] = []
+    var _sweeping = False
+    var _drop_logged_at = -1.0e9
+    var _drops_not_logged = 0
+
+    var _sent = 0
+    var _received = 0
+    var _routed = 0
+    var _routed_by_id = 0
+    var _unroutable = 0
+    var _late = 0
+    var _ambiguous = 0
+    var _collisions = 0
+    var _refused = 0
+
+    # Records #######################################################################################
+
+    proc def _drop_peer_if_idle(peer: _Peer) -> None:
+        if len(peer.endpoints) == 0 and len(peer.ids) == 0:
+            k = (peer.address, peer.port)
+            p = _peers.get(k)
+            if p is not None:
+                if p.serial == peer.serial:
+                    del _peers[k]
+
+    proc def _unmap(rec: _Rec) -> None:
+        # rec leaves the maps: it expired, made room, or a newer record of its key replaces it
+        if rec.gone:
+            return
+        rec.gone = True
+        ep = rec.ep
+        if rec.answered:
+            ep.n_ans -= 1
+        else:
+            ep.n_pend -= 1
+        peer = ep.peer
+        cur = peer.ids.get(rec.key)
+        if cur is not None:
+            if cur.serial == rec.serial:
+                del peer.ids[rec.key]
+                if ep.closed:
+                    peer.tombs -= 1
+        if ep.loose:
+            g = _by_id.get(rec.key)
+            if g is not None:
+                if g.serial == rec.serial:
+                    del _by_id[rec.key]
+        _drop_peer_if_idle(peer)
+
+    proc def _expire(ep: _Endpoint, now: float) -> None:
+        # Forget ep's expired records at the heads of its lists (the oldest come first), and step over
+        # the entries that were answered (pend) or are gone
+        pend = ep.pend
+        i = ep.phead
+        n = len(pend)
+        while i < n:
+            r = pend[i]
+            if r.gone or r.answered:
+                i += 1
+            elif r.expires <= now:
+                _unmap(r)
+                i += 1
+            else:
+                break
+        if i >= n:
+            ep.pend = []
+            ep.phead = 0
+        elif i > 64 and i * 2 > n:
+            ep.pend = pend[i:]
+            ep.phead = 0
+        else:
+            ep.phead = i
+        ans = ep.ans
+        j = ep.ahead
+        m = len(ans)
+        while j < m:
+            r = ans[j]
+            if r.gone:
+                j += 1
+            elif r.expires <= now:
+                _unmap(r)
+                j += 1
+            else:
+                break
+        if j >= m:
+            ep.ans = []
+            ep.ahead = 0
+        elif j > 64 and j * 2 > m:
+            ep.ans = ans[j:]
+            ep.ahead = 0
+        else:
+            ep.ahead = j
+
+    proc def _compact(ep: _Endpoint) -> None:
+        # Keep the lists in proportion to the live records: an old record still waited for at the head
+        # of pend would otherwise keep every later entry in it
+        if len(ep.pend) - ep.phead > 2 * ep.n_pend + 64:
+            ep.pend = [r for r in ep.pend[ep.phead:] if not r.gone and not r.answered]
+            ep.phead = 0
+        if len(ep.ans) - ep.ahead > 2 * ep.n_ans + 64:
+            ep.ans = [r for r in ep.ans[ep.ahead:] if not r.gone]
+            ep.ahead = 0
+
+    proc def _make_room(ep: _Endpoint, now: float) -> bool:
+        # ep has max_ids records of unanswered requests: forget the oldest one whose sender no longer
+        # waits for it (usually the first; holds may differ between requests, so look further, at most
+        # max_ids records); False if the sender waits for all of them (the new request is refused)
+        _expire(ep, now)
+        if ep.n_pend < _max_ids:
+            return True
+        pend = ep.pend
+        for i in range(ep.phead, len(pend)):
+            r = pend[i]
+            if not r.gone and not r.answered and r.held_until <= now:
+                _unmap(r)
+                if i == ep.phead:
+                    ep.phead += 1
+                return True
+        return False
+
+    proc def _mark_answered(rec: _Rec) -> None:
+        # A datagram was routed to rec: it moves to the answered records (bounded by max_ids, the
+        # oldest answered forgotten first)
+        if rec.answered or rec.gone:
+            return
+        rec.answered = True
+        ep = rec.ep
+        ep.n_pend -= 1
+        ep.n_ans += 1
+        ep.ans.append(rec)
+        if ep.n_ans > _max_ids:
+            j = ep.ahead
+            while j < len(ep.ans) and ep.ans[j].gone:
+                j += 1
+            if j < len(ep.ans):
+                _unmap(ep.ans[j])
+                j += 1
+            ep.ahead = j
+        _compact(ep)
+
+    def _sweep() -> None:
+        # Forget expired records of every endpoint, open or closed; runs while there are records
+        if _failure is not None:
+            _sweeping = False
+            return
+        now = _now()
+        for ep in _eps.values():
+            _expire(ep, now)
+        kept: list[_Endpoint] = []
+        for ep in _closed_eps:
+            _expire(ep, now)
+            if ep.n_pend + ep.n_ans > 0:
+                kept.append(ep)
+        _closed_eps = kept
+        stale = [k for k, until in _ambiguous_keys.items() if until <= now]
+        for k in stale:
+            del _ambiguous_keys[k]
+        if len(kept) > 0 or any([len(p.ids) > 0 for p in _peers.values()]):
+            after now SWEEP_INTERVAL: _sweep()
+        else:
+            _sweeping = False
+
+    proc def _arm_sweep() -> None:
+        if not _sweeping:
+            _sweeping = True
+            after now SWEEP_INTERVAL: _sweep()
+
+    proc def _record(ep: _Endpoint, key: int, community: bytes, hold: float, now: float) -> bool:
+        # Record a request ep is about to send, its sender waiting up to hold seconds for the answer;
+        # False if it must not be sent: another endpoint of the peer, open or closed, has the key
+        # recorded (ID_IN_USE), or ep has max_ids requests still waited for (FULL)
+        peer = ep.peer
+        old = peer.ids.get(key)
+        if old is not None:
+            if old.expires > now and old.ep.token != ep.token:
+                _collisions += 1
+                if _logging:
+                    _log.debug("request id in use by another client of the peer; not sent",
+                               {"address": peer.address, "port": peer.port, "id": key & _MASK32})
+                cb = ep.on_error
+                if cb is not None:
+                    cb(transport_mod.ID_IN_USE + str(key & _MASK32), False)
+                return False
+            # expired, or ep's own earlier request with this id (an SNMPv2c inform retransmission)
+            _unmap(old)
+        if ep.n_pend >= _max_ids:
+            if not _make_room(ep, now):
+                _refused += 1
+                if _logging:
+                    _log.debug("max_ids requests of a client wait for answers; not sent",
+                               {"address": peer.address, "port": peer.port, "id": key & _MASK32})
+                cb = ep.on_error
+                if cb is not None:
+                    cb(FULL + str(key & _MASK32), False)
+                return False
+        h = hold if hold > 0.0 else 0.0
+        rec = _Rec(_next_serial, key, ep, now + (h if h > _lifetime else _lifetime), now + h,
+                   community if ep.loose else b"")
+        _next_serial += 1
+        peer.ids[key] = rec
+        ep.pend.append(rec)
+        ep.n_pend += 1
+        _compact(ep)
+        if ep.loose:
+            g = _by_id.get(key)
+            if g is not None:
+                if g.expires > now and not g.gone and g.ep.token != ep.token:
+                    _ambiguous_keys[key] = g.expires if g.expires > rec.expires else rec.expires
+            _by_id[key] = rec
+        _arm_sweep()
+        return True
+
+    # Endpoints (the procs of attach()'s transports call these) #####################################
+
+    def ep_send(token: int, data: bytes, key: int, community: bytes, hold: float) -> None:
+        """Send data for the transport token (key and community: of the request in data, -1 and b"" for
+        other datagrams; hold: seconds its sender waits for the answer); the transports call this"""
+        ep = _eps.get(token)
+        if ep is not None:
+            if key >= 0:
+                now = _now()
+                _expire(ep, now)
+                if not _record(ep, key, community, hold, now):
+                    return
+            _sent += 1
+            server.send_to(data, ep.peer.address, ep.peer.port)
+        # else closed: the Client knows (its own close(), or CLOSED from close())
+
+    def ep_set_receiver(token: int, on_data: action(bytes, str, int) -> None,
+                        on_error: action(str, bool) -> None) -> None:
+        """Register the callbacks of the transport token; the transports call this"""
+        failure = _failure
+        if failure is not None:
+            on_error(failure, True)
+            return
+        ep = _eps.get(token)
+        if ep is not None:
+            ep.on_data = on_data
+            ep.on_error = on_error
+            early = ep.early
+            ep.early = []
+            for d in early:
+                on_data(d.0, d.1, d.2)
+
+    proc def _close_endpoint(ep: _Endpoint) -> None:
+        token = ep.token
+        del _eps[token]
+        ep.closed = True
+        ep.on_data = None
+        ep.on_error = None
+        ep.early = []
+        peer = ep.peer
+        peer.endpoints = [x for x in peer.endpoints if x.token != token]
+        kept = ep.n_pend + ep.n_ans
+        if kept > 0:
+            peer.tombs += kept
+            _closed_eps.append(ep)
+            _arm_sweep()
+        else:
+            ep.pend = []
+            ep.phead = 0
+            ep.ans = []
+            ep.ahead = 0
+            _drop_peer_if_idle(peer)
+
+    def ep_close(token: int) -> None:
+        """Close (detach) the transport token; its records stay until they expire. The transports call this"""
+        ep = _eps.get(token)
+        if ep is not None:
+            _close_endpoint(ep)
+
+    # Incoming ######################################################################################
+
+    proc def _deliver(ep: _Endpoint, data: bytes, src_address: str, src_port: int) -> None:
+        _routed += 1
+        on_data = ep.on_data
+        if on_data is not None:
+            on_data(data, src_address, src_port)
+        elif len(ep.early) < transport_mod.MAX_BUFFERED:
+            ep.early.append((data, src_address, src_port))
+
+    proc def _drop(why: str, src_address: str, src_port: int, now: float) -> None:
+        # Count a dropped datagram; with a log handler, log it unless a drop was logged less than
+        # DROP_LOG_INTERVAL ago (a flood must not cost a log line per datagram)
+        _unroutable += 1
+        if _logging:
+            if now - _drop_logged_at >= DROP_LOG_INTERVAL:
+                _log.debug("datagram dropped: " + why, {"from": src_address, "port": src_port,
+                                                         "drops_not_logged_before": _drops_not_logged})
+                _drop_logged_at = now
+                _drops_not_logged = 0
+            else:
+                _drops_not_logged += 1
+
+    proc def _route_by_id(key: int, data: bytes, src_address: str, src_port: int, now: float) -> bool:
+        # A datagram whose key its source's peer has not recorded: deliver it by the key alone when
+        # exactly one live record of a loose endpoint has it (and, SNMPv1/v2c, the datagram carries that
+        # request's community). True if it was delivered or dropped here
+        until = _ambiguous_keys.get(key)
+        if until is not None:
+            if until > now:
+                _ambiguous += 1
+                _drop("its id is recorded for more than one request", src_address, src_port, now)
+                return True
+            del _ambiguous_keys[key]
+        rec = _by_id.get(key)
+        if rec is not None:
+            if rec.expires > now and not rec.gone:
+                ep = rec.ep
+                if (key >> 32) != message.SNMP_V3:
+                    c = _community_of(data)
+                    if c is None:
+                        return False
+                    if c != rec.community:
+                        return False
+                if ep.closed:
+                    _late += 1
+                    _drop("an answer for a closed client", src_address, src_port, now)
+                    return True
+                _mark_answered(rec)
+                _routed_by_id += 1
+                _deliver(ep, data, src_address, src_port)
+                return True
+        return False
+
+    def _on_datagram(data: bytes, src_address: str, src_port: int) -> None:
+        if _failure is not None:
+            return
+        _received += 1
+        now = _now()
+        src = transport_mod.normalize_address(src_address)
+        peer = _peers.get((src, src_port))
+        if peer is None and ":" in src:
+            # IPv6 text that differs from the attached one (a socket reports IPv4 canonically)
+            c = canonical_address(src)
+            if c is not None:
+                if c != src:
+                    peer = _peers.get((c, src_port))
+        key = answer_key(data)
+        if peer is not None and key >= 0:
+            rec = peer.ids.get(key)
+            if rec is not None:
+                if rec.expires > now:
+                    ep = rec.ep
+                    if ep.closed:
+                        _late += 1
+                        _drop("an answer for a closed client", src, src_port, now)
+                    else:
+                        _mark_answered(rec)
+                        _deliver(ep, data, src, src_port)
+                    return
+        if key >= 0 and len(_by_id) > 0:
+            if _route_by_id(key, data, src, src_port, now):
+                return
+        if peer is not None:
+            if len(peer.endpoints) == 1:
+                # a datagram the client may still know (an id whose record made room, junk): it decides,
+                # as with its own socket
+                _deliver(peer.endpoints[0], data, src, src_port)
+                return
+            if len(peer.endpoints) > 1:
+                _drop("unknown or undecodable id on a shared peer", src, src_port, now)
+                return
+        _drop("no client for this source", src, src_port, now)
+
+    # API ###########################################################################################
+
+    proc def _new_endpoint(token: int, canon: str, port: int, loose: bool) -> None:
+        k = (canon, port)
+        peer = _peers.get(k)
+        if peer is not None:
+            ep = _Endpoint(token, peer, loose)
+            peer.endpoints.append(ep)
+            _eps[token] = ep
+        else:
+            p = _Peer(_next_serial, canon, port)
+            _next_serial += 1
+            _peers[k] = p
+            ep = _Endpoint(token, p, loose)
+            p.endpoints.append(ep)
+            _eps[token] = ep
+
+    def attach(address: str, port: int, strict: ?bool=None) -> Transport:
+        """Return a Transport to address and port over the shared socket, for one Client
+
+        address must be an IP address in any text form, without an IPv6
+        zone, and of a family the socket can reach (checked when the
+        Dispatcher knows its local_address). Host names must be resolved by
+        the caller. Raises ValueError otherwise, or for a port outside
+        1..65535. Several transports may be attached to the same peer.
+        strict, if given, overrides the Dispatcher's strict_source for this
+        transport. The transport's close() detaches it; a transport
+        attached to a closed Dispatcher reports a fatal error at once.
+        """
+        if port < 1 or port > 65535:
+            raise ValueError("Dispatcher.attach: port %d is outside 1..65535" % port)
+        if "%" in address:
+            raise ValueError("Dispatcher.attach: " + address + " has an IPv6 zone, which the socket cannot send to")
+        canon = canonical_address(address)
+        if canon is not None:
+            family = 6 if ":" in canon else 4
+            if _local_family != 0 and family != _local_family:
+                raise ValueError("Dispatcher.attach: " + address + " is an IPv%d address and the socket is bound to "
+                                 % family + local_address + " (IPv%d only)" % _local_family)
+            loose = not _strict_default
+            if strict is not None:
+                loose = not strict
+            token = _next_token
+            _next_token += 1
+            if _failure is None:
+                _new_endpoint(token, canon, port, loose)
+            return _endpoint_transport(self, token, loose)
+        raise ValueError("Dispatcher.attach: " + address + " is not an IP address (resolve host names first)")
+
+    def local_port() -> int:
+        """Return the port of the shared socket (0 if binding it failed)"""
+        return server.local_port()
+
+    def stats() -> DispatcherStats:
+        """Return a snapshot of the counters"""
+        records = 0
+        for p in _peers.values():
+            records += len(p.ids)
+        return DispatcherStats(len(_eps), len(_peers), records, _sent, _received, _routed, _routed_by_id,
+                               _unroutable, _late, _ambiguous, _collisions, _refused)
+
+    def close() -> None:
+        """Close the socket and every attached transport
+
+        Each transport's Client gets the fatal error CLOSED (its pending
+        requests fail with errors.TransportError); later attach() calls
+        give transports that report it at once. Idempotent.
+        """
+        if _failure is not None:
+            return
+        _failure = CLOSED
+        eps = list(_eps.values())
+        _eps = {}
+        _peers = {}
+        _by_id = {}
+        _ambiguous_keys = {}
+        _closed_eps = []
+        for ep in eps:
+            ep.closed = True
+            cb = ep.on_error
+            ep.on_data = None
+            ep.on_error = None
+            if cb is not None:
+                cb(CLOSED, True)
+        server.close()
+
+    if server.local_port() == 0:
+        _failure = "the Dispatcher's socket is not bound (its setup failed)"
+    else:
+        server.set_receiver(_on_datagram)
+
+
+def udp_dispatcher(cap: net.UDPListenCap, address: str, port: int,
+                   on_ready: action(Dispatcher, ?str) -> None,
+                   log_handler: ?logging.Handler=None, strict_source: bool=True,
+                   id_lifetime: float=ID_LIFETIME, max_ids: int=MAX_IDS) -> None:
+    """Open a UDP socket on address and port with a Dispatcher on it, then call on_ready once
+
+    address is the local address to bind: "::" for IPv6 and IPv4 peers,
+    "0.0.0.0" for IPv4 only, or a specific address, which then is the
+    source address of every request (and attach() refuses peers of the
+    other address family). port 0 picks an ephemeral port; a fixed port
+    gives every request that source port. on_ready(dispatcher, None) means
+    it is listening; on_ready(dispatcher, error) means the socket could not
+    be opened, and that Dispatcher is closed (its transports fail at once).
+    The other arguments are the Dispatcher's; log_handler also gets the
+    socket's warnings.
+    """
+    _UdpDispatcherSetup(cap, address, port, on_ready, log_handler, strict_source, id_lifetime, max_ids)
+
+
+actor _UdpDispatcherSetup(cap: net.UDPListenCap, address: str, port: int,
+                          on_ready: action(Dispatcher, ?str) -> None, log_handler: ?logging.Handler,
+                          strict_source: bool, id_lifetime: float, max_ids: int):
+    # udp_server_transport() reports to an action; this actor builds the Dispatcher on its socket
+    def _ready(st: ServerTransport, error: ?str) -> None:
+        on_ready(Dispatcher(st, log_handler, strict_source, id_lifetime, max_ids, address), error)
+
+    transport_mod.udp_server_transport(cap, address, port, _ready, log_handler)

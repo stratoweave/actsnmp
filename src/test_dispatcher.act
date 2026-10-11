@@ -1,0 +1,1982 @@
+"""Tests for dispatcher
+
+The actor tests put the Dispatcher on MemNet with a real Agent and
+NotificationReceiver behind it, so they are deterministic. The env tests
+use real UDP: dual stack, a chosen source address, and a fleet of 2000
+Clients of 20 agents over one socket, timed against a socket per Client
+(see the log with --show-log).
+"""
+
+import file
+import logging
+import net
+import testing
+import time
+
+import ber
+import client
+import dispatcher
+import errors
+import fmt
+import message
+import pdu
+import transport
+import usm
+from agent import Agent, AgentConfig
+from client import Client, EngineInfo, Options, Response, Table
+from dispatcher import Dispatcher, DispatcherStats, answer_key, canonical_address, request_key
+from message import CommunityMessage, ScopedPdu, UsmSecurityParameters, V3Message
+from mibview import MibView, WriteRule
+from notify import Notification
+from oid import Oid
+from pdu import Pdu, TrapV1Pdu
+from receiver import NotificationReceiver, ReceiverConfig
+from security import Community, Security, Usm
+from transport import MemNet, NetFaults, ServerTransport, Transport
+from values import Integer, Null, OctetString, VarBind
+from testutil import h, outcome, read_text, report, report_env
+
+SYS_DESCR = Oid([1, 3, 6, 1, 2, 1, 1, 1, 0])
+
+
+# Pure ##############################################################################################
+
+def _test_canonical_address() -> None:
+    """IPv4, IPv6 in many text forms, IPv4-mapped, zones; None for names and junk"""
+    testing.assertEqual(canonical_address("10.0.0.1"), "10.0.0.1")
+    testing.assertEqual(canonical_address("010.000.000.001"), "10.0.0.1")
+    testing.assertEqual(canonical_address("::ffff:10.0.0.1"), "10.0.0.1")
+    testing.assertEqual(canonical_address("::FFFF:a00:1"), "10.0.0.1")
+    testing.assertEqual(canonical_address("::1"), "::1")
+    testing.assertEqual(canonical_address("::"), "::")
+    testing.assertEqual(canonical_address("2001:DB8:0:0:0:0:0:1"), "2001:db8::1")
+    testing.assertEqual(canonical_address("2001:0db8:0000::0001"), "2001:db8::1")
+    testing.assertEqual(canonical_address("2001:db8:0:1:0:0:0:1"), "2001:db8:0:1::1")
+    testing.assertEqual(canonical_address("2001:db8:0:0:1:0:0:1"), "2001:db8::1:0:0:1")
+    testing.assertEqual(canonical_address("2001:db8:1:1:1:1:0:1"), "2001:db8:1:1:1:1:0:1")
+    testing.assertEqual(canonical_address("fe80::1%eth0"), "fe80::1")
+    testing.assertEqual(canonical_address("1:0:0:0:0:0:0:0"), "1::")
+    testing.assertEqual(canonical_address("::2:3:4:5:6:7:8"), "0:2:3:4:5:6:7:8")      # RFC 5952 4.2.2: one zero group stays
+    testing.assertEqual(canonical_address("0:2:3:4:5:6:7:8"), "0:2:3:4:5:6:7:8")
+    testing.assertEqual(canonical_address("localhost"), None)
+    testing.assertEqual(canonical_address("10.0.0.256"), None)
+    testing.assertEqual(canonical_address(""), None)
+    testing.assertEqual(canonical_address("1:2:3"), None)
+
+def _community(version: int, pdu_type: int, request_id: int) -> bytes:
+    p = Pdu(pdu_type, request_id, 0, 0, [VarBind(SYS_DESCR, Integer(1))])
+    return message.encode_community(CommunityMessage(version, b"public", p))
+
+def _v3(msg_id: int, flags: int) -> bytes:
+    p = Pdu(pdu.GET, 77, 0, 0, [VarBind(SYS_DESCR, Integer(1))])
+    scoped = message.encode_scoped(ScopedPdu(b"", b"", p))
+    hdr = V3Message(msg_id, 65507, flags, UsmSecurityParameters(b"", 0, 0, b""))
+    return message.encode_v3(hdr, scoped).msg
+
+def _test_request_key() -> None:
+    """Requests (confirmed class) have a key, version in the high bits; traps, responses, reports and junk -1"""
+    v2 = message.SNMP_V2C
+    v1 = message.SNMP_V1
+    testing.assertEqual(request_key(_community(v2, pdu.GET, 1234)), (1 << 32) | 1234)
+    testing.assertEqual(request_key(_community(v2, pdu.GETNEXT, 5)), (1 << 32) | 5)
+    testing.assertEqual(request_key(_community(v2, pdu.GETBULK, 6)), (1 << 32) | 6)
+    testing.assertEqual(request_key(_community(v2, pdu.SET, 7)), (1 << 32) | 7)
+    testing.assertEqual(request_key(_community(v2, pdu.INFORM, 0x7fffffff)), (1 << 32) | 0x7fffffff)
+    testing.assertEqual(request_key(_community(v1, pdu.GET, 9)), 9)
+    testing.assertEqual(request_key(_community(v2, pdu.TRAP_V2, 8)), -1)
+    testing.assertEqual(request_key(_community(v2, pdu.RESPONSE, 8)), -1)
+    testing.assertEqual(request_key(_community(v2, pdu.REPORT, 8)), -1)
+    trap = TrapV1Pdu(Oid([1, 3, 6, 1, 4, 1, 8072]), b"\x0a\x00\x00\x01", 6, 1, 0, [])
+    testing.assertEqual(request_key(message.encode_community(CommunityMessage(v1, b"public", None, trap))), -1)
+    testing.assertEqual(request_key(_v3(4242, message.FLAG_REPORTABLE)), (3 << 32) | 4242)
+    testing.assertEqual(request_key(_v3(4242, message.FLAG_REPORTABLE | message.FLAG_AUTH)), (3 << 32) | 4242)
+    testing.assertEqual(request_key(_v3(4242, 0)), -1)
+    testing.assertEqual(request_key(b""), -1)
+    testing.assertEqual(request_key(b"\x30\x03\x02\x01\x07"), -1)
+    testing.assertEqual(request_key(_community(v2, pdu.GET, 1234)[:10]), -1)
+
+def _test_answer_key() -> None:
+    """Incoming datagrams: message.peek's id under the same key; -1 for what does not peek"""
+    testing.assertEqual(answer_key(_community(message.SNMP_V2C, pdu.RESPONSE, 1234)), (1 << 32) | 1234)
+    testing.assertEqual(answer_key(_community(message.SNMP_V1, pdu.RESPONSE, 3)), 3)
+    testing.assertEqual(answer_key(_v3(4242, 0)), (3 << 32) | 4242)
+    testing.assertEqual(answer_key(b"\x30\x00"), -1)
+    testing.assertEqual(answer_key(b"junk"), -1)
+
+def _peek_key(data: bytes) -> int:
+    # The reference of dispatcher.answer_key: message.peek's (version << 32) | id, -1 where it raises
+    try:
+        r = message.peek(data)
+        return (r.version << 32) | (r.id & 0xffffffff)
+    except Exception:
+        return -1
+
+def _ref_request_key_of(data: bytes) -> int:
+    n = len(data)
+    start, stop = ber.expect_tlv(data, 0, n, ber.TAG_SEQUENCE)
+    vs, ve = ber.expect_tlv(data, start, stop, ber.TAG_INTEGER)
+    version = ber.dec_int(data, vs, ve)
+    if version == message.SNMP_V3:
+        hs, he = ber.expect_tlv(data, ve, stop, ber.TAG_SEQUENCE)
+        msg_id, p = ber.read_integer(data, hs, he, 0, 0x7fffffff, "msgID")
+        max_size, q = ber.read_integer(data, p, he, 0, 0x7fffffff, "msgMaxSize")
+        fs, fe = ber.expect_tlv(data, q, he, ber.TAG_OCTET_STRING)
+        if fe - fs != 1 or (data[fs] & message.FLAG_REPORTABLE) == 0:
+            return -1
+        return (version << 32) | msg_id
+    if version != message.SNMP_V1 and version != message.SNMP_V2C:
+        return -1
+    cs, ce = ber.expect_tlv(data, ve, stop, ber.TAG_OCTET_STRING)
+    tag, ps, pe = ber.read_tlv(data, ce, stop)
+    if tag != pdu.GET and tag != pdu.GETNEXT and tag != pdu.GETBULK and tag != pdu.SET and tag != pdu.INFORM:
+        return -1
+    request_id, r = ber.read_integer(data, ps, pe, -0x80000000, 0x7fffffff, "request-id")
+    return (version << 32) | (request_id & 0xffffffff)
+
+def _ref_request_key(data: bytes) -> int:
+    # The reference of dispatcher.request_key: the same checks through ber's raising readers
+    try:
+        return _ref_request_key_of(data)
+    except Exception:
+        return -1
+
+def _key_corpus() -> list[bytes]:
+    """Datagrams of every kind the keys read, with long-form lengths and redundant INTEGER octets"""
+    v1 = message.SNMP_V1
+    v2 = message.SNMP_V2C
+    out = [_community(v2, pdu.GET, 1234), _community(v2, pdu.RESPONSE, -5), _community(v1, pdu.GETNEXT, 0x7fffffff),
+           _community(v2, pdu.GETBULK, 77), _community(v2, pdu.SET, -0x80000000), _community(v2, pdu.INFORM, 9),
+           _community(v2, pdu.REPORT, 3), _community(v2, pdu.TRAP_V2, 4), _v3(4242, message.FLAG_REPORTABLE),
+           _v3(0x7fffffff, 0), _v3(0, message.FLAG_REPORTABLE | message.FLAG_AUTH)]
+    trap = TrapV1Pdu(Oid([1, 3, 6, 1, 4, 1, 8072]), b"\x0a\x00\x00\x01", 6, 1, 0, [])
+    out.append(message.encode_community(CommunityMessage(v1, b"public", None, trap)))
+    # long-form lengths: a 200-octet community, 40 varbinds
+    big = Pdu(pdu.RESPONSE, 0x123456, 0, 0, [VarBind(Oid([1, 3, 6, 1, 4, 1, 8072, 9999, 1, 20, i, 0]), Integer(i))
+                                             for i in range(40)])
+    out.append(message.encode_community(CommunityMessage(v2, b"c" * 200, big)))
+    # hand-made: non-minimal outer length (0x84), a 9-octet request-id, a 9-octet version
+    out.append(h("30 84 00 00 00 20 02 01 01 04 06 70 75 62 6c 69 63 a2 13 02 09 00 00 00 00 00 00 00 30 39"
+                 + " 02 01 00 02 01 00 30 00"))
+    out.append(h("30 25 02 09 00 00 00 00 00 00 00 00 01 04 06 70 75 62 6c 69 63 a0 10 02 02 30 39 02 01 00"
+                 + " 02 01 00 30 04 30 02 06 00"))
+    return out
+
+def _mutations(d: bytes) -> list[bytes]:
+    """d, every prefix of d, d with one of its first 48 octets replaced by each of some telling values, and d
+    with octets after it"""
+    out = [d, d + b"\x00", d + b"\x30\x00"]
+    for k in range(len(d)):
+        out.append(d[:k])
+    vals = [0x00, 0x01, 0x02, 0x03, 0x04, 0x1f, 0x30, 0x7f, 0x80, 0x81, 0x82, 0x84, 0x85, 0xa0, 0xa1, 0xa2, 0xa4,
+            0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xff]
+    for i in range(len(d) if len(d) < 48 else 48):
+        for v in vals + [d[i] ^ 1, (d[i] + 1) & 0xff]:
+            if v != d[i]:
+                b = bytearray(d)
+                b[i] = v
+                out.append(bytes(b))
+    return out
+
+def _test_keys_agree_with_ber() -> None:
+    """answer_key equals message.peek's key and request_key the key of ber's raising readers, -1 where they
+    raise, on valid datagrams of every kind and on thousands of truncated and corrupted ones"""
+    checked = 0
+    for d in _key_corpus():
+        for m in _mutations(d):
+            a = answer_key(m)
+            ra = _peek_key(m)
+            if a != ra:
+                raise AssertionError("answer_key %d, peek %d: %s" % (a, ra, m.hex()))
+            q = request_key(m)
+            rq = _ref_request_key(m)
+            if q != rq:
+                raise AssertionError("request_key %d, reference %d: %s" % (q, rq, m.hex()))
+            checked += 1
+    testing.assertTrue(checked > 10000, "checked %d" % checked)
+
+def _test_id_in_use() -> None:
+    """transport.id_in_use parses the Dispatcher's collision error, -1 for every other error"""
+    testing.assertEqual(transport.id_in_use(transport.ID_IN_USE + "12345"), 12345)
+    testing.assertEqual(transport.id_in_use(transport.ID_IN_USE + "2147483647"), 2147483647)
+    testing.assertEqual(transport.id_in_use(transport.ID_IN_USE), -1)
+    testing.assertEqual(transport.id_in_use(transport.ID_IN_USE + "12x"), -1)
+    testing.assertEqual(transport.id_in_use(transport.REFUSED), -1)
+    testing.assertEqual(transport.id_in_use(""), -1)
+
+
+# MemNet setup #######################################################################################
+
+AGENT = "10.0.0.1"
+AGENT2 = "10.0.0.2"
+OTHER = "10.0.0.5"
+RECEIVER = "10.0.0.9"
+MANAGER = "10.0.0.100"
+MPORT = 40000
+ENGINE = "80001f8880646973706174636872"
+RECEIVER_ENGINE = "80001f8880616374736e6d7072"
+
+# Every request waits up to 2 s (no retries) unless a test says otherwise; MemNet loses nothing
+OPTS = Options(timeout=2.0, retries=0)
+# Seconds to wait to see that nothing more arrives
+QUIET = 0.2
+
+def e(arcs: list[int]) -> Oid:
+    """An OID below the lab's enterprise subtree 1.3.6.1.4.1.8072.9999.1"""
+    return Oid([1, 3, 6, 1, 4, 1, 8072, 9999, 1] + arcs)
+
+def table(c: int, i: int) -> VarBind:
+    return VarBind(e([10, 1, c, i]), Integer(c * 100 + i))
+
+def make_view(descr: bytes=b"dispatcher test agent") -> MibView:
+    """sysDescr.0, two scalars, a 3-column table of 5 rows and 64 writable integers (value i)"""
+    vbs = [VarBind(SYS_DESCR, OctetString(descr)), VarBind(e([1, 1, 0]), Integer(42)),
+           VarBind(e([2, 1, 0]), OctetString(b"hello"))]
+    for c in range(1, 4):
+        for i in range(1, 6):
+            vbs.append(table(c, i))
+    for i in range(1, 65):
+        vbs.append(VarBind(e([20, i, 0]), Integer(i)))
+    return MibView(vbs)
+
+def agent_config(users: list[Usm]) -> AgentConfig:
+    return AgentConfig({"public": False, "private": True}, users, h(ENGINE), 1,
+                       [WriteRule(e([20]), [ber.TAG_INTEGER], 0, 100000)])
+
+def noauth() -> Usm:
+    return Usm.from_passwords("u_noauth")
+
+def md5() -> Usm:
+    return Usm.from_passwords("u_md5", usm.AUTH_MD5, "authpass123")
+
+def sha_aes() -> Usm:
+    return Usm.from_passwords("u_sha_aes", usm.AUTH_SHA1, "authpass123", usm.PRIV_AES128, "privpass123")
+
+def sha256_des() -> Usm:
+    return Usm.from_passwords("u_sha256_des", usm.AUTH_SHA256, "authpass123", usm.PRIV_DES, "privpass123")
+
+proc def mem_dispatcher(mn: MemNet, log: ?logging.Handler, strict_source: bool=True,
+                        id_lifetime: float=dispatcher.ID_LIFETIME, max_ids: int=dispatcher.MAX_IDS) -> Dispatcher:
+    """A Dispatcher on MANAGER:MPORT of mn"""
+    return Dispatcher(mn.server(MANAGER, MPORT), log, strict_source, id_lifetime, max_ids)
+
+proc def client_via(d: Dispatcher, address: str, sec: Security, opts: Options=OPTS, port: int=161,
+                    log: ?logging.Handler=None) -> Client:
+    """A Client of address and port whose transport the Dispatcher d attached"""
+    return Client(None, address, sec, log, port=port, opts=opts, transport=d.attach(address, port))
+
+
+class Got(object):
+    """What one callback got"""
+    r: ?Response
+    e: ?errors.SnmpError
+    vbs: list[VarBind]
+    table: ?Table
+    info: ?EngineInfo
+
+    def __init__(self, r: ?Response=None, e: ?errors.SnmpError=None, vbs: list[VarBind]=[], table: ?Table=None,
+                 info: ?EngineInfo=None):
+        self.r = r
+        self.e = e
+        self.vbs = vbs
+        self.table = table
+        self.info = info
+
+def describe(g: Got) -> str:
+    e = g.e
+    if e is not None:
+        return "error " + str(e)
+    r = g.r
+    if r is not None:
+        return repr(r)
+    return "%d varbinds" % len(g.vbs)
+
+def ok(g: Got, what: str) -> Response:
+    e = g.e
+    if e is not None:
+        raise AssertionError(what + ": unexpected error " + str(e))
+    r = g.r
+    if r is not None:
+        return r
+    raise AssertionError(what + ": no response")
+
+def vbs_of(g: Got, what: str) -> list[VarBind]:
+    return ok(g, what).varbinds
+
+def walked(g: Got, what: str) -> list[VarBind]:
+    e = g.e
+    if e is not None:
+        raise AssertionError(what + ": unexpected error " + str(e))
+    return g.vbs
+
+def status_of(g: Got, what: str) -> (int, int):
+    e = g.e
+    if isinstance(e, errors.ErrorStatusError):
+        return (e.status, e.index)
+    raise AssertionError(what + ": expected an error-status, got " + describe(g))
+
+def timed_out(g: Got, what: str) -> None:
+    if not isinstance(g.e, errors.TimeoutError):
+        raise AssertionError(what + ": expected a TimeoutError, got " + describe(g))
+
+def table_vbs(tb: Table) -> list[VarBind]:
+    """The cells of a Table as varbinds, column after column (walk order)"""
+    out: list[VarBind] = []
+    for k in range(len(tb.columns)):
+        col = tb.columns[k]
+        for row in tb.rows:
+            v = row.cells[k]
+            if v is not None:
+                out.append(VarBind(col.child(row.index), v))
+    return out
+
+def full_view() -> list[VarBind]:
+    """make_view() below 1.3.6.1.4.1.8072.9999.1, in OID order"""
+    out = [VarBind(e([1, 1, 0]), Integer(42)), VarBind(e([2, 1, 0]), OctetString(b"hello"))]
+    for c in range(1, 4):
+        for i in range(1, 6):
+            out.append(table(c, i))
+    for i in range(1, 65):
+        out.append(VarBind(e([20, i, 0]), Integer(i)))
+    return out
+
+def got_of(label: str, d: dict[str, Got]) -> Got:
+    g = d.get(label)
+    if g is not None:
+        return g
+    raise AssertionError("no outcome for " + label)
+
+
+actor Tally(want: int, done: action(dict[str, Got]) -> None):
+    """Callbacks that record what they got by label; done(outcomes) once want of them came"""
+    var got: dict[str, Got] = {}
+    var streams: dict[str, list[VarBind]] = {}
+    var reported = False
+
+    def put(label: str, g: Got) -> None:
+        got[label] = g
+        if not reported and len(got) >= want:
+            reported = True
+            done(got)
+
+    def req(label: str) -> action(Client, ?Response, ?errors.SnmpError) -> None:
+        def cb(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            put(label, Got(r=r, e=e))
+        return cb
+
+    def walk(label: str) -> action(Client, list[VarBind], ?errors.SnmpError) -> None:
+        def cb(c: Client, vbs: list[VarBind], e: ?errors.SnmpError) -> None:
+            put(label, Got(vbs=vbs, e=e))
+        return cb
+
+    def table(label: str) -> action(Client, ?Table, ?errors.SnmpError) -> None:
+        def cb(c: Client, tb: ?Table, e: ?errors.SnmpError) -> None:
+            put(label, Got(table=tb, e=e))
+        return cb
+
+    def engine(label: str) -> action(Client, ?EngineInfo, ?errors.SnmpError) -> None:
+        def cb(c: Client, info: ?EngineInfo, e: ?errors.SnmpError) -> None:
+            put(label, Got(info=info, e=e))
+        return cb
+
+    def sent(label: str) -> action(Client, ?errors.SnmpError) -> None:
+        def cb(c: Client, e: ?errors.SnmpError) -> None:
+            put(label, Got(e=e))
+        return cb
+
+    def batch(label: str) -> action(Client, list[VarBind]) -> None:
+        def cb(c: Client, vbs: list[VarBind]) -> None:
+            streams[label] = streams.get_def(label, []) + vbs
+        return cb
+
+    def stream_end(label: str) -> action(Client, int, ?errors.SnmpError) -> None:
+        def cb(c: Client, count: int, e: ?errors.SnmpError) -> None:
+            put(label, Got(vbs=streams.get_def(label, []), e=e))
+        return cb
+
+    def count() -> int:
+        return len(got)
+
+
+# Routing ##########################################################################################
+
+actor _test_routing(t: testing.AsyncT):
+    """Clients of two agents over one socket get their own answers; a datagram from an unknown source is unroutable"""
+    t.timeout(20.0)
+    mn = MemNet()
+    a1 = Agent(mn.server(AGENT, 161), make_view(b"agent one"), agent_config([]), None)
+    a2 = Agent(mn.server(AGENT2, 161), make_view(b"agent two"), agent_config([]), None)
+    d = mem_dispatcher(mn, t.log_handler)
+    c1 = client_via(d, AGENT, Community("public"))
+    c2 = client_via(d, AGENT2, Community("public"))
+
+    def finish(got: dict[str, Got]) -> None:
+        s = d.stats()
+        s1 = c1.stats()
+        s2 = c2.stats()
+        def check() -> None:
+            testing.assertEqual(vbs_of(got_of("c1 get", got), "c1 get"), [VarBind(SYS_DESCR, OctetString(b"agent one"))])
+            testing.assertEqual(vbs_of(got_of("c2 get", got), "c2 get"), [VarBind(SYS_DESCR, OctetString(b"agent two"))])
+            testing.assertEqual(vbs_of(got_of("c1 next", got), "c1 next"), [VarBind(e([2, 1, 0]), OctetString(b"hello"))])
+            testing.assertEqual(vbs_of(got_of("c2 bulk", got), "c2 bulk"), [table(1, 1), table(1, 2)])
+            testing.assertEqual((s.endpoints, s.peers, s.sent, s.received, s.routed, s.unroutable, s.collisions),
+                                (2, 2, 4, 5, 4, 1, 0), str(s))
+            testing.assertEqual(s.records, 4, "one record per request: " + str(s))
+            testing.assertEqual((s1.responses, s1.drops_unknown_id, s1.drops_source), (2, 0, 0), str(s1))
+            testing.assertEqual((s2.responses, s2.drops_unknown_id, s2.drops_source), (2, 0, 0), str(s2))
+        c1.close()
+        c2.close()
+        report(t, outcome(check))
+
+    tally = Tally(4, finish)
+    # injected before the requests, so the Dispatcher has seen it when the last answer comes
+    mn.send(_community(message.SNMP_V2C, pdu.RESPONSE, 7), "10.0.0.99", 161, MANAGER, MPORT)
+    c1.get(tally.req("c1 get"), [SYS_DESCR])
+    c2.get(tally.req("c2 get"), [SYS_DESCR])
+    c1.get_next(tally.req("c1 next"), [e([1, 1, 0])])
+    c2.get_bulk(tally.req("c2 bulk"), [e([10, 1, 1])], 0, 2)
+
+
+actor _test_shared_peer_communities(t: testing.AsyncT):
+    """Two SNMPv2c communities of one agent, 8 requests in flight each: every answer reaches the Client that asked"""
+    t.timeout(30.0)
+    mn = MemNet()
+    a = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), None)
+    d = mem_dispatcher(mn, t.log_handler)
+    o8 = OPTS.with_(max_in_flight=8)
+    pub = client_via(d, AGENT, Community("public"), o8)
+    priv = client_via(d, AGENT, Community("private"), o8)
+
+    def finish(got: dict[str, Got]) -> None:
+        s = d.stats()
+        sp = pub.stats()
+        sq = priv.stats()
+        def check() -> None:
+            for i in range(1, 21):
+                testing.assertEqual(vbs_of(got_of("pub %d" % i, got), "pub get"), [VarBind(e([20, i, 0]), Integer(i))])
+                j = 20 + i
+                testing.assertEqual(vbs_of(got_of("priv %d" % j, got), "priv set"),
+                                    [VarBind(e([20, j, 0]), Integer(1000 + j))])
+            testing.assertEqual(status_of(got_of("pub set", got), "SET with public"), (pdu.NO_ACCESS, 1))
+            testing.assertEqual((sp.responses, sp.drops_unknown_id, sp.drops_auth, sp.id_collisions), (21, 0, 0, 0), str(sp))
+            testing.assertEqual((sq.responses, sq.drops_unknown_id, sq.drops_auth, sq.id_collisions), (20, 0, 0, 0), str(sq))
+            testing.assertEqual((s.endpoints, s.peers, s.routed, s.unroutable), (2, 1, 41, 0), str(s))
+        pub.close()
+        priv.close()
+        report(t, outcome(check))
+
+    tally = Tally(41, finish)
+    for i in range(1, 21):
+        pub.get(tally.req("pub %d" % i), [e([20, i, 0])])
+        j = 20 + i
+        priv.set(tally.req("priv %d" % j), [VarBind(e([20, j, 0]), Integer(1000 + j))])
+    pub.set(tally.req("pub set"), [VarBind(e([20, 1, 0]), Integer(5))])
+
+
+actor _test_shared_peer_v3_users(t: testing.AsyncT):
+    """Four SNMPv3 users and an SNMPv2c community of one agent, from cold (concurrent discovery), over one socket"""
+    t.timeout(60.0)
+    users = [noauth(), md5(), sha_aes(), sha256_des()]
+    mn = MemNet()
+    a = Agent(mn.server(AGENT, 161), make_view(), agent_config(users), None)
+    d = mem_dispatcher(mn, t.log_handler)
+    var clients: list[Client] = []
+    for u in users:
+        clients.append(client_via(d, AGENT, u, OPTS.with_(max_in_flight=4)))
+    v2 = client_via(d, AGENT, Community("public"), OPTS.with_(max_in_flight=4))
+
+    def finish(got: dict[str, Got]) -> None:
+        s = d.stats()
+        infos = [c.engine_info() for c in clients]
+        stats = [c.stats() for c in clients]
+        def check() -> None:
+            for k in range(len(users)):
+                name = users[k].user
+                n = k + 1
+                testing.assertEqual(vbs_of(got_of(name + " get", got), name), [VarBind(SYS_DESCR, OctetString(b"dispatcher test agent"))])
+                testing.assertEqual(vbs_of(got_of(name + " bulk", got), name), [table(1, 1), table(1, 2), table(1, 3)])
+                testing.assertEqual(vbs_of(got_of(name + " next", got), name), [VarBind(e([20, n + 1, 0]), Integer(n + 1))])
+                info = infos[k]
+                if info is not None:
+                    testing.assertEqual(info.engine_id, h(ENGINE), name + " engine")
+                else:
+                    raise AssertionError(name + ": no engine info after discovery")
+                st = stats[k]
+                testing.assertEqual((st.drops_unknown_id, st.drops_auth, st.timeouts), (0, 0, 0), name + " " + str(st))
+            testing.assertEqual(vbs_of(got_of("v2c get", got), "v2c"), [VarBind(SYS_DESCR, OctetString(b"dispatcher test agent"))])
+            testing.assertEqual((s.endpoints, s.peers, s.unroutable), (5, 1, 0), str(s))
+        for c in clients:
+            c.close()
+        v2.close()
+        report(t, outcome(check))
+
+    tally = Tally(3 * len(users) + 1, finish)
+    for k in range(len(users)):
+        c = clients[k]
+        name = users[k].user
+        c.get(tally.req(name + " get"), [SYS_DESCR])
+        c.get_bulk(tally.req(name + " bulk"), [e([10, 1, 1])], 0, 3)
+        c.get_next(tally.req(name + " next"), [e([20, k + 1, 0])])
+    v2.get(tally.req("v2c get"), [SYS_DESCR])
+
+
+# Id collisions #####################################################################################
+
+actor Recorder():
+    """The callbacks of a raw transport: the routing keys of the datagrams and the errors it got"""
+    var keys: list[int] = []
+    var errs: list[str] = []
+
+    def on_data(data: bytes, src_address: str, src_port: int) -> None:
+        keys.append(answer_key(data))
+
+    def on_error(message: str, fatal: bool) -> None:
+        errs.append(message + (" (fatal)" if fatal else ""))
+
+    def got_keys() -> list[int]:
+        return keys.copy()
+
+    def got_errors() -> list[str]:
+        return errs.copy()
+
+
+def v2key(id: int) -> int:
+    return (1 << 32) | id
+
+actor _test_collision_raw(t: testing.AsyncT):
+    """A request whose id another transport of the peer has recorded is not sent (ID_IN_USE), also after
+    that transport closed, until the record expires; another version's id space does not collide"""
+    t.timeout(20.0)
+    mn = MemNet()
+    a = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), None)
+    d = mem_dispatcher(mn, t.log_handler, id_lifetime=2.0)
+    ta = d.attach(AGENT, 161)
+    tb = d.attach(AGENT, 161)
+    ra = Recorder()
+    rb = Recorder()
+    ta.set_receiver(ra.on_data, ra.on_error)
+    tb.set_receiver(rb.on_data, rb.on_error)
+    var phase1: ?DispatcherStats = None
+    var phase2: ?DispatcherStats = None
+    var keys_a: list[int] = []
+    var keys_b: list[int] = []
+    var errs_b: list[str] = []
+
+    def last() -> None:
+        s = d.stats()
+        kb = rb.got_keys()
+        eb = rb.got_errors()
+        def check() -> None:
+            testing.assertEqual(keys_a, [v2key(42)], "ta got the answer to its id 42")
+            testing.assertEqual(sorted(keys_b), sorted([42, v2key(43)]), "tb: the SNMPv1 id 42 and the SNMPv2c id 43")
+            testing.assertEqual(errs_b, [transport.ID_IN_USE + "42"])
+            p1 = phase1
+            if p1 is not None:
+                testing.assertEqual((p1.collisions, p1.sent, p1.routed, p1.endpoints), (1, 3, 3, 2), str(p1))
+            p2 = phase2
+            if p2 is not None:
+                testing.assertEqual((p2.collisions, p2.endpoints), (2, 1), "the closed transport's id: " + str(p2))
+            testing.assertEqual(sorted(kb), sorted([42, v2key(43), v2key(42)]), "id 42 is free after the lifetime")
+            testing.assertEqual(eb, [transport.ID_IN_USE + "42", transport.ID_IN_USE + "42"])
+            testing.assertEqual((s.collisions, s.sent, s.routed, s.unroutable, s.late), (2, 4, 4, 0, 0), str(s))
+        tb.close()
+        report(t, outcome(check))
+
+    def resend() -> None:
+        tb.send(_community(message.SNMP_V2C, pdu.GET, 42))
+
+    def second() -> None:
+        phase2 = d.stats()
+        after 2.3: resend()
+        after 2.3 + QUIET: last()
+
+    def first() -> None:
+        phase1 = d.stats()
+        keys_a = ra.got_keys()
+        keys_b = rb.got_keys()
+        errs_b = rb.got_errors()
+        ta.close()
+        tb.send(_community(message.SNMP_V2C, pdu.GET, 42))
+        after QUIET: second()
+
+    ta.send(_community(message.SNMP_V2C, pdu.GET, 42))
+    tb.send(_community(message.SNMP_V2C, pdu.GET, 42))
+    tb.send(_community(message.SNMP_V1, pdu.GET, 42))
+    tb.send(_community(message.SNMP_V2C, pdu.GET, 43))
+    after QUIET: first()
+
+
+actor _Refuser(inner: Transport, pattern: list[bool]):
+    """A transport wrapper that refuses the k-th request (from 0) when pattern[k], as a Dispatcher does on a
+    collision; traps and the requests beyond the pattern are sent"""
+    var _on_error: ?action(str, bool) -> None = None
+    var _seen = 0
+    var _refused: list[int] = []
+
+    def send(data: bytes) -> None:
+        key = request_key(data)
+        cb = _on_error
+        if key >= 0 and cb is not None:
+            k = _seen
+            _seen += 1
+            if k < len(pattern) and pattern[k]:
+                id = key & 0xffffffff
+                _refused.append(id)
+                cb(transport.ID_IN_USE + str(id), False)
+                return
+        inner.send(data)
+
+    def set_receiver(on_data: action(bytes, str, int) -> None, on_error: action(str, bool) -> None) -> None:
+        _on_error = on_error
+        inner.set_receiver(on_data, on_error)
+
+    def close() -> None:
+        inner.close()
+
+    def refused() -> list[int]:
+        return _refused.copy()
+
+def refusing(r: _Refuser) -> Transport:
+    def _send(data: bytes) -> None:
+        r.send(data)
+    def _set_receiver(on_data: action(bytes, str, int) -> None, on_error: action(str, bool) -> None) -> None:
+        r.set_receiver(on_data, on_error)
+    def _close() -> None:
+        r.close()
+    return Transport(_send, _set_receiver, _close)
+
+actor _test_client_redraws(t: testing.AsyncT):
+    """The Client sends a refused attempt again at once with a fresh id: no retry, no extra attempt (SNMPv2c GET,
+    SNMPv3 discovery and GET, SNMPv2c inform)"""
+    t.timeout(30.0)
+    mn = MemNet()
+    a = Agent(mn.server(AGENT, 161), make_view(), agent_config([sha_aes()]), None)
+
+    def ignore(r: NotificationReceiver, n: Notification) -> None:
+        pass
+
+    rcv = NotificationReceiver(mn.server(RECEIVER, 162), ReceiverConfig(["public"], [], [], h(RECEIVER_ENGINE), 1),
+                               ignore, None)
+    r2 = _Refuser(mn.client(MANAGER, 40001, AGENT, 161), [True, True])
+    r3 = _Refuser(mn.client(MANAGER, 40002, AGENT, 161), [True, False, True])
+    ri = _Refuser(mn.client(MANAGER, 40003, RECEIVER, 162), [True])
+    c2 = Client(None, AGENT, Community("public"), t.log_handler, opts=OPTS, transport=refusing(r2))
+    c3 = Client(None, AGENT, sha_aes(), t.log_handler, opts=OPTS, transport=refusing(r3))
+    ci = Client(None, RECEIVER, Community("public"), t.log_handler, port=162, opts=OPTS, transport=refusing(ri))
+
+    def finish(got: dict[str, Got]) -> None:
+        s2 = c2.stats()
+        s3 = c3.stats()
+        si = ci.stats()
+        f2 = r2.refused()
+        f3 = r3.refused()
+        fi = ri.refused()
+        def check() -> None:
+            g = ok(got_of("v2c", got), "v2c")
+            testing.assertEqual(g.varbinds, [VarBind(SYS_DESCR, OctetString(b"dispatcher test agent"))])
+            testing.assertEqual(g.attempts, 1, "a refused attempt is not an attempt")
+            testing.assertTrue(g.request_id not in f2, "the answered id is a fresh one")
+            testing.assertEqual((s2.retries, s2.id_collisions, s2.responses), (0, 2, 1), str(s2))
+            g3 = ok(got_of("v3", got), "v3")
+            testing.assertEqual(g3.varbinds, [VarBind(SYS_DESCR, OctetString(b"dispatcher test agent"))])
+            testing.assertEqual((s3.retries, s3.id_collisions, s3.timeouts), (0, 2, 0), "probe and GET refused once: " + str(s3))
+            testing.assertEqual(g3.attempts, 1)
+            gi = ok(got_of("inform", got), "inform")
+            testing.assertEqual(gi.attempts, 1)
+            testing.assertEqual((si.retries, si.id_collisions), (0, 1), str(si))
+            testing.assertEqual((len(f2), len(f3), len(fi)), (2, 2, 1))
+        c2.close()
+        c3.close()
+        ci.close()
+        report(t, outcome(check))
+
+    tally = Tally(3, finish)
+    c2.get(tally.req("v2c"), [SYS_DESCR])
+    c3.get(tally.req("v3"), [SYS_DESCR])
+    ci.inform(tally.req("inform"), Oid([1, 3, 6, 1, 6, 3, 1, 1, 5, 4]), [VarBind(e([1, 1, 0]), Integer(1))], 100)
+
+actor _test_collisions_16bit(t: testing.AsyncT):
+    """With request_id_bits=16 and 30720 of the 32767 ids of the peer recorded by another transport, every
+    GET of a Client redraws until a free id (Stats.id_collisions, DispatcherStats.collisions) and succeeds"""
+    t.timeout(120.0)
+    mn = MemNet()
+    a = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), None)
+    d = mem_dispatcher(mn, t.log_handler, max_ids=40000)
+    raw = d.attach(AGENT, 161)
+    rr = Recorder()
+    raw.set_receiver(rr.on_data, rr.on_error)
+    # a community the agent drops silently: the ids stay recorded, nothing answers them
+    for id in range(1, 32768):
+        if id % 16 != 0:
+            p = Pdu(pdu.GET, id, 0, 0, [VarBind(SYS_DESCR, Integer(1))])
+            raw.send(message.encode_community(CommunityMessage(message.SNMP_V2C, b"nobody", p)))
+    c = client_via(d, AGENT, Community("public"), Options(timeout=5.0, retries=0, request_id_bits=16))
+
+    def finish(got: dict[str, Got]) -> None:
+        s = d.stats()
+        sc = c.stats()
+        def check() -> None:
+            for i in range(1, 11):
+                g = ok(got_of("get %d" % i, got), "get %d" % i)
+                testing.assertEqual(g.varbinds, [VarBind(e([20, i, 0]), Integer(i))])
+                testing.assertEqual(g.request_id % 16, 0, "a free id")
+                testing.assertEqual(g.attempts, 1)
+            testing.assertTrue(sc.id_collisions >= 1, "collisions: " + str(sc))
+            testing.assertEqual((sc.retries, sc.timeouts, sc.responses), (0, 0, 10), str(sc))
+            testing.assertEqual(s.collisions, sc.id_collisions, "every collision redrawn: " + str(s))
+            testing.assertEqual(s.unroutable, 0, str(s))
+        c.close()
+        raw.close()
+        report(t, outcome(check))
+
+    tally = Tally(10, finish)
+    for i in range(1, 11):
+        c.get(tally.req("get %d" % i), [e([20, i, 0])])
+
+
+# Late answers, multi-homed agents ##################################################################
+
+actor _test_late_answer_after_detach(t: testing.AsyncT):
+    """An answer that comes after its Client closed is dropped (late), not handed to another Client of the peer"""
+    t.timeout(20.0)
+    mn = MemNet(NetFaults(delay=1.0, to_address=MANAGER))
+    a = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), None)
+    d = mem_dispatcher(mn, t.log_handler)
+    early = client_via(d, AGENT, Community("public"), Options(timeout=0.1, retries=0))
+    var other: ?Client = None
+    var timeout_seen: ?Got = None
+
+    def finish(got: dict[str, Got]) -> None:
+        s = d.stats()
+        o = other
+        so = o.stats() if o is not None else None
+        def check() -> None:
+            g = timeout_seen
+            if g is not None:
+                timed_out(g, "the early client's GET")
+            testing.assertEqual(vbs_of(got_of("other", got), "other"), [VarBind(e([20, 2, 0]), Integer(2))])
+            if so is not None:
+                testing.assertEqual((so.drops_unknown_id, so.responses), (0, 1), "the late answer never reached it: " + str(so))
+            testing.assertEqual((s.late, s.unroutable, s.routed, s.endpoints), (1, 1, 1, 1), str(s))
+        if o is not None:
+            o.close()
+        report(t, outcome(check))
+
+    tally = Tally(1, finish)
+
+    def timed(c: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+        timeout_seen = Got(r=r, e=err)
+        c.close()
+        # attached to the same peer after the first one closed; its answer comes after the late one
+        o = client_via(d, AGENT, Community("public"), Options(timeout=3.0, retries=0))
+        other = o
+        o.get(tally.req("other"), [e([20, 2, 0])])
+
+    early.get(timed, [e([20, 1, 0])])
+
+
+actor _Relay(mn: MemNet, front: str, behind: str):
+    """A multi-homed agent: requests to front:161 are answered from behind:161 (forwarded with their source)"""
+    srv = mn.server(front, 161)
+
+    def on_data(data: bytes, src_address: str, src_port: int) -> None:
+        mn.send(data, src_address, src_port, behind, 161)
+
+    srv.set_receiver(on_data)
+
+
+actor _MultiHomed(t: testing.AsyncT, strict: bool):
+    """SNMPv2c and SNMPv3 (with discovery) against an agent that answers from another address"""
+    mn = MemNet()
+    a = Agent(mn.server(OTHER, 161), make_view(), agent_config([sha_aes()]), None)
+    relay = _Relay(mn, AGENT, OTHER)
+    d = mem_dispatcher(mn, t.log_handler, strict_source=strict)
+    o = Options(timeout=0.3, retries=1)
+    c2 = client_via(d, AGENT, Community("public"), o)
+    c3 = client_via(d, AGENT, sha_aes(), o)
+
+    def finish(got: dict[str, Got]) -> None:
+        s = d.stats()
+        s2 = c2.stats()
+        def check() -> None:
+            if strict:
+                timed_out(got_of("v2c", got), "v2c, strict")
+                timed_out(got_of("v3", got), "v3, strict")
+                testing.assertEqual((s.routed, s.routed_by_id), (0, 0), str(s))
+                testing.assertTrue(s.unroutable >= 4, "every answer unroutable: " + str(s))
+            else:
+                testing.assertEqual(vbs_of(got_of("v2c", got), "v2c"), [VarBind(SYS_DESCR, OctetString(b"dispatcher test agent"))])
+                testing.assertEqual(vbs_of(got_of("v3", got), "v3"), [VarBind(SYS_DESCR, OctetString(b"dispatcher test agent"))])
+                testing.assertTrue(s.routed_by_id >= 3, "v2c answer, discovery Report, v3 answer: " + str(s))
+                testing.assertEqual((s.unroutable, s2.drops_source), (0, 0), str(s))
+        c2.close()
+        c3.close()
+        report(t, outcome(check))
+
+    tally = Tally(2, finish)
+    c2.get(tally.req("v2c"), [SYS_DESCR])
+    c3.get(tally.req("v3"), [SYS_DESCR])
+
+actor _test_multihomed_strict(t: testing.AsyncT):
+    """strict_source (default): answers from another address than the attached one are unroutable"""
+    t.timeout(20.0)
+    m = _MultiHomed(t, True)
+
+actor _test_multihomed_loose(t: testing.AsyncT):
+    """strict_source=False: answers from another address are routed by their id, SNMPv2c and SNMPv3"""
+    t.timeout(20.0)
+    m = _MultiHomed(t, False)
+
+
+actor _test_loose_ambiguous(t: testing.AsyncT):
+    """strict_source=False: an answer from an unknown source whose id two peers' requests have is dropped"""
+    t.timeout(20.0)
+    mn = MemNet()
+    d = mem_dispatcher(mn, t.log_handler, strict_source=False)
+    t1 = d.attach(AGENT, 161)
+    t2 = d.attach(AGENT2, 161)
+    r1 = Recorder()
+    r2 = Recorder()
+    t1.set_receiver(r1.on_data, r1.on_error)
+    t2.set_receiver(r2.on_data, r2.on_error)
+    t1.send(_community(message.SNMP_V2C, pdu.GET, 77))
+    t2.send(_community(message.SNMP_V2C, pdu.GET, 77))
+    t2.send(_community(message.SNMP_V2C, pdu.GET, 78))
+
+    def finish() -> None:
+        s = d.stats()
+        k1 = r1.got_keys()
+        k2 = r2.got_keys()
+        def check() -> None:
+            testing.assertEqual(k1, [], "no answer for t1")
+            testing.assertEqual(k2, [v2key(78)], "the unique id routed to t2")
+            testing.assertEqual((s.ambiguous, s.routed_by_id, s.unroutable, s.collisions), (1, 1, 2, 0), str(s))
+        t1.close()
+        t2.close()
+        report(t, outcome(check))
+
+    # answers from a source nobody attached: id 77 (two peers), 78 (one), 79 (none)
+    mn.send(_community(message.SNMP_V2C, pdu.RESPONSE, 77), OTHER, 161, MANAGER, MPORT)
+    mn.send(_community(message.SNMP_V2C, pdu.RESPONSE, 78), OTHER, 161, MANAGER, MPORT)
+    mn.send(_community(message.SNMP_V2C, pdu.RESPONSE, 79), OTHER, 161, MANAGER, MPORT)
+    after QUIET: finish()
+
+
+# Address forms #####################################################################################
+
+actor _Echo(mn: MemNet, bind: str, reply_from: str):
+    """A scripted agent on bind:161 that answers every SNMPv2c request with sysDescr.0 = "echo", sent as if
+    from reply_from:161 (another text form of its address)"""
+    srv = mn.server(bind, 161)
+
+    def on_data(data: bytes, src_address: str, src_port: int) -> None:
+        c, m = message.decode(data)
+        if c is not None:
+            p = c.pdu
+            if p is not None:
+                r = Pdu(pdu.RESPONSE, p.request_id, 0, 0, [VarBind(SYS_DESCR, OctetString(b"echo"))])
+                out = message.encode_community(CommunityMessage(c.version, c.community, r))
+                mn.send(out, reply_from, 161, src_address, src_port)
+
+    srv.set_receiver(on_data)
+
+actor _test_address_forms(t: testing.AsyncT):
+    """IPv4-mapped and IPv6 addresses in any text form, attached and as answer sources, route to their Client"""
+    t.timeout(20.0)
+    mn = MemNet()
+    a4 = Agent(mn.server(AGENT, 161), make_view(b"v4"), agent_config([]), None)
+    a6 = Agent(mn.server("2001:db8::1", 161), make_view(b"v6"), agent_config([]), None)
+    m4 = _Echo(mn, "10.0.0.3", "::ffff:10.0.0.3")
+    m6 = _Echo(mn, "2001:db8::3", "2001:0DB8:0:0::0:3")
+    d = mem_dispatcher(mn, t.log_handler)
+    cmap = client_via(d, "::FFFF:10.0.0.1", Community("public"))
+    c6 = client_via(d, "2001:DB8:0:0:0:0:0:1", Community("public"))
+    ce4 = client_via(d, "10.0.0.3", Community("public"))
+    ce6 = client_via(d, "2001:db8::3", Community("public"))
+
+    def finish(got: dict[str, Got]) -> None:
+        s = d.stats()
+        def check() -> None:
+            testing.assertEqual(vbs_of(got_of("mapped", got), "mapped"), [VarBind(SYS_DESCR, OctetString(b"v4"))])
+            testing.assertEqual(vbs_of(got_of("v6", got), "v6"), [VarBind(SYS_DESCR, OctetString(b"v6"))])
+            testing.assertEqual(vbs_of(got_of("echo4", got), "echo4"), [VarBind(SYS_DESCR, OctetString(b"echo"))])
+            testing.assertEqual(vbs_of(got_of("echo6", got), "echo6"), [VarBind(SYS_DESCR, OctetString(b"echo"))])
+            testing.assertEqual((s.peers, s.routed, s.unroutable), (4, 4, 0), str(s))
+        for c in [cmap, c6, ce4, ce6]:
+            c.close()
+        report(t, outcome(check))
+
+    tally = Tally(4, finish)
+    cmap.get(tally.req("mapped"), [SYS_DESCR])
+    c6.get(tally.req("v6"), [SYS_DESCR])
+    ce4.get(tally.req("echo4"), [SYS_DESCR])
+    ce6.get(tally.req("echo6"), [SYS_DESCR])
+
+
+# Attach, detach, close #############################################################################
+
+actor _test_attach_and_close(t: testing.AsyncT):
+    """attach() refuses names and bad ports; Client.close() detaches; Dispatcher.close() fails pending requests
+    with a permanent TransportError, and transports attached afterwards fail at once"""
+    t.timeout(20.0)
+    mn = MemNet()
+    a = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), None)
+    d = mem_dispatcher(mn, t.log_handler)
+    var refusals: list[str] = []
+    for spec in [("localhost", 161), ("10.0.0.1", 0), ("10.0.0.1", 65536), ("", 161)]:
+        try:
+            tr = d.attach(spec.0, spec.1)
+            refusals.append("accepted " + spec.0)
+        except ValueError:
+            refusals.append("refused")
+    c1 = client_via(d, AGENT, Community("public"))
+    c2 = client_via(d, AGENT2, Community("public"), Options(timeout=30.0, retries=0))   # nobody answers
+    var before: ?DispatcherStats = None
+    var after_detach: ?DispatcherStats = None
+
+    def finish(got: dict[str, Got]) -> None:
+        s = d.stats()
+        def check() -> None:
+            testing.assertEqual(refusals, ["refused", "refused", "refused", "refused"])
+            testing.assertEqual(vbs_of(got_of("get", got), "get"), [VarBind(SYS_DESCR, OctetString(b"dispatcher test agent"))])
+            b = before
+            if b is not None:
+                testing.assertEqual((b.endpoints, b.peers), (2, 2), str(b))
+            ad = after_detach
+            if ad is not None:
+                testing.assertEqual((ad.endpoints, ad.peers, ad.records), (1, 2, 2), "the records stay: " + str(ad))
+            for label in ["pending", "after close"]:
+                err = got_of(label, got).e
+                if isinstance(err, errors.TransportError):
+                    testing.assertFalse(err.transient, label + ": permanent")
+                    testing.assertTrue(dispatcher.CLOSED in err.error_message, label + ": " + err.error_message)
+                else:
+                    raise AssertionError(label + ": expected a TransportError, got " + describe(got_of(label, got)))
+            testing.assertEqual((s.endpoints, s.peers, s.records), (0, 0, 0), str(s))
+        c2.close()
+        report(t, outcome(check))
+
+    tally = Tally(3, finish)
+
+    def closed_then_attach(c: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+        tally.put("pending", Got(r=r, e=err))
+        c3 = client_via(d, AGENT, Community("public"))
+        c3.get(tally.req("after close"), [SYS_DESCR])
+
+    def got_first(c: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+        tally.put("get", Got(r=r, e=err))
+        before = d.stats()
+        # the Client's close() calls the Dispatcher before this actor's next call does
+        await async c.close()
+        after_detach = d.stats()
+        d.close()
+
+    c2.get(closed_then_attach, [SYS_DESCR])
+    c1.get(got_first, [SYS_DESCR])
+
+
+def _no_send(data: bytes, address: str, port: int) -> None:
+    pass
+
+def _no_receiver(on_data: action(bytes, str, int) -> None) -> None:
+    pass
+
+def _no_close() -> None:
+    pass
+
+def _no_port() -> int:
+    return 0
+
+actor _test_dead_socket(t: testing.AsyncT):
+    """A Dispatcher over a ServerTransport that is not bound (local_port() 0) is closed from the start"""
+    t.timeout(10.0)
+
+    dead = ServerTransport(_no_send, _no_receiver, _no_close, _no_port)
+    d = Dispatcher(dead, t.log_handler)
+    c = client_via(d, AGENT, Community("public"))
+
+    def done(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+        cl.close()
+        def check() -> None:
+            if isinstance(err, errors.TransportError):
+                testing.assertFalse(err.transient)
+            else:
+                raise AssertionError("expected a TransportError")
+            testing.assertEqual(d.local_port(), 0)
+        report(t, outcome(check))
+
+    c.get(done, [SYS_DESCR])
+
+
+# Full Client flows through the Dispatcher ##########################################################
+
+actor _test_client_flows(t: testing.AsyncT):
+    """get, walk, walk_stream, get_table, SNMPv3 discover and walk, SET, trap, SNMPv2c and SNMPv3 informs: all
+    through one Dispatcher, several Clients per peer"""
+    t.timeout(60.0)
+    users = [sha_aes(), md5()]
+    mn = MemNet()
+    a = Agent(mn.server(AGENT, 161), make_view(), agent_config(users), None)
+    var blocks: list[str] = []
+
+    def on_notification(r: NotificationReceiver, n: Notification) -> None:
+        blocks.append(fmt.canon_notification(n).split("\n")[0])
+
+    rcv = NotificationReceiver(mn.server(RECEIVER, 162),
+                               ReceiverConfig(["public"], [sha_aes()], [], h(RECEIVER_ENGINE), 1), on_notification, None)
+    d = mem_dispatcher(mn, t.log_handler)
+    o = Options(timeout=2.0, retries=1, max_repetitions=4)
+    v2 = client_via(d, AGENT, Community("public"), o)
+    v2w = client_via(d, AGENT, Community("private"), o)
+    v3 = client_via(d, AGENT, sha_aes(), o)
+    v3b = client_via(d, AGENT, md5(), o.with_(use_bulk=False))
+    n2 = client_via(d, RECEIVER, Community("public"), o, port=162)
+    n3 = client_via(d, RECEIVER, sha_aes(), o, port=162)
+    trap_oid = Oid([1, 3, 6, 1, 6, 3, 1, 1, 5, 4])
+    payload = [VarBind(e([1, 1, 0]), Integer(5))]
+    full = full_view()
+    tab: list[VarBind] = full[2:17]
+    var walks_left = 2
+
+    def finish(got: dict[str, Got]) -> None:
+        s = d.stats()
+        info = v3.engine_info()
+        bl = sorted(blocks)
+        def check() -> None:
+            testing.assertEqual(walked(got_of("v2c walk", got), "v2c walk"), full)
+            testing.assertEqual(walked(got_of("v2c stream", got), "v2c stream"), tab)
+            g = got_of("v2c table", got)
+            tb = g.table
+            if tb is not None:
+                testing.assertEqual(len(tb.rows), 5)
+                testing.assertEqual(table_vbs(tb), tab)
+            else:
+                raise AssertionError("no table: " + describe(g))
+            testing.assertEqual(vbs_of(got_of("v2c set", got), "set"), [VarBind(e([20, 9, 0]), Integer(99))])
+            gi = got_of("v3 discover", got).info
+            if gi is not None:
+                testing.assertEqual(gi.engine_id, h(ENGINE))
+            else:
+                raise AssertionError("discover: " + describe(got_of("v3 discover", got)))
+            testing.assertEqual(walked(got_of("v3 walk", got), "v3 walk"), tab)
+            testing.assertEqual(walked(got_of("v3 getnext walk", got), "v3 getnext walk"), full)
+            testing.assertEqual(vbs_of(got_of("v3 get", got), "v3 get"), [VarBind(e([20, 9, 0]), Integer(99))])
+            testing.assertTrue(got_of("trap", got).e is None, "trap sent")
+            ok(got_of("inform v2c", got), "inform v2c")
+            ok(got_of("inform v3", got), "inform v3")
+            testing.assertEqual(bl, ['NOTIFICATION v2c INFORM community="public" uptime=200 trapoid=.1.3.6.1.6.3.1.1.5.4',
+                                     'NOTIFICATION v2c TRAP2 community="public" uptime=100 trapoid=.1.3.6.1.6.3.1.1.5.4',
+                                     'NOTIFICATION v3 INFORM user="u_sha_aes" level=authPriv context="" uptime=300 '
+                                     + 'trapoid=.1.3.6.1.6.3.1.1.5.4'])
+            testing.assertEqual((s.unroutable, s.collisions, s.endpoints, s.peers), (0, 0, 6, 2), str(s))
+        for c in [v2, v2w, v3, v3b, n2, n3]:
+            c.close()
+        report(t, outcome(check))
+
+    tally = Tally(11, finish)
+
+    def after_set(c: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+        tally.put("v2c set", Got(r=r, e=err))
+        v3.get(tally.req("v3 get"), [e([20, 9, 0])])
+
+    proc def walk_done(label: str, vbs: list[VarBind], err: ?errors.SnmpError) -> None:
+        tally.put(label, Got(vbs=vbs, e=err))
+        walks_left -= 1
+        if walks_left == 0:
+            # the SET changes a walked variable: only after both walks
+            v2w.set(after_set, [VarBind(e([20, 9, 0]), Integer(99))])
+
+    def v2_walked(c: Client, vbs: list[VarBind], err: ?errors.SnmpError) -> None:
+        walk_done("v2c walk", vbs, err)
+
+    def v3b_walked(c: Client, vbs: list[VarBind], err: ?errors.SnmpError) -> None:
+        walk_done("v3 getnext walk", vbs, err)
+
+    def trap_sent(c: Client, err: ?errors.SnmpError) -> None:
+        tally.put("trap", Got(e=err))
+        # the receiver gets the trap before the inform that follows it from the same Client
+        n2.inform(tally.req("inform v2c"), trap_oid, payload, 200)
+
+    v2.walk(v2_walked, Oid([1, 3, 6, 1, 4, 1, 8072, 9999, 1]))
+    v2.walk_stream(tally.batch("v2c stream"), tally.stream_end("v2c stream"), e([10]))
+    v2.get_table(tally.table("v2c table"), [e([10, 1, 1]), e([10, 1, 2]), e([10, 1, 3])])
+    v3.discover(tally.engine("v3 discover"))
+    v3.walk(tally.walk("v3 walk"), e([10]))
+    v3b.walk(v3b_walked, Oid([1, 3, 6, 1, 4, 1, 8072, 9999, 1]))
+    n2.trap(trap_sent, trap_oid, payload, 100)
+    n3.inform(tally.req("inform v3"), trap_oid, payload, 300)
+
+
+# Faults ############################################################################################
+
+actor _test_faults(t: testing.AsyncT):
+    """Lost, duplicated, reordered and spoofed answers on the shared socket: three Clients of one agent
+    (two communities, an SNMPv3 user) walk it with retries and each gets exactly its walk"""
+    t.timeout(60.0)
+    mn = MemNet(NetFaults(drop_every_nth=5, duplicate=True, reorder=True, spoof_source=True, to_address=MANAGER))
+    a = Agent(mn.server(AGENT, 161), make_view(), agent_config([sha_aes()]), None)
+    d = mem_dispatcher(mn, t.log_handler)
+    o = Options(timeout=0.3, retries=5, max_repetitions=6)
+    clients = [client_via(d, AGENT, Community("public"), o), client_via(d, AGENT, Community("private"), o),
+               client_via(d, AGENT, sha_aes(), o)]
+    labels = ["public", "private", "u_sha_aes"]
+    full = full_view()
+
+    def finish(got: dict[str, Got]) -> None:
+        s = d.stats()
+        ns = mn.stats()
+        cs = [c.stats() for c in clients]
+        def check() -> None:
+            for k in range(len(labels)):
+                testing.assertEqual(walked(got_of(labels[k], got), labels[k]), full)
+                testing.assertEqual((cs[k].drops_source, cs[k].drops_auth), (0, 0), labels[k] + ": " + str(cs[k]))
+            testing.assertTrue(ns.dropped > 0 and ns.duplicated > 0 and ns.reordered > 0, str(ns))
+            testing.assertTrue(s.unroutable >= ns.spoofed, "the forged copies (source port 162): " + str(s) + str(ns))
+            testing.assertEqual(s.late, 0, str(s))
+        for c in clients:
+            c.close()
+        report(t, outcome(check))
+
+    tally = Tally(3, finish)
+    for k in range(len(labels)):
+        clients[k].walk(tally.walk(labels[k]), Oid([1, 3, 6, 1, 4, 1, 8072, 9999, 1]))
+
+
+# Record bounds and lifetime, redraws, spoofers, zones ##############################################
+
+def _v2c_request(community: bytes, pdu_type: int, request_id: int, oid: Oid) -> bytes:
+    """An SNMPv2c request for oid (value Null) with community and request_id"""
+    p = Pdu(pdu_type, request_id, 0, 0, [VarBind(oid, Null())])
+    return message.encode_community(CommunityMessage(message.SNMP_V2C, community, p))
+
+proc def first_request_id(hist: list[transport.Datagram], oid: Oid) -> int:
+    """The request-id of the first SNMPv2c GET to AGENT in hist that names oid, -1 if there is none"""
+    for d in hist:
+        if d.dst_address == AGENT:
+            c, m = message.decode(d.data)
+            if c is not None:
+                p = c.pdu
+                if p is not None:
+                    if p.pdu_type == pdu.GET and len(p.varbinds) == 1 and p.varbinds[0].oid == oid:
+                        return p.request_id
+    return -1
+
+
+actor _SlowAgent(mn: MemNet, slow: Oid, delay: float):
+    """A scripted SNMPv2c agent on AGENT:161: answers every GET at once with Integer(7) for its first OID, and a
+    GET of slow after delay seconds"""
+    srv = mn.server(AGENT, 161)
+
+    def _later(out: bytes, address: str, port: int) -> None:
+        srv.send_to(out, address, port)
+
+    def on_data(data: bytes, src_address: str, src_port: int) -> None:
+        c, m = message.decode(data)
+        if c is not None:
+            p = c.pdu
+            if p is not None and len(p.varbinds) > 0:
+                r = Pdu(pdu.RESPONSE, p.request_id, 0, 0, [VarBind(p.varbinds[0].oid, Integer(7))])
+                out = message.encode_community(CommunityMessage(c.version, c.community, r))
+                if p.varbinds[0].oid == slow:
+                    after delay: _later(out, src_address, src_port)
+                else:
+                    srv.send_to(out, src_address, src_port)
+
+    srv.set_receiver(on_data)
+
+
+actor _test_slow_answer_on_shared_peer(t: testing.AsyncT):
+    """Default max_ids: a Client with 8 in flight makes 3000 quick GETs while one GET waits 1 s for its answer,
+    and another transport is attached to the same agent: the slow answer still reaches its Client (answered
+    records make room, never the record of a request that is still waited for)"""
+    t.timeout(60.0)
+    mn = MemNet()
+    slow = e([99, 0])
+    ag = _SlowAgent(mn, slow, 1.0)
+    d = mem_dispatcher(mn, t.log_handler)
+    a = client_via(d, AGENT, Community("public"), Options(timeout=3.0, retries=0, max_in_flight=8))
+    other = d.attach(AGENT, 161)
+    rec = Recorder()
+    other.set_receiver(rec.on_data, rec.on_error)
+    var quick_ok = 0
+    var quick_done = 0
+    var slow_got: ?Got = None
+    var ended = False
+
+    proc def _maybe_end() -> None:
+        g = slow_got
+        if g is not None and quick_done == 3000 and not ended:
+            ended = True
+            s = d.stats()
+            sa = a.stats()
+            keys = rec.got_keys()
+            a.close()
+            other.close()
+            def check() -> None:
+                testing.assertEqual(vbs_of(g, "the slow GET"), [VarBind(slow, Integer(7))])
+                testing.assertEqual(quick_ok, 3000, "quick GETs answered")
+                testing.assertEqual(keys, [], "nothing for the other transport")
+                testing.assertEqual((s.unroutable, s.routed, sa.timeouts), (0, 3001, 0), str(s) + " " + str(sa))
+            report(t, outcome(check))
+
+    def quick(c: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+        quick_done += 1
+        if err is None:
+            quick_ok += 1
+        _maybe_end()
+
+    def slow_cb(c: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+        slow_got = Got(r=r, e=err)
+        _maybe_end()
+
+    a.get(slow_cb, [slow])
+    for i in range(3000):
+        a.get(quick, [e([20, 1 + i % 64, 0])])
+
+
+actor _test_pending_records_kept(t: testing.AsyncT):
+    """max_ids=2 and three GETs whose answers take 1 s: the records of the pending GETs are kept, so another
+    transport of the agent cannot take their ids (ID_IN_USE) or get their answers, and the third GET is not sent
+    until there is room (back-pressure: its retry goes out once the first two are answered)"""
+    t.timeout(30.0)
+    mn = MemNet(NetFaults(delay=1.0, to_address=MANAGER))
+    a = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), None)
+    d = mem_dispatcher(mn, t.log_handler, max_ids=2)
+    ca = client_via(d, AGENT, Community("public"), Options(timeout=1.5, retries=1, max_in_flight=4))
+    tb = d.attach(AGENT, 161)
+    rb = Recorder()
+    tb.set_receiver(rb.on_data, rb.on_error)
+    var stolen = -1
+
+    def finish(got: dict[str, Got]) -> None:
+        s = d.stats()
+        keys_b = rb.got_keys()
+        errs_b = rb.got_errors()
+        ca.close()
+        tb.close()
+        def check() -> None:
+            testing.assertTrue(stolen > 0, "the first GET's request-id")
+            testing.assertEqual(errs_b, [transport.ID_IN_USE + str(stolen)], "B's GET with that id is refused")
+            testing.assertEqual(keys_b, [], "B never gets an answer")
+            for i in range(1, 4):
+                testing.assertEqual(vbs_of(got_of("get %d" % i, got), "get %d" % i), [VarBind(e([20, i, 0]), Integer(i))])
+            testing.assertEqual(ok(got_of("get 1", got), "get 1").attempts, 1)
+            testing.assertEqual(ok(got_of("get 3", got), "get 3").attempts, 2, "the third waited for room")
+            testing.assertEqual((s.collisions, s.refused, s.unroutable), (1, 1, 0), str(s))
+        report(t, outcome(check))
+
+    tally = Tally(3, finish)
+
+    def steal() -> None:
+        stolen = first_request_id(mn.history(), e([20, 1, 0]))
+        tb.send(_v2c_request(b"nobody", pdu.GET, stolen, SYS_DESCR))
+
+    for i in range(1, 4):
+        ca.get(tally.req("get %d" % i), [e([20, i, 0])])
+    after 0.3: steal()
+
+
+actor _test_records_outlive_short_lifetime(t: testing.AsyncT):
+    """id_lifetime 0.5 s, a Client that waits up to 3 s and an answer that takes 1 s: the record lives as long as
+    the Client waits, so another transport of the agent cannot take the id (ID_IN_USE) or get the answer"""
+    t.timeout(20.0)
+    mn = MemNet(NetFaults(delay=1.0, to_address=MANAGER))
+    a = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), None)
+    d = mem_dispatcher(mn, t.log_handler, id_lifetime=0.5)
+    ca = client_via(d, AGENT, Community("public"), Options(timeout=3.0, retries=0))
+    tb = d.attach(AGENT, 161)
+    rb = Recorder()
+    tb.set_receiver(rb.on_data, rb.on_error)
+    var stolen = -1
+
+    def finish(got: dict[str, Got]) -> None:
+        s = d.stats()
+        keys_b = rb.got_keys()
+        errs_b = rb.got_errors()
+        ca.close()
+        tb.close()
+        def check() -> None:
+            testing.assertTrue(stolen > 0, "the GET's request-id")
+            testing.assertEqual(errs_b, [transport.ID_IN_USE + str(stolen)], "B's GET with that id is refused")
+            testing.assertEqual(keys_b, [], "B never gets an answer")
+            r = ok(got_of("get", got), "get")
+            testing.assertEqual((r.varbinds, r.attempts), ([VarBind(e([20, 1, 0]), Integer(1))], 1))
+            testing.assertEqual((s.collisions, s.unroutable), (1, 0), str(s))
+        report(t, outcome(check))
+
+    tally = Tally(1, finish)
+
+    def steal() -> None:
+        stolen = first_request_id(mn.history(), e([20, 1, 0]))
+        tb.send(_v2c_request(b"nobody", pdu.GET, stolen, SYS_DESCR))
+
+    ca.get(tally.req("get"), [e([20, 1, 0])])
+    after 0.7: steal()
+
+
+actor _test_redraws_bounded(t: testing.AsyncT):
+    """request_id_bits=16 and every id of the peer recorded by another transport: a GET (timeout 0.5 s, no
+    retries) fails at once with QueueFullError instead of redrawing until the records expire"""
+    t.timeout(60.0)
+    mn = MemNet()
+    a = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), None)
+    d = mem_dispatcher(mn, None, id_lifetime=4.0, max_ids=40000)
+    raw = d.attach(AGENT, 161)
+    rr = Recorder()
+    raw.set_receiver(rr.on_data, rr.on_error)
+    for id in range(1, 32768):
+        raw.send(_v2c_request(b"nobody", pdu.GET, id, SYS_DESCR))
+    c = client_via(d, AGENT, Community("public"), Options(timeout=0.5, retries=0, request_id_bits=16))
+    var started = 0.0
+
+    def done(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+        elapsed = _ms() - started
+        sc = cl.stats()
+        cl.close()
+        raw.close()
+        def check() -> None:
+            testing.assertTrue(isinstance(err, errors.QueueFullError),
+                               "expected a QueueFullError, got " + describe(Got(r=r, e=err)))
+            testing.assertTrue(elapsed < 1500.0, "finished after %d ms (%d redraws)" % (int(elapsed), sc.id_collisions))
+            testing.assertEqual(sc.id_collisions, client.MAX_REDRAWS + 1, "redraws: " + str(sc))
+        report(t, outcome(check))
+
+    def go() -> None:
+        started = _ms()
+        c.get(done, [SYS_DESCR])
+
+    after 0.5: go()
+
+
+actor _test_redraw_keeps_attempt_timer(t: testing.AsyncT):
+    """A refused attempt is not an attempt: a GET to a silent agent, refused twice, with one retry, times out
+    after its two attempt timeouts with TimeoutError.attempts 2 (a redraw neither counts nor restarts the timer)"""
+    t.timeout(20.0)
+    mn = MemNet()
+    a = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), None)
+    rf = _Refuser(mn.client(MANAGER, 40001, AGENT, 161), [True, True])
+    c = Client(None, AGENT, Community("nobody"), t.log_handler, opts=Options(timeout=0.5, retries=1),
+               transport=refusing(rf))
+    var started = _ms()
+
+    def done(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+        elapsed = _ms() - started
+        sc = cl.stats()
+        cl.close()
+        def check() -> None:
+            if isinstance(err, errors.TimeoutError):
+                testing.assertEqual(err.attempts, 2, str(err))
+            else:
+                raise AssertionError("expected a TimeoutError, got " + describe(Got(r=r, e=err)))
+            testing.assertTrue(elapsed >= 950.0 and elapsed < 1450.0, "timed out after %d ms" % int(elapsed))
+            testing.assertEqual((sc.id_collisions, sc.retries, sc.timeouts), (2, 1, 1), str(sc))
+        report(t, outcome(check))
+
+    c.get(done, [SYS_DESCR])
+
+
+actor _test_loose_spoofer(t: testing.AsyncT):
+    """strict_source=False and request_id_bits=16: 20 Clients of 20 silent agents (communities secret0 to
+    secret19); an off-path sender that knows only the Dispatcher's port answers every id once from 192.0.2.66
+    with a forged value and another community: no Client accepts it"""
+    t.timeout(60.0)
+    mn = MemNet()
+    d = mem_dispatcher(mn, None, strict_source=False)
+    var clients: list[Client] = []
+    for k in range(20):
+        addr = "10.1.0.%d" % (k + 1)
+        clients.append(client_via(d, addr, Community("secret%d" % k),
+                                  Options(timeout=20.0, retries=0, request_id_bits=16)))
+    var outcomes: list[str] = []
+    var polls = 0
+
+    def got(c: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+        outcomes.append(describe(Got(r=r, e=err)))
+
+    def finish() -> None:
+        s = d.stats()
+        polls += 1
+        if s.received < 32767 and polls < 100:
+            after 0.2: finish()
+            return
+        out = outcomes.copy()
+        for c in clients:
+            c.close()
+        def check() -> None:
+            forged = [o for o in out if "forged" in o]
+            testing.assertEqual(len(forged), 0, "forged answers accepted by %d of 20 Clients; %s" % (len(forged), str(s)))
+            testing.assertEqual((s.received, s.routed), (32767, 0), str(s))
+        report(t, outcome(check))
+
+    def spoof() -> None:
+        for id in range(1, 32768):
+            p = Pdu(pdu.RESPONSE, id, 0, 0, [VarBind(SYS_DESCR, OctetString(b"forged"))])
+            mn.send(message.encode_community(CommunityMessage(message.SNMP_V2C, b"x", p)), "192.0.2.66", 4444,
+                    MANAGER, MPORT)
+        after 0.5: finish()
+
+    for k in range(20):
+        clients[k].get(got, [SYS_DESCR])
+    after 0.3: spoof()
+
+
+actor _test_attach_refuses_zones(t: testing.AsyncT):
+    """attach() refuses an IPv6 address with a zone: the UDP socket cannot send to one, so every
+    request would be dropped with only a log warning"""
+    t.timeout(10.0)
+    mn = MemNet()
+    d = mem_dispatcher(mn, t.log_handler)
+    var outcomes: list[str] = []
+    for spec in ["fe80::1%eth0", "::1%lo", "fe80::1%1"]:
+        try:
+            tr = d.attach(spec, 161)
+            outcomes.append("accepted " + spec)
+        except ValueError:
+            outcomes.append("refused")
+
+    def check() -> None:
+        testing.assertEqual(outcomes, ["refused", "refused", "refused"])
+
+    report(t, outcome(check))
+
+
+actor _test_attach_family(t: testing.AsyncT):
+    """A Dispatcher that knows its local address refuses peers of the other address family: IPv6 when bound
+    to an IPv4 address, IPv4 (also IPv4-mapped) when bound to an IPv6 one; "::" and an unknown address
+    refuse neither"""
+    t.timeout(10.0)
+    mn = MemNet()
+    var outcomes: list[str] = []
+    for local in ["10.0.0.100", "0.0.0.0", "2001:db8::100", "::", ""]:
+        d = Dispatcher(mn.server(local if local != "" else "mem", 0), None, local_address=local)
+        row: list[str] = []
+        for peer in ["10.0.0.1", "::ffff:10.0.0.1", "2001:db8::1"]:
+            try:
+                tr = d.attach(peer, 161)
+                tr.close()
+                row.append("+")
+            except ValueError:
+                row.append("-")
+        outcomes.append(local + " " + "".join(row))
+        d.close()
+
+    def check() -> None:
+        testing.assertEqual(outcomes, ["10.0.0.100 ++-", "0.0.0.0 ++-", "2001:db8::100 --+", ":: +++", " +++"])
+
+    report(t, outcome(check))
+
+
+actor _test_full_hint(t: testing.AsyncT):
+    """max_ids=1 on a shared peer, answers after 1 s: a second GET is not sent while the first waits; it times
+    out with the refusal as its hint (DispatcherStats.refused)"""
+    t.timeout(20.0)
+    mn = MemNet(NetFaults(delay=1.0, to_address=MANAGER))
+    a = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), None)
+    d = mem_dispatcher(mn, t.log_handler, max_ids=1)
+    ca = client_via(d, AGENT, Community("public"), Options(timeout=0.5, retries=0, max_in_flight=2))
+    other = d.attach(AGENT, 161)
+
+    def finish(got: dict[str, Got]) -> None:
+        s = d.stats()
+        sa = ca.stats()
+        ca.close()
+        other.close()
+        def check() -> None:
+            timed_out(got_of("first", got), "first")
+            g = got_of("second", got)
+            err = g.e
+            if isinstance(err, errors.TimeoutError):
+                testing.assertEqual(err.attempts, 1, str(err))
+                h = err.hint
+                if h is not None:
+                    testing.assertTrue(dispatcher.FULL in h, h)
+                else:
+                    raise AssertionError("no hint: " + str(err))
+            else:
+                raise AssertionError("expected a TimeoutError, got " + describe(g))
+            testing.assertEqual((s.sent, s.refused), (1, 1), str(s))
+        report(t, outcome(check))
+
+    tally = Tally(2, finish)
+    ca.get(tally.req("first"), [e([20, 1, 0])])
+    ca.get(tally.req("second"), [e([20, 2, 0])])
+
+
+actor _test_record_bounds(t: testing.AsyncT):
+    """max_ids=4: a Client's 40 answered GETs leave 4 answered records, and the records of 12 timed-out GETs to
+    a silent peer make room once their Client no longer waits (no refusal), on shared peers"""
+    t.timeout(30.0)
+    mn = MemNet()
+    a = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), None)
+    d = mem_dispatcher(mn, t.log_handler, max_ids=4)
+    busy = client_via(d, AGENT, Community("public"))
+    idle = d.attach(AGENT, 161)
+    dead = client_via(d, AGENT2, Community("public"), Options(timeout=0.05, retries=0))
+    idle2 = d.attach(AGENT2, 161)
+    var left_busy = 40
+    var left_dead = 12
+    var errs: list[str] = []
+    var reported = False
+
+    proc def _maybe_end() -> None:
+        if left_busy == 0 and left_dead == 0 and not reported:
+            reported = True
+            s = d.stats()
+            busy.close()
+            dead.close()
+            idle.close()
+            idle2.close()
+            def check() -> None:
+                testing.assertEqual(errs, [])
+                testing.assertEqual((s.refused, s.collisions, s.sent), (0, 0, 52), str(s))
+                testing.assertTrue(s.records <= 8, "4 answered, at most 4 pending: " + str(s))
+            report(t, outcome(check))
+
+    def busy_cb(c: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+        if err is not None:
+            errs.append("busy: " + str(err))
+        left_busy -= 1
+        if left_busy > 0:
+            c.get(busy_cb, [e([20, 1 + left_busy % 64, 0])])
+        _maybe_end()
+
+    def dead_cb(c: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+        if not isinstance(err, errors.TimeoutError):
+            errs.append("dead: " + describe(Got(r=r, e=err)))
+        left_dead -= 1
+        if left_dead > 0:
+            # one hold later (budget 0.05 s plus one attempt timeout): the oldest record may go
+            after 0.12: _next_dead()
+        _maybe_end()
+
+    def _next_dead() -> None:
+        dead.get(dead_cb, [SYS_DESCR])
+
+    busy.get(busy_cb, [e([20, 1, 0])])
+    dead.get(dead_cb, [SYS_DESCR])
+
+
+actor _test_room_from_shorter_holds(t: testing.AsyncT):
+    """max_ids=2 on a shared peer, answers after 1 s: a GET with a long budget, then one with a 0.05 s budget
+    that times out; a third GET takes the timed-out one's record, behind the older one still waited for, and
+    is sent (no refusal)"""
+    t.timeout(20.0)
+    mn = MemNet(NetFaults(delay=1.0, to_address=MANAGER))
+    a = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), None)
+    d = mem_dispatcher(mn, t.log_handler, max_ids=2)
+    long = Options(timeout=3.0, retries=0, max_in_flight=4)
+    ca = client_via(d, AGENT, Community("public"), long)
+    other = d.attach(AGENT, 161)
+
+    def finish(got: dict[str, Got]) -> None:
+        s = d.stats()
+        ca.close()
+        other.close()
+        def check() -> None:
+            testing.assertEqual(vbs_of(got_of("long", got), "long"), [VarBind(e([20, 1, 0]), Integer(1))])
+            timed_out(got_of("short", got), "short")
+            testing.assertEqual(vbs_of(got_of("third", got), "third"), [VarBind(e([20, 3, 0]), Integer(3))])
+            testing.assertEqual((s.sent, s.refused), (3, 0), str(s))
+        report(t, outcome(check))
+
+    tally = Tally(3, finish)
+
+    def third() -> None:
+        ca.get(tally.req("third"), [e([20, 3, 0])])
+
+    ca.get(tally.req("long"), [e([20, 1, 0])])
+    ca.get(tally.req("short"), [e([20, 2, 0])], Options(timeout=0.05, retries=0))
+    after 0.3: third()
+
+
+actor _test_strict_per_attach(t: testing.AsyncT):
+    """attach(..., strict) overrides the Dispatcher's strict_source: on a strict Dispatcher, a loose attach
+    hears its multi-homed agent; on a loose one, a strict attach is not reached by answers from other
+    sources, even with the right community and id (only the loose transports' requests are candidates)"""
+    t.timeout(30.0)
+    mn = MemNet()
+    a = Agent(mn.server(OTHER, 161), make_view(), agent_config([]), None)
+    relay = _Relay(mn, AGENT, OTHER)
+    ds = Dispatcher(mn.server(MANAGER, MPORT), t.log_handler)
+    dl = Dispatcher(mn.server(MANAGER, MPORT + 1), t.log_handler, False)
+    o = Options(timeout=0.3, retries=1)
+    loose_on_strict = Client(None, AGENT, Community("public"), None, opts=o, transport=ds.attach(AGENT, 161, False))
+    strict_on_loose = Client(None, AGENT, Community("public"), None, opts=o, transport=dl.attach(AGENT, 161, True))
+
+    def finish(got: dict[str, Got]) -> None:
+        s1 = ds.stats()
+        s2 = dl.stats()
+        loose_on_strict.close()
+        strict_on_loose.close()
+        def check() -> None:
+            testing.assertEqual(vbs_of(got_of("loose on strict", got), "loose on strict"),
+                                [VarBind(SYS_DESCR, OctetString(b"dispatcher test agent"))])
+            timed_out(got_of("strict on loose", got), "strict on loose")
+            testing.assertEqual((s1.routed_by_id, s1.unroutable), (1, 0), str(s1))
+            testing.assertEqual((s2.routed, s2.routed_by_id), (0, 0), str(s2))
+            testing.assertTrue(s2.unroutable >= 2, str(s2))
+        report(t, outcome(check))
+
+    tally = Tally(2, finish)
+    loose_on_strict.get(tally.req("loose on strict"), [SYS_DESCR])
+    strict_on_loose.get(tally.req("strict on loose"), [SYS_DESCR])
+
+
+# Real UDP (env tests) ##############################################################################
+
+proc def listen_cap(t: testing.EnvT) -> net.UDPListenCap:
+    return net.UDPListenCap(net.UDPCap(net.NetCap(t.env.cap)))
+
+proc def connect_cap(t: testing.EnvT) -> net.UDPConnectCap:
+    return net.UDPConnectCap(net.UDPCap(net.NetCap(t.env.cap)))
+
+proc def open_fds(t: testing.EnvT) -> int:
+    """The number of open file descriptors of this process (the entries of /proc/self/fd)"""
+    return len(file.FS(file.FileCap(t.env.cap)).listdir("/proc/self/fd"))
+
+proc def max_open_files(t: testing.EnvT) -> int:
+    """The soft RLIMIT_NOFILE of this process (/proc/self/limits), -1 if unknown"""
+    try:
+        for line in read_text(t, "/proc/self/limits").split("\n"):
+            if line.startswith("Max open files"):
+                return int(line[len("Max open files"):].strip().split(" ")[0])
+    except Exception:
+        pass
+    return -1
+
+def _ms() -> float:
+    return float(time.monotonic_ns()) / 1000000.0
+
+
+actor _UdpEcho(t: testing.EnvT, address: str, on_ready: action(int) -> None):
+    """A scripted agent over UDP that answers SNMPv2c GETs with sysDescr.0 = "echo" and records the sources"""
+    var sources: list[(str, int)] = []
+    var srv: ?ServerTransport = None
+
+    def on_data(data: bytes, src_address: str, src_port: int) -> None:
+        sources.append((src_address, src_port))
+        c, m = message.decode(data)
+        if c is not None:
+            p = c.pdu
+            s = srv
+            if p is not None and s is not None:
+                r = Pdu(pdu.RESPONSE, p.request_id, 0, 0, [VarBind(SYS_DESCR, OctetString(b"echo"))])
+                s.send_to(message.encode_community(CommunityMessage(c.version, c.community, r)), src_address, src_port)
+
+    def ready(st: ServerTransport, error: ?str) -> None:
+        if error is not None:
+            t.failure(AssertionError("listen on " + address + " failed: " + error))
+            return
+        srv = st
+        st.set_receiver(on_data)
+        on_ready(st.local_port())
+
+    def seen() -> list[(str, int)]:
+        return sources.copy()
+
+    def close() -> None:
+        s = srv
+        if s is not None:
+            s.close()
+
+    transport.udp_server_transport(listen_cap(t), address, 0, ready, None)
+
+
+actor _test_udp_dual_stack(t: testing.EnvT):
+    """A Dispatcher on "::" (port 0): SNMPv2c and SNMPv3 Clients of agents on 127.0.0.1 and ::1 over one socket"""
+    t.timeout(30.0)
+    var agents: list[ServerTransport] = []
+    var ports: list[int] = []
+    var disp: ?Dispatcher = None
+    var clients: list[Client] = []
+
+    def finish(got: dict[str, Got]) -> None:
+        d = disp
+        s = d.stats() if d is not None else None
+        def check() -> None:
+            for label in ["v4 v2c", "v4 v3", "v6 v2c", "v6 v3"]:
+                testing.assertEqual(vbs_of(got_of(label, got), label), [VarBind(SYS_DESCR, OctetString(b"dispatcher test agent"))])
+            if s is not None:
+                testing.assertEqual((s.endpoints, s.peers, s.unroutable, s.collisions), (4, 2, 0, 0), str(s))
+        for c in clients:
+            c.close()
+        if d is not None:
+            d.close()
+        for a in agents:
+            a.close()
+        report_env(t, outcome(check))
+
+    tally = Tally(4, finish)
+
+    def disp_ready(d: Dispatcher, error: ?str) -> None:
+        if error is not None:
+            t.failure(AssertionError("dispatcher: " + error))
+            return
+        disp = d
+        o = Options(timeout=1.0, retries=2)
+        for k in range(2):
+            address = "127.0.0.1" if k == 0 else "::1"
+            label = "v4" if k == 0 else "v6"
+            c2 = client_via(d, address, Community("public"), o, port=ports[k])
+            c3 = client_via(d, address, sha_aes(), o, port=ports[k])
+            clients.append(c2)
+            clients.append(c3)
+            c2.get(tally.req(label + " v2c"), [SYS_DESCR])
+            c3.get(tally.req(label + " v3"), [SYS_DESCR])
+
+    def agent_ready(st: ServerTransport, error: ?str) -> None:
+        if error is not None:
+            t.failure(AssertionError("agent listen failed: " + error))
+            return
+        a = Agent(st, make_view(), agent_config([sha_aes()]), None)
+        agents.append(st)
+        ports.append(st.local_port())
+        if len(ports) == 1:
+            transport.udp_server_transport(listen_cap(t), "::1", 0, agent_ready, None)
+        else:
+            dispatcher.udp_dispatcher(listen_cap(t), "::", 0, disp_ready, t.log_handler)
+
+    transport.udp_server_transport(listen_cap(t), "127.0.0.1", 0, agent_ready, None)
+
+
+actor _test_udp_source_address(t: testing.EnvT):
+    """A Dispatcher bound to 127.0.0.1 sends every request from that address and its own port"""
+    t.timeout(30.0)
+    var disp: ?Dispatcher = None
+    var echo: ?_UdpEcho = None
+    var agent_port = 0
+
+    def done(c: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+        c.close()
+        d = disp
+        ec = echo
+        seen = ec.seen() if ec is not None else []
+        local = d.local_port() if d is not None else -1
+        def check() -> None:
+            if err is not None:
+                raise AssertionError("GET failed: " + str(err))
+            testing.assertEqual(seen, [("127.0.0.1", local)])
+        if d is not None:
+            d.close()
+        if ec is not None:
+            ec.close()
+        report_env(t, outcome(check))
+
+    def disp_ready(d: Dispatcher, error: ?str) -> None:
+        if error is not None:
+            t.failure(AssertionError("dispatcher: " + error))
+            return
+        disp = d
+        c = client_via(d, "127.0.0.1", Community("public"), Options(timeout=1.0, retries=2), port=agent_port)
+        c.get(done, [SYS_DESCR])
+
+    def echo_ready(port: int) -> None:
+        agent_port = port
+        dispatcher.udp_dispatcher(listen_cap(t), "127.0.0.1", 0, disp_ready, t.log_handler)
+
+    echo = _UdpEcho(t, "127.0.0.1", echo_ready)
+
+
+actor _test_udp_listen_failure(t: testing.EnvT):
+    """udp_dispatcher on an address that is not ours reports the error; its Dispatcher's transports fail at once"""
+    t.timeout(30.0)
+
+    def done(c: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+        c.close()
+        def check() -> None:
+            if not isinstance(err, errors.TransportError):
+                raise AssertionError("expected a TransportError, got " + describe(Got(r=r, e=err)))
+        report_env(t, outcome(check))
+
+    def disp_ready(d: Dispatcher, error: ?str) -> None:
+        if error is None:
+            t.failure(AssertionError("listening on 192.0.2.1 should fail"))
+            return
+        c = client_via(d, "127.0.0.1", Community("public"), Options(timeout=1.0, retries=0))
+        c.get(done, [SYS_DESCR])
+
+    dispatcher.udp_dispatcher(listen_cap(t), "192.0.2.1", 0, disp_ready, None)
+
+
+actor _test_udp_family_refused(t: testing.EnvT):
+    """attach() refuses a peer of an address family the socket cannot reach: IPv6 on a Dispatcher bound to
+    0.0.0.0, IPv4 on one bound to ::1 (every send would fail with only a log warning)"""
+    t.timeout(30.0)
+    var results: list[str] = []
+
+    proc def _try(d: Dispatcher, address: str) -> str:
+        try:
+            tr = d.attach(address, 161)
+            tr.close()
+            return address + " accepted"
+        except ValueError:
+            return address + " refused"
+
+    def v6_ready(d: Dispatcher, error: ?str) -> None:
+        if error is not None:
+            t.failure(AssertionError("dispatcher on ::1: " + error))
+            return
+        results.append("::1: " + _try(d, "::1") + ", " + _try(d, "127.0.0.1"))
+        d.close()
+        r = results.copy()
+        def check() -> None:
+            testing.assertEqual(r, ["0.0.0.0: ::1 refused, 127.0.0.1 accepted",
+                                    "::1: ::1 accepted, 127.0.0.1 refused"])
+        report_env(t, outcome(check))
+
+    def v4_ready(d: Dispatcher, error: ?str) -> None:
+        if error is not None:
+            t.failure(AssertionError("dispatcher on 0.0.0.0: " + error))
+            return
+        results.append("0.0.0.0: " + _try(d, "::1") + ", " + _try(d, "127.0.0.1"))
+        d.close()
+        dispatcher.udp_dispatcher(listen_cap(t), "::1", 0, v6_ready, t.log_handler)
+
+    dispatcher.udp_dispatcher(listen_cap(t), "0.0.0.0", 0, v4_ready, t.log_handler)
+
+
+# The fleet: thousands of Clients, one socket
+
+FLEET_CLIENTS = 2000
+FLEET_AGENTS = 20
+FLEET_GETS = 5
+
+actor _Fleet(t: testing.EnvT, shared: bool, n: int, agents: int, gets: int):
+    """n Clients (SNMPv2c, every 4th with community "private") of `agents` Agents on 127.0.0.1 and ::1, each
+    making `gets` GETs one after another, all Clients at once; over one Dispatcher (shared) or with a
+    connected UDP socket per Client. Checks every answer, logs the time, and how many file descriptors the
+    Clients added"""
+    log = logging.Logger(t.log_handler)
+    var servers: list[ServerTransport] = []
+    var ports: list[(str, int)] = []
+    var disp: ?Dispatcher = None
+    var clients: list[Client] = []
+    var fds_before = 0
+    var fds_with_clients = 0
+    var started = 0.0
+    var finished = 0
+    var wrong: list[str] = []
+    var answers = 0
+
+    proc def _finish() -> None:
+        elapsed = _ms() - started
+        fds_after = open_fds(t)
+        d = disp
+        s = d.stats() if d is not None else None
+        retries = 0
+        for c in clients:
+            retries += c.stats().retries
+        rate = float(n * gets) * 1000.0 / elapsed
+        log.info("fleet", {"mode": "dispatcher" if shared else "connected sockets", "clients": n, "agents": agents,
+                           "requests": n * gets, "ms": elapsed, "requests_per_s": rate, "retries": retries,
+                           "fds_added_by_clients": fds_with_clients - fds_before, "fds_after": fds_after - fds_before})
+        def check() -> None:
+            testing.assertEqual(wrong, [], "every GET answered by its own agent")
+            testing.assertEqual(answers, n * gets)
+            if shared:
+                testing.assertTrue(fds_with_clients - fds_before <= 8,
+                                   "%d Clients over one socket added %d file descriptors" % (n, fds_with_clients - fds_before))
+                if s is not None:
+                    testing.assertEqual((s.endpoints, s.peers, s.unroutable), (n, agents, 0), str(s))
+                    testing.assertTrue(s.routed >= n * gets, str(s))
+            else:
+                testing.assertTrue(fds_with_clients - fds_before >= n,
+                                   "%d connected Clients added %d file descriptors" % (n, fds_with_clients - fds_before))
+        for c in clients:
+            c.close()
+        if d is not None:
+            d.close()
+        for st in servers:
+            st.close()
+        report_env(t, outcome(check))
+
+    def one_done(errs: list[str], got: int) -> None:
+        wrong.extend(errs)
+        answers += got
+        finished += 1
+        if finished == n:
+            _finish()
+
+    proc def _start() -> None:
+        d = disp
+        fds_before = open_fds(t)
+        o = Options(timeout=2.0, retries=3)
+        for i in range(n):
+            peer = ports[i % len(ports)]
+            sec = Community("private" if i % 4 == 3 else "public")
+            if d is not None:
+                clients.append(client_via(d, peer.0, sec, o, port=peer.1))
+            else:
+                clients.append(Client(connect_cap(t), peer.0, sec, None, port=peer.1, opts=o))
+        fds_with_clients = open_fds(t)
+        started = _ms()
+        for i in range(n):
+            peer = ports[i % len(ports)]
+            _FleetRunner(clients[i], gets, OctetString(("agent %d" % (i % len(ports))).encode()), one_done)
+
+    def disp_ready(d: Dispatcher, error: ?str) -> None:
+        if error is not None:
+            t.failure(AssertionError("dispatcher: " + error))
+            return
+        disp = d
+        _start()
+
+    def agent_ready(st: ServerTransport, error: ?str) -> None:
+        if error is not None:
+            t.failure(AssertionError("agent listen failed: " + error))
+            return
+        k = len(servers)
+        address = "127.0.0.1" if k % 2 == 0 else "::1"
+        a = Agent(st, make_view(("agent %d" % k).encode()), agent_config([]), None)
+        servers.append(st)
+        ports.append((address, st.local_port()))
+        if len(servers) < agents:
+            transport.udp_server_transport(listen_cap(t), "127.0.0.1" if (k + 1) % 2 == 0 else "::1", 0, agent_ready, None)
+        elif shared:
+            dispatcher.udp_dispatcher(listen_cap(t), "::", 0, disp_ready, None)
+        else:
+            _start()
+
+    transport.udp_server_transport(listen_cap(t), "127.0.0.1", 0, agent_ready, None)
+
+
+actor _FleetRunner(c: Client, gets: int, descr: OctetString, done: action(list[str], int) -> None):
+    """gets GETs of sysDescr.0 one after another; done(wrong answers, answers) at the end"""
+    var left = gets
+    var errs: list[str] = []
+    var got = 0
+
+    def cb(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+        if err is not None:
+            errs.append(str(err))
+        elif r is not None:
+            got += 1
+            if r.varbinds != [VarBind(SYS_DESCR, descr)]:
+                errs.append("wrong answer: " + repr(r))
+        left -= 1
+        if left > 0:
+            cl.get(cb, [SYS_DESCR])
+        else:
+            done(errs, got)
+
+    c.get(cb, [SYS_DESCR])
+
+
+actor _test_udp_fleet_dispatcher(t: testing.EnvT):
+    """2000 Clients of 20 agents (127.0.0.1 and ::1) over ONE Dispatcher socket: 10000 GETs, every answer right,
+    the file descriptors stay flat (the time is logged: --show-log)"""
+    t.timeout(120.0)
+    f = _Fleet(t, True, FLEET_CLIENTS, FLEET_AGENTS, FLEET_GETS)
+
+
+actor _test_udp_fleet_connected(t: testing.EnvT):
+    """The same fleet with a connected UDP socket per Client, for comparison: one file descriptor per Client
+    (skipped when the open-files limit is too low for it)"""
+    t.timeout(120.0)
+    limit = max_open_files(t)
+    if limit >= 0 and limit < FLEET_CLIENTS + 1000:
+        try:
+            t.skip("the open-files limit %d is too low for %d connected sockets" % (limit, FLEET_CLIENTS))
+        except testing.AbortTest:
+            pass
+    else:
+        f = _Fleet(t, False, FLEET_CLIENTS, FLEET_AGENTS, FLEET_GETS)
