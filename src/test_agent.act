@@ -242,7 +242,7 @@ def v3_of(r: Reply) -> V3Message:
         return m
     raise AssertionError("not an SNMPv3 message: " + r.data.hex())
 
-def opened(r: Reply, keys: ?LocalizedUser) -> ScopedPdu:
+def unprotected_scoped(r: Reply, keys: ?LocalizedUser) -> ScopedPdu:
     """The ScopedPDU of an SNMPv3 reply, checked and decrypted with keys"""
     return usm.unprotect(r.data, v3_of(r), keys)
 
@@ -271,7 +271,7 @@ def check_report(r: Reply, keys: ?LocalizedUser, msg_id: int, user: bytes, count
     testing.assertEqual((m.usm.engine_id, m.usm.boots, m.usm.user), (engine_id, boots, user), counter + ": usm")
     testing.assertTrue(m.usm.time >= 0 and m.usm.time < 10, counter + ": engine time %d" % m.usm.time)
     want = Pdu(pdu.REPORT, rid, 0, 0, [VarBind(usm.report_oid(counter), Counter32(value))])
-    testing.assertEqual(opened(r, keys), ScopedPdu(engine_id, b"", want), counter + ": report")
+    testing.assertEqual(unprotected_scoped(r, keys), ScopedPdu(engine_id, b"", want), counter + ": report")
 
 def check_v3_response(r: Reply, keys: ?LocalizedUser, msg_id: int, user: bytes, level: int, want: Pdu,
                       context_engine_id: bytes=ENGINE_ID, boots: int=1, engine_id: bytes=ENGINE_ID) -> None:
@@ -281,7 +281,7 @@ def check_v3_response(r: Reply, keys: ?LocalizedUser, msg_id: int, user: bytes, 
     testing.assertEqual(m.msg_id, msg_id, what)
     testing.assertEqual(m.flags, level, what + ": flags (level, not reportable)")
     testing.assertEqual((m.usm.engine_id, m.usm.boots, m.usm.user), (engine_id, boots, user), what + ": usm")
-    testing.assertEqual(opened(r, keys), ScopedPdu(context_engine_id, b"", want), what)
+    testing.assertEqual(unprotected_scoped(r, keys), ScopedPdu(context_engine_id, b"", want), what)
 
 def check_stats(stats: dict[str, int], want: dict[str, int]) -> None:
     for name, n in want.items():
@@ -323,7 +323,7 @@ actor _exchange(report: proc(?Exception) -> None, ag: Agent, client: Transport, 
     var replies: list[Reply] = []
     var done = False
 
-    def conclude() -> None:
+    def settled() -> None:
         if done:
             return
         done = True
@@ -337,22 +337,22 @@ actor _exchange(report: proc(?Exception) -> None, ag: Agent, client: Transport, 
             return
         report(None)
 
-    def on_data(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         replies.append(Reply(data, address, port))
         if len(replies) == expect:
-            after now QUIET: conclude()
+            after now QUIET: settled()
 
-    def on_error(message: str, fatal: bool) -> None:
+    def failed(message: str, fatal: bool) -> None:
         if not done:
             done = True
             report(AssertionError("unexpected transport error: " + message))
 
-    client.set_receiver(on_data, on_error)
+    client.set_receiver(received, failed)
     for r in requests:
         client.send(r)
     if expect == 0:
-        after now QUIET: conclude()
-    after now watchdog: conclude()
+        after now QUIET: settled()
+    after now watchdog: settled()
 
 proc def _client(mn: MemNet) -> Transport:
     return mn.client(MANAGER_ADDR, MANAGER_PORT, AGENT_ADDR, AGENT_PORT)
@@ -1239,7 +1239,7 @@ actor _test_close(t: testing.AsyncT):
     client = _client(mn)
     var replies = 0
 
-    def conclude() -> None:
+    def settled() -> None:
         st = ag.stats()
         client.close()
         if replies == 0 and st["received"] == 0:
@@ -1247,15 +1247,15 @@ actor _test_close(t: testing.AsyncT):
         else:
             t.failure(AssertionError("a closed agent answered: %d replies, %d received" % (replies, st["received"])))
 
-    def on_data(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         replies += 1
 
-    def on_error(message: str, fatal: bool) -> None:
+    def failed(message: str, fatal: bool) -> None:
         pass
 
-    client.set_receiver(on_data, on_error)
+    client.set_receiver(received, failed)
     client.send(v2c(get_pdu(1, [eo("1.1.0")])))
-    after now QUIET: conclude()
+    after now QUIET: settled()
 
 def _check_stats_keys(replies: list[Reply], stats: dict[str, int]) -> None:
     testing.assertEqual(list(stats.keys()), STATS + COUNTERS)
@@ -1348,7 +1348,7 @@ actor _walk(t: testing.EnvT, mode: int, expected_file: str):
         testing.assertEqual((p.request_id, p.error_status), (rid, 0), "response")
         return p.varbinds
 
-    def on_data(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         if done:
             return
         try:
@@ -1365,10 +1365,10 @@ actor _walk(t: testing.EnvT, mode: int, expected_file: str):
         except Exception as e:
             finish(e)
 
-    def on_error(message: str, fatal: bool) -> None:
+    def failed(message: str, fatal: bool) -> None:
         finish(AssertionError("transport error: " + message))
 
-    client.set_receiver(on_data, on_error)
+    client.set_receiver(received, failed)
     client.send(request())
 
 actor _test_lab_walk_getnext(t: testing.EnvT):
@@ -1447,7 +1447,7 @@ actor _test_getbulk_non_repeaters_not_capped(t: testing.AsyncT):
         except AssertionError as e:
             t.failure(e)
 
-    def on_data(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         cm, m = message.decode(data)
         if cm is not None:
             p = cm.pdu
@@ -1456,10 +1456,10 @@ actor _test_getbulk_non_repeaters_not_capped(t: testing.AsyncT):
         if len(got) == 2:
             fin()
 
-    def on_error(msg: str, fatal: bool) -> None:
+    def failed(msg: str, fatal: bool) -> None:
         pass
 
-    c.set_receiver(on_data, on_error)
+    c.set_receiver(received, failed)
     base = [1, 3, 6, 1, 4, 1, 99999, 1]
     c.send(_bulk300(10, 1000, [Oid(base + [i, 0]) for i in range(1, 11)] + [Oid(base)]))
     c.send(_bulk300(150, 0, [Oid(base + [i, 0]) for i in range(1, 151)]))

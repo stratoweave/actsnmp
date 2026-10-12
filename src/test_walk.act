@@ -190,23 +190,23 @@ def requests_sent(datagrams: list[bytes]) -> list[Pdu]:
     return out
 
 
-actor Sink(label: str, report_to: action(str, Got) -> None):
-    """The callbacks of one walk, walk_stream or get_table; each callback reports to report_to"""
+actor Sink(label: str, on_result: action(str, Got) -> None):
+    """The callbacks of one walk, walk_stream or get_table; each callback reports to on_result"""
     var batches: list[int] = []
     var streamed: list[VarBind] = []
 
-    def walk_cb(c: Client, vbs: list[VarBind], e: ?errors.SnmpError) -> None:
-        report_to(label, Got(vbs, None, len(vbs), [], e))
+    def walked(c: Client, vbs: list[VarBind], e: ?errors.SnmpError) -> None:
+        on_result(label, Got(vbs, None, len(vbs), [], e))
 
-    def table_cb(c: Client, t: ?Table, e: ?errors.SnmpError) -> None:
-        report_to(label, Got([], t, 0, [], e))
+    def got_table(c: Client, t: ?Table, e: ?errors.SnmpError) -> None:
+        on_result(label, Got([], t, 0, [], e))
 
-    def on_batch(c: Client, vbs: list[VarBind]) -> None:
+    def got_batch(c: Client, vbs: list[VarBind]) -> None:
         batches.append(len(vbs))
         streamed.extend(vbs)
 
-    def on_done(c: Client, count: int, e: ?errors.SnmpError) -> None:
-        report_to(label, Got(streamed, None, count, batches, e))
+    def stream_ended(c: Client, count: int, e: ?errors.SnmpError) -> None:
+        on_result(label, Got(streamed, None, count, batches, e))
 
 
 actor Harness(t: testing.AsyncT, want: int, verify: proc(dict[str, Got]) -> None):
@@ -216,7 +216,7 @@ actor Harness(t: testing.AsyncT, want: int, verify: proc(dict[str, Got]) -> None
     var calls = 0
     var armed = False
 
-    def finish() -> None:
+    def settled() -> None:
         def check() -> None:
             testing.assertEqual(calls, want, "callbacks (exactly once per walk)")
             verify(results)
@@ -227,7 +227,7 @@ actor Harness(t: testing.AsyncT, want: int, verify: proc(dict[str, Got]) -> None
         calls += 1
         if calls >= want and not armed:
             armed = True
-            after now QUIET: finish()
+            after now QUIET: settled()
 
 
 # Row and Table ######################################################################################
@@ -274,18 +274,18 @@ actor _test_walks(t: testing.AsyncT):
     c2 = client(mn, v2c(), 40001)
     c1 = client(mn, v1(), 40002)
     c3 = client(mn, shaaes(), 40003)
-    c2.walk(Sink("getnext", h.got).walk_cb, b([1]), OPTS.with_(use_bulk=False))
-    c2.walk(Sink("bulk", h.got).walk_cb, b([1]))
+    c2.walk(Sink("getnext", h.got).walked, b([1]), OPTS.with_(use_bulk=False))
+    c2.walk(Sink("bulk", h.got).walked, b([1]))
     s = Sink("stream", h.got)
-    c2.walk_stream(s.on_batch, s.on_done, b([1]), OPTS.with_(max_repetitions=10))
+    c2.walk_stream(s.got_batch, s.stream_ended, b([1]), OPTS.with_(max_repetitions=10))
     s1 = Sink("stream getnext", h.got)
-    c2.walk_stream(s1.on_batch, s1.on_done, b([1]), OPTS.with_(use_bulk=False))
-    c2.walk(Sink("sparse", h.got).walk_cb, b([2, 1, 3]), OPTS.with_(max_repetitions=3))
-    c2.walk(Sink("enterprises", h.got).walk_cb, Oid([1, 3, 6, 1, 4]))
-    c1.walk(Sink("v1", h.got).walk_cb, b([1]))
-    c1.walk(Sink("v1 counter64", h.got).walk_cb, b([2, 1, 2]), OPTS.with_(get_root_if_empty=False))
-    c3.walk(Sink("v3 getnext", h.got).walk_cb, b([1]), OPTS.with_(use_bulk=False))
-    c3.walk(Sink("v3 bulk", h.got).walk_cb, b([1]), OPTS.with_(max_repetitions=7))
+    c2.walk_stream(s1.got_batch, s1.stream_ended, b([1]), OPTS.with_(use_bulk=False))
+    c2.walk(Sink("sparse", h.got).walked, b([2, 1, 3]), OPTS.with_(max_repetitions=3))
+    c2.walk(Sink("enterprises", h.got).walked, Oid([1, 3, 6, 1, 4]))
+    c1.walk(Sink("v1", h.got).walked, b([1]))
+    c1.walk(Sink("v1 counter64", h.got).walked, b([2, 1, 2]), OPTS.with_(get_root_if_empty=False))
+    c3.walk(Sink("v3 getnext", h.got).walked, b([1]), OPTS.with_(use_bulk=False))
+    c3.walk(Sink("v3 bulk", h.got).walked, b([1]), OPTS.with_(max_repetitions=7))
 
 
 def check_end_of_view(r: dict[str, Got]) -> None:
@@ -305,11 +305,11 @@ actor _test_walk_end_of_mib_view(t: testing.AsyncT):
     h = Harness(t, 5, check_end_of_view)
     c2 = client(mn, v2c(), 40001)
     c1 = client(mn, v1(), 40002)
-    c2.walk(Sink("getnext", h.got).walk_cb, Oid([2, 7]), OPTS.with_(use_bulk=False))
-    c2.walk(Sink("bulk", h.got).walk_cb, Oid([2, 7]))
-    c1.walk(Sink("v1", h.got).walk_cb, Oid([2, 7]))
-    c2.walk(Sink("past the end", h.got).walk_cb, Oid([2, 999]))
-    c1.walk(Sink("v1 past the end", h.got).walk_cb, Oid([2, 999]))
+    c2.walk(Sink("getnext", h.got).walked, Oid([2, 7]), OPTS.with_(use_bulk=False))
+    c2.walk(Sink("bulk", h.got).walked, Oid([2, 7]))
+    c1.walk(Sink("v1", h.got).walked, Oid([2, 7]))
+    c2.walk(Sink("past the end", h.got).walked, Oid([2, 999]))
+    c1.walk(Sink("v1 past the end", h.got).walked, Oid([2, 999]))
 
 
 def check_root_get(r: dict[str, Got]) -> None:
@@ -333,16 +333,16 @@ actor _test_walk_empty_subtree_gets_root(t: testing.AsyncT):
     h = Harness(t, 8, check_root_get)
     c2 = client(mn, v2c(), 40001)
     c1 = client(mn, v1(), 40002)
-    c2.walk(Sink("scalar", h.got).walk_cb, b([3, 0]), OPTS.with_(use_bulk=False))
+    c2.walk(Sink("scalar", h.got).walked, b([3, 0]), OPTS.with_(use_bulk=False))
     s = Sink("scalar stream", h.got)
-    c2.walk_stream(s.on_batch, s.on_done, b([3, 0]))
-    c2.walk(Sink("scalar bulk", h.got).walk_cb, b([3, 0]))
-    c1.walk(Sink("v1 scalar", h.got).walk_cb, b([3, 0]))
-    c2.walk(Sink("no fallback", h.got).walk_cb, b([3, 0]), OPTS.with_(get_root_if_empty=False))
-    c2.walk(Sink("missing", h.got).walk_cb, b([4]))
-    c1.walk(Sink("v1 missing", h.got).walk_cb, b([4]))
+    c2.walk_stream(s.got_batch, s.stream_ended, b([3, 0]))
+    c2.walk(Sink("scalar bulk", h.got).walked, b([3, 0]))
+    c1.walk(Sink("v1 scalar", h.got).walked, b([3, 0]))
+    c2.walk(Sink("no fallback", h.got).walked, b([3, 0]), OPTS.with_(get_root_if_empty=False))
+    c2.walk(Sink("missing", h.got).walked, b([4]))
+    c1.walk(Sink("v1 missing", h.got).walked, b([4]))
     s2 = Sink("missing stream", h.got)
-    c2.walk_stream(s2.on_batch, s2.on_done, b([4]))
+    c2.walk_stream(s2.got_batch, s2.stream_ended, b([4]))
 
 
 # Ordering, loops and agent faults ##################################################################
@@ -374,16 +374,16 @@ actor _test_walk_not_increasing(t: testing.AsyncT):
     c2 = client(mn, v2c(), 40001)
     c1 = client(mn, v1(), 40002)
     unchecked = OPTS.with_(check_increasing=False)
-    c2.walk(Sink("getnext", h.got).walk_cb, b([1]), OPTS.with_(use_bulk=False))
-    c2.walk(Sink("bulk", h.got).walk_cb, b([1]))
-    c1.walk(Sink("v1", h.got).walk_cb, b([1]))
+    c2.walk(Sink("getnext", h.got).walked, b([1]), OPTS.with_(use_bulk=False))
+    c2.walk(Sink("bulk", h.got).walked, b([1]))
+    c1.walk(Sink("v1", h.got).walked, b([1]))
     s = Sink("stream", h.got)
-    c2.walk_stream(s.on_batch, s.on_done, b([1]), OPTS.with_(max_repetitions=5))
-    c2.walk(Sink("unchecked getnext", h.got).walk_cb, b([1]), unchecked.with_(use_bulk=False))
-    c2.walk(Sink("unchecked bulk", h.got).walk_cb, b([1]), unchecked)
-    c2.walk(Sink("root", h.got).walk_cb, b([1, 11, 0]))
-    c2.walk(Sink("unchecked root", h.got).walk_cb, b([1, 11, 0]), unchecked)
-    c2.walk(Sink("unrelated", h.got).walk_cb, b([2, 1, 1]))
+    c2.walk_stream(s.got_batch, s.stream_ended, b([1]), OPTS.with_(max_repetitions=5))
+    c2.walk(Sink("unchecked getnext", h.got).walked, b([1]), unchecked.with_(use_bulk=False))
+    c2.walk(Sink("unchecked bulk", h.got).walked, b([1]), unchecked)
+    c2.walk(Sink("root", h.got).walked, b([1, 11, 0]))
+    c2.walk(Sink("unchecked root", h.got).walked, b([1, 11, 0]), unchecked)
+    c2.walk(Sink("unrelated", h.got).walked, b([2, 1, 1]))
 
 
 actor _test_walk_disorder_scripted(t: testing.AsyncT):
@@ -424,7 +424,7 @@ actor _test_walk_disorder_scripted(t: testing.AsyncT):
         if len(results) == 5:
             after now QUIET: report(t, outcome(check))
 
-    def on_request(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         c, m = message.decode(data)
         if c is not None:
             p = c.pdu
@@ -451,14 +451,14 @@ actor _test_walk_disorder_scripted(t: testing.AsyncT):
                 server.send_to(message.encode_community(message.CommunityMessage(c.version, c.community, resp)),
                                address, port)
 
-    server.set_receiver(on_request)
+    server.set_receiver(received)
     c2 = client(mn, v2c(), 40001, OPTS.with_(use_bulk=False))
-    c2.walk(Sink("checked", got).walk_cb, root)
-    c2.walk(Sink("unchecked", got).walk_cb, root, OPTS.with_(use_bulk=False, check_increasing=False))
-    c2.walk(Sink("loop", got).walk_cb, loop, OPTS.with_(use_bulk=False, check_increasing=False))
-    c2.walk(Sink("noSuchObject", got).walk_cb, nso, OPTS.with_(use_bulk=False))
+    c2.walk(Sink("checked", got).walked, root)
+    c2.walk(Sink("unchecked", got).walked, root, OPTS.with_(use_bulk=False, check_increasing=False))
+    c2.walk(Sink("loop", got).walked, loop, OPTS.with_(use_bulk=False, check_increasing=False))
+    c2.walk(Sink("noSuchObject", got).walked, nso, OPTS.with_(use_bulk=False))
     c1 = client(mn, v1(), 40002, OPTS.with_(v1_fix_errors=False))
-    c1.walk(Sink("v1 noSuchName", got).walk_cb, nsn)
+    c1.walk(Sink("v1 noSuchName", got).walked, nsn)
 
 
 def check_truncated(r: dict[str, Got]) -> None:
@@ -483,12 +483,12 @@ actor _test_walk_truncated_bulk(t: testing.AsyncT):
     h = Harness(t, 4, check_truncated)
     c = client(mn, v2c(), 40001)
     s = Sink("cut to 3", h.got)
-    c.walk_stream(s.on_batch, s.on_done, b([1]), OPTS.with_(max_repetitions=10))
+    c.walk_stream(s.got_batch, s.stream_ended, b([1]), OPTS.with_(max_repetitions=10))
     c0 = client(mn0, v2c(), 40001)
-    c0.walk(Sink("empty", h.got).walk_cb, b([1]))
+    c0.walk(Sink("empty", h.got).walked, b([1]))
     s0 = Sink("empty stream", h.got)
-    c0.walk_stream(s0.on_batch, s0.on_done, b([1]))
-    c0.walk(Sink("getnext", h.got).walk_cb, b([1]), OPTS.with_(use_bulk=False))
+    c0.walk_stream(s0.got_batch, s0.stream_ended, b([1]))
+    c0.walk(Sink("getnext", h.got).walked, b([1]), OPTS.with_(use_bulk=False))
 
 
 actor _test_walk_adaptive_too_big(t: testing.AsyncT):
@@ -531,14 +531,14 @@ actor _test_walk_adaptive_too_big(t: testing.AsyncT):
         calls += 1
         if label == "first":
             reps["first"] = sent_reps(40001)
-            c.walk(Sink("second", got).walk_cb, b([5]))
+            c.walk(Sink("second", got).walked, b([5]))
         elif label == "plain":
-            plain.walk(Sink("plain again", got).walk_cb, b([5]), OPTS.with_(adaptive_bulk=False))
+            plain.walk(Sink("plain again", got).walked, b([5]), OPTS.with_(adaptive_bulk=False))
         if calls == 4:
             after now QUIET: report(t, outcome(check))
 
-    c.walk(Sink("first", got).walk_cb, b([5]))
-    plain.walk(Sink("plain", got).walk_cb, b([5]), OPTS.with_(adaptive_bulk=False))
+    c.walk(Sink("first", got).walked, b([5]))
+    plain.walk(Sink("plain", got).walked, b([5]), OPTS.with_(adaptive_bulk=False))
 
 
 actor _test_walk_adaptive_timeout(t: testing.AsyncT):
@@ -573,15 +573,15 @@ actor _test_walk_adaptive_timeout(t: testing.AsyncT):
         results[label] = g
         calls += 1
         if label == "first":
-            c.walk(Sink("second", got).walk_cb, b([5]))
+            c.walk(Sink("second", got).walked, b([5]))
             fixed = client(mn, v2c(), 40002, opts.with_(adaptive_bulk=False))
             mn.set_faults(NetFaults(drop_first_n=1, to_address=MANAGER, to_port=40002))
-            fixed.walk(Sink("fixed", got).walk_cb, b([5]))
+            fixed.walk(Sink("fixed", got).walked, b([5]))
         if calls == 3:
             after now QUIET: report(t, outcome(check))
 
     mn.set_faults(NetFaults(drop_first_n=1, to_address=MANAGER, to_port=40001))
-    c.walk(Sink("first", got).walk_cb, b([5]))
+    c.walk(Sink("first", got).walked, b([5]))
 
 
 actor _test_walk_adaptive_timeout_v3(t: testing.AsyncT):
@@ -651,11 +651,11 @@ actor _test_walk_adaptive_regrow(t: testing.AsyncT):
         results[label] = g
         if label == "learn":
             agent.set_faults(None)
-            c.walk(Sink("regrow", got).walk_cb, b([6]))
+            c.walk(Sink("regrow", got).walked, b([6]))
         else:
             after now QUIET: report(t, outcome(check))
 
-    c.walk(Sink("learn", got).walk_cb, b([5]))
+    c.walk(Sink("learn", got).walked, b([5]))
 
 
 actor _test_walk_adaptive_regrow_backoff(t: testing.AsyncT):
@@ -707,17 +707,17 @@ actor _test_walk_retries_mid_walk(t: testing.AsyncT):
         testing.assertEqual(g.count, 23)
         testing.assertEqual(c.stats().retries, 2, "one retry per dropped answer")
 
-    def on_batch(cl: Client, vbs: list[VarBind]) -> None:
+    def got_batch(cl: Client, vbs: list[VarBind]) -> None:
         batches += 1
         delivered.extend(vbs)
         if batches == 3:
             agent.set_faults(Faults(drop_first_n=2))
 
-    def on_done(cl: Client, count: int, e: ?errors.SnmpError) -> None:
+    def stream_ended(cl: Client, count: int, e: ?errors.SnmpError) -> None:
         done.append(Got(delivered, None, count, [], e))
         after now QUIET: report(t, outcome(check))
 
-    c.walk_stream(on_batch, on_done, b([1]))
+    c.walk_stream(got_batch, stream_ended, b([1]))
 
 
 def check_errors(r: dict[str, Got]) -> None:
@@ -745,17 +745,17 @@ actor _test_walk_errors_and_limits(t: testing.AsyncT):
     clean = Agent(mn2.server(AGENT, 161), small_view(), config(), None)
     h = Harness(t, 7, check_errors)
     c = client(mn, v2c(), 40001)
-    c.walk(Sink("genErr", h.got).walk_cb, b([1]), OPTS.with_(use_bulk=False))
-    c.walk(Sink("genErr bulk", h.got).walk_cb, b([1]), OPTS.with_(max_repetitions=5))
+    c.walk(Sink("genErr", h.got).walked, b([1]), OPTS.with_(use_bulk=False))
+    c.walk(Sink("genErr bulk", h.got).walked, b([1]), OPTS.with_(max_repetitions=5))
     lonely = Client(None, "10.9.9.9", v2c(), None, opts=Options(timeout=0.1, retries=1),
                     transport=mn.client(MANAGER, 40002, "10.9.9.9", 161))
-    lonely.walk(Sink("timeout", h.got).walk_cb, b([1]))
+    lonely.walk(Sink("timeout", h.got).walked, b([1]))
     c2 = client(mn2, v2c(), 40001)
-    c2.walk(Sink("limit", h.got).walk_cb, b([1]), OPTS.with_(use_bulk=False, max_walk_varbinds=5))
-    c2.walk(Sink("limit bulk", h.got).walk_cb, b([1]), OPTS.with_(max_walk_varbinds=7))
+    c2.walk(Sink("limit", h.got).walked, b([1]), OPTS.with_(use_bulk=False, max_walk_varbinds=5))
+    c2.walk(Sink("limit bulk", h.got).walked, b([1]), OPTS.with_(max_walk_varbinds=7))
     s = Sink("limit stream", h.got)
-    c2.walk_stream(s.on_batch, s.on_done, b([1]), OPTS.with_(max_walk_varbinds=7))
-    c2.walk(Sink("limit 1", h.got).walk_cb, b([1]), OPTS.with_(max_walk_varbinds=1))
+    c2.walk_stream(s.got_batch, s.stream_ended, b([1]), OPTS.with_(max_walk_varbinds=7))
+    c2.walk(Sink("limit 1", h.got).walked, b([1]), OPTS.with_(max_walk_varbinds=1))
 
 
 # Cancel, close, invalid arguments ##################################################################
@@ -795,28 +795,28 @@ actor _test_walk_cancel(t: testing.AsyncT):
             results[label] = []
         results[label].append(g)
         if label == "stream":
-            c.walk(Sink("after", got).walk_cb, b([1]))
+            c.walk(Sink("after", got).walked, b([1]))
         if label == "after":
             after now QUIET: report(t, outcome(check))
 
-    def on_batch(cl: Client, vbs: list[VarBind]) -> None:
+    def got_batch(cl: Client, vbs: list[VarBind]) -> None:
         batches += 1
         delivered.extend(vbs)
         if batches == 2:
             c.cancel(hs)
             c.cancel(hs)
 
-    def on_done(cl: Client, count: int, e: ?errors.SnmpError) -> None:
+    def stream_ended(cl: Client, count: int, e: ?errors.SnmpError) -> None:
         got("stream", Got(delivered, None, count, [], e))
 
-    hu = c.walk(Sink("unaffected", got).walk_cb, b([1]))
+    hu = c.walk(Sink("unaffected", got).walked, b([1]))
     c.cancel(hu + 1)
-    h1 = c.walk(Sink("immediate", got).walk_cb, b([1]))
+    h1 = c.walk(Sink("immediate", got).walked, b([1]))
     c.cancel(h1)
     c.cancel(h1)
-    ht = c.get_table(Sink("table", got).table_cb, [b([2, 1, 1]), b([2, 1, 3])])
+    ht = c.get_table(Sink("table", got).got_table, [b([2, 1, 1]), b([2, 1, 3])])
     c.cancel(ht)
-    hs = c.walk_stream(on_batch, on_done, b([1]))
+    hs = c.walk_stream(got_batch, stream_ended, b([1]))
 
 
 actor _test_walk_close(t: testing.AsyncT):
@@ -844,20 +844,20 @@ actor _test_walk_close(t: testing.AsyncT):
         if len(results) == 6:
             after now QUIET: report(t, outcome(check))
 
-    def on_batch(cl: Client, vbs: list[VarBind]) -> None:
+    def got_batch(cl: Client, vbs: list[VarBind]) -> None:
         if not closed:
             closed = True
             c.close()
-            c.walk(Sink("late", got).walk_cb, b([1]))
-            c.get_table(Sink("late table", got).table_cb, [b([2, 1, 1])])
+            c.walk(Sink("late", got).walked, b([1]))
+            c.get_table(Sink("late table", got).got_table, [b([2, 1, 1])])
 
-    def on_done(cl: Client, count: int, e: ?errors.SnmpError) -> None:
+    def stream_ended(cl: Client, count: int, e: ?errors.SnmpError) -> None:
         got("stream", Got([], None, count, [], e))
 
-    c.walk(Sink("a", got).walk_cb, b([1]))
-    c.walk(Sink("b", got).walk_cb, b([5]))
-    c.get_table(Sink("table", got).table_cb, [b([2, 1, 1]), b([2, 1, 3])])
-    c.walk_stream(on_batch, on_done, b([1]))
+    c.walk(Sink("a", got).walked, b([1]))
+    c.walk(Sink("b", got).walked, b([5]))
+    c.get_table(Sink("table", got).got_table, [b([2, 1, 1]), b([2, 1, 3])])
+    c.walk_stream(got_batch, stream_ended, b([1]))
 
 
 def check_invalid(r: dict[str, Got]) -> None:
@@ -877,22 +877,22 @@ actor _test_walk_invalid_arguments(t: testing.AsyncT):
     mn = MemNet()
     h = Harness(t, 8, check_invalid)
 
-    def ignore(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def ignored(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         pass
 
     c = client(mn, v2c(), 40001, Options(timeout=5.0, retries=0, max_queued=1))
-    c.walk(Sink("one arc", h.got).walk_cb, Oid([1]))
+    c.walk(Sink("one arc", h.got).walked, Oid([1]))
     s = Sink("stream one arc", h.got)
-    c.walk_stream(s.on_batch, s.on_done, Oid([1]))
-    c.get_table(Sink("no columns", h.got).table_cb, [])
-    c.get_table(Sink("bad column", h.got).table_cb, [b([1]), Oid([7, 1])])
-    c.get_table(Sink("nested columns", h.got).table_cb, [b([2, 1]), b([2, 1, 3])])
-    c.get_table(Sink("same column", h.got).table_cb, [b([2, 1, 3]), b([2, 1, 3])])
-    c.get_table(Sink("bad index prefix", h.got).table_cb, [b([2, 1, 3])], None, [4294967296])
+    c.walk_stream(s.got_batch, s.stream_ended, Oid([1]))
+    c.get_table(Sink("no columns", h.got).got_table, [])
+    c.get_table(Sink("bad column", h.got).got_table, [b([1]), Oid([7, 1])])
+    c.get_table(Sink("nested columns", h.got).got_table, [b([2, 1]), b([2, 1, 3])])
+    c.get_table(Sink("same column", h.got).got_table, [b([2, 1, 3]), b([2, 1, 3])])
+    c.get_table(Sink("bad index prefix", h.got).got_table, [b([2, 1, 3])], None, [4294967296])
     # nobody answers 10.0.0.1 on this network: the first walk stays in flight, the second is queued
-    c.walk(Sink("in flight", h.got).walk_cb, b([1]))
-    c.get(ignore, [b([1])])
-    c.walk(Sink("queue full", h.got).walk_cb, b([1]))
+    c.walk(Sink("in flight", h.got).walked, b([1]))
+    c.get(ignored, [b([1])])
+    c.walk(Sink("queue full", h.got).walked, b([1]))
 
 
 # Tables ############################################################################################
@@ -940,19 +940,19 @@ actor _test_tables(t: testing.AsyncT):
     h = Harness(t, 11, check_tables)
     cols = [b([2, 1, 1]), b([2, 1, 2]), b([2, 1, 3])]
     c = client(mn, v2c(), 40001)
-    c.get_table(Sink("bulk", h.got).table_cb, cols, OPTS.with_(max_repetitions=4))
-    c.get_table(Sink("getnext", h.got).table_cb, cols, OPTS.with_(use_bulk=False))
-    c.get_table(Sink("groups", h.got).table_cb, cols, OPTS.with_(max_oids_per_request=2, max_repetitions=3))
-    c.get_table(Sink("limit", h.got).table_cb, cols, OPTS.with_(max_walk_varbinds=4))
-    c.get_table(Sink("one column", h.got).table_cb, [b([2, 1, 3])])
-    c.get_table(Sink("empty", h.got).table_cb, [b([2, 1, 9])])
+    c.get_table(Sink("bulk", h.got).got_table, cols, OPTS.with_(max_repetitions=4))
+    c.get_table(Sink("getnext", h.got).got_table, cols, OPTS.with_(use_bulk=False))
+    c.get_table(Sink("groups", h.got).got_table, cols, OPTS.with_(max_oids_per_request=2, max_repetitions=3))
+    c.get_table(Sink("limit", h.got).got_table, cols, OPTS.with_(max_walk_varbinds=4))
+    c.get_table(Sink("one column", h.got).got_table, [b([2, 1, 3])])
+    c.get_table(Sink("empty", h.got).got_table, [b([2, 1, 9])])
     parallel = client(mn, v2c(), 40002, OPTS.with_(max_in_flight=3))
-    parallel.get_table(Sink("groups in parallel", h.got).table_cb, cols, OPTS.with_(max_oids_per_request=1,
+    parallel.get_table(Sink("groups in parallel", h.got).got_table, cols, OPTS.with_(max_oids_per_request=1,
                        max_repetitions=2))
-    client(mn2, v2c(), 40001).get_table(Sink("cut mid-row", h.got).table_cb, cols)
-    client(mn, v1(), 40003).get_table(Sink("v1", h.got).table_cb, cols)
-    client(mn, shaaes(), 40004).get_table(Sink("v3", h.got).table_cb, cols, OPTS.with_(max_repetitions=5))
-    client(mn, v2c(), 40005).walk(Sink("unrelated walk", h.got).walk_cb, b([1]))
+    client(mn2, v2c(), 40001).get_table(Sink("cut mid-row", h.got).got_table, cols)
+    client(mn, v1(), 40003).get_table(Sink("v1", h.got).got_table, cols)
+    client(mn, shaaes(), 40004).get_table(Sink("v3", h.got).got_table, cols, OPTS.with_(max_repetitions=5))
+    client(mn, v2c(), 40005).walk(Sink("unrelated walk", h.got).walked, b([1]))
 
 
 # Queued requests of a finished table, slow agents ###################################################
@@ -975,10 +975,10 @@ actor _test_table_cancel_sends_once(t: testing.AsyncT):
         s = c.stats()
         testing.assertEqual((s.queued, s.in_flight), (0, 0), str(s))
 
-    def on_table(cl: Client, tb: ?Table, e: ?errors.SnmpError) -> None:
+    def got_table(cl: Client, tb: ?Table, e: ?errors.SnmpError) -> None:
         got.append(Got([], tb, 0, [], e))
 
-    h = c.get_table(on_table, [b([2, 1, 1]), b([2, 1, 2]), b([2, 1, 3])])
+    h = c.get_table(got_table, [b([2, 1, 1]), b([2, 1, 2]), b([2, 1, 3])])
     c.cancel(h)
     after now 0.6: report(t, outcome(check))
 
@@ -996,11 +996,11 @@ actor _test_table_timeout_sends_once(t: testing.AsyncT):
         sent = requests_sent([d.data for d in mn.history() if d.src_port == 40001])
         testing.assertEqual(len(sent), 1, "requests on the wire: %d" % len(sent))
 
-    def on_table(cl: Client, tb: ?Table, e: ?errors.SnmpError) -> None:
+    def got_table(cl: Client, tb: ?Table, e: ?errors.SnmpError) -> None:
         got.append(Got([], tb, 0, [], e))
         after now 0.3: report(t, outcome(check))
 
-    c.get_table(on_table, [b([2, 1, 1]), b([2, 1, 2]), b([2, 1, 3])])
+    c.get_table(got_table, [b([2, 1, 1]), b([2, 1, 2]), b([2, 1, 3])])
 
 def slow_view() -> MibView:
     """Six columns of 20 rows, B.8.1.c.r"""
@@ -1099,12 +1099,12 @@ actor _test_tables_shared_index(t: testing.AsyncT):
     agent = Agent(mn.server(AGENT, 161), if_view(), config(), None)
     h = Harness(t, 5, check_shared_index)
     c = client(mn, v2c(), 40001)
-    c.get_table(Sink("augmented", h.got).table_cb, [IF_DESCR, IF_PHYS, IF_HC_IN], OPTS.with_(max_repetitions=2))
-    c.get_table(Sink("narrowed", h.got).table_cb, [RCV_STATUS, RCV_TYPE], None, [5])
-    client(mn, v1(), 40002).get_table(Sink("narrowed v1", h.got).table_cb, [RCV_STATUS, RCV_TYPE], None, [5])
-    c.get_table(Sink("limit", h.got).table_cb, [IF_DESCR, IF_PHYS, IF_HC_IN],
+    c.get_table(Sink("augmented", h.got).got_table, [IF_DESCR, IF_PHYS, IF_HC_IN], OPTS.with_(max_repetitions=2))
+    c.get_table(Sink("narrowed", h.got).got_table, [RCV_STATUS, RCV_TYPE], None, [5])
+    client(mn, v1(), 40002).get_table(Sink("narrowed v1", h.got).got_table, [RCV_STATUS, RCV_TYPE], None, [5])
+    c.get_table(Sink("limit", h.got).got_table, [IF_DESCR, IF_PHYS, IF_HC_IN],
                 OPTS.with_(max_walk_varbinds=4, max_repetitions=1))
-    c.get_table(Sink("under the limit", h.got).table_cb, [IF_DESCR], OPTS.with_(max_walk_varbinds=4))
+    c.get_table(Sink("under the limit", h.got).got_table, [IF_DESCR], OPTS.with_(max_walk_varbinds=4))
 
 
 # Lab dataset (env tests) ###########################################################################
@@ -1123,22 +1123,22 @@ def under(text: str, prefix: str) -> str:
     """The lines of an expected file that start with prefix"""
     return "".join([line + "\n" for line in text.split("\n") if line.startswith(prefix)])
 
-actor Gather(want: int, done: action(dict[str, Got], int) -> None):
-    """Collects the results of want walks by label and hands them to done QUIET seconds after the
+actor Gather(want: int, on_done: action(dict[str, Got], int) -> None):
+    """Collects the results of want walks by label and hands them to on_done QUIET seconds after the
     last one, with the number of callbacks (env tests check in their own actor)"""
     var results: dict[str, Got] = {}
     var calls = 0
     var armed = False
 
-    def finish() -> None:
-        done(results, calls)
+    def settled() -> None:
+        on_done(results, calls)
 
     def got(label: str, g: Got) -> None:
         results[label] = g
         calls += 1
         if calls >= want and not armed:
             armed = True
-            after now QUIET: finish()
+            after now QUIET: settled()
 
 def check_lab(results: dict[str, Got], calls: int, want: int, expected: str, labels: list[str]) -> None:
     testing.assertEqual(calls, want, "callbacks (exactly once per walk)")
@@ -1154,18 +1154,18 @@ actor _test_lab_walks_v2c(t: testing.EnvT):
     mn = MemNet()
     agent = lab_agent(mn, snmprec)
 
-    def done(r: dict[str, Got], calls: int) -> None:
+    def gathered(r: dict[str, Got], calls: int) -> None:
         def check() -> None:
             check_lab(r, calls, 3, expected, ["getnext", "bulk", "stream"])
             testing.assertEqual(r["stream"].count, 6038)
         report_env(t, outcome(check))
 
-    g = Gather(3, done)
+    g = Gather(3, gathered)
     c = client(mn, v2c(), 40001)
-    c.walk(Sink("getnext", g.got).walk_cb, BASE, OPTS.with_(use_bulk=False))
-    c.walk(Sink("bulk", g.got).walk_cb, BASE)
+    c.walk(Sink("getnext", g.got).walked, BASE, OPTS.with_(use_bulk=False))
+    c.walk(Sink("bulk", g.got).walked, BASE)
     s = Sink("stream", g.got)
-    c.walk_stream(s.on_batch, s.on_done, BASE, OPTS.with_(max_repetitions=40))
+    c.walk_stream(s.got_batch, s.stream_ended, BASE, OPTS.with_(max_repetitions=40))
 
 actor _test_lab_walks_v1(t: testing.EnvT):
     """SNMPv1 walk of the lab dataset (GETNEXT, Counter64 skipped) equals expected/canon/dataset-v1.txt"""
@@ -1175,13 +1175,13 @@ actor _test_lab_walks_v1(t: testing.EnvT):
     mn = MemNet()
     agent = lab_agent(mn, snmprec)
 
-    def done(r: dict[str, Got], calls: int) -> None:
+    def gathered(r: dict[str, Got], calls: int) -> None:
         def check() -> None:
             check_lab(r, calls, 1, expected, ["v1"])
         report_env(t, outcome(check))
 
-    g = Gather(1, done)
-    client(mn, v1(), 40001).walk(Sink("v1", g.got).walk_cb, BASE)
+    g = Gather(1, gathered)
+    client(mn, v1(), 40001).walk(Sink("v1", g.got).walked, BASE)
 
 actor _test_lab_walks_v3(t: testing.EnvT):
     """SNMPv3 (authPriv, SHA/AES) walks of the lab dataset, GETNEXT and GETBULK, equal expected/canon/dataset.txt"""
@@ -1191,15 +1191,15 @@ actor _test_lab_walks_v3(t: testing.EnvT):
     mn = MemNet()
     agent = lab_agent(mn, snmprec)
 
-    def done(r: dict[str, Got], calls: int) -> None:
+    def gathered(r: dict[str, Got], calls: int) -> None:
         def check() -> None:
             check_lab(r, calls, 2, expected, ["getnext", "bulk"])
         report_env(t, outcome(check))
 
-    g = Gather(2, done)
+    g = Gather(2, gathered)
     c = client(mn, shaaes(), 40001)
-    c.walk(Sink("getnext", g.got).walk_cb, BASE, OPTS.with_(use_bulk=False))
-    c.walk(Sink("bulk", g.got).walk_cb, BASE)
+    c.walk(Sink("getnext", g.got).walked, BASE, OPTS.with_(use_bulk=False))
+    c.walk(Sink("bulk", g.got).walked, BASE)
 
 def lab_columns(table: int, n: int) -> list[Oid]:
     return [b([table, 1, c]) for c in range(1, n + 1)]
@@ -1232,20 +1232,20 @@ actor _test_lab_tables(t: testing.EnvT):
         assert_same_lines(canon(table_varbinds(table_of(r["bigtable"], "bigtable"))), bigtable, "bigtable")
         assert_same_lines(canon(table_varbinds(table_of(r["v1 table"], "v1 table"))), v1_table, "v1 table")
 
-    def done(r: dict[str, Got], calls: int) -> None:
+    def gathered(r: dict[str, Got], calls: int) -> None:
         def check() -> None:
             verify(r, calls)
         report_env(t, outcome(check))
 
-    g = Gather(7, done)
+    g = Gather(7, gathered)
     c = client(mn, v2c(), 40001)
-    c.get_table(Sink("table", g.got).table_cb, lab_columns(10, 7))
-    c.get_table(Sink("table getnext", g.got).table_cb, lab_columns(10, 7), OPTS.with_(use_bulk=False))
-    c.get_table(Sink("table in groups", g.got).table_cb, lab_columns(10, 7), OPTS.with_(max_oids_per_request=3))
-    c.get_table(Sink("strtable", g.got).table_cb, lab_columns(11, 3))
-    c.get_table(Sink("bigtable", g.got).table_cb, lab_columns(12, 2), OPTS.with_(max_repetitions=50))
-    client(mn, v1(), 40002).get_table(Sink("v1 table", g.got).table_cb, lab_columns(10, 7))
-    client(mn2, v2c(), 40001).get_table(Sink("table cut mid-row", g.got).table_cb, lab_columns(10, 7))
+    c.get_table(Sink("table", g.got).got_table, lab_columns(10, 7))
+    c.get_table(Sink("table getnext", g.got).got_table, lab_columns(10, 7), OPTS.with_(use_bulk=False))
+    c.get_table(Sink("table in groups", g.got).got_table, lab_columns(10, 7), OPTS.with_(max_oids_per_request=3))
+    c.get_table(Sink("strtable", g.got).got_table, lab_columns(11, 3))
+    c.get_table(Sink("bigtable", g.got).got_table, lab_columns(12, 2), OPTS.with_(max_repetitions=50))
+    client(mn, v1(), 40002).get_table(Sink("v1 table", g.got).got_table, lab_columns(10, 7))
+    client(mn2, v2c(), 40001).get_table(Sink("table cut mid-row", g.got).got_table, lab_columns(10, 7))
 
 actor _test_lab_bulk_walk_time(t: testing.EnvT):
     """Times a GETBULK walk of the 6038-varbind lab dataset over MemNet (SNMPv2c, max-repetitions 25 and 100)
@@ -1267,20 +1267,20 @@ actor _test_lab_bulk_walk_time(t: testing.EnvT):
     def ms() -> float:
         return float(time.monotonic_ns()) / 1000000.0
 
-    def second(cl: Client, vbs: list[VarBind], e: ?errors.SnmpError) -> None:
+    def walked_m100(cl: Client, vbs: list[VarBind], e: ?errors.SnmpError) -> None:
         times.append(ms() - started)
         def check() -> None:
             assert_same_lines(canon(ok(Got(vbs, None, 0, [], e), "M=100")), expected, "M=100")
         log.info("GETBULK walk of the lab dataset", {"varbinds": len(vbs), "ms_m25": times[0], "ms_m100": times[1]})
         report_env(t, outcome(check))
 
-    def first(cl: Client, vbs: list[VarBind], e: ?errors.SnmpError) -> None:
+    def walked_m25(cl: Client, vbs: list[VarBind], e: ?errors.SnmpError) -> None:
         times.append(ms() - started)
         if e is not None or len(vbs) != 6038:
             report_env(t, AssertionError("M=25: " + describe(Got(vbs, None, 0, [], e))))
             return
         started = ms()
-        c.walk(second, BASE, OPTS.with_(max_repetitions=100))
+        c.walk(walked_m100, BASE, OPTS.with_(max_repetitions=100))
 
     started = ms()
-    c.walk(first, BASE)
+    c.walk(walked_m25, BASE)

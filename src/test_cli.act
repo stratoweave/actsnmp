@@ -108,8 +108,8 @@ class Result(object):
         self.err = err
         self.code = code
 
-actor Capture(report: action(Result) -> None):
-    """The out, err and done callbacks of one command; report() once with everything"""
+actor Capture(on_done: action(Result) -> None):
+    """The out, err and finished callbacks of one command; on_done() once with everything"""
     var _out: list[str] = []
     var _err: list[str] = []
     var _done = False
@@ -120,10 +120,10 @@ actor Capture(report: action(Result) -> None):
     def err(s: str) -> None:
         _err.append(s)
 
-    def done(code: int) -> None:
+    def finished(code: int) -> None:
         if not _done:
             _done = True
-            report(Result("".join(_out), "".join(_err), code))
+            on_done(Result("".join(_out), "".join(_err), code))
 
 class Step(object):
     """A command line (without "actsnmp") and what it must write: exactly, or as a prefix of out and err"""
@@ -140,14 +140,14 @@ class Step(object):
         self.code = code
         self.exact = exact
 
-proc def run_cli(mn: MemNet, port: int, args: list[str], report: action(Result) -> None,
+proc def run_cli(mn: MemNet, port: int, args: list[str], on_done: action(Result) -> None,
                  tree: ?mibcli.MibTree=None) -> None:
     """Run one client command over MemNet from MANAGER:port; parse errors are reported as exit code 1
 
     With tree the command reads and prints OIDs with those MIBs, as the CLI
     does after loading the -m modules (cliopts.scan, CliOptions.mib, finish).
     """
-    cap = Capture(report)
+    cap = Capture(on_done)
     try:
         o = cliopts.scan(["actsnmp"] + args)
         o.mib = tree
@@ -155,14 +155,14 @@ proc def run_cli(mn: MemNet, port: int, args: list[str], report: action(Result) 
             cliopts.finish(o)
         sec = actsnmp.security_of(o)
         c = actsnmp.new_client(None, o, sec, mn.client(MANAGER, port, o.address, o.port))
-        Command(o, c, cap.out, cap.err, cap.done)
+        Command(o, c, cap.out, cap.err, cap.finished)
     except cliopts.CliError as x:
         if x.error_message != "":
             cap.err(x.error_message + "\n")
-        cap.done(1)
+        cap.finished(1)
     except ValueError as x:
         cap.err(x.error_message + "\n")
-        cap.done(1)
+        cap.finished(1)
 
 def _mismatch(s: Step, r: Result) -> ?str:
     ok = r.code == s.code
@@ -175,13 +175,13 @@ def _mismatch(s: Step, r: Result) -> ?str:
     return ("actsnmp " + " ".join(s.args) + "\n  expected exit %d, out %r, err %r\n  got      exit %d, out %r, err %r"
             % (s.code, s.out, s.err, r.code, r.out, r.err))
 
-actor Script(mn: MemNet, steps: list[Step], first_port: int, report: action(list[str]) -> None,
+actor Script(mn: MemNet, steps: list[Step], first_port: int, on_done: action(list[str]) -> None,
              tree: ?mibcli.MibTree=None):
     """Runs steps one after the other and reports the mismatches (empty: all passed); tree: the MIBs to use"""
     var _i = 0
     var _failures: list[str] = []
 
-    def _step_done(r: Result) -> None:
+    def _step_finished(r: Result) -> None:
         m = _mismatch(steps[_i], r)
         if m is not None:
             _failures.append(m)
@@ -190,9 +190,9 @@ actor Script(mn: MemNet, steps: list[Step], first_port: int, report: action(list
 
     proc def _next() -> None:
         if _i >= len(steps):
-            report(_failures)
+            on_done(_failures)
         else:
-            run_cli(mn, first_port + _i, steps[_i].args, _step_done, tree)
+            run_cli(mn, first_port + _i, steps[_i].args, _step_finished, tree)
 
     _next()
 
@@ -290,10 +290,10 @@ actor _test_requests(t: testing.AsyncT):
     mn = MemNet()
     ag = Agent(mn.server(AGENT, 161), make_view(), make_config(), None)
 
-    def done(failures: list[str]) -> None:
+    def finished(failures: list[str]) -> None:
         finish(t, failures)
 
-    Script(mn, request_steps(), 41000, done)
+    Script(mn, request_steps(), 41000, finished)
 
 
 # Walks and tables ##################################################################################
@@ -348,10 +348,10 @@ actor _test_walks(t: testing.AsyncT):
     mn = MemNet()
     ag = Agent(mn.server(AGENT, 161), make_view(), make_config(), None)
 
-    def done(failures: list[str]) -> None:
+    def finished(failures: list[str]) -> None:
         finish(t, failures)
 
-    Script(mn, walk_steps(), 42000, done)
+    Script(mn, walk_steps(), 42000, finished)
 
 actor _test_walk_faults(t: testing.AsyncT):
     """A walk that meets a non-increasing OID (exit 1) or an error-status (exit 2), as net-snmp reports them"""
@@ -381,10 +381,10 @@ actor _test_walk_faults(t: testing.AsyncT):
              "Error in packet.\nReason: (genError) A general failure occured\nFailed object: " + EP + ".10.1.2.2\n\n", 2),
     ]
 
-    def done(failures: list[str]) -> None:
+    def finished(failures: list[str]) -> None:
         finish(t, failures)
 
-    Script(mn, steps, 43000, done)
+    Script(mn, steps, 43000, finished)
 
 
 # net-snmp parity ####################################################################################
@@ -452,10 +452,10 @@ actor _test_parity(t: testing.AsyncT):
     nsn = Agent(mn.server("10.0.0.4", 161), make_view(), make_config(), None,
                 Faults(error_at=e([10]), error_status=pdu.NO_SUCH_NAME))
 
-    def done(failures: list[str]) -> None:
+    def finished(failures: list[str]) -> None:
         finish(t, failures)
 
-    Script(mn, parity_steps(), 46000, done)
+    Script(mn, parity_steps(), 46000, finished)
 
 def _test_failure_texts() -> None:
     """A DNS failure of the agent's name is net-snmp's Unknown host, a discovery timeout is "<tool>: Timeout" """
@@ -503,8 +503,8 @@ def _test_build_problem() -> None:
 
 # Notifications ######################################################################################
 
-actor Blocks(want: int, report: action(str) -> None):
-    """Collects trapd output; report(text) once it holds want END lines"""
+actor Blocks(want: int, on_done: action(str) -> None):
+    """Collects trapd output; on_done(text) once it holds want END lines"""
     var _parts: list[str] = []
     var _ends = 0
     var _reported = False
@@ -514,7 +514,7 @@ actor Blocks(want: int, report: action(str) -> None):
         _ends += s.count("END\n")
         if not _reported and _ends >= want:
             _reported = True
-            report("".join(_parts))
+            on_done("".join(_parts))
 
 def trap_steps() -> list[Step]:
     v3 = ["-v3", "-l", "authPriv", "-u", "u_md5_aes256c", "-a", "MD5", "-A", "authpass123", "-x", "AES-256-C", "-X",
@@ -602,20 +602,20 @@ actor _test_notifications(t: testing.AsyncT):
                 f.append("last block: " + repr(tail))
             finish(t, f)
 
-    def _steps_done(failures: list[str]) -> None:
+    def steps_finished(failures: list[str]) -> None:
         _failures = failures
         _check()
 
-    def _blocks(text: str) -> None:
+    def collected(text: str) -> None:
         _text = text
         _check()
 
     trapd = cliopts.parse(["actsnmp", "trapd", "--canon"])
-    blocks = Blocks(7, _blocks)
+    blocks = Blocks(7, collected)
     printer = TrapPrinter(trapd, blocks.out)
     config = ReceiverConfig(["public"], security.load_users_tsv("\n".join(USERS)).users, [], h(RECEIVER_ENGINE), 1)
-    rcv = NotificationReceiver(mn.server(RECEIVER, 162), config, printer.on_notification, None)
-    Script(mn, trap_steps(), 44000, _steps_done)
+    rcv = NotificationReceiver(mn.server(RECEIVER, 162), config, printer.received, None)
+    Script(mn, trap_steps(), 44000, steps_finished)
 
 def _test_trapd_text() -> None:
     """trapd without --canon: the canonical header plus the source, net-snmp varbinds, no snmpTrapCommunity.0"""
@@ -640,12 +640,12 @@ def _now() -> float:
     # Monotonic time in seconds
     return float(time.monotonic_ns()) / 1000000000.0
 
-proc def start_cli(mn: MemNet, port: int, args: list[str], report: action(Result) -> None) -> Command:
+proc def start_cli(mn: MemNet, port: int, args: list[str], on_done: action(Result) -> None) -> Command:
     """Start one client command over MemNet from MANAGER:port, like run_cli, and return its Command"""
-    cap = Capture(report)
+    cap = Capture(on_done)
     o = cliopts.parse(["actsnmp"] + args)
     c = actsnmp.new_client(None, o, actsnmp.security_of(o), mn.client(MANAGER, port, o.address, o.port))
-    return Command(o, c, cap.out, cap.err, cap.done)
+    return Command(o, c, cap.out, cap.err, cap.finished)
 
 def _test_tcp_texts() -> None:
     """Failed TCP connections in net-snmp's words, the connect timeouts, host lookups and the listening texts"""
@@ -727,16 +727,16 @@ actor Recorder():
     """What the owner of a watched transport and the failure callback received, in order"""
     var _events: list[str] = []
 
-    def data(data: bytes, src_address: str, src_port: int) -> None:
+    def received(data: bytes, src_address: str, src_port: int) -> None:
         _events.append("data %d octets from " % len(data) + src_address + ":%d" % src_port)
 
-    def error(text: str, fatal: bool) -> None:
+    def failed(text: str, fatal: bool) -> None:
         _events.append("error " + text + (" (fatal)" if fatal else ""))
 
-    def failed(reason: str) -> None:
+    def connection_failed(reason: str) -> None:
         _events.append("failed: " + reason)
 
-    def up() -> None:
+    def connected() -> None:
         _events.append("up")
 
     def events() -> list[str]:
@@ -758,7 +758,7 @@ actor _test_tcp_watch(t: testing.AsyncT):
     t2 = w2.watch(fake_transport(f2))
     r2 = Recorder()
 
-    def check() -> None:
+    def settled() -> None:
         e1 = r1.events()
         e2 = r2.events()
         def checks() -> None:
@@ -772,14 +772,14 @@ actor _test_tcp_watch(t: testing.AsyncT):
             testing.assertEqual(e2, ["data 2 octets from 10.0.0.1:161", "error " + refused, "up"])
         report(t, outcome(checks))
 
-    def late_registration() -> None:
-        w1.on_failure(r1.failed)
-        w2.on_connect(r2.up)
-        after 0.1: check()
+    def registration_due() -> None:
+        w1.on_failure(r1.connection_failed)
+        w2.on_connect(r2.connected)
+        after 0.1: settled()
 
-    t1.set_receiver(r1.data, r1.error)
-    t2.set_receiver(r2.data, r2.error)
-    w2.on_failure(r2.failed)
+    t1.set_receiver(r1.received, r1.failed)
+    t2.set_receiver(r2.received, r2.failed)
+    w2.on_failure(r2.connection_failed)
     f1.fail(closed)
     f1.fail(broken)
     f1.fail(refused)
@@ -788,7 +788,7 @@ actor _test_tcp_watch(t: testing.AsyncT):
     f2.fail(refused)
     w2.connected()
     w2.connected()
-    after 0.2: late_registration()
+    after 0.2: registration_due()
 
 actor _test_tcp_commands(t: testing.AsyncT):
     """Over TCP: connection_failed() ends a command with net-snmp's Unknown host; a trap waits for connected() or -t"""
@@ -842,18 +842,18 @@ actor _test_tcp_commands(t: testing.AsyncT):
         up_wait = _now() - started
         _done("trap after connected", r)
 
-    def printed(text: str) -> None:
+    def collected(text: str) -> None:
         blocks = text
 
-    def refuse_trap() -> None:
+    def refusal_due() -> None:
         c = trap_cmd
         if c is not None:
             c.connection_failed("Connection refused")
 
     trapd = cliopts.parse(["actsnmp", "trapd", "--canon"])
-    printer = TrapPrinter(trapd, Blocks(3, printed).out)
+    printer = TrapPrinter(trapd, Blocks(3, collected).out)
     config = ReceiverConfig(["public"], [], [], h(RECEIVER_ENGINE), 1)
-    rcv = NotificationReceiver(mn.server(RECEIVER, 162), config, printer.on_notification, None)
+    rcv = NotificationReceiver(mn.server(RECEIVER, 162), config, printer.received, None)
     # nothing listens on 10.0.0.77, and the request would time out only after 5 s
     get_cmd = start_cli(mn, 45000, ["get", "-v2c", "-c", "public", "-t", "5", "tcp:10.0.0.77", "1.3.6.1.2.1.1.1.0"],
                         got)
@@ -866,7 +866,7 @@ actor _test_tcp_commands(t: testing.AsyncT):
     up_cmd = start_cli(mn, 45003, ["trap", "-v2c", "-c", "public", "-t", "5", "tcp:" + RECEIVER, "9",
                                    "1.3.6.1.6.3.1.1.5.1"], trapped_up)
     up_cmd.connected()
-    after 0.05: refuse_trap()
+    after 0.05: refusal_due()
 
 
 # Helpers ###########################################################################################
@@ -940,7 +940,7 @@ actor LabWalk(t: testing.EnvT, args: list[str], expected_file: str, sort_lines: 
     expected = sorted_lines(expected_text) if sort_lines else expected_text
     ag = Agent(mn.server(AGENT, 161), view, config, None)
 
-    def _done(r: Result) -> None:
+    def walked(r: Result) -> None:
         out = sorted_lines(r.out) if sort_lines else r.out
         if r.code == 0 and r.err == "" and out == expected:
             t.success()
@@ -954,7 +954,7 @@ actor LabWalk(t: testing.EnvT, args: list[str], expected_file: str, sort_lines: 
                                      % (r.code, r.err, n + 1, got[n] if n < len(got) else "<end>",
                                         want[n] if n < len(want) else "<end>")))
 
-    run_cli(mn, 45000, args, _done, tree)
+    run_cli(mn, 45000, args, walked, tree)
 
 actor _test_lab_bulkwalk(t: testing.EnvT):
     """bulkwalk -v2c of the lab dataset equals interop/expected/netsnmp/snmpd-dataset.On.txt (snmpbulkwalk -On)"""
@@ -1100,10 +1100,10 @@ actor _test_with_mibs(t: testing.AsyncT):
     mn = MemNet()
     ag = Agent(mn.server(AGENT, 161), make_view(), make_config(), None)
 
-    def done(failures: list[str]) -> None:
+    def finished(failures: list[str]) -> None:
         finish(t, failures)
 
-    Script(mn, mib_steps(), 46000, done, cli_tree())
+    Script(mn, mib_steps(), 46000, finished, cli_tree())
 
 def _test_mib_texts() -> None:
     """Error texts and trapd blocks name OIDs per the MIBs; --canon stays numeric"""

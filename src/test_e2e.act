@@ -197,8 +197,8 @@ def timeout_hint(o: Outcome, what: str) -> str:
         return hint if hint is not None else ""
     raise AssertionError(what + ": expected a TimeoutError, got " + describe(o))
 
-actor Collector(label: str, report: action(str, list[Outcome]) -> None):
-    """The callbacks of one Client's requests, in completion order; report(label, outcomes) once expect(n) are in"""
+actor Collector(label: str, on_done: action(str, list[Outcome]) -> None):
+    """The callbacks of one Client's requests, in completion order; on_done(label, outcomes) once expect(n) are in"""
     var got: list[Outcome] = []
     var want = -1
     var reported = False
@@ -206,9 +206,9 @@ actor Collector(label: str, report: action(str, list[Outcome]) -> None):
     proc def _check() -> None:
         if not reported and want >= 0 and len(got) >= want:
             reported = True
-            report(label, got)
+            on_done(label, got)
 
-    def cb(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def completed(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         got.append(Outcome(r, e))
         _check()
 
@@ -270,23 +270,23 @@ actor _test_v2c_ops(t: testing.AsyncT):
 
     pub = _client(mn, Community("public"), 40001, OPTS, t.log_handler)
     cp = Collector("public", reported)
-    pub.get(cp.cb, [SYS_DESCR, e([6, 1, 0]), e([3, 1, 0]), e([4, 1, 0]), e([1, 1, 1]), e([99, 0])])
-    pub.get_next(cp.cb, [e([1, 1, 0]), e([10, 1, 1]), Oid([2, 999])])
-    pub.get_bulk(cp.cb, [e([1, 1, 0]), e([10, 1, 1]), e([10, 1, 2])], 1, 3)
-    pub.set(cp.cb, [VarBind(e([1, 1, 0]), Integer(1))])
+    pub.get(cp.completed, [SYS_DESCR, e([6, 1, 0]), e([3, 1, 0]), e([4, 1, 0]), e([1, 1, 1]), e([99, 0])])
+    pub.get_next(cp.completed, [e([1, 1, 0]), e([10, 1, 1]), Oid([2, 999])])
+    pub.get_bulk(cp.completed, [e([1, 1, 0]), e([10, 1, 1]), e([10, 1, 2])], 1, 3)
+    pub.set(cp.completed, [VarBind(e([1, 1, 0]), Integer(1))])
     cp.expect(4)
 
     priv = _client(mn, Community("private"), 40002, OPTS, t.log_handler)
     cq = Collector("private", reported)
-    priv.set(cq.cb, [VarBind(e([1, 1, 0]), Integer(7))])
-    priv.get(cq.cb, [e([1, 1, 0])])
-    priv.set(cq.cb, [VarBind(SYS_DESCR, OctetString(b"x"))])
-    priv.set(cq.cb, [VarBind(e([1, 1, 0]), OctetString(b"x"))])
-    priv.set(cq.cb, [VarBind(e([2, 1, 0]), OctetString(b"y" * 17))])
-    priv.set(cq.cb, [VarBind(e([1, 1, 0]), Integer(101))])
-    priv.set(cq.cb, [VarBind(e([1, 9, 0]), Integer(1))])
-    priv.set(cq.cb, [VarBind(e([1, 1, 0]), Integer(55)), VarBind(e([2, 1, 0]), Integer(1))])
-    priv.get(cq.cb, [e([1, 1, 0])])
+    priv.set(cq.completed, [VarBind(e([1, 1, 0]), Integer(7))])
+    priv.get(cq.completed, [e([1, 1, 0])])
+    priv.set(cq.completed, [VarBind(SYS_DESCR, OctetString(b"x"))])
+    priv.set(cq.completed, [VarBind(e([1, 1, 0]), OctetString(b"x"))])
+    priv.set(cq.completed, [VarBind(e([2, 1, 0]), OctetString(b"y" * 17))])
+    priv.set(cq.completed, [VarBind(e([1, 1, 0]), Integer(101))])
+    priv.set(cq.completed, [VarBind(e([1, 9, 0]), Integer(1))])
+    priv.set(cq.completed, [VarBind(e([1, 1, 0]), Integer(55)), VarBind(e([2, 1, 0]), Integer(1))])
+    priv.get(cq.completed, [e([1, 1, 0])])
     cq.expect(9)
 
 actor _test_v1_ops(t: testing.AsyncT):
@@ -328,24 +328,24 @@ actor _test_v1_ops(t: testing.AsyncT):
 
     pub = _client(mn, Community("public", message.SNMP_V1), 40001, OPTS, t.log_handler)
     cp = Collector("public", reported)
-    pub.get(cp.cb, [SYS_DESCR, e([3, 1, 0]), e([6, 1, 0])])
-    pub.get(cp.cb, [e([1, 1, 1])])
-    pub.get_next(cp.cb, [e([2, 1, 0])])
-    pub.get_bulk(cp.cb, [e([10, 1, 1])], 0, 5)
-    pub.get_next(cp.cb, [Oid([2, 999])])
-    pub.set(cp.cb, [VarBind(e([1, 1, 0]), Integer(1))])
-    pub.get(cp.cb, [e([1, 1, 1]), SYS_DESCR, e([99, 0]), e([6, 1, 0])])
-    pub.get_next(cp.cb, [e([5, 1, 0]), Oid([2, 999])])
+    pub.get(cp.completed, [SYS_DESCR, e([3, 1, 0]), e([6, 1, 0])])
+    pub.get(cp.completed, [e([1, 1, 1])])
+    pub.get_next(cp.completed, [e([2, 1, 0])])
+    pub.get_bulk(cp.completed, [e([10, 1, 1])], 0, 5)
+    pub.get_next(cp.completed, [Oid([2, 999])])
+    pub.set(cp.completed, [VarBind(e([1, 1, 0]), Integer(1))])
+    pub.get(cp.completed, [e([1, 1, 1]), SYS_DESCR, e([99, 0]), e([6, 1, 0])])
+    pub.get_next(cp.completed, [e([5, 1, 0]), Oid([2, 999])])
     cp.expect(8)
 
     priv = _client(mn, Community("private", message.SNMP_V1), 40002, OPTS, t.log_handler)
     cq = Collector("private", reported)
-    priv.set(cq.cb, [VarBind(e([1, 1, 0]), Integer(9))])
-    priv.set(cq.cb, [VarBind(SYS_DESCR, OctetString(b"x"))])
-    priv.set(cq.cb, [VarBind(e([1, 1, 0]), OctetString(b"x"))])
-    priv.set(cq.cb, [VarBind(e([1, 9, 0]), Integer(1))])
-    priv.set(cq.cb, [VarBind(e([1, 1, 0]), Integer(1000))])
-    priv.get(cq.cb, [e([1, 1, 0])])
+    priv.set(cq.completed, [VarBind(e([1, 1, 0]), Integer(9))])
+    priv.set(cq.completed, [VarBind(SYS_DESCR, OctetString(b"x"))])
+    priv.set(cq.completed, [VarBind(e([1, 1, 0]), OctetString(b"x"))])
+    priv.set(cq.completed, [VarBind(e([1, 9, 0]), Integer(1))])
+    priv.set(cq.completed, [VarBind(e([1, 1, 0]), Integer(1000))])
+    priv.get(cq.completed, [e([1, 1, 0])])
     cq.expect(6)
 
 
@@ -399,11 +399,11 @@ actor _V3Group(t: testing.AsyncT, auth: str):
         c = _client(mn, u, 41000 + n)
         clients[u.user] = c
         col = Collector(u.user, reported)
-        c.get(col.cb, [SYS_DESCR, e([20, n, 0])])
-        c.set(col.cb, [VarBind(e([20, n, 0]), Integer(n * 7 + 1))])
-        c.get(col.cb, [e([20, n, 0])])
-        c.get_next(col.cb, [e([1, 1, 0])])
-        c.get_bulk(col.cb, [e([10, 1, 1])], 0, 3)
+        c.get(col.completed, [SYS_DESCR, e([20, n, 0])])
+        c.set(col.completed, [VarBind(e([20, n, 0]), Integer(n * 7 + 1))])
+        c.get(col.completed, [e([20, n, 0])])
+        c.get_next(col.completed, [e([1, 1, 0])])
+        c.get_bulk(col.completed, [e([10, 1, 1])], 0, 3)
         col.expect(5)
 
 actor _test_v3_md5(t: testing.AsyncT):
@@ -445,7 +445,7 @@ actor _test_v3_discover(t: testing.AsyncT):
     c = _client(mn, u, 40001, OPTS, t.log_handler)
     var info: ?EngineInfo = None
 
-    def got(r: ?Response, err: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
         s = c.stats()
         def check() -> None:
             testing.assertEqual(vbs_of(Outcome(r, err), "get"), [VarBind(SYS_DESCR, OctetString(DESCR))])
@@ -457,15 +457,12 @@ actor _test_v3_discover(t: testing.AsyncT):
             testing.assertEqual(s.reports, 1, "one discovery Report: " + str(s))
         report(t, outcome(check))
 
-    def get_done(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
-        got(r, err)
-
     def discovered(cl: Client, i: ?EngineInfo, err: ?errors.SnmpError) -> None:
         if err is not None:
             t.failure(AssertionError("discovery failed: " + str(err)))
             return
         info = i
-        c.get(get_done, [SYS_DESCR])
+        c.get(got, [SYS_DESCR])
 
     c.discover(discovered)
 
@@ -489,8 +486,8 @@ actor _FaultRun(t: testing.AsyncT, faults: ?Faults, net_faults: ?NetFaults, sec:
     def client() -> Client:
         return c
 
-    def callback() -> action(Client, ?Response, ?errors.SnmpError) -> None:
-        return col.cb
+    def completed() -> action(Client, ?Response, ?errors.SnmpError) -> None:
+        return col.completed
 
     def expect(n: int) -> None:
         col.expect(n)
@@ -514,9 +511,9 @@ actor _test_fault_drop_first_n(t: testing.AsyncT):
 
     run = _FaultRun(t, Faults(drop_first_n=1), None, Community("public"), Options(timeout=0.2, retries=2), check)
     c = run.client()
-    cb = run.callback()
-    c.get(cb, [SYS_DESCR])
-    c.get(cb, [e([1, 1, 0])])
+    completed = run.completed()
+    c.get(completed, [SYS_DESCR])
+    c.get(completed, [e([1, 1, 0])])
     run.expect(2)
 
 actor _test_fault_wrong_request_id(t: testing.AsyncT):
@@ -531,9 +528,9 @@ actor _test_fault_wrong_request_id(t: testing.AsyncT):
 
     run = _FaultRun(t, Faults(wrong_request_id=True), None, Community("public"), OPTS, check)
     c = run.client()
-    cb = run.callback()
-    c.get(cb, [SYS_DESCR])
-    c.get_next(cb, [e([1, 1, 0])])
+    completed = run.completed()
+    c.get(completed, [SYS_DESCR])
+    c.get_next(completed, [e([1, 1, 0])])
     run.expect(2)
 
 actor _test_net_duplicate(t: testing.AsyncT):
@@ -549,9 +546,9 @@ actor _test_net_duplicate(t: testing.AsyncT):
 
     run = _FaultRun(t, None, NetFaults(duplicate=True, to_address=MANAGER), Community("public"), OPTS, check)
     c = run.client()
-    cb = run.callback()
+    completed = run.completed()
     for _ in range(3):
-        c.get(cb, [SYS_DESCR])
+        c.get(completed, [SYS_DESCR])
     run.quietly(3)
 
 actor _test_net_late(t: testing.AsyncT):
@@ -568,7 +565,7 @@ actor _test_net_late(t: testing.AsyncT):
     run = _FaultRun(t, None, NetFaults(delay=0.3, to_address=MANAGER), Community("public"),
                     Options(timeout=0.2, retries=2), check)
     c = run.client()
-    c.get(run.callback(), [SYS_DESCR])
+    c.get(run.completed(), [SYS_DESCR])
     run.expect(1)
 
 actor _test_fault_not_in_time_window_once(t: testing.AsyncT):
@@ -583,9 +580,9 @@ actor _test_fault_not_in_time_window_once(t: testing.AsyncT):
 
     run = _FaultRun(t, Faults(report_not_in_time_window_once=True), None, _sha_aes(), OPTS, check)
     c = run.client()
-    cb = run.callback()
-    c.get(cb, [SYS_DESCR])
-    c.get(cb, [e([1, 1, 0])])
+    completed = run.completed()
+    c.get(completed, [SYS_DESCR])
+    c.get(completed, [e([1, 1, 0])])
     run.expect(2)
 
 actor _test_fault_too_big(t: testing.AsyncT):
@@ -602,10 +599,10 @@ actor _test_fault_too_big(t: testing.AsyncT):
 
     run = _FaultRun(t, Faults(too_big_over=300), None, Community("private"), OPTS, check)
     c = run.client()
-    cb = run.callback()
-    c.get(cb, oids)
-    c.get_bulk(cb, [e([9, 1, 0])], 0, 8)
-    c.set(cb, [VarBind(e([20, i, 0]), Integer(i)) for i in range(1, 30)])
+    completed = run.completed()
+    c.get(completed, oids)
+    c.get_bulk(completed, [e([9, 1, 0])], 0, 8)
+    c.set(completed, [VarBind(e([20, i, 0]), Integer(i)) for i in range(1, 30)])
     run.expect(3)
 
 actor _test_fault_truncate_bulk(t: testing.AsyncT):
@@ -617,7 +614,7 @@ actor _test_fault_truncate_bulk(t: testing.AsyncT):
 
     run = _FaultRun(t, Faults(truncate_bulk=2), None, Community("public"), OPTS, check)
     c = run.client()
-    c.get_bulk(run.callback(), [e([10, 1, 1]), e([10, 1, 2])], 0, 5)
+    c.get_bulk(run.completed(), [e([10, 1, 1]), e([10, 1, 2])], 0, 5)
     run.expect(1)
 
 actor _test_fault_error_at(t: testing.AsyncT):
@@ -635,9 +632,9 @@ actor _test_fault_error_at(t: testing.AsyncT):
     run = _FaultRun(t, Faults(error_at=e([5, 1, 0]), error_status=pdu.RESOURCE_UNAVAILABLE), None,
                     Community("public"), OPTS, check)
     c = run.client()
-    cb = run.callback()
-    c.get(cb, [e([1, 1, 0]), e([5, 1, 0])])
-    c.get(cb, [e([6, 1, 0])])
+    completed = run.completed()
+    c.get(completed, [e([1, 1, 0]), e([5, 1, 0])])
+    c.get(completed, [e([6, 1, 0])])
     run.expect(2)
 
 actor _test_fault_wrong_source_version_community(t: testing.AsyncT):
@@ -673,7 +670,7 @@ actor _test_fault_wrong_source_version_community(t: testing.AsyncT):
 
     for c, label in [(c1, "port"), (c2, "version"), (c3, "community"), (c4, "unchecked")]:
         col = Collector(label, reported)
-        c.get(col.cb, [SYS_DESCR])
+        c.get(col.completed, [SYS_DESCR])
         col.expect(1)
 
 actor _test_fault_trailing_bytes(t: testing.AsyncT):
@@ -698,10 +695,10 @@ actor _test_fault_trailing_bytes(t: testing.AsyncT):
             report(t, outcome(check))
 
     k1 = Collector("v2c", reported)
-    c1.get(k1.cb, [SYS_DESCR])
+    c1.get(k1.completed, [SYS_DESCR])
     k1.expect(1)
     k2 = Collector("v3", reported)
-    c2.get(k2.cb, [SYS_DESCR])
+    c2.get(k2.completed, [SYS_DESCR])
     k2.expect(1)
 
 
@@ -732,7 +729,7 @@ actor _NotifyRun(t: testing.AsyncT, users: list[Usm], communities: list[str], wa
                 check(sorted(blocks), st, outcomes)
             report(t, outcome(run))
 
-    def on_notification(r: NotificationReceiver, n: Notification) -> None:
+    def received(r: NotificationReceiver, n: Notification) -> None:
         blocks.append(fmt.canon_notification(n))
         _maybe_done()
 
@@ -740,7 +737,7 @@ actor _NotifyRun(t: testing.AsyncT, users: list[Usm], communities: list[str], wa
         outcomes[label] = outs
         _maybe_done()
 
-    def trap_done(c: Client, err: ?errors.SnmpError) -> None:
+    def trap_sent(c: Client, err: ?errors.SnmpError) -> None:
         if err is not None:
             t.failure(AssertionError("trap failed: " + str(err)))
         traps_done.append("x")
@@ -752,11 +749,8 @@ actor _NotifyRun(t: testing.AsyncT, users: list[Usm], communities: list[str], wa
         expected += 1
         return Collector(label, reported)
 
-    def trap_cb() -> action(Client, ?errors.SnmpError) -> None:
-        return trap_done
-
     rcv = NotificationReceiver(mn.server(RECEIVER, 162), ReceiverConfig(communities, users, [], h(RECEIVER_ENGINE), 1),
-                               on_notification, None)
+                               received, None)
 
 actor _test_notify_v1_v2c(t: testing.AsyncT):
     """trap_v1, trap and inform over SNMPv1/v2c: delivered, informs acknowledged, canonical blocks as the lab's"""
@@ -779,12 +773,11 @@ actor _test_notify_v1_v2c(t: testing.AsyncT):
     v1 = run.client(Community("public", message.SNMP_V1), 42001)
     v2 = run.client(Community("public"), 42002)
     bad = run.client(Community("secret"), 42003)
-    tcb = run.trap_cb()
-    v1.trap_v1(tcb, ENTERPRISE, b"\xc0\x00\x02\x01", 6, 42, [VarBind(e([1, 1, 0]), Integer(0))], 12345)
-    bad.trap(tcb, notify.TRAP_COLD_START, [], 1)
-    v2.trap(tcb, notify.TRAP_COLD_START, [VarBind(e([2, 1, 0]), OctetString(b"Hello, SNMP!"))], 12345)
+    v1.trap_v1(run.trap_sent, ENTERPRISE, b"\xc0\x00\x02\x01", 6, 42, [VarBind(e([1, 1, 0]), Integer(0))], 12345)
+    bad.trap(run.trap_sent, notify.TRAP_COLD_START, [], 1)
+    v2.trap(run.trap_sent, notify.TRAP_COLD_START, [VarBind(e([2, 1, 0]), OctetString(b"Hello, SNMP!"))], 12345)
     col = run.collector("inform")
-    v2.inform(col.cb, notify.TRAP_LINK_DOWN, [VarBind(e([1, 1, 0]), Integer(3))], 500)
+    v2.inform(col.completed, notify.TRAP_LINK_DOWN, [VarBind(e([1, 1, 0]), Integer(3))], 500)
     col.expect(1)
 
 actor _NotifyV3(t: testing.AsyncT, auth: str):
@@ -807,13 +800,12 @@ actor _NotifyV3(t: testing.AsyncT, auth: str):
                             str(st))
 
     run = _NotifyRun(t, users, [], 2 * len(users), check)
-    tcb = run.trap_cb()
     for i in range(len(users)):
         u = users[i]
         c = run.client(u, 43000 + i)
-        c.trap(tcb, notify.TRAP_LINK_UP, [VarBind(e([1, 1, 0]), Integer(i))], 1000 + i)
+        c.trap(run.trap_sent, notify.TRAP_LINK_UP, [VarBind(e([1, 1, 0]), Integer(i))], 1000 + i)
         col = run.collector(u.user)
-        c.inform(col.cb, notify.TRAP_LINK_DOWN, [VarBind(e([1, 1, 0]), Integer(i))], 2000 + i)
+        c.inform(col.completed, notify.TRAP_LINK_DOWN, [VarBind(e([1, 1, 0]), Integer(i))], 2000 + i)
         col.expect(1)
 
 actor _test_notify_v3_md5(t: testing.AsyncT):
@@ -862,7 +854,7 @@ actor _test_v3_agent_reboot(t: testing.AsyncT):
             return True
         return False
 
-    def third(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+    def got_third(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
         if fail("after the engine ID change", r, err):
             return
         info = c.engine_info()
@@ -877,7 +869,7 @@ actor _test_v3_agent_reboot(t: testing.AsyncT):
             testing.assertEqual((s.reports, s.timeouts), (4, 0), str(s))
         report(t, outcome(check))
 
-    def second(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+    def got_second(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
         if fail("after the reboot", r, err):
             return
         boots = -1
@@ -888,15 +880,15 @@ actor _test_v3_agent_reboot(t: testing.AsyncT):
             t.failure(AssertionError("boots not learned after the reboot: %d" % boots))
             return
         agent.reboot(1, new_engine)
-        c.get(third, [SYS_DESCR])
+        c.get(got_third, [SYS_DESCR])
 
-    def first(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+    def got_first(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
         if fail("first get", r, err):
             return
         agent.reboot()
-        c.get(second, [SYS_DESCR])
+        c.get(got_second, [SYS_DESCR])
 
-    c.get(first, [SYS_DESCR])
+    c.get(got_first, [SYS_DESCR])
 
 actor _test_v3_agent_restart_boots_lost(t: testing.AsyncT):
     """The agent restarts without its boots (5 before, 1 after, its time from 0 again, as the lab's snmpd does
@@ -930,13 +922,13 @@ actor _test_v3_agent_restart_boots_lost(t: testing.AsyncT):
 
     col = Collector("restart", reported)
 
-    def first(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
-        col.cb(cl, r, err)
+    def got_first(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+        col.completed(cl, r, err)
         agent.reboot(1)
-        c.get(col.cb, [SYS_DESCR])
-        c.get(col.cb, [e([1, 1, 0])])
+        c.get(col.completed, [SYS_DESCR])
+        c.get(col.completed, [e([1, 1, 0])])
 
-    c.get(first, [SYS_DESCR])
+    c.get(got_first, [SYS_DESCR])
     col.expect(3)
 
 actor _test_fault_too_big_v3(t: testing.AsyncT):
@@ -949,7 +941,7 @@ actor _test_fault_too_big_v3(t: testing.AsyncT):
 
     run = _FaultRun(t, Faults(too_big_over=500), None, _sha_aes(), OPTS, check)
     c = run.client()
-    c.get(run.callback(), [e([9, i, 0]) for i in range(1, 9)])
+    c.get(run.completed(), [e([9, i, 0]) for i in range(1, 9)])
     run.expect(1)
 
 actor _test_inform_retransmission_dedup(t: testing.AsyncT):
@@ -958,15 +950,15 @@ actor _test_inform_retransmission_dedup(t: testing.AsyncT):
     mn = MemNet(NetFaults(drop_first_n=1, to_address=MANAGER))
     var got: list[Notification] = []
 
-    def on_n(r: NotificationReceiver, n: Notification) -> None:
+    def received(r: NotificationReceiver, n: Notification) -> None:
         got.append(n)
 
     rcv = NotificationReceiver(mn.server(RECEIVER, 162), ReceiverConfig(["public"], [], [], h(RECEIVER_ENGINE), 1, 60.0),
-                               on_n, t.log_handler)
+                               received, t.log_handler)
     c = Client(None, RECEIVER, Community("public"), t.log_handler, port=162, opts=Options(timeout=0.2, retries=2),
                transport=mn.client(MANAGER, 42001, RECEIVER, 162))
 
-    def done(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+    def acked(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
         st = rcv.stats()
         def check() -> None:
             resp = ok(Outcome(r, err), "inform")
@@ -975,7 +967,7 @@ actor _test_inform_retransmission_dedup(t: testing.AsyncT):
             testing.assertEqual((st["delivered"], st["duplicates"], st["acked"]), (1, 1, 2), str(st))
         report(t, outcome(check))
 
-    c.inform(done, notify.TRAP_LINK_DOWN, [VarBind(e([1, 1, 0]), Integer(3))], 500)
+    c.inform(acked, notify.TRAP_LINK_DOWN, [VarBind(e([1, 1, 0]), Integer(3))], 500)
 
 actor _test_discovery_budgets(t: testing.AsyncT):
     """Discovery keeps each request's own budget: a long one outlives a short Client default, a short one fails early"""
@@ -998,16 +990,16 @@ actor _test_discovery_budgets(t: testing.AsyncT):
         if len(log) == 2:
             report(t, outcome(check))
 
-    def long_done(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+    def got_long(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
         note("long:" + ("ok" if err is None else str(err)))
 
-    def short_done(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+    def got_short(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
         short_elapsed = float(time.monotonic_ns()) / 1e9 - started
         note("short:" + ("timeout" if isinstance(err, errors.TimeoutError) else describe(Outcome(r, err))))
 
     started = float(time.monotonic_ns()) / 1e9
-    c.get(long_done, [SYS_DESCR], Options(timeout=3.0, retries=0))
-    c.get(short_done, [SYS_DESCR], Options(timeout=0.2, retries=0))
+    c.get(got_long, [SYS_DESCR], Options(timeout=3.0, retries=0))
+    c.get(got_short, [SYS_DESCR], Options(timeout=0.2, retries=0))
 
 
 # Logging ##########################################################################################
@@ -1050,7 +1042,7 @@ actor _test_logs_never_show_secrets(t: testing.AsyncT):
     var got = 0
     var done_count = 0
 
-    def on_n(r: NotificationReceiver, n: Notification) -> None:
+    def received(r: NotificationReceiver, n: Notification) -> None:
         got += 1
         maybe_done()
 
@@ -1065,33 +1057,33 @@ actor _test_logs_never_show_secrets(t: testing.AsyncT):
         if got == 4 and done_count == 4:
             after now QUIET: report(t, outcome(check))
 
-    def req_done(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+    def completed(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
         if err is not None:
             t.failure(AssertionError(str(err)))
             return
         done_count += 1
         maybe_done()
 
-    def trap_done(cl: Client, err: ?errors.SnmpError) -> None:
+    def trap_sent(cl: Client, err: ?errors.SnmpError) -> None:
         if err is not None:
             t.failure(AssertionError(str(err)))
 
     rcv = NotificationReceiver(mn.server(RECEIVER, 162), ReceiverConfig([secret], [u], [], h(RECEIVER_ENGINE), 1),
-                               on_n, handler)
+                               received, handler)
     c2 = _client(mn, Community(secret), 40001, OPTS, handler)
-    c2.get(req_done, [SYS_DESCR])
-    c2.set(req_done, [VarBind(e([1, 1, 0]), Integer(5))])
+    c2.get(completed, [SYS_DESCR])
+    c2.set(completed, [VarBind(e([1, 1, 0]), Integer(5))])
     c3 = _client(mn, u, 40002, OPTS, handler)
-    c3.get(req_done, [SYS_DESCR])
+    c3.get(completed, [SYS_DESCR])
     n1 = Client(None, RECEIVER, Community(secret, message.SNMP_V1), handler, port=162, opts=OPTS,
                 transport=mn.client(MANAGER, 42001, RECEIVER, 162))
-    n1.trap_v1(trap_done, ENTERPRISE, b"\xc0\x00\x02\x01", 6, 1, [VarBind(e([1, 1, 0]), Integer(1))], 1)
+    n1.trap_v1(trap_sent, ENTERPRISE, b"\xc0\x00\x02\x01", 6, 1, [VarBind(e([1, 1, 0]), Integer(1))], 1)
     n2 = Client(None, RECEIVER, Community(secret), handler, port=162, opts=OPTS,
                 transport=mn.client(MANAGER, 42002, RECEIVER, 162))
-    n2.trap(trap_done, notify.TRAP_COLD_START, [], 1)
+    n2.trap(trap_sent, notify.TRAP_COLD_START, [], 1)
     n3 = Client(None, RECEIVER, u, handler, port=162, opts=OPTS, transport=mn.client(MANAGER, 42003, RECEIVER, 162))
-    n3.trap(trap_done, notify.TRAP_COLD_START, [], 1)
-    n3.inform(req_done, notify.TRAP_LINK_DOWN, [VarBind(e([1, 1, 0]), Integer(3))], 2)
+    n3.trap(trap_sent, notify.TRAP_COLD_START, [], 1)
+    n3.inform(completed, notify.TRAP_LINK_DOWN, [VarBind(e([1, 1, 0]), Integer(3))], 2)
 
 
 # Retry timers after a resynchronisation #############################################################
@@ -1106,7 +1098,7 @@ actor _ResyncStaleTimer(t: testing.AsyncT, delay: float, retries: int):
     c = _client(mn, u, 40001, Options(timeout=0.25, retries=retries), t.log_handler)
     var started = 0.0
 
-    def second(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+    def got_second(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
         waited = float(time.monotonic_ns()) / 1e9 - started
         s = c.stats()
         def check() -> None:
@@ -1116,16 +1108,16 @@ actor _ResyncStaleTimer(t: testing.AsyncT, delay: float, retries: int):
             testing.assertEqual(s.retries, 0, "no retransmission: " + str(s))
         report(t, outcome(check))
 
-    def first(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+    def got_first(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
         if err is not None:
             t.failure(AssertionError("first get: " + str(err)))
             return
         agent.reboot()
         mn.set_faults(NetFaults(delay=delay, to_address=MANAGER))
         started = float(time.monotonic_ns()) / 1e9
-        c.get(second, [SYS_DESCR])
+        c.get(got_second, [SYS_DESCR])
 
-    c.get(first, [SYS_DESCR])
+    c.get(got_first, [SYS_DESCR])
 
 # The resend goes out when the Report arrives, delay after the request, and its answer comes delay later:
 # after the first attempt's timeout (0.25 s) when delay is 0.15 s, but within the resend's own timeout
@@ -1170,7 +1162,7 @@ actor _test_resync_then_silence(t: testing.AsyncT):
                   Faults(report_not_in_time_window_once=True))
     c = _client(mn, u, 40001, Options(timeout=0.2, retries=2), t.log_handler)
 
-    def done(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
         s = c.stats()
         sends = [d.dst_port for d in mn.history() if d.src_port == 40001]
         def check() -> None:
@@ -1184,4 +1176,4 @@ actor _test_resync_then_silence(t: testing.AsyncT):
             testing.assertEqual(len(sends), 5, "probe and four attempts")
         report(t, outcome(check))
 
-    c.get(done, [SYS_DESCR])
+    c.get(got, [SYS_DESCR])

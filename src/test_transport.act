@@ -153,19 +153,19 @@ actor _test_mem_roundtrip(t: testing.AsyncT):
         testing.assertEqual(repr(mn.stats()), _counts(sent=2, delivered=2))
         testing.assertEqual(p.server.local_port(), 161)
 
-    def on_server(data: bytes, address: str, port: int) -> None:
+    def server_received(data: bytes, address: str, port: int) -> None:
         log.append((data, address, port))
         p.server.send_to(b"pong", address, port)
 
-    def on_client(data: bytes, address: str, port: int) -> None:
+    def client_received(data: bytes, address: str, port: int) -> None:
         log.append((data, address, port))
         report(t, outcome(check))
 
-    def on_error(message: str, fatal: bool) -> None:
+    def client_failed(message: str, fatal: bool) -> None:
         t.failure(AssertionError("unexpected error: " + message))
 
-    p.server.set_receiver(on_server)
-    p.client.set_receiver(on_client, on_error)
+    p.server.set_receiver(server_received)
+    p.client.set_receiver(client_received, client_failed)
     p.client.send(b"ping")
 
 
@@ -181,20 +181,20 @@ actor _test_mem_order(t: testing.AsyncT):
         testing.assertEqual(at_server, _numbered(count))
         testing.assertEqual(at_client, [b"re:" + d for d in _numbered(count)])
 
-    def on_server(data: bytes, address: str, port: int) -> None:
+    def server_received(data: bytes, address: str, port: int) -> None:
         at_server.append(data)
         p.server.send_to(b"re:" + data, address, port)
 
-    def on_client(data: bytes, address: str, port: int) -> None:
+    def client_received(data: bytes, address: str, port: int) -> None:
         at_client.append(data)
         if len(at_client) == count:
             report(t, outcome(check))
 
-    def on_error(message: str, fatal: bool) -> None:
+    def client_failed(message: str, fatal: bool) -> None:
         t.failure(AssertionError("unexpected error: " + message))
 
-    p.server.set_receiver(on_server)
-    p.client.set_receiver(on_client, on_error)
+    p.server.set_receiver(server_received)
+    p.client.set_receiver(client_received, client_failed)
     for d in _numbered(count):
         p.client.send(d)
 
@@ -214,23 +214,23 @@ actor _test_mem_many_peers(t: testing.AsyncT):
                                                  (1, b"to 10.0.0.3", "10.0.0.1", 161),
                                                  (2, b"to 10.0.0.4", "10.0.0.1", 161)])
 
-    def on_server(data: bytes, address: str, port: int) -> None:
+    def server_received(data: bytes, address: str, port: int) -> None:
         at_server.append((data, address, port))
         srv.send_to(b"to " + address.encode(), address, port)
 
-    def on_error(message: str, fatal: bool) -> None:
+    def client_failed(message: str, fatal: bool) -> None:
         t.failure(AssertionError("unexpected error: " + message))
 
     def receiver(i: int) -> action(bytes, str, int) -> None:
-        def on_client(data: bytes, address: str, port: int) -> None:
+        def client_received(data: bytes, address: str, port: int) -> None:
             at_clients.append((i, data, address, port))
             if len(at_clients) == 3:
                 report(t, outcome(check))
-        return on_client
+        return client_received
 
-    srv.set_receiver(on_server)
+    srv.set_receiver(server_received)
     for i in range(3):
-        clients[i].set_receiver(receiver(i), on_error)
+        clients[i].set_receiver(receiver(i), client_failed)
         clients[i].send(("c%d" % i).encode())
 
 
@@ -297,17 +297,17 @@ actor _test_mem_buffered_until_receiver(t: testing.AsyncT):
         testing.assertEqual(got, _numbered(transport.MAX_BUFFERED) + [b"after"])
         testing.assertEqual(repr(mn.stats()), _counts(sent=total + 2, delivered=total + 2))
 
-    def on_late(data: bytes, address: str, port: int) -> None:
+    def late_received(data: bytes, address: str, port: int) -> None:
         got.append(data)
         if data == b"after":
             report(t, outcome(check))
 
-    def on_marker(data: bytes, address: str, port: int) -> None:
+    def marker_received(data: bytes, address: str, port: int) -> None:
         # MemNet delivered every earlier datagram to late before this one
-        late.set_receiver(on_late)
+        late.set_receiver(late_received)
         sender.send_to(b"after", "10.0.0.1", 161)
 
-    marker.set_receiver(on_marker)
+    marker.set_receiver(marker_received)
     for d in _numbered(total):
         sender.send_to(d, "10.0.0.1", 161)
     sender.send_to(b"marker", "10.0.0.3", 3)
@@ -322,23 +322,23 @@ actor _test_mem_replace_receiver(t: testing.AsyncT):
     def check() -> None:
         testing.assertEqual(log, ["first a", "second b"])
 
-    def on_error(message: str, fatal: bool) -> None:
+    def client_failed(message: str, fatal: bool) -> None:
         t.failure(AssertionError("unexpected error: " + message))
 
-    def second(data: bytes, address: str, port: int) -> None:
+    def second_received(data: bytes, address: str, port: int) -> None:
         log.append("second " + data.decode())
         report(t, outcome(check))
 
-    def first(data: bytes, address: str, port: int) -> None:
+    def first_received(data: bytes, address: str, port: int) -> None:
         log.append("first " + data.decode())
-        p.client.set_receiver(second, on_error)
+        p.client.set_receiver(second_received, client_failed)
         p.server.send_to(b"b", "10.0.0.2", 40000)
 
-    def on_server(data: bytes, address: str, port: int) -> None:
+    def server_received(data: bytes, address: str, port: int) -> None:
         p.server.send_to(b"a", address, port)
 
-    p.server.set_receiver(on_server)
-    p.client.set_receiver(first, on_error)
+    p.server.set_receiver(server_received)
+    p.client.set_receiver(first_received, client_failed)
     p.client.send(b"go")
 
 
@@ -354,14 +354,14 @@ actor _test_mem_inject_and_history(t: testing.AsyncT):
         testing.assertEqual(len(hist), 1)
         testing.assertEqual(repr(hist[0]), "Datagram(192.0.2.66:6666 -> 10.0.0.2:40000, 416869)")
 
-    def on_client(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         got.append((data, address, port))
         report(t, outcome(check))
 
-    def on_error(message: str, fatal: bool) -> None:
+    def failed(message: str, fatal: bool) -> None:
         t.failure(AssertionError("unexpected error: " + message))
 
-    p.client.set_receiver(on_client, on_error)
+    p.client.set_receiver(received, failed)
     mn.send(b"Ahi", "192.0.2.66", 6666, "10.0.0.2", 40000)
 
 
@@ -376,25 +376,25 @@ actor _test_mem_unroutable(t: testing.AsyncT):
         testing.assertEqual(errors, [(transport.REFUSED, False)])
         testing.assertEqual(repr(mn.stats()), _counts(sent=3, unroutable=2, delivered=1))
 
-    def on_late(data: bytes, address: str, port: int) -> None:
+    def late_received(data: bytes, address: str, port: int) -> None:
         if data == b"again":
             report(t, outcome(check))
 
-    def on_error(message: str, fatal: bool) -> None:
+    def client_failed(message: str, fatal: bool) -> None:
         errors.append((message, fatal))
         # Bind the missing peer, then send again over the same transport
         s = mn.server("10.0.0.7", 7)
-        s.set_receiver(on_late)
+        s.set_receiver(late_received)
         cl.send(b"again")
 
-    def on_client(data: bytes, address: str, port: int) -> None:
+    def client_received(data: bytes, address: str, port: int) -> None:
         t.failure(AssertionError("unexpected datagram"))
 
-    def on_server(data: bytes, address: str, port: int) -> None:
+    def server_received(data: bytes, address: str, port: int) -> None:
         t.failure(AssertionError("unexpected datagram at the server"))
 
-    srv.set_receiver(on_server)
-    cl.set_receiver(on_client, on_error)
+    srv.set_receiver(server_received)
+    cl.set_receiver(client_received, client_failed)
     # From the server's address straight into MemNet, so it comes first; a
     # server has no error callback, so its REFUSED goes nowhere
     mn.send(b"nobody", "10.0.0.1", 161, "10.9.9.9", 9)
@@ -411,19 +411,19 @@ actor _test_mem_errors_and_data_in_order(t: testing.AsyncT):
     def check() -> None:
         testing.assertEqual(log, ["error " + transport.REFUSED, "data one", "error " + transport.REFUSED, "data two"])
 
-    def on_data(data: bytes, address: str, port: int) -> None:
+    def client_received(data: bytes, address: str, port: int) -> None:
         log.append("data " + data.decode())
         if data == b"two":
             report(t, outcome(check))
 
-    def on_error(message: str, fatal: bool) -> None:
+    def client_failed(message: str, fatal: bool) -> None:
         log.append("error " + message)
 
-    def on_server(data: bytes, address: str, port: int) -> None:
+    def server_received(data: bytes, address: str, port: int) -> None:
         log.append("server got " + data.decode())
 
-    cl.set_receiver(on_data, on_error)
-    srv.set_receiver(on_server)
+    cl.set_receiver(client_received, client_failed)
+    srv.set_receiver(server_received)
     # Straight into MemNet in this order; from an unbound destination the
     # sender (the client, or the server) gets REFUSED
     mn.send(b"lost", "10.0.0.2", 40000, "10.0.0.9", 9)
@@ -444,21 +444,21 @@ actor _test_mem_spoofed_copy_not_refused(t: testing.AsyncT):
         testing.assertEqual(log, ["sender " + transport.REFUSED])
         testing.assertEqual(repr(mn.stats()), _counts(sent=1, spoofed=1, unroutable=2))
 
-    def conclude() -> None:
+    def settled() -> None:
         report(t, outcome(check))
 
-    def on_data(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         log.append("data")
 
-    def on_sender_error(message: str, fatal: bool) -> None:
+    def sender_failed(message: str, fatal: bool) -> None:
         log.append("sender " + message)
-        after now NOTHING_WAIT: conclude()
+        after now NOTHING_WAIT: settled()
 
-    def on_bystander_error(message: str, fatal: bool) -> None:
+    def bystander_failed(message: str, fatal: bool) -> None:
         log.append("bystander " + message)
 
-    sender.set_receiver(on_data, on_sender_error)
-    bystander.set_receiver(on_data, on_bystander_error)
+    sender.set_receiver(received, sender_failed)
+    bystander.set_receiver(received, bystander_failed)
     sender.send(b"x")
 
 
@@ -473,18 +473,18 @@ actor _test_mem_oversize(t: testing.AsyncT):
         testing.assertEqual(errors, [("Failed to send UDP datagram: message too long", False)])
         testing.assertEqual(repr(mn.stats()), _counts(sent=2, oversize=1, delivered=1))
 
-    def on_server(data: bytes, address: str, port: int) -> None:
+    def server_received(data: bytes, address: str, port: int) -> None:
         report(t, outcome(lambda: check(len(data))))
 
-    def on_client(data: bytes, address: str, port: int) -> None:
+    def client_received(data: bytes, address: str, port: int) -> None:
         t.failure(AssertionError("unexpected datagram"))
 
-    def on_error(message: str, fatal: bool) -> None:
+    def client_failed(message: str, fatal: bool) -> None:
         errors.append((message, fatal))
         p.client.send(pseudo_random(transport.MAX_DATAGRAM, 2))
 
-    p.server.set_receiver(on_server)
-    p.client.set_receiver(on_client, on_error)
+    p.server.set_receiver(server_received)
+    p.client.set_receiver(client_received, client_failed)
     p.client.send(pseudo_random(transport.MAX_DATAGRAM + 1, 1))
 
 
@@ -499,32 +499,32 @@ actor _test_mem_close(t: testing.AsyncT):
         # "to closed server" and the injected "to closed client"
         testing.assertEqual(mn.stats().sent, 2)
 
-    def conclude() -> None:
+    def settled() -> None:
         report(t, outcome(check))
 
-    def on_server(data: bytes, address: str, port: int) -> None:
+    def server_received(data: bytes, address: str, port: int) -> None:
         log.append("server got " + data.decode())
 
-    def on_client(data: bytes, address: str, port: int) -> None:
+    def client_received(data: bytes, address: str, port: int) -> None:
         log.append("client got " + data.decode())
 
-    def on_error(message: str, fatal: bool) -> None:
+    def client_failed(message: str, fatal: bool) -> None:
         if not transport.is_unreachable(message):
             log.append("client error " + message)
 
-    p.server.set_receiver(on_server)
-    p.client.set_receiver(on_client, on_error)
+    p.server.set_receiver(server_received)
+    p.client.set_receiver(client_received, client_failed)
     p.server.close()
     p.server.close()
-    p.server.set_receiver(on_server)
+    p.server.set_receiver(server_received)
     p.server.send_to(b"from closed server", "10.0.0.2", 40000)
     p.client.send(b"to closed server")
     p.client.close()
     p.client.close()
-    p.client.set_receiver(on_client, on_error)
+    p.client.set_receiver(client_received, client_failed)
     p.client.send(b"from closed client")
     mn.send(b"to closed client", "10.0.0.1", 161, "10.0.0.2", 40000)
-    after now NOTHING_WAIT: conclude()
+    after now NOTHING_WAIT: settled()
 
 
 actor _test_mem_wrapped_transport(t: testing.AsyncT):
@@ -543,19 +543,19 @@ actor _test_mem_wrapped_transport(t: testing.AsyncT):
     def check() -> None:
         testing.assertEqual(recorded, [b"one", b"two"])
 
-    def on_server(data: bytes, address: str, port: int) -> None:
+    def server_received(data: bytes, address: str, port: int) -> None:
         if data == b"two":
             p.server.send_to(b"done", address, port)
 
-    def on_client(data: bytes, address: str, port: int) -> None:
+    def client_received(data: bytes, address: str, port: int) -> None:
         wrapped.close()
         report(t, outcome(check))
 
-    def on_error(message: str, fatal: bool) -> None:
+    def client_failed(message: str, fatal: bool) -> None:
         t.failure(AssertionError("unexpected error: " + message))
 
-    p.server.set_receiver(on_server)
-    wrapped.set_receiver(on_client, on_error)
+    p.server.set_receiver(server_received)
+    wrapped.set_receiver(client_received, client_failed)
     wrapped.send(b"one")
     wrapped.send(b"two")
 
@@ -579,23 +579,23 @@ actor _fault_run(t: testing.AsyncT, faults: NetFaults, sends: list[bytes], expec
         testing.assertEqual(repr(mn.stats()), counts)
         testing.assertTrue(last_elapsed >= min_elapsed, "last datagram after %f s" % last_elapsed)
 
-    def conclude() -> None:
+    def settled() -> None:
         report(t, outcome(check))
 
-    def on_server(data: bytes, address: str, port: int) -> None:
+    def server_received(data: bytes, address: str, port: int) -> None:
         got.append((data, port))
         if len(got) == len(expected):
             last_elapsed = _elapsed(start)
-            after now NOTHING_WAIT: conclude()
+            after now NOTHING_WAIT: settled()
 
-    def on_error(message: str, fatal: bool) -> None:
+    def client_failed(message: str, fatal: bool) -> None:
         t.failure(AssertionError("unexpected error: " + message))
 
-    def on_client(data: bytes, address: str, port: int) -> None:
+    def client_received(data: bytes, address: str, port: int) -> None:
         t.failure(AssertionError("unexpected datagram at the client"))
 
-    p.server.set_receiver(on_server)
-    p.client.set_receiver(on_client, on_error)
+    p.server.set_receiver(server_received)
+    p.client.set_receiver(client_received, client_failed)
     for d in sends:
         p.client.send(d)
 
@@ -678,24 +678,24 @@ actor _test_fault_selector(t: testing.AsyncT):
         testing.assertEqual(at_client, [b"b", b"b"])
         testing.assertEqual(repr(mn.stats()), _counts(sent=3, duplicated=1, delivered=4))
 
-    def conclude() -> None:
+    def settled() -> None:
         report(t, outcome(check))
 
-    def on_server(data: bytes, address: str, port: int) -> None:
+    def server_received(data: bytes, address: str, port: int) -> None:
         at_server.append(data)
         if data == b"end":
             p.server.send_to(b"b", address, port)
 
-    def on_client(data: bytes, address: str, port: int) -> None:
+    def client_received(data: bytes, address: str, port: int) -> None:
         at_client.append(data)
         if len(at_client) == 2:
-            after now NOTHING_WAIT: conclude()
+            after now NOTHING_WAIT: settled()
 
-    def on_error(message: str, fatal: bool) -> None:
+    def client_failed(message: str, fatal: bool) -> None:
         t.failure(AssertionError("unexpected error: " + message))
 
-    p.server.set_receiver(on_server)
-    p.client.set_receiver(on_client, on_error)
+    p.server.set_receiver(server_received)
+    p.client.set_receiver(client_received, client_failed)
     p.client.send(b"a")
     p.client.send(b"end")
 
@@ -710,7 +710,7 @@ actor _test_fault_set_faults(t: testing.AsyncT):
         testing.assertEqual(got, [b"1", b"3", b"4"])
         testing.assertEqual(repr(mn.stats()), _counts(sent=5, dropped=2, delivered=3))
 
-    def on_server(data: bytes, address: str, port: int) -> None:
+    def server_received(data: bytes, address: str, port: int) -> None:
         got.append(data)
         if data == b"1":
             mn.set_faults(NetFaults(drop_first_n=1))
@@ -722,14 +722,14 @@ actor _test_fault_set_faults(t: testing.AsyncT):
         else:
             report(t, outcome(check))
 
-    def on_error(message: str, fatal: bool) -> None:
+    def client_failed(message: str, fatal: bool) -> None:
         t.failure(AssertionError("unexpected error: " + message))
 
-    def on_client(data: bytes, address: str, port: int) -> None:
+    def client_received(data: bytes, address: str, port: int) -> None:
         pass
 
-    p.server.set_receiver(on_server)
-    p.client.set_receiver(on_client, on_error)
+    p.server.set_receiver(server_received)
+    p.client.set_receiver(client_received, client_failed)
     p.client.send(b"0")
     p.client.send(b"1")
 
@@ -744,15 +744,15 @@ actor _test_fault_set_faults_releases_held(t: testing.AsyncT):
         testing.assertEqual(got, [b"0", b"2", b"1"])
         testing.assertEqual(repr(mn.stats()), _counts(sent=3, reordered=1, delivered=3))
 
-    def conclude() -> None:
+    def settled() -> None:
         report(t, outcome(check))
 
-    def on_server(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         got.append(data)
         if len(got) == 3:
-            after now NOTHING_WAIT: conclude()
+            after now NOTHING_WAIT: settled()
 
-    srv.set_receiver(on_server)
+    srv.set_receiver(received)
     # The test talks to MemNet directly, so these happen in this order
     mn.send(b"0", "10.0.0.2", 40000, "10.0.0.1", 161)
     mn.set_faults(NetFaults(reorder=True))
@@ -772,12 +772,12 @@ actor _test_fault_set_faults_releases_delayed(t: testing.AsyncT):
         testing.assertEqual(repr(mn.stats()), _counts(sent=4, delayed=3, delivered=4))
         testing.assertTrue(_elapsed(start) < 30.0)
 
-    def on_server(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         got.append(data)
         if len(got) == 4:
             report(t, outcome(check))
 
-    srv.set_receiver(on_server)
+    srv.set_receiver(received)
     for d in _numbered(3):
         mn.send(d, "10.0.0.2", 40000, "10.0.0.1", 161)
     mn.set_faults(None)
@@ -811,7 +811,7 @@ actor _udp_roundtrip(t: testing.EnvT, listen_address: str, connect_address: str,
             s.close()
         report_env(t, error)
 
-    def on_client(data: bytes, address: str, port: int) -> None:
+    def client_received(data: bytes, address: str, port: int) -> None:
         def check() -> None:
             testing.assertEqual(server_saw, [(b"one", connect_address), (b"two", connect_address)])
             testing.assertEqual(data, b"pong")
@@ -819,17 +819,17 @@ actor _udp_roundtrip(t: testing.EnvT, listen_address: str, connect_address: str,
             testing.assertEqual(port, srv_port)
         finish(outcome(check))
 
-    def on_client_error(message: str, fatal: bool) -> None:
+    def client_failed(message: str, fatal: bool) -> None:
         finish(AssertionError("client error: " + message))
 
-    def on_server(data: bytes, address: str, port: int) -> None:
+    def server_received(data: bytes, address: str, port: int) -> None:
         server_saw.append((data, address))
         s = srv
         if s is not None:
             if data == b"two":
                 s.send_to(b"pong", address, port)
 
-    def on_ready(s: ServerTransport, error: ?str) -> None:
+    def listening(s: ServerTransport, error: ?str) -> None:
         if error is not None:
             if optional_ipv6 and _ipv6_unavailable(error):
                 done = True
@@ -842,18 +842,18 @@ actor _udp_roundtrip(t: testing.EnvT, listen_address: str, connect_address: str,
         if srv_port <= 0:
             finish(AssertionError("no local port"))
             return
-        s.set_receiver(on_server)
+        s.set_receiver(server_received)
         c = transport.udp_transport(net.UDPConnectCap(ucap), connect_address, srv_port)
         cl = c
-        c.set_receiver(on_client, on_client_error)
+        c.set_receiver(client_received, client_failed)
         c.send(b"one")
         c.send(b"two")
 
-    def watchdog() -> None:
+    def timed_out() -> None:
         finish(AssertionError("UDP roundtrip timed out"))
 
-    after now SOCKET_WATCHDOG: watchdog()
-    transport.udp_server_transport(net.UDPListenCap(ucap), listen_address, 0, on_ready, t.log_handler)
+    after now SOCKET_WATCHDOG: timed_out()
+    transport.udp_server_transport(net.UDPListenCap(ucap), listen_address, 0, listening, t.log_handler)
 
 
 actor _test_udp_ipv4_roundtrip(t: testing.EnvT):
@@ -893,7 +893,7 @@ actor _test_udp_unreachable_then_usable(t: testing.EnvT):
             s.close()
         report_env(t, error)
 
-    def on_client(data: bytes, address: str, rport: int) -> None:
+    def client_received(data: bytes, address: str, rport: int) -> None:
         if data == b"probe":
             # a probe sent after the one that was refused, before the refusal arrived, can reach the
             # second listener and come back: wait for the answer to "again"
@@ -907,12 +907,12 @@ actor _test_udp_unreachable_then_usable(t: testing.EnvT):
                 testing.assertFalse(e.1, "fatal error " + e.0)
         finish(outcome(check))
 
-    def on_echo(data: bytes, address: str, rport: int) -> None:
+    def echo_received(data: bytes, address: str, rport: int) -> None:
         s = srv
         if s is not None:
             s.send_to(data, address, rport)
 
-    def on_second_ready(s: ServerTransport, error: ?str) -> None:
+    def second_listening(s: ServerTransport, error: ?str) -> None:
         if done:
             return
         if error is not None:
@@ -923,16 +923,16 @@ actor _test_udp_unreachable_then_usable(t: testing.EnvT):
             finish(AssertionError("second listen: " + error))
             return
         srv = s
-        s.set_receiver(on_echo)
+        s.set_receiver(echo_received)
         c = cl
         if c is not None:
             c.send(b"again")
 
     def listen_again() -> None:
         listen_tries += 1
-        transport.udp_server_transport(net.UDPListenCap(ucap), "127.0.0.1", port, on_second_ready, t.log_handler)
+        transport.udp_server_transport(net.UDPListenCap(ucap), "127.0.0.1", port, second_listening, t.log_handler)
 
-    def on_client_error(message: str, fatal: bool) -> None:
+    def client_failed(message: str, fatal: bool) -> None:
         errors.append((message, fatal))
         refused += 1
         if refused == 1:
@@ -946,7 +946,7 @@ actor _test_udp_unreachable_then_usable(t: testing.EnvT):
                 c.send(b"probe")
                 after now 0.05: probe(n + 1)
 
-    def on_first_ready(s: ServerTransport, error: ?str) -> None:
+    def first_listening(s: ServerTransport, error: ?str) -> None:
         if error is not None:
             finish(AssertionError("first listen: " + error))
             return
@@ -954,14 +954,14 @@ actor _test_udp_unreachable_then_usable(t: testing.EnvT):
         s.close()
         c = transport.udp_transport(net.UDPConnectCap(ucap), "127.0.0.1", port)
         cl = c
-        c.set_receiver(on_client, on_client_error)
+        c.set_receiver(client_received, client_failed)
         probe(0)
 
-    def watchdog() -> None:
+    def timed_out() -> None:
         finish(AssertionError("timed out; errors: " + str(errors)))
 
-    after now SOCKET_WATCHDOG: watchdog()
-    transport.udp_server_transport(net.UDPListenCap(ucap), "127.0.0.1", 0, on_first_ready, t.log_handler)
+    after now SOCKET_WATCHDOG: timed_out()
+    transport.udp_server_transport(net.UDPListenCap(ucap), "127.0.0.1", 0, first_listening, t.log_handler)
 
 
 actor _test_udp_hostname_queues_until_connected(t: testing.EnvT):
@@ -986,7 +986,7 @@ actor _test_udp_hostname_queues_until_connected(t: testing.EnvT):
             s.close()
         report_env(t, error)
 
-    def on_server(data: bytes, address: str, port: int) -> None:
+    def server_received(data: bytes, address: str, port: int) -> None:
         got.append(data)
         sources.append(address)
         if len(got) == 20:
@@ -996,13 +996,13 @@ actor _test_udp_hostname_queues_until_connected(t: testing.EnvT):
                     testing.assertIn(a, ["127.0.0.1", "::1"])
             finish(outcome(check))
 
-    def on_client(data: bytes, address: str, port: int) -> None:
+    def client_received(data: bytes, address: str, port: int) -> None:
         finish(AssertionError("unexpected datagram"))
 
-    def on_client_error(message: str, fatal: bool) -> None:
+    def client_failed(message: str, fatal: bool) -> None:
         finish(AssertionError("client error: " + message))
 
-    def on_ready(s: ServerTransport, error: ?str) -> None:
+    def listening(s: ServerTransport, error: ?str) -> None:
         if error is not None:
             if _ipv6_unavailable(error):
                 done = True
@@ -1011,19 +1011,19 @@ actor _test_udp_hostname_queues_until_connected(t: testing.EnvT):
             finish(AssertionError("listen: " + error))
             return
         srv = s
-        s.set_receiver(on_server)
+        s.set_receiver(server_received)
         c = transport.udp_transport(net.UDPConnectCap(ucap), "localhost", s.local_port())
         cl = c
-        c.set_receiver(on_client, on_client_error)
+        c.set_receiver(client_received, client_failed)
         for d in _numbered(20):
             c.send(d)
 
-    def watchdog() -> None:
+    def timed_out() -> None:
         finish(AssertionError("timed out; got " + str(got)))
 
-    after now SOCKET_WATCHDOG: watchdog()
+    after now SOCKET_WATCHDOG: timed_out()
     # "::" takes the A and the AAAA answer for localhost alike
-    transport.udp_server_transport(net.UDPListenCap(ucap), "::", 0, on_ready, t.log_handler)
+    transport.udp_server_transport(net.UDPListenCap(ucap), "::", 0, listening, t.log_handler)
 
 
 actor _udp_setup_failure(t: testing.EnvT, address: str, port: int, expect: str):
@@ -1044,7 +1044,7 @@ actor _udp_setup_failure(t: testing.EnvT, address: str, port: int, expect: str):
             testing.assertIn(expect, e.0)
             testing.assertFalse(is_unreachable(e.0))
 
-    def conclude() -> None:
+    def settled() -> None:
         finish(outcome(check))
 
     def finish(error: ?Exception) -> None:
@@ -1053,23 +1053,23 @@ actor _udp_setup_failure(t: testing.EnvT, address: str, port: int, expect: str):
             c.close()
             report_env(t, error)
 
-    def on_data(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         finish(AssertionError("unexpected datagram"))
 
-    def on_error(message: str, fatal: bool) -> None:
+    def failed(message: str, fatal: bool) -> None:
         errors.append((message, fatal))
         if len(errors) == 1:
             c.send(b"fails fast")
         elif len(errors) == 2:
-            c.set_receiver(on_data, on_error)
+            c.set_receiver(received, failed)
         else:
-            after now NOTHING_WAIT: conclude()
+            after now NOTHING_WAIT: settled()
 
-    def watchdog() -> None:
+    def timed_out() -> None:
         finish(AssertionError("timed out; errors: " + str(errors)))
 
-    after now SOCKET_WATCHDOG: watchdog()
-    c.set_receiver(on_data, on_error)
+    after now SOCKET_WATCHDOG: timed_out()
+    c.set_receiver(received, failed)
 
 actor _test_udp_invalid_port_is_fatal(t: testing.EnvT):
     """Port 0 cannot be connected to: a fatal error, repeated for each send"""
@@ -1101,7 +1101,7 @@ actor _test_udp_server_failures(t: testing.EnvT):
             f.close()
         report_env(t, error)
 
-    def on_busy(s: ServerTransport, error: ?str) -> None:
+    def busy_failed(s: ServerTransport, error: ?str) -> None:
         def check() -> None:
             testing.assertNotNone(error)
             testing.assertIn("address already in use", error!)
@@ -1113,14 +1113,14 @@ actor _test_udp_server_failures(t: testing.EnvT):
         s.close()
         finish(outcome(check))
 
-    def on_first(s: ServerTransport, error: ?str) -> None:
+    def first_listening(s: ServerTransport, error: ?str) -> None:
         if error is not None:
             finish(AssertionError("listen: " + error))
             return
         first = s
-        transport.udp_server_transport(net.UDPListenCap(ucap), "127.0.0.1", s.local_port(), on_busy, t.log_handler)
+        transport.udp_server_transport(net.UDPListenCap(ucap), "127.0.0.1", s.local_port(), busy_failed, t.log_handler)
 
-    def on_bad_port(s: ServerTransport, error: ?str) -> None:
+    def bad_port_failed(s: ServerTransport, error: ?str) -> None:
         if error is not None:
             log.append(error)
         if len(log) != 1 or s.local_port() != 0:
@@ -1128,13 +1128,13 @@ actor _test_udp_server_failures(t: testing.EnvT):
             return
         s.send_to(b"ignored", "127.0.0.1", 9)
         s.close()
-        transport.udp_server_transport(net.UDPListenCap(ucap), "127.0.0.1", 0, on_first, t.log_handler)
+        transport.udp_server_transport(net.UDPListenCap(ucap), "127.0.0.1", 0, first_listening, t.log_handler)
 
-    def watchdog() -> None:
+    def timed_out() -> None:
         finish(AssertionError("timed out; log: " + str(log)))
 
-    after now SOCKET_WATCHDOG: watchdog()
-    transport.udp_server_transport(net.UDPListenCap(ucap), "127.0.0.1", 70000, on_bad_port, t.log_handler)
+    after now SOCKET_WATCHDOG: timed_out()
+    transport.udp_server_transport(net.UDPListenCap(ucap), "127.0.0.1", 70000, bad_port_failed, t.log_handler)
 
 
 actor _test_udp_close_idempotent(t: testing.EnvT):
@@ -1144,39 +1144,39 @@ actor _test_udp_close_idempotent(t: testing.EnvT):
     var log: list[str] = []
     var srv: ?ServerTransport = None
 
-    def on_server(data: bytes, address: str, port: int) -> None:
+    def server_received(data: bytes, address: str, port: int) -> None:
         # "early" may or may not have left before the close
         if data != b"early":
             log.append("server got " + data.decode())
 
-    def on_data(data: bytes, address: str, port: int) -> None:
+    def client_received(data: bytes, address: str, port: int) -> None:
         log.append("data " + data.decode())
 
-    def on_error(message: str, fatal: bool) -> None:
+    def client_failed(message: str, fatal: bool) -> None:
         log.append("error " + message)
 
     def check() -> None:
         testing.assertEqual(log, [])
 
-    def finish() -> None:
+    def settled() -> None:
         s = srv
         if s is not None:
             s.close()
         report_env(t, outcome(check))
 
-    def on_ready(s: ServerTransport, error: ?str) -> None:
+    def listening(s: ServerTransport, error: ?str) -> None:
         if error is not None:
             report_env(t, AssertionError("listen: " + error))
             return
         srv = s
-        s.set_receiver(on_server)
+        s.set_receiver(server_received)
         port = s.local_port()
         # Dropped and logged: a port that is not valid, an address that is not an IP address
         s.send_to(b"bad port", "127.0.0.1", 0)
         s.send_to(b"bad address", "not-an-ip", 9)
         # Closed right away, before its socket is connected
         early = transport.udp_transport(net.UDPConnectCap(ucap), "127.0.0.1", port)
-        early.set_receiver(on_data, on_error)
+        early.set_receiver(client_received, client_failed)
         early.send(b"early")
         early.close()
         early.close()
@@ -1184,12 +1184,12 @@ actor _test_udp_close_idempotent(t: testing.EnvT):
         # Closed first, then used
         c = transport.udp_transport(net.UDPConnectCap(ucap), "127.0.0.1", port)
         c.close()
-        c.set_receiver(on_data, on_error)
+        c.set_receiver(client_received, client_failed)
         c.send(b"after close")
         c.close()
-        after now NOTHING_WAIT: finish()
+        after now NOTHING_WAIT: settled()
 
-    transport.udp_server_transport(net.UDPListenCap(ucap), "127.0.0.1", 0, on_ready, t.log_handler)
+    transport.udp_server_transport(net.UDPListenCap(ucap), "127.0.0.1", 0, listening, t.log_handler)
 
 
 # Stream framing ###################################################################################
@@ -1408,30 +1408,30 @@ actor _tcp_roundtrip(t: testing.EnvT, address: str, first_port: int, optional_ip
             s.close()
         report_env(t, error)
 
-    def conclude() -> None:
+    def settled() -> None:
         def check() -> None:
             testing.assertTrue(got == sent, "the echoes differ from what was sent")
             testing.assertEqual(server_saw, [("", 1) for _ in sent])
             testing.assertEqual(sources, [(address, srv_port) for _ in sent])
         finish(outcome(check))
 
-    def on_client(data: bytes, address_seen: str, port_seen: int) -> None:
+    def client_received(data: bytes, address_seen: str, port_seen: int) -> None:
         got.append(data)
         sources.append((address_seen, port_seen))
         if len(got) == len(sent):
-            after now NOTHING_WAIT: conclude()
+            after now NOTHING_WAIT: settled()
 
-    def on_client_error(message: str, fatal: bool) -> None:
+    def client_failed(message: str, fatal: bool) -> None:
         finish(AssertionError("client error: " + message))
 
-    def on_server(data: bytes, src_address: str, src_port: int) -> None:
+    def server_received(data: bytes, src_address: str, src_port: int) -> None:
         server_saw.append((src_address, src_port))
         s = srv
         if s is not None:
             s.send_to(data, address, src_port)
             s.send_to(data, src_address, src_port)
 
-    def on_ready(s: ServerTransport, error: ?str) -> None:
+    def listening(s: ServerTransport, error: ?str) -> None:
         if error is not None:
             if optional_ipv6 and _ipv6_unavailable(error):
                 done = True
@@ -1441,18 +1441,18 @@ actor _tcp_roundtrip(t: testing.EnvT, address: str, first_port: int, optional_ip
             return
         srv = s
         srv_port = s.local_port()
-        s.set_receiver(on_server)
+        s.set_receiver(server_received)
         c = transport.tcp_transport(net.TCPConnectCap(tcap), address, srv_port)
         cl = c
-        c.set_receiver(on_client, on_client_error)
+        c.set_receiver(client_received, client_failed)
         for m in sent:
             c.send(m)
 
-    def watchdog() -> None:
+    def timed_out() -> None:
         finish(AssertionError("TCP roundtrip timed out; got %d of %d" % (len(got), len(sent))))
 
-    after now SOCKET_WATCHDOG: watchdog()
-    listener = ListenTcp(net.TCPListenCap(tcap), address, first_port, TCP_RANGE, on_ready, t.log_handler)
+    after now SOCKET_WATCHDOG: timed_out()
+    listener = ListenTcp(net.TCPListenCap(tcap), address, first_port, TCP_RANGE, listening, t.log_handler)
 
 actor _test_tcp_ipv4_roundtrip(t: testing.EnvT):
     """TCP client and server over 127.0.0.1: messages of any size in order, the server sees a session"""
@@ -1513,15 +1513,15 @@ actor _tcp_pair(t: testing.EnvT, first_port: int, server_idle_timeout: float, cl
     def error_log() -> list[(str, bool)]:
         return errors
 
-    def on_client(data: bytes, address_seen: str, port_seen: int) -> None:
+    def client_received(data: bytes, address_seen: str, port_seen: int) -> None:
         client_got.append(data)
         on_event(self, "data")
 
-    def on_client_error(message: str, fatal: bool) -> None:
+    def client_failed(message: str, fatal: bool) -> None:
         errors.append((message, fatal))
         on_event(self, "error")
 
-    def on_server(data: bytes, src_address: str, src_port: int) -> None:
+    def server_received(data: bytes, src_address: str, src_port: int) -> None:
         server_saw.append((data, src_port))
         s = srv
         if s is not None:
@@ -1529,25 +1529,25 @@ actor _tcp_pair(t: testing.EnvT, first_port: int, server_idle_timeout: float, cl
                 s.send_to(data, src_address, src_port)
         on_event(self, "server")
 
-    def on_ready(s: ServerTransport, error: ?str) -> None:
+    def listening(s: ServerTransport, error: ?str) -> None:
         if error is not None:
             finish(AssertionError("listen: " + error))
             return
         srv = s
         port = s.local_port()
-        s.set_receiver(on_server)
+        s.set_receiver(server_received)
         c = transport.tcp_transport(net.TCPConnectCap(tcap), "127.0.0.1", port, idle_timeout=client_idle_timeout,
                                     stall_timeout=stall_timeout)
         cl = c
-        c.set_receiver(on_client, on_client_error)
+        c.set_receiver(client_received, client_failed)
         on_event(self, "ready")
 
-    def watchdog() -> None:
+    def timed_out() -> None:
         finish(AssertionError("timed out; server saw %d, client got %d, errors %s"
                               % (len(server_saw), len(client_got), str(errors))))
 
-    after now SOCKET_WATCHDOG: watchdog()
-    listener = ListenTcp(net.TCPListenCap(tcap), "127.0.0.1", first_port, TCP_RANGE, on_ready, t.log_handler,
+    after now SOCKET_WATCHDOG: timed_out()
+    listener = ListenTcp(net.TCPListenCap(tcap), "127.0.0.1", first_port, TCP_RANGE, listening, t.log_handler,
                          idle_timeout=server_idle_timeout)
 
 
@@ -1555,7 +1555,7 @@ actor _test_tcp_lost_framing(t: testing.EnvT):
     """The server closes a connection that loses framing; the client reports it and reconnects for its next message"""
     var sent_again = False
 
-    def conclude(pair: _tcp_pair) -> None:
+    def settled(pair: _tcp_pair) -> None:
         saw = pair.server_log()
         errors = pair.error_log()
         p = pair.local_port()
@@ -1564,7 +1564,7 @@ actor _test_tcp_lost_framing(t: testing.EnvT):
             testing.assertEqual(errors, [("TCP connection to 127.0.0.1:%d closed by the peer" % p, False)])
         pair.finish(outcome(check))
 
-    def on_event(pair: _tcp_pair, event: str) -> None:
+    def happened(pair: _tcp_pair, event: str) -> None:
         if event == "ready":
             # An INTEGER where the message's SEQUENCE belongs
             pair.send(b"\x02\x01\x00")
@@ -1572,9 +1572,9 @@ actor _test_tcp_lost_framing(t: testing.EnvT):
             sent_again = True
             pair.send(GET_SYS_DESCR)
         elif event == "data":
-            after now NOTHING_WAIT: conclude(pair)
+            after now NOTHING_WAIT: settled(pair)
 
-    pair = _tcp_pair(t, _tcp_port_range(2), 300.0, 60.0, 1.0, [], on_event)
+    pair = _tcp_pair(t, _tcp_port_range(2), 300.0, 60.0, 1.0, [], happened)
 
 
 actor _test_tcp_stall_reconnects(t: testing.EnvT):
@@ -1589,10 +1589,10 @@ actor _test_tcp_stall_reconnects(t: testing.EnvT):
     unanswered = _seq(4, 0, 22)
     next_one = _seq(4, 0, 23)
 
-    def later(pair: _tcp_pair, data: bytes) -> None:
+    def send_due(pair: _tcp_pair, data: bytes) -> None:
         pair.send(data)
 
-    def conclude(pair: _tcp_pair) -> None:
+    def settled(pair: _tcp_pair) -> None:
         saw = pair.server_log()
         errors = pair.error_log()
         p = pair.local_port()
@@ -1605,18 +1605,18 @@ actor _test_tcp_stall_reconnects(t: testing.EnvT):
             testing.assertFalse(errors[0].1, "fatal")
         pair.finish(outcome(check))
 
-    def on_event(pair: _tcp_pair, event: str) -> None:
+    def happened(pair: _tcp_pair, event: str) -> None:
         if event == "ready":
             pair.send(ping)
         elif event == "data":
-            after now 0.3: later(pair, unanswered)
+            after now 0.3: send_due(pair, unanswered)
         elif event == "server" and len(pair.server_log()) == 2:
             # twice stall_timeout after unanswered went out
-            after now 0.3: later(pair, next_one)
+            after now 0.3: send_due(pair, next_one)
         elif event == "server" and len(pair.server_log()) == 3:
-            after now NOTHING_WAIT: conclude(pair)
+            after now NOTHING_WAIT: settled(pair)
 
-    pair = _tcp_pair(t, _tcp_port_range(3), 300.0, 60.0, 0.15, [unanswered, next_one], on_event)
+    pair = _tcp_pair(t, _tcp_port_range(3), 300.0, 60.0, 0.15, [unanswered, next_one], happened)
 
 
 actor _test_tcp_client_idle_timeout(t: testing.EnvT):
@@ -1624,10 +1624,10 @@ actor _test_tcp_client_idle_timeout(t: testing.EnvT):
     first = _seq(4, 0, 31)
     second = _seq(4, 0, 32)
 
-    def later(pair: _tcp_pair, data: bytes) -> None:
+    def send_due(pair: _tcp_pair, data: bytes) -> None:
         pair.send(data)
 
-    def conclude(pair: _tcp_pair) -> None:
+    def settled(pair: _tcp_pair) -> None:
         saw = pair.server_log()
         got = pair.client_log()
         errors = pair.error_log()
@@ -1637,16 +1637,16 @@ actor _test_tcp_client_idle_timeout(t: testing.EnvT):
             testing.assertEqual(errors, [])
         pair.finish(outcome(check))
 
-    def on_event(pair: _tcp_pair, event: str) -> None:
+    def happened(pair: _tcp_pair, event: str) -> None:
         if event == "ready":
             pair.send(first)
         elif event == "data":
             if len(pair.client_log()) == 1:
-                after now 0.35: later(pair, second)
+                after now 0.35: send_due(pair, second)
             else:
-                after now NOTHING_WAIT: conclude(pair)
+                after now NOTHING_WAIT: settled(pair)
 
-    pair = _tcp_pair(t, _tcp_port_range(4), 300.0, 0.1, 1.0, [], on_event)
+    pair = _tcp_pair(t, _tcp_port_range(4), 300.0, 0.1, 1.0, [], happened)
 
 
 actor _test_tcp_server_idle_timeout(t: testing.EnvT):
@@ -1666,7 +1666,7 @@ actor _test_tcp_server_idle_timeout(t: testing.EnvT):
             testing.assertEqual(errors, [("TCP connection to 127.0.0.1:%d closed by the peer" % p, False)])
         pair.finish(outcome(check))
 
-    def on_event(pair: _tcp_pair, event: str) -> None:
+    def happened(pair: _tcp_pair, event: str) -> None:
         if event == "ready":
             pair.send(first)
         elif event == "error" and not sent_again:
@@ -1676,7 +1676,7 @@ actor _test_tcp_server_idle_timeout(t: testing.EnvT):
             # now, before the second connection idles out as well
             conclude(pair)
 
-    pair = _tcp_pair(t, _tcp_port_range(5), 0.1, 60.0, 1.0, [], on_event)
+    pair = _tcp_pair(t, _tcp_port_range(5), 0.1, 60.0, 1.0, [], happened)
 
 
 actor _test_tcp_server_close(t: testing.EnvT):
@@ -1685,7 +1685,7 @@ actor _test_tcp_server_close(t: testing.EnvT):
     second = _seq(4, 0, 52)
     var sent_again = False
 
-    def conclude(pair: _tcp_pair) -> None:
+    def settled(pair: _tcp_pair) -> None:
         saw = pair.server_log()
         got = pair.client_log()
         errors = pair.error_log()
@@ -1699,7 +1699,7 @@ actor _test_tcp_server_close(t: testing.EnvT):
             testing.assertEqual(errors[0], ("TCP connection to 127.0.0.1:%d closed by the peer" % p, False))
         pair.finish(outcome(check))
 
-    def on_event(pair: _tcp_pair, event: str) -> None:
+    def happened(pair: _tcp_pair, event: str) -> None:
         if event == "ready":
             pair.send(first)
         elif event == "data":
@@ -1707,9 +1707,9 @@ actor _test_tcp_server_close(t: testing.EnvT):
         elif event == "error" and not sent_again:
             sent_again = True
             pair.send(second)
-            after now 0.3: conclude(pair)
+            after now 0.3: settled(pair)
 
-    pair = _tcp_pair(t, _tcp_port_range(6), 300.0, 60.0, 1.0, [], on_event)
+    pair = _tcp_pair(t, _tcp_port_range(6), 300.0, 60.0, 1.0, [], happened)
 
 
 actor _test_tcp_refused(t: testing.EnvT):
@@ -1728,7 +1728,7 @@ actor _test_tcp_refused(t: testing.EnvT):
             c.close()
             report_env(t, error)
 
-    def conclude() -> None:
+    def settled() -> None:
         def check() -> None:
             text = "TCP connection to 127.0.0.1:%d failed: connection refused" % TCP_CLOSED_PORT
             # the first connection with its two messages, 50 sends while it is held off, one connection after
@@ -1738,13 +1738,13 @@ actor _test_tcp_refused(t: testing.EnvT):
             testing.assertTrue(fds_after - fds_before < 10, "%d more file descriptors" % (fds_after - fds_before))
         finish(outcome(check))
 
-    def try_again() -> None:
+    def retry_due() -> None:
         c.send(GET_SYS_DESCR)
 
-    def on_data(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         finish(AssertionError("unexpected message"))
 
-    def on_error(message: str, fatal: bool) -> None:
+    def failed(message: str, fatal: bool) -> None:
         errors.append((message, fatal))
         n = len(errors)
         if n == 1:
@@ -1754,15 +1754,15 @@ actor _test_tcp_refused(t: testing.EnvT):
             c.send(GET_SYS_DESCR)
         elif n == 51:
             fds_after = _open_fds(t)
-            after now 1.2: try_again()
+            after now 1.2: retry_due()
         elif n == 52:
-            after now NOTHING_WAIT: conclude()
+            after now NOTHING_WAIT: settled()
 
-    def watchdog() -> None:
+    def timed_out() -> None:
         finish(AssertionError("timed out; errors: " + str(errors)))
 
-    after now SOCKET_WATCHDOG: watchdog()
-    c.set_receiver(on_data, on_error)
+    after now SOCKET_WATCHDOG: timed_out()
+    c.set_receiver(received, failed)
     c.send(GET_SYS_DESCR)
     c.send(GET_SYS_DESCR)
 
@@ -1784,16 +1784,16 @@ actor _test_tcp_connect_timeout(t: testing.EnvT):
             c.close()
             report_env(t, error)
 
-    def conclude() -> None:
+    def settled() -> None:
         def check() -> None:
             testing.assertEqual(errors, [(expected, False)])
             testing.assertTrue(elapsed >= 0.15, "error after %f s" % elapsed)
         finish(outcome(check))
 
-    def on_data(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         finish(AssertionError("unexpected message"))
 
-    def on_error(message: str, fatal: bool) -> None:
+    def failed(message: str, fatal: bool) -> None:
         errors.append((message, fatal))
         if len(errors) == 1:
             elapsed = _elapsed(start)
@@ -1803,13 +1803,13 @@ actor _test_tcp_connect_timeout(t: testing.EnvT):
                 c.close()
                 _skip_env(t, "no route to 192.0.2.1: " + message)
                 return
-            after now NOTHING_WAIT: conclude()
+            after now NOTHING_WAIT: settled()
 
-    def watchdog() -> None:
+    def timed_out() -> None:
         finish(AssertionError("timed out; errors: " + str(errors)))
 
-    after now SOCKET_WATCHDOG: watchdog()
-    c.set_receiver(on_data, on_error)
+    after now SOCKET_WATCHDOG: timed_out()
+    c.set_receiver(received, failed)
     c.send(GET_SYS_DESCR)
 
 
@@ -1825,7 +1825,7 @@ actor _tcp_setup_failure(t: testing.EnvT, address: str, port: int, expect: str):
     def check() -> None:
         testing.assertEqual(errors, [(expect, True), (expect, True), (expect, True)])
 
-    def conclude() -> None:
+    def settled() -> None:
         finish(outcome(check))
 
     def finish(error: ?Exception) -> None:
@@ -1834,23 +1834,23 @@ actor _tcp_setup_failure(t: testing.EnvT, address: str, port: int, expect: str):
             c.close()
             report_env(t, error)
 
-    def on_data(data: bytes, address_seen: str, port_seen: int) -> None:
+    def received(data: bytes, address_seen: str, port_seen: int) -> None:
         finish(AssertionError("unexpected message"))
 
-    def on_error(message: str, fatal: bool) -> None:
+    def failed(message: str, fatal: bool) -> None:
         errors.append((message, fatal))
         if len(errors) == 1:
             c.send(GET_SYS_DESCR)
         elif len(errors) == 2:
-            c.set_receiver(on_data, on_error)
+            c.set_receiver(received, failed)
         else:
-            after now NOTHING_WAIT: conclude()
+            after now NOTHING_WAIT: settled()
 
-    def watchdog() -> None:
+    def timed_out() -> None:
         finish(AssertionError("timed out; errors: " + str(errors)))
 
-    after now SOCKET_WATCHDOG: watchdog()
-    c.set_receiver(on_data, on_error)
+    after now SOCKET_WATCHDOG: timed_out()
+    c.set_receiver(received, failed)
 
 actor _test_tcp_invalid_port_is_fatal(t: testing.EnvT):
     """Port 0 cannot be connected to: a fatal error, repeated for each send"""
@@ -1872,7 +1872,7 @@ actor _test_tcp_option_validation(t: testing.EnvT):
     lcap = net.TCPListenCap(tcap)
     var accepted: list[str] = []
 
-    def ignore(s: ServerTransport, error: ?str) -> None:
+    def ignored(s: ServerTransport, error: ?str) -> None:
         pass
 
     try:
@@ -1896,12 +1896,12 @@ actor _test_tcp_option_validation(t: testing.EnvT):
     except ValueError:
         pass
     try:
-        transport.tcp_server_transport(lcap, "127.0.0.1", TCP_CLOSED_PORT, ignore, max_connections=0)
+        transport.tcp_server_transport(lcap, "127.0.0.1", TCP_CLOSED_PORT, ignored, max_connections=0)
         accepted.append("max_connections 0")
     except ValueError:
         pass
     try:
-        transport.tcp_server_transport(lcap, "127.0.0.1", TCP_CLOSED_PORT, ignore, idle_timeout=-0.5)
+        transport.tcp_server_transport(lcap, "127.0.0.1", TCP_CLOSED_PORT, ignored, idle_timeout=-0.5)
         accepted.append("server idle_timeout -0.5")
     except ValueError:
         pass
@@ -1935,7 +1935,7 @@ actor _test_tcp_server_failures(t: testing.EnvT):
             f.close()
         report_env(t, error)
 
-    def failed(s: ServerTransport, error: ?str) -> None:
+    def listen_failed(s: ServerTransport, error: ?str) -> None:
         log.append(error if error is not None else "listening")
         ports.append(s.local_port())
         s.send_to(GET_SYS_DESCR, "", 1)
@@ -1943,12 +1943,12 @@ actor _test_tcp_server_failures(t: testing.EnvT):
         s.close()
         n = len(log)
         if n == 1:
-            transport.tcp_server_transport(lcap, "127.0.0.1", 70000, failed, t.log_handler)
+            transport.tcp_server_transport(lcap, "127.0.0.1", 70000, listen_failed, t.log_handler)
         elif n == 2:
-            transport.tcp_server_transport(lcap, "localhost", TCP_CLOSED_PORT, failed, t.log_handler)
+            transport.tcp_server_transport(lcap, "localhost", TCP_CLOSED_PORT, listen_failed, t.log_handler)
         elif n == 3:
             # Bound by this listener, or by the same test's run before in this process
-            transport.tcp_server_transport(lcap, "127.0.0.1", busy, on_first, t.log_handler)
+            transport.tcp_server_transport(lcap, "127.0.0.1", busy, first_listening, t.log_handler)
         else:
             def check() -> None:
                 testing.assertEqual(log[0], "TCP listen on 127.0.0.1:0 failed: port 0 is not supported: the port "
@@ -1960,20 +1960,20 @@ actor _test_tcp_server_failures(t: testing.EnvT):
                 testing.assertEqual(ports, [0, 0, 0, 0])
             finish(outcome(check))
 
-    def on_first(s: ServerTransport, error: ?str) -> None:
+    def first_listening(s: ServerTransport, error: ?str) -> None:
         if error is not None:
             if "address already in use" not in error:
                 finish(AssertionError("listen: " + error))
                 return
         else:
             first = s
-        transport.tcp_server_transport(lcap, "127.0.0.1", busy, failed, t.log_handler)
+        transport.tcp_server_transport(lcap, "127.0.0.1", busy, listen_failed, t.log_handler)
 
-    def watchdog() -> None:
+    def timed_out() -> None:
         finish(AssertionError("timed out; log: " + str(log)))
 
-    after now SOCKET_WATCHDOG: watchdog()
-    transport.tcp_server_transport(lcap, "127.0.0.1", 0, failed, t.log_handler)
+    after now SOCKET_WATCHDOG: timed_out()
+    transport.tcp_server_transport(lcap, "127.0.0.1", 0, listen_failed, t.log_handler)
 
 
 actor _test_tcp_close_idempotent(t: testing.EnvT):
@@ -1983,36 +1983,36 @@ actor _test_tcp_close_idempotent(t: testing.EnvT):
     var log: list[str] = []
     var srv: ?ServerTransport = None
 
-    def on_server(data: bytes, address: str, port: int) -> None:
+    def server_received(data: bytes, address: str, port: int) -> None:
         log.append("server got %d octets" % len(data))
 
-    def on_data(data: bytes, address: str, port: int) -> None:
+    def client_received(data: bytes, address: str, port: int) -> None:
         log.append("data")
 
-    def on_error(message: str, fatal: bool) -> None:
+    def client_failed(message: str, fatal: bool) -> None:
         log.append("error " + message)
 
     def check() -> None:
         testing.assertEqual(log, [])
 
-    def finish() -> None:
+    def settled() -> None:
         s = srv
         if s is not None:
             s.close()
         report_env(t, outcome(check))
 
-    def on_ready(s: ServerTransport, error: ?str) -> None:
+    def listening(s: ServerTransport, error: ?str) -> None:
         if error is not None:
             report_env(t, AssertionError("listen: " + error))
             return
         srv = s
-        s.set_receiver(on_server)
+        s.set_receiver(server_received)
         port = s.local_port()
         # Dropped: a session that does not exist
         s.send_to(GET_SYS_DESCR, "", 7)
         # Closed right away, while it connects: the message queued for it is dropped
         early = transport.tcp_transport(net.TCPConnectCap(tcap), "127.0.0.1", port)
-        early.set_receiver(on_data, on_error)
+        early.set_receiver(client_received, client_failed)
         early.send(GET_SYS_DESCR)
         early.close()
         early.close()
@@ -2020,9 +2020,9 @@ actor _test_tcp_close_idempotent(t: testing.EnvT):
         # Closed first, then used
         c = transport.tcp_transport(net.TCPConnectCap(tcap), "127.0.0.1", port)
         c.close()
-        c.set_receiver(on_data, on_error)
+        c.set_receiver(client_received, client_failed)
         c.send(GET_SYS_DESCR)
         c.close()
-        after now NOTHING_WAIT: finish()
+        after now NOTHING_WAIT: settled()
 
-    listener = ListenTcp(net.TCPListenCap(tcap), "127.0.0.1", _tcp_port_range(8), TCP_RANGE, on_ready, t.log_handler)
+    listener = ListenTcp(net.TCPListenCap(tcap), "127.0.0.1", _tcp_port_range(8), TCP_RANGE, listening, t.log_handler)

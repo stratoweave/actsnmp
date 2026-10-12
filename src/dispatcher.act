@@ -8,7 +8,7 @@ number of Clients over one ServerTransport: a socket from
 udp_server_transport(), bound to a wildcard or a chosen source address, or
 MemNet.server() in tests.
 
-    udp_dispatcher(cap, "::", 0, on_ready)      # on_ready(d, None) once listening
+    udp_dispatcher(cap, "::", 0, listening)     # listening(d, None) once the socket is bound
     c = Client(None, "192.0.2.7", sec, log, transport=d.attach("192.0.2.7", 161))
 
 attach(address, port) returns an ordinary transport.Transport for one
@@ -682,7 +682,7 @@ actor Dispatcher(server: ServerTransport, log_handler: ?logging.Handler, strict_
             ep.ahead = j
         _compact(ep)
 
-    def _sweep() -> None:
+    def _sweep_due() -> None:
         # Forget expired records of every endpoint, open or closed; runs while there are records
         if _failure is not None:
             _sweeping = False
@@ -700,14 +700,14 @@ actor Dispatcher(server: ServerTransport, log_handler: ?logging.Handler, strict_
         for k in stale:
             del _ambiguous_keys[k]
         if len(kept) > 0 or any([len(p.ids) > 0 for p in _peers.values()]):
-            after now SWEEP_INTERVAL: _sweep()
+            after now SWEEP_INTERVAL: _sweep_due()
         else:
             _sweeping = False
 
     proc def _arm_sweep() -> None:
         if not _sweeping:
             _sweeping = True
-            after now SWEEP_INTERVAL: _sweep()
+            after now SWEEP_INTERVAL: _sweep_due()
 
     proc def _record(ep: _Endpoint, key: int, community: bytes, hold: float, now: float) -> bool:
         # Record a request ep is about to send, its sender waiting up to hold seconds for the answer;
@@ -721,9 +721,9 @@ actor Dispatcher(server: ServerTransport, log_handler: ?logging.Handler, strict_
                 if _logging:
                     _log.debug("request id in use by another client of the peer; not sent",
                                {"address": peer.address, "port": peer.port, "id": key & _MASK32})
-                cb = ep.on_error
-                if cb is not None:
-                    cb(transport_mod.ID_IN_USE + str(key & _MASK32), False)
+                on_error = ep.on_error
+                if on_error is not None:
+                    on_error(transport_mod.ID_IN_USE + str(key & _MASK32), False)
                 return False
             # expired, or ep's own earlier request with this id (an SNMPv2c inform retransmission)
             _unmap(old)
@@ -733,9 +733,9 @@ actor Dispatcher(server: ServerTransport, log_handler: ?logging.Handler, strict_
                 if _logging:
                     _log.debug("max_ids requests of a client wait for answers; not sent",
                                {"address": peer.address, "port": peer.port, "id": key & _MASK32})
-                cb = ep.on_error
-                if cb is not None:
-                    cb(FULL + str(key & _MASK32), False)
+                on_error = ep.on_error
+                if on_error is not None:
+                    on_error(FULL + str(key & _MASK32), False)
                 return False
         h = hold if hold > 0.0 else 0.0
         rec = _Rec(_next_serial, key, ep, now + (h if h > _lifetime else _lifetime), now + h,
@@ -867,7 +867,7 @@ actor Dispatcher(server: ServerTransport, log_handler: ?logging.Handler, strict_
                 return True
         return False
 
-    def _on_datagram(data: bytes, src_address: str, src_port: int) -> None:
+    def _datagram_received(data: bytes, src_address: str, src_port: int) -> None:
         if _failure is not None:
             return
         _received += 1
@@ -986,17 +986,17 @@ actor Dispatcher(server: ServerTransport, log_handler: ?logging.Handler, strict_
         _closed_eps = []
         for ep in eps:
             ep.closed = True
-            cb = ep.on_error
+            on_error = ep.on_error
             ep.on_data = None
             ep.on_error = None
-            if cb is not None:
-                cb(CLOSED, True)
+            if on_error is not None:
+                on_error(CLOSED, True)
         server.close()
 
     if server.local_port() == 0:
         _failure = "the Dispatcher's socket is not bound (its setup failed)"
     else:
-        server.set_receiver(_on_datagram)
+        server.set_receiver(_datagram_received)
 
 
 def udp_dispatcher(cap: net.UDPListenCap, address: str, port: int,
@@ -1022,7 +1022,7 @@ actor _UdpDispatcherSetup(cap: net.UDPListenCap, address: str, port: int,
                           on_ready: action(Dispatcher, ?str) -> None, log_handler: ?logging.Handler,
                           strict_source: bool, id_lifetime: float, max_ids: int):
     # udp_server_transport() reports to an action; this actor builds the Dispatcher on its socket
-    def _ready(st: ServerTransport, error: ?str) -> None:
+    def _listening(st: ServerTransport, error: ?str) -> None:
         on_ready(Dispatcher(st, log_handler, strict_source, id_lifetime, max_ids, address), error)
 
-    transport_mod.udp_server_transport(cap, address, port, _ready, log_handler)
+    transport_mod.udp_server_transport(cap, address, port, _listening, log_handler)

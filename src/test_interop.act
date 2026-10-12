@@ -339,46 +339,46 @@ class Outcome(object):
         self.text = text
 
 
-actor Slot(label: str, started: float, sink: action(str, Outcome) -> None):
-    """The callbacks of one Step; whichever is called reports to sink(label, outcome)"""
+actor Slot(label: str, started: float, on_outcome: action(str, Outcome) -> None):
+    """The callbacks of one Step; whichever is called reports to on_outcome(label, outcome)"""
     var streamed: list[VarBind] = []
     var batches = 0
 
-    def req(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-        sink(label, Outcome(_now() - started, r=r, e=e))
+    def completed(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        on_outcome(label, Outcome(_now() - started, r=r, e=e))
 
     def walked(c: Client, vbs: list[VarBind], e: ?errors.SnmpError) -> None:
-        sink(label, Outcome(_now() - started, vbs=vbs, count=len(vbs), e=e))
+        on_outcome(label, Outcome(_now() - started, vbs=vbs, count=len(vbs), e=e))
 
-    def batch(c: Client, vbs: list[VarBind]) -> None:
+    def got_batch(c: Client, vbs: list[VarBind]) -> None:
         streamed.extend(vbs)
         batches += 1
 
-    def streamed_all(c: Client, count: int, e: ?errors.SnmpError) -> None:
-        sink(label, Outcome(_now() - started, vbs=streamed, count=count, batches=batches, e=e))
+    def stream_ended(c: Client, count: int, e: ?errors.SnmpError) -> None:
+        on_outcome(label, Outcome(_now() - started, vbs=streamed, count=count, batches=batches, e=e))
 
-    def tabled(c: Client, table: ?Table, e: ?errors.SnmpError) -> None:
-        sink(label, Outcome(_now() - started, table=table, e=e))
+    def got_table(c: Client, table: ?Table, e: ?errors.SnmpError) -> None:
+        on_outcome(label, Outcome(_now() - started, table=table, e=e))
 
     def discovered(c: Client, info: ?EngineInfo, e: ?errors.SnmpError) -> None:
-        sink(label, Outcome(_now() - started, info=info, e=e))
+        on_outcome(label, Outcome(_now() - started, info=info, e=e))
 
-    def sent(c: Client, e: ?errors.SnmpError) -> None:
-        sink(label, Outcome(_now() - started, e=e))
+    def trap_sent(c: Client, e: ?errors.SnmpError) -> None:
+        on_outcome(label, Outcome(_now() - started, e=e))
 
-    def shelled(code: int, out: str, err: str) -> None:
-        sink(label, Outcome(_now() - started, code=code, text=out + err))
+    def exited(code: int, out: str, err: str) -> None:
+        on_outcome(label, Outcome(_now() - started, code=code, text=out + err))
 
 
-actor Script(name: str, steps: list[Step], done: action(str, dict[str, Outcome]) -> None,
+actor Script(name: str, steps: list[Step], on_done: action(str, dict[str, Outcome]) -> None,
              pcap: ?process.ProcessCap=None):
     """Run steps strictly one after another (each when the previous one's callback came), then call
-    done(name, outcomes by label) once and close the steps' Clients; pcap runs the _SHELL steps"""
+    on_done(name, outcomes by label) once and close the steps' Clients; pcap runs the _SHELL steps"""
     var got: dict[str, Outcome] = {}
     var at = 0
     var finished = False
 
-    def _put(label: str, o: Outcome) -> None:
+    def _step_finished(label: str, o: Outcome) -> None:
         got[label] = o
         _advance()
 
@@ -386,7 +386,7 @@ actor Script(name: str, steps: list[Step], done: action(str, dict[str, Outcome])
         if at >= len(steps):
             if not finished:
                 finished = True
-                done(name, got)
+                on_done(name, got)
                 for s in steps:
                     c = s.client
                     if c is not None:
@@ -401,61 +401,61 @@ actor Script(name: str, steps: list[Step], done: action(str, dict[str, Outcome])
         if k == _SHELL:
             pc = pcap
             if pc is not None:
-                slot = Slot(s.label, _now(), _put)
-                sh = Shell(pc, s.cmd, slot.shelled, s.seconds)
+                slot = Slot(s.label, _now(), _step_finished)
+                sh = Shell(pc, s.cmd, slot.exited, s.seconds)
             else:
-                _put(s.label, Outcome(0.0, code=-1, text="no ProcessCap for " + " ".join(s.cmd)))
+                _step_finished(s.label, Outcome(0.0, code=-1, text="no ProcessCap for " + " ".join(s.cmd)))
             return
         c = s.client
         if c is not None:
             _call(s, c)
         else:
-            _put(s.label, Outcome(0.0, e=errors.EncodeError("step without a client")))
+            _step_finished(s.label, Outcome(0.0, e=errors.EncodeError("step without a client")))
 
     proc def _call(s: Step, c: Client) -> None:
         k = s.kind
         if k == _INFO:
             info = c.engine_info()
             st = c.stats()
-            _put(s.label, Outcome(0.0, info=info, stats=st))
+            _step_finished(s.label, Outcome(0.0, info=info, stats=st))
             return
-        slot = Slot(s.label, _now(), _put)
+        slot = Slot(s.label, _now(), _step_finished)
         if k == _GET:
-            c.get(slot.req, s.oids, s.opts)
+            c.get(slot.completed, s.oids, s.opts)
         elif k == _GETNEXT:
-            c.get_next(slot.req, s.oids, s.opts)
+            c.get_next(slot.completed, s.oids, s.opts)
         elif k == _GETBULK:
-            c.get_bulk(slot.req, s.oids, s.non_repeaters, s.max_repetitions, s.opts)
+            c.get_bulk(slot.completed, s.oids, s.non_repeaters, s.max_repetitions, s.opts)
         elif k == _SET:
-            c.set(slot.req, s.varbinds, s.opts)
+            c.set(slot.completed, s.varbinds, s.opts)
         elif k == _WALK:
             c.walk(slot.walked, s.oids[0], s.opts)
         elif k == _STREAM:
-            c.walk_stream(slot.batch, slot.streamed_all, s.oids[0], s.opts)
+            c.walk_stream(slot.got_batch, slot.stream_ended, s.oids[0], s.opts)
         elif k == _TABLE:
-            c.get_table(slot.tabled, s.oids, s.opts)
+            c.get_table(slot.got_table, s.oids, s.opts)
         elif k == _DISCOVER:
             c.discover(slot.discovered)
         elif k == _TRAP:
-            c.trap(slot.sent, s.trap_oid, s.varbinds, s.uptime)
+            c.trap(slot.trap_sent, s.trap_oid, s.varbinds, s.uptime)
         elif k == _TRAP_V1:
-            c.trap_v1(slot.sent, s.enterprise, s.agent_addr, s.generic, s.specific, s.varbinds, s.uptime)
+            c.trap_v1(slot.trap_sent, s.enterprise, s.agent_addr, s.generic, s.specific, s.varbinds, s.uptime)
         elif k == _INFORM:
-            c.inform(slot.req, s.trap_oid, s.varbinds, s.uptime, s.opts)
+            c.inform(slot.completed, s.trap_oid, s.varbinds, s.uptime, s.opts)
 
     _advance()
 
 
-actor Gather(want: int, done: action(dict[str, dict[str, Outcome]]) -> None):
-    """Collects the outcomes of want Scripts that run concurrently (Script's done callback is put)"""
+actor Gather(want: int, on_done: action(dict[str, dict[str, Outcome]]) -> None):
+    """Collects the outcomes of want Scripts that run concurrently (each Script's on_done is script_finished)"""
     var results: dict[str, dict[str, Outcome]] = {}
     var reported = False
 
-    def put(name: str, got: dict[str, Outcome]) -> None:
+    def script_finished(name: str, got: dict[str, Outcome]) -> None:
         results[name] = got
         if len(results) >= want and not reported:
             reported = True
-            done(results)
+            on_done(results)
 
 
 proc def skip(t: testing.EnvT, reason: str) -> None:
@@ -465,14 +465,14 @@ proc def skip(t: testing.EnvT, reason: str) -> None:
     except testing.AbortTest:
         pass
 
-actor LabGate(t: testing.EnvT, go: action() -> None):
-    """Call go() when the lab's snmpd answers a GET; skip the test when it does not answer (lab not up)"""
+actor LabGate(t: testing.EnvT, on_up: action() -> None):
+    """Call on_up() when the lab's snmpd answers a GET; skip the test when it does not answer (lab not up)"""
     c = Client(udp_cap(t), LOCAL4, Community("public"), None, port=SNMPD.port, opts=Options(timeout=1.0, retries=2))
 
     def probed(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         cl.close()
         if e is None:
-            go()
+            on_up()
         elif isinstance(e, errors.TimeoutError):
             skip(t, "the interop lab does not answer on 127.0.0.1:%d; start it with interop/up.sh" % SNMPD.port)
         else:
@@ -490,22 +490,22 @@ def _decode(data: bytes) -> str:
 proc def proc_cap(t: testing.EnvT) -> process.ProcessCap:
     return process.ProcessCap(t.env.cap)
 
-actor Shell(pcap: process.ProcessCap, cmd: list[str], done: action(int, str, str) -> None, limit: float=120.0):
-    """Run cmd (paths relative to the project root) and call done(exit status, stdout, stderr) once;
+actor Shell(pcap: process.ProcessCap, cmd: list[str], on_done: action(int, str, str) -> None, limit: float=120.0):
+    """Run cmd (paths relative to the project root) and call on_done(exit status, stdout, stderr) once;
     a process killed by a signal gives 128 + the signal, one that could not start -1"""
     var called = False
 
-    def _exit(pr: process.Process, code: int, sig: int, out: bytes, err: bytes) -> None:
+    def _exited(pr: process.Process, code: int, sig: int, out: bytes, err: bytes) -> None:
         if not called:
             called = True
-            done(code if sig == 0 else 128 + sig, _decode(out), _decode(err))
+            on_done(code if sig == 0 else 128 + sig, _decode(out), _decode(err))
 
-    def _error(pr: process.Process, msg: str) -> None:
+    def _failed(pr: process.Process, msg: str) -> None:
         if not called:
             called = True
-            done(-1, "", msg)
+            on_done(-1, "", msg)
 
-    _p = process.RunProcess(pcap, cmd, _exit, _error, None, None, limit)
+    _p = process.RunProcess(pcap, cmd, _exited, _failed, None, None, limit)
 
 
 # Checks #############################################################################################
@@ -538,11 +538,11 @@ def response(o: Outcome, what: str) -> Response:
 def lines(vbs: list[VarBind]) -> list[str]:
     return [fmt.canon_varbind(vb) for vb in vbs]
 
-def got_lines(o: Outcome, what: str) -> list[str]:
+def lines_of(o: Outcome, what: str) -> list[str]:
     """The canonical lines of a successful request's response varbinds"""
     return lines(response(o, what).varbinds)
 
-def walked(o: Outcome, what: str) -> list[VarBind]:
+def walk_result(o: Outcome, what: str) -> list[VarBind]:
     """The varbinds of a walk that ended without an error"""
     e = o.e
     if e is not None:
@@ -580,7 +580,7 @@ def report_name(o: Outcome, what: str) -> str:
         return e.name
     raise AssertionError(what + ": expected a ReportError, got " + describe(o))
 
-def timed_out(o: Outcome, what: str) -> errors.TimeoutError:
+def expect_timeout(o: Outcome, what: str) -> errors.TimeoutError:
     e = o.e
     if isinstance(e, errors.TimeoutError):
         return e
@@ -673,7 +673,7 @@ actor _Communities(t: testing.EnvT, a: LabAgent):
         steps.append(walk_step("sysonly walk", so, MIB2))
         steps.append(bulk_step("sysonly getbulk", so, [SYSTEM], 0, 100))
 
-    def finish(name: str, got: dict[str, Outcome]) -> None:
+    def finished(name: str, got: dict[str, Outcome]) -> None:
         def run() -> None:
             failures: list[str] = []
             for lv in labels:
@@ -682,15 +682,15 @@ actor _Communities(t: testing.EnvT, a: LabAgent):
 
                 def scalars() -> None:
                     want = v1_get_lines(scal) if v1 else scal
-                    same_lines(got_lines(outcome_of(got, label + " get scalars"), label), want,
+                    same_lines(lines_of(outcome_of(got, label + " get scalars"), label), want,
                                label + " GET of the 70 scalars")
 
                 def sysgroup() -> None:
-                    same_lines(got_lines(outcome_of(got, label + " get system"), label), system,
+                    same_lines(lines_of(outcome_of(got, label + " get system"), label), system,
                                label + " GET of the system group")
 
                 def getnext() -> None:
-                    same_lines(got_lines(outcome_of(got, label + " getnext"), label),
+                    same_lines(lines_of(outcome_of(got, label + " getnext"), label),
                                [".1.3.6.1.4.1.8072.9999.1.1.1.0 = INTEGER: 0",
                                 '.1.3.6.1.4.1.8072.9999.1.2.1.0 = STRING: "Hello, SNMP!"',
                                 ".1.3.6.1.4.1.8072.9999.1.10.1.1.1 = INTEGER: 1"], label + " GETNEXT")
@@ -702,7 +702,7 @@ actor _Communities(t: testing.EnvT, a: LabAgent):
                     if not v1:
                         want += ['.1.3.6.1.4.1.8072.9999.1.10.1.2.2 = STRING: "row-0002"',
                                  '.1.3.6.1.4.1.8072.9999.1.10.1.2.3 = STRING: "row-0003"']
-                    same_lines(got_lines(outcome_of(got, label + " getbulk"), label), want,
+                    same_lines(lines_of(outcome_of(got, label + " getbulk"), label), want,
                                label + " GETBULK N=1 R=3")
 
                 def missing() -> None:
@@ -726,7 +726,7 @@ actor _Communities(t: testing.EnvT, a: LabAgent):
                 attempt(failures, label + " missing", missing)
 
                 def engine_group() -> None:
-                    ls = lines(walked(outcome_of(got, label + " engine group"), label + " engine group"))
+                    ls = lines(walk_result(outcome_of(got, label + " engine group"), label + " engine group"))
                     head = ".1.3.6.1.6.3.10.2.1.1.0 = " + fmt.canon_value(OctetString(a.engine_id))
                     if a.name == "snmpd":
                         # snmpEngineID, snmpEngineBoots, snmpEngineTime (volatile), snmpEngineMaxMessageSize
@@ -738,20 +738,20 @@ actor _Communities(t: testing.EnvT, a: LabAgent):
                 attempt(failures, label + " engine group", engine_group)
 
             def unknown() -> None:
-                e = timed_out(outcome_of(got, "unknown community"), "an unknown community")
+                e = expect_timeout(outcome_of(got, "unknown community"), "an unknown community")
                 check(e.attempts == 2, "unknown community: %d attempts" % e.attempts)
 
             def ipv6() -> None:
-                same_lines(got_lines(outcome_of(got, "ipv6 get scalars"), "ipv6"), scal, "IPv6 GET of the scalars")
-                same_lines(lines(walked(outcome_of(got, "ipv6 walk"), "ipv6 walk")), under(scal, b([1])),
+                same_lines(lines_of(outcome_of(got, "ipv6 get scalars"), "ipv6"), scal, "IPv6 GET of the scalars")
+                same_lines(lines(walk_result(outcome_of(got, "ipv6 walk"), "ipv6 walk")), under(scal, b([1])),
                            "IPv6 walk of B.1")
-                same_lines(lines(walked(outcome_of(got, "ipv6 v1 walk"), "ipv6 v1 walk")), under(scal, b([2])),
+                same_lines(lines(walk_result(outcome_of(got, "ipv6 v1 walk"), "ipv6 v1 walk")), under(scal, b([2])),
                            "IPv6 SNMPv1 walk of B.2")
 
             attempt(failures, "unknown community", unknown)
 
             def localhost() -> None:
-                same_lines(got_lines(outcome_of(got, "localhost"), "localhost"), system[:1], "GET via localhost")
+                same_lines(lines_of(outcome_of(got, "localhost"), "localhost"), system[:1], "GET via localhost")
                 r = response(outcome_of(got, "check community"), "check community")
                 same_lines(lines(r.varbinds), system[:1], "GET with check_community and 16-bit request-ids")
                 check(r.request_id >= 1 and r.request_id <= 32767, "request-id %d" % r.request_id)
@@ -764,7 +764,7 @@ actor _Communities(t: testing.EnvT, a: LabAgent):
                     check(isinstance(r.varbinds[0].value, NoSuchObject),
                           "sysonly: B.1.1.0 is outside the view: " + repr(r.varbinds[0]))
                     check(fmt.canon_varbind(r.varbinds[1]) == system[0], "sysonly sysDescr: " + repr(r.varbinds[1]))
-                    vbs = walked(outcome_of(got, "sysonly walk"), "sysonly walk")
+                    vbs = walk_result(outcome_of(got, "sysonly walk"), "sysonly walk")
                     for vb in vbs:
                         check(vb.oid.startswith(SYSTEM), "sysonly walk left the system group: " + repr(vb))
                     ls = lines(vbs)
@@ -778,10 +778,10 @@ actor _Communities(t: testing.EnvT, a: LabAgent):
             all_passed(failures)
         report_env(t, outcome(run))
 
-    def go() -> None:
-        s = Script(a.name, steps, finish)
+    def lab_up() -> None:
+        s = Script(a.name, steps, finished)
 
-    gate = LabGate(t, go)
+    gate = LabGate(t, lab_up)
 
 actor _test_snmpd_communities(t: testing.EnvT):
     """snmpd: SNMPv1/v2c public and private, unknown community, IPv6, the sysonly view"""
@@ -829,7 +829,7 @@ actor _V3Users(t: testing.EnvT, a: LabAgent):
     scripts.append(("wrong engine ID", [get_step("get", moved, [b([1, 18, 0])]), get_step("get 2", moved, [b([1, 18, 0])]),
                                         get_step("get 3", moved, [b([1, 18, 0])]), info_step("info", moved)]))
 
-    def finish(results: dict[str, dict[str, Outcome]]) -> None:
+    def gathered(results: dict[str, dict[str, Outcome]]) -> None:
         def run() -> None:
             failures: list[str] = []
             want_get = [".1.3.6.1.4.1.8072.9999.1.1.18.0 = INTEGER: 2147483647",
@@ -862,7 +862,7 @@ actor _V3Users(t: testing.EnvT, a: LabAgent):
                             check(i.engine_id == a.engine_id and i.boots == a.boots, "discovered " + repr(i))
                         else:
                             raise AssertionError("discover() without EngineInfo")
-                        same_lines(got_lines(outcome_of(got, "get"), "get"), want_get[:1], "GET after discover()")
+                        same_lines(lines_of(outcome_of(got, "get"), "get"), want_get[:1], "GET after discover()")
                         st = outcome_of(got, "info").stats
                         if st is not None:
                             check(st.reports == 1, "one Report (the discovery): " + str(st))
@@ -887,11 +887,11 @@ actor _V3Users(t: testing.EnvT, a: LabAgent):
                         r = response(outcome_of(got, "get"), "get")
                         same_lines(lines(r.varbinds), want_get[:1], "GET")
                         check(r.attempts == 2, "%d datagrams for the request" % r.attempts)
-                        same_lines(got_lines(outcome_of(got, "get 2"), "get 2"), want_get[:1], "GET")
+                        same_lines(lines_of(outcome_of(got, "get 2"), "get 2"), want_get[:1], "GET")
                         if st is not None:
                             check(st.reports == 2 and st.timeouts == 0 and st.drops_auth == 0,
                                   "the Report from the agent's engine and discovery: " + str(st))
-                        same_lines(got_lines(outcome_of(got, "get 3"), "get 3"), want_get[:1], "GET")
+                        same_lines(lines_of(outcome_of(got, "get 3"), "get 3"), want_get[:1], "GET")
                         info = outcome_of(got, "info").info
                         if info is not None:
                             check(info.engine_id == a.engine_id and info.boots == a.boots, "engine " + repr(info))
@@ -907,7 +907,7 @@ actor _V3Users(t: testing.EnvT, a: LabAgent):
 
                     def walk() -> None:
                         o = outcome_of(got, "walk")
-                        same_lines(lines(walked(o, "walk")), scal, "GETBULK walk of B.1..B.9")
+                        same_lines(lines(walk_result(o, "walk")), scal, "GETBULK walk of B.1..B.9")
 
                     attempt(failures, name + " get", get)
                     attempt(failures, name + " walk", walk)
@@ -915,12 +915,12 @@ actor _V3Users(t: testing.EnvT, a: LabAgent):
             all_passed(failures)
         report_env(t, outcome(run))
 
-    def go() -> None:
-        g = Gather(len(scripts), finish)
+    def lab_up() -> None:
+        g = Gather(len(scripts), gathered)
         for sn in scripts:
-            s = Script(sn.0, sn.1, g.put)
+            s = Script(sn.0, sn.1, g.script_finished)
 
-    gate = LabGate(t, go)
+    gate = LabGate(t, lab_up)
 
 actor _test_snmpd_v3_users(t: testing.EnvT):
     """snmpd: every lab user (44) from cold: discovery, GET, GETBULK walk of B.1..B.9; discover(); IPv6"""
@@ -992,7 +992,7 @@ actor _V3Negative(t: testing.EnvT, a: LabAgent):
         c = Client(cap, LOCAL4, cs.1, None, port=a.port, opts=neg)
         scripts.append((cs.0, [get_step("get", c, [b([1, 18, 0])]), info_step("info", c)]))
 
-    def finish(results: dict[str, dict[str, Outcome]]) -> None:
+    def gathered(results: dict[str, dict[str, Outcome]]) -> None:
         def run() -> None:
             failures: list[str] = []
             for cs in cases:
@@ -1002,10 +1002,10 @@ actor _V3Negative(t: testing.EnvT, a: LabAgent):
 
                 def one() -> None:
                     if want == "ok":
-                        same_lines(got_lines(o, label), [".1.3.6.1.4.1.8072.9999.1.1.18.0 = INTEGER: 2147483647"],
+                        same_lines(lines_of(o, label), [".1.3.6.1.4.1.8072.9999.1.1.18.0 = INTEGER: 2147483647"],
                                    label)
                     elif want == "timeout":
-                        timed_out(o, label)
+                        expect_timeout(o, label)
                     elif want.startswith("report:"):
                         name = report_name(o, label)
                         check(name == want[7:], "%s: report %s, expected %s" % (label, name, want[7:]))
@@ -1016,12 +1016,12 @@ actor _V3Negative(t: testing.EnvT, a: LabAgent):
             all_passed(failures)
         report_env(t, outcome(run))
 
-    def go() -> None:
-        g = Gather(len(scripts), finish)
+    def lab_up() -> None:
+        g = Gather(len(scripts), gathered)
         for sn in scripts:
-            s = Script(sn.0, sn.1, g.put)
+            s = Script(sn.0, sn.1, g.script_finished)
 
-    gate = LabGate(t, go)
+    gate = LabGate(t, lab_up)
 
 actor _test_snmpd_v3_negative(t: testing.EnvT):
     """snmpd: wrong credentials give Reports, undecryptable requests and unknown contexts no answer, a level
@@ -1062,7 +1062,7 @@ actor _Walks(t: testing.EnvT, a: LabAgent, users: list[str]):
         c = Client(cap, LOCAL4, find_user(lab, name), None, port=a.port, opts=OPTS)
         scripts.append((name, [walk_step("walk", c, BASE, OPTS.with_(max_repetitions=40))]))
 
-    def finish(results: dict[str, dict[str, Outcome]]) -> None:
+    def gathered(results: dict[str, dict[str, Outcome]]) -> None:
         def run() -> None:
             failures: list[str] = []
             for sn in scripts:
@@ -1070,7 +1070,7 @@ actor _Walks(t: testing.EnvT, a: LabAgent, users: list[str]):
                 o = outcome_of(results[name], "walk")
 
                 def one() -> None:
-                    same_lines(lines(walked(o, name)), full_v1 if name.startswith("v1") else full, "walk of B")
+                    same_lines(lines(walk_result(o, name)), full_v1 if name.startswith("v1") else full, "walk of B")
                     if name == "v2c walk_stream":
                         check(o.count == len(full) and o.batches >= len(full) // 50,
                               "walk_stream: %d varbinds in %d batches" % (o.count, o.batches))
@@ -1078,12 +1078,12 @@ actor _Walks(t: testing.EnvT, a: LabAgent, users: list[str]):
             all_passed(failures)
         report_env(t, outcome(run))
 
-    def go() -> None:
-        g = Gather(len(scripts), finish)
+    def lab_up() -> None:
+        g = Gather(len(scripts), gathered)
         for sn in scripts:
-            s = Script(sn.0, sn.1, g.put)
+            s = Script(sn.0, sn.1, g.script_finished)
 
-    gate = LabGate(t, go)
+    gate = LabGate(t, lab_up)
 
 actor _test_snmpd_walks(t: testing.EnvT):
     """snmpd: the whole dataset by SNMPv1 GETNEXT (5731), SNMPv2c GETNEXT/GETBULK/walk_stream, IPv6 and
@@ -1138,7 +1138,7 @@ actor _Tables(t: testing.EnvT, a: LabAgent, user: str):
     scripts.append(("v3", [table_step("B.12", c3, t12), table_step("B.11", c3, t11),
                            bulk_step("cap", c3, [b([12, 1, 1])], 0, 200)]))
 
-    def finish(results: dict[str, dict[str, Outcome]]) -> None:
+    def gathered(results: dict[str, dict[str, Outcome]]) -> None:
         def run() -> None:
             failures: list[str] = []
             n = a.bulk_cap
@@ -1158,14 +1158,14 @@ actor _Tables(t: testing.EnvT, a: LabAgent, user: str):
 
             def caps() -> None:
                 v2r = results["v2c"]
-                same_lines(got_lines(outcome_of(v2r, "cap"), "cap"), bigtable[:n], "GETBULK R=200")
-                same_lines(got_lines(outcome_of(v2r, "cap non-repeater"), "cap"),
+                same_lines(lines_of(outcome_of(v2r, "cap"), "cap"), bigtable[:n], "GETBULK R=200")
+                same_lines(lines_of(outcome_of(v2r, "cap non-repeater"), "cap"),
                            [".1.3.6.1.4.1.8072.9999.1.1.1.0 = INTEGER: 0"] + bigtable[:n],
                            "GETBULK N=1 R=200 (the non-repeater is not counted)")
-                same_lines(got_lines(outcome_of(v2r, "cap two columns"), "cap"), rows, "GETBULK of 2 columns R=200")
-                same_lines(lines(walked(outcome_of(v2r, "walk B.12 R=200"), "walk")), bigtable,
+                same_lines(lines_of(outcome_of(v2r, "cap two columns"), "cap"), rows, "GETBULK of 2 columns R=200")
+                same_lines(lines(walk_result(outcome_of(v2r, "walk B.12 R=200"), "walk")), bigtable,
                            "GETBULK walk with R=200")
-                same_lines(got_lines(outcome_of(results["v3"], "cap"), "v3 cap"), bigtable[:n], "SNMPv3 GETBULK R=200")
+                same_lines(lines_of(outcome_of(results["v3"], "cap"), "v3 cap"), bigtable[:n], "SNMPv3 GETBULK R=200")
             attempt(failures, "GETBULK caps", caps)
 
             def zero() -> None:
@@ -1173,10 +1173,10 @@ actor _Tables(t: testing.EnvT, a: LabAgent, user: str):
                 # counts 0 as 1
                 o = outcome_of(results["v2c"], "M=0")
                 if a.name == "snmpd":
-                    same_lines(got_lines(o, "M=0"), [], "GETBULK M=0")
+                    same_lines(lines_of(o, "M=0"), [], "GETBULK M=0")
                 else:
-                    timed_out(o, "GETBULK M=0")
-                same_lines(lines(walked(outcome_of(results["v2c"], "walk R=0"), "walk R=0")), under(full, b([1])),
+                    expect_timeout(o, "GETBULK M=0")
+                same_lines(lines(walk_result(outcome_of(results["v2c"], "walk R=0"), "walk R=0")), under(full, b([1])),
                            "walk with max_repetitions 0")
             attempt(failures, "max-repetitions 0", zero)
 
@@ -1184,18 +1184,18 @@ actor _Tables(t: testing.EnvT, a: LabAgent, user: str):
                 r = response(outcome_of(results["v2c"], "getnext 70"), "getnext 70")
                 same_lines(lines(r.varbinds), next_lines(full, scal_oids), "GETNEXT of the 70 scalars")
                 check(r.attempts == 3, "three PDUs: %d attempts" % r.attempts)
-                same_lines(got_lines(outcome_of(results["v1"], "getnext 70"), "v1 getnext 70"),
+                same_lines(lines_of(outcome_of(results["v1"], "getnext 70"), "v1 getnext 70"),
                            next_lines(full_v1, scal_oids), "SNMPv1 GETNEXT of the 70 scalars (Counter64 skipped)")
             attempt(failures, "GETNEXT split", getnext)
             all_passed(failures)
         report_env(t, outcome(run))
 
-    def go() -> None:
-        g = Gather(len(scripts), finish)
+    def lab_up() -> None:
+        g = Gather(len(scripts), gathered)
         for sn in scripts:
-            s = Script(sn.0, sn.1, g.put)
+            s = Script(sn.0, sn.1, g.script_finished)
 
-    gate = LabGate(t, go)
+    gate = LabGate(t, lab_up)
 
 actor _test_snmpd_tables(t: testing.EnvT):
     """snmpd: tables with get_table (SNMPv1/v2c/v3, parallel column groups), GETBULK capped at 100 varbinds"""
@@ -1243,7 +1243,7 @@ actor _test_snmpd_real_mib(t: testing.EnvT):
                   walk_step(st.0 + " v1", v1, st.1), walk_step(st.0 + " v3", c3, st.1, OPTS.with_(max_repetitions=60))]
     steps += [table_step("usmUserEntry", v2, usm_columns), table_step("vacmSecurityToGroupEntry", c3, vacm_columns)]
 
-    def finish(name: str, got: dict[str, Outcome]) -> None:
+    def finished(name: str, got: dict[str, Outcome]) -> None:
         def run() -> None:
             failures: list[str] = []
             for st in subtrees:
@@ -1256,7 +1256,7 @@ actor _test_snmpd_real_mib(t: testing.EnvT):
                 def one() -> None:
                     check(ref.code == 0 and len(want) > 10, "net-snmp walk: %d %s" % (ref.code, clip(ref.text)))
                     for variant in [" v2c", " v2c getnext", " v1", " v3"]:
-                        same_lines(lines(walked(outcome_of(got, label + variant), label + variant)), want,
+                        same_lines(lines(walk_result(outcome_of(got, label + variant), label + variant)), want,
                                    label + variant)
                     if label == "usmUserTable":
                         same_lines(table_lines(outcome_of(got, "usmUserEntry"), "usmUserEntry"),
@@ -1268,10 +1268,10 @@ actor _test_snmpd_real_mib(t: testing.EnvT):
             all_passed(failures)
         report_env(t, outcome(run))
 
-    def go() -> None:
-        s = Script("real mib", steps, finish, proc_cap(t))
+    def lab_up() -> None:
+        s = Script("real mib", steps, finished, proc_cap(t))
 
-    gate = LabGate(t, go)
+    gate = LabGate(t, lab_up)
 
 
 def type_of(line: str) -> str:
@@ -1316,7 +1316,7 @@ actor _test_snmpd_full_mib(t: testing.EnvT):
         walk_step("v2c", v2, everything, OPTS.with_(max_repetitions=50)),
         walk_step("v3", c3, everything, OPTS.with_(max_repetitions=50))]
 
-    def finish(name: str, got: dict[str, Outcome]) -> None:
+    def finished(name: str, got: dict[str, Outcome]) -> None:
         def run() -> None:
             failures: list[str] = []
             ref = outcome_of(got, "net-snmp")
@@ -1327,7 +1327,7 @@ actor _test_snmpd_full_mib(t: testing.EnvT):
                 def one() -> None:
                     check(ref.code == 0 and len(want) > 10000, "net-snmp walk: %d lines, status %d" % (len(want),
                                                                                                      ref.code))
-                    ours = lines(walked(outcome_of(got, label), label))
+                    ours = lines(walk_result(outcome_of(got, label), label))
                     mine = by_oid(ours)
                     common = 0
                     for oid, line in mine.items():
@@ -1350,10 +1350,10 @@ actor _test_snmpd_full_mib(t: testing.EnvT):
             all_passed(failures)
         report_env(t, outcome(run))
 
-    def go() -> None:
-        s = Script("full mib", steps, finish, proc_cap(t))
+    def lab_up() -> None:
+        s = Script("full mib", steps, finished, proc_cap(t))
 
-    gate = LabGate(t, go)
+    gate = LabGate(t, lab_up)
 
 
 # Large responses ##################################################################################
@@ -1373,7 +1373,7 @@ actor _Large(t: testing.EnvT, a: LabAgent):
                              get_step("v1 80 KB", v1, too_big), get_step("v3 60 KB", c3, fits),
                              get_step("v3 80 KB", c3, too_big, quick), info_step("v3 info", c3)]
 
-    def finish(name: str, got: dict[str, Outcome]) -> None:
+    def finished(name: str, got: dict[str, Outcome]) -> None:
         def run() -> None:
             failures: list[str] = []
             line = fmt.canon_varbind(VarBind(b([2, 13, 0]), OctetString(pattern(4000))))
@@ -1385,7 +1385,7 @@ actor _Large(t: testing.EnvT, a: LabAgent):
                 attempt(failures, label, fit)
             for label in ["v2c 80 KB", "v1 80 KB"]:
                 def dropped() -> None:
-                    timed_out(outcome_of(got, label), label)
+                    expect_timeout(outcome_of(got, label), label)
                 attempt(failures, label, dropped)
 
             def v3() -> None:
@@ -1395,15 +1395,15 @@ actor _Large(t: testing.EnvT, a: LabAgent):
                     same_lines(lines(r.varbinds), [line for _ in range(20)], "v3 80 KB")
                     check(r.attempts == 3, "tooBig, then two halves: %d attempts" % r.attempts)
                 else:
-                    timed_out(o, "v3 80 KB")
+                    expect_timeout(o, "v3 80 KB")
             attempt(failures, "v3 80 KB", v3)
             all_passed(failures)
         report_env(t, outcome(run))
 
-    def go() -> None:
-        s = Script(a.name, steps, finish)
+    def lab_up() -> None:
+        s = Script(a.name, steps, finished)
 
-    gate = LabGate(t, go)
+    gate = LabGate(t, lab_up)
 
 actor _test_snmpd_large(t: testing.EnvT):
     """snmpd: 60 KB responses; 80 KB dropped in SNMPv1/v2c, tooBig in SNMPv3 (the Client splits the GET)"""
@@ -1436,9 +1436,9 @@ actor _test_snmpd_restart(t: testing.EnvT):
     cap = udp_cap(t)
     u = find_user(lab_users(t), "u_sha_aes")
 
-    def finish(name: str, got: dict[str, Outcome]) -> None:
+    def finished(name: str, got: dict[str, Outcome]) -> None:
         def run() -> None:
-            same_lines(got_lines(outcome_of(got, "before"), "before"),
+            same_lines(lines_of(outcome_of(got, "before"), "before"),
                        [".1.3.6.1.4.1.8072.9999.1.1.18.0 = INTEGER: 2147483647"], "before the restart")
             ib = outcome_of(got, "info before").info
             if ib is not None:
@@ -1454,7 +1454,7 @@ actor _test_snmpd_restart(t: testing.EnvT):
             same_lines(lines(r.varbinds), [".1.3.6.1.4.1.8072.9999.1.1.18.0 = INTEGER: 2147483647"],
                        "the first request after the restart")
             check(r.attempts == 2, "%d datagrams for the first request after the restart" % r.attempts)
-            same_lines(got_lines(outcome_of(got, "again"), "again"),
+            same_lines(lines_of(outcome_of(got, "again"), "again"),
                        [".1.3.6.1.4.1.8072.9999.1.1.18.0 = INTEGER: 2147483647"], "the next request")
             ia = outcome_of(got, "info after").info
             if ia is not None:
@@ -1476,7 +1476,7 @@ actor _test_snmpd_restart(t: testing.EnvT):
                  get_step("probe", probe, [b([1, 1, 0])]),
                  get_step("after restart", c, [b([1, 18, 0])]),
                  get_step("again", c, [b([1, 18, 0])]), info_step("info after", c)]
-        s = Script("restart", steps, finish, proc_cap(t))
+        s = Script("restart", steps, finished, proc_cap(t))
 
     def measured(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         c.close()
@@ -1493,11 +1493,11 @@ actor _test_snmpd_restart(t: testing.EnvT):
         else:
             restart()
 
-    def go() -> None:
+    def lab_up() -> None:
         m = Client(cap, LOCAL4, Community("public"), None, port=SNMPD.port, opts=OPTS)
         m.get(measured, [SNMP_ENGINE_TIME])
 
-    gate = LabGate(t, go)
+    gate = LabGate(t, lab_up)
 
 
 # SET ##############################################################################################
@@ -1592,12 +1592,12 @@ actor _Set(t: testing.EnvT, a: LabAgent):
     if snmpd:
         steps.append(get_step("system after", pub, [SYS_CONTACT, SYS_NAME, SYS_LOCATION], OPTS))
 
-    def finish(name: str, got: dict[str, Outcome]) -> None:
+    def finished(name: str, got: dict[str, Outcome]) -> None:
         def run() -> None:
             failures: list[str] = []
 
             def before() -> None:
-                same_lines(lines(walked(outcome_of(got, "before"), "before")), initial,
+                same_lines(lines(walk_result(outcome_of(got, "before"), "before")), initial,
                            "B.20 before the test (a failed earlier run may have left other values)")
             attempt(failures, "initial values", before)
             for sc in set_cases():
@@ -1605,16 +1605,16 @@ actor _Set(t: testing.EnvT, a: LabAgent):
                 want = [fmt.canon_varbind(sc.1)]
 
                 def ok() -> None:
-                    same_lines(got_lines(outcome_of(got, "set " + label), "set"), want, "SET response")
-                    same_lines(got_lines(outcome_of(got, "get " + label), "get"), want, "GET after the SET")
+                    same_lines(lines_of(outcome_of(got, "set " + label), "set"), want, "SET response")
+                    same_lines(lines_of(outcome_of(got, "get " + label), "get"), want, "GET after the SET")
                 attempt(failures, "set " + label, ok)
 
             def others() -> None:
                 want = [".1.3.6.1.4.1.8072.9999.1.20.5.0 = Gauge32: 7"]
-                same_lines(got_lines(outcome_of(got, "set v1"), "set v1"), want, "SNMPv1 SET")
-                same_lines(got_lines(outcome_of(got, "get v1"), "get v1"), want, "GET after the SNMPv1 SET")
-                same_lines(got_lines(outcome_of(got, "set v3"), "set v3"), lines(v3vbs), "SNMPv3 SET of 2 varbinds")
-                same_lines(got_lines(outcome_of(got, "get v3"), "get v3"), lines(v3vbs), "GET after the SNMPv3 SET")
+                same_lines(lines_of(outcome_of(got, "set v1"), "set v1"), want, "SNMPv1 SET")
+                same_lines(lines_of(outcome_of(got, "get v1"), "get v1"), want, "GET after the SNMPv1 SET")
+                same_lines(lines_of(outcome_of(got, "set v3"), "set v3"), lines(v3vbs), "SNMPv3 SET of 2 varbinds")
+                same_lines(lines_of(outcome_of(got, "get v3"), "get v3"), lines(v3vbs), "GET after the SNMPv3 SET")
             attempt(failures, "set v1/v3", others)
 
             for se in set_errors():
@@ -1625,7 +1625,7 @@ actor _Set(t: testing.EnvT, a: LabAgent):
                 def err() -> None:
                     o = outcome_of(got, "error " + label)
                     if want == "ok":
-                        same_lines(got_lines(o, label), lines(vbs), "SET response")
+                        same_lines(lines_of(o, label), lines(vbs), "SET response")
                     elif want == "nosuchinstance":
                         r = response(o, label)
                         check(len(r.varbinds) == len(vbs) and isinstance(r.varbinds[0].value, NoSuchInstance),
@@ -1646,7 +1646,7 @@ actor _Set(t: testing.EnvT, a: LabAgent):
 
             def non_atomic() -> None:
                 # README: the B.20 objects are not atomic on either agent
-                same_lines(got_lines(outcome_of(got, "get after second varbind wrongValue"), "get"),
+                same_lines(lines_of(outcome_of(got, "get after second varbind wrongValue"), "get"),
                            [".1.3.6.1.4.1.8072.9999.1.20.1.0 = INTEGER: 7"],
                            "the first varbind of the failed SET stays applied")
             attempt(failures, "non-atomic", non_atomic)
@@ -1663,29 +1663,29 @@ actor _Set(t: testing.EnvT, a: LabAgent):
                           "u_ro_sha_aes: noAccess")
                     check(status(outcome_of(got, "error atomic"), "atomic") == (pdu.NOT_WRITABLE, 2),
                           "atomic: notWritable at index 2")
-                    same_lines(got_lines(outcome_of(got, "get after atomic"), "get"),
+                    same_lines(lines_of(outcome_of(got, "get after atomic"), "get"),
                                ['.1.3.6.1.2.1.1.4.0 = STRING: "actsnmp-contact"'],
                                "sysContact rolled back after the failed SET")
-                    same_lines(got_lines(outcome_of(got, "get system"), "get"),
+                    same_lines(lines_of(outcome_of(got, "get system"), "get"),
                                ['.1.3.6.1.2.1.1.4.0 = STRING: "new-contact"', '.1.3.6.1.2.1.1.5.0 = STRING: "new-name"',
                                 '.1.3.6.1.2.1.1.6.0 = STRING: "new-location"'], "system objects set")
-                    same_lines(got_lines(outcome_of(got, "system after"), "get"),
+                    same_lines(lines_of(outcome_of(got, "system after"), "get"),
                                ['.1.3.6.1.2.1.1.4.0 = STRING: "actsnmp-contact"',
                                 '.1.3.6.1.2.1.1.5.0 = STRING: "actsnmp-snmpd"',
                                 '.1.3.6.1.2.1.1.6.0 = STRING: "actsnmp-lab"'], "system objects restored")
                 attempt(failures, "snmpd", snmpd_only)
 
             def restored() -> None:
-                same_lines(got_lines(outcome_of(got, "restore"), "restore"), lines(restore), "restoring SET")
-                same_lines(lines(walked(outcome_of(got, "after"), "after")), initial, "B.20 restored")
+                same_lines(lines_of(outcome_of(got, "restore"), "restore"), lines(restore), "restoring SET")
+                same_lines(lines(walk_result(outcome_of(got, "after"), "after")), initial, "B.20 restored")
             attempt(failures, "restore", restored)
             all_passed(failures)
         report_env(t, outcome(run))
 
-    def go() -> None:
-        s = Script(a.name, steps, finish)
+    def lab_up() -> None:
+        s = Script(a.name, steps, finished)
 
-    gate = LabGate(t, go)
+    gate = LabGate(t, lab_up)
 
 actor _test_snmpd_set(t: testing.EnvT):
     """snmpd: SET of every writable type (v1/v2c/v3), every error status, atomicity, restore"""
@@ -1762,7 +1762,7 @@ actor _test_snmpsim_pathological(t: testing.EnvT):
         steps.append(get_step("error %d" % i, v2, [p([3, i, 0])]))
         steps.append(get_step("v1 error %d" % i, v1, [p([3, i, 0])]))
 
-    def finish(name: str, got: dict[str, Outcome]) -> None:
+    def finished(name: str, got: dict[str, Outcome]) -> None:
         def run() -> None:
             failures: list[str] = []
             p11 = ".1.3.6.1.4.1.8072.9999.2.1.1.0 = INTEGER: 1"
@@ -1772,46 +1772,47 @@ actor _test_snmpsim_pathological(t: testing.EnvT):
             p53 = ".1.3.6.1.4.1.8072.9999.2.5.3.0 = INTEGER: 53"
 
             def values() -> None:
-                same_lines(got_lines(outcome_of(got, "values"), "values"),
+                same_lines(lines_of(outcome_of(got, "values"), "values"),
                            [p11, p12, ".1.3.6.1.4.1.8072.9999.2.1.5.0 = INTEGER: 5"], "NULL and integers")
-                same_lines(got_lines(outcome_of(got, "10000"), "10000"), [p13], "10000-octet string")
-                same_lines(got_lines(outcome_of(got, "60000"), "60000"),
+                same_lines(lines_of(outcome_of(got, "10000"), "10000"), [p13], "10000-octet string")
+                same_lines(lines_of(outcome_of(got, "60000"), "60000"),
                            [fmt.canon_varbind(VarBind(p([1, 6, 0]), OctetString(pattern(60000))))], "60000-octet string")
             attempt(failures, "values", values)
 
             def too_big() -> None:
                 # P.1.4.0 (65535 octets) cannot fit into a UDP datagram: snmpsim does not answer
-                timed_out(outcome_of(got, "65535"), "GET of the 65535-octet string")
-                timed_out(outcome_of(got, "getbulk too big"), "GETBULK P.1 R=10")
+                expect_timeout(outcome_of(got, "65535"), "GET of the 65535-octet string")
+                expect_timeout(outcome_of(got, "getbulk too big"), "GETBULK P.1 R=10")
                 # a walk's GETBULK halves max-repetitions on each timeout (10, 5, 2: P.1.1 and P.1.2 fit), then
                 # P.1.3 alone fits, P.1.4 never does: the walk ends with the timeout and what it collected
                 o = outcome_of(got, "walk P.1 adaptive")
-                timed_out(o, "adaptive walk of P.1")
+                expect_timeout(o, "adaptive walk of P.1")
                 same_lines(lines(o.vbs), [p11, p12, p13], "adaptive walk of P.1 before the timeout")
                 # the Client remembers max-repetitions 1: the next walk needs no halving and no retry
                 o2 = outcome_of(got, "walk P.1 after")
-                timed_out(o2, "second walk of P.1")
+                expect_timeout(o2, "second walk of P.1")
                 same_lines(lines(o2.vbs), [p11, p12, p13], "second walk of P.1 (max-repetitions 1 learned)")
                 st = outcome_of(got, "adaptive stats").stats
                 if st is not None:
                     check(st.retries == 2 + 1 + 3, "adaptive retries (10, 5, 2; 2, 1; 1, 1, 1, 1): " + str(st))
                 for label in ["walk P.1 getnext", "v1 walk P.1", "v3 walk P.1 adaptive"]:
                     o3 = outcome_of(got, label)
-                    timed_out(o3, label)
+                    expect_timeout(o3, label)
                     same_lines(lines(o3.vbs), [p11, p12, p13], label + " before the timeout")
             attempt(failures, "too big for UDP", too_big)
 
             def exceptions() -> None:
-                same_lines(got_lines(outcome_of(got, "exceptions"), "exceptions"),
+                same_lines(lines_of(outcome_of(got, "exceptions"), "exceptions"),
                            [".1.3.6.1.4.1.8072.9999.2.2.1.0 = noSuchObject", ".1.3.6.1.4.1.8072.9999.2.2.2.0 = noSuchInstance",
                             ".1.3.6.1.4.1.8072.9999.2.2.3.0 = endOfMibView", ".1.3.6.1.4.1.8072.9999.2.2.4.0 = INTEGER: 24"],
                            "exception values as data")
-                same_lines(got_lines(outcome_of(got, "getnext P.2"), "getnext"),
+                same_lines(lines_of(outcome_of(got, "getnext P.2"), "getnext"),
                            [".1.3.6.1.4.1.8072.9999.2.2.1.0 = noSuchObject"], "GETNEXT landing on noSuchObject data")
                 # a walk ends at the first exception value; nothing collected, and the GET of the root P.2
                 # gives an exception too
-                same_lines(lines(walked(outcome_of(got, "walk P.2"), "walk P.2")), [], "walk of P.2")
-                same_lines(lines(walked(outcome_of(got, "walk P.2 getnext"), "walk P.2")), [], "GETNEXT walk of P.2")
+                same_lines(lines(walk_result(outcome_of(got, "walk P.2"), "walk P.2")), [], "walk of P.2")
+                same_lines(lines(walk_result(outcome_of(got, "walk P.2 getnext"), "walk P.2")), [],
+                           "GETNEXT walk of P.2")
             attempt(failures, "exceptions as data", exceptions)
 
             def statuses() -> None:
@@ -1831,7 +1832,7 @@ actor _test_snmpsim_pathological(t: testing.EnvT):
                     want = V1_ERROR_CASES[i - 1]
                     o = outcome_of(got, "v1 error %d" % i)
                     if want.0 == 0:
-                        same_lines(got_lines(o, "v1"), [".1.3.6.1.4.1.8072.9999.2.3.%d.0 = noSuchObject" % i],
+                        same_lines(lines_of(o, "v1"), [".1.3.6.1.4.1.8072.9999.2.3.%d.0 = noSuchObject" % i],
                                    "SNMPv1 P.3.%d.0: noSuchName fixed" % i)
                     else:
                         st = status(o, "SNMPv1 P.3.%d.0" % i)
@@ -1864,22 +1865,22 @@ actor _test_snmpsim_pathological(t: testing.EnvT):
                 same_lines(lines(r.varbinds), [p11, p12], "SNMPv3 context pathological")
                 check(r.context_name == b"pathological" and r.context_engine_id == a.engine_id,
                       "context " + repr(r.context_name))
-                same_lines(got_lines(outcome_of(got, "v3 60000"), "v3 60000"),
+                same_lines(lines_of(outcome_of(got, "v3 60000"), "v3 60000"),
                            [fmt.canon_varbind(VarBind(p([1, 6, 0]), OctetString(pattern(60000))))],
                            "60000 octets encrypted")
                 check(status(outcome_of(got, "v3 genErr"), "v3") == (pdu.GEN_ERR, 1), "SNMPv3 genErr")
                 o = outcome_of(got, "v3 walk P.5")
                 check(not_increasing(o, "v3 walk") == (p([5, 1, 0]).arcs, p([5, 1, 0]).arcs), describe(o))
                 # README: an oversized SNMPv3 response is dropped by snmpsim (snmpd answers tooBig)
-                timed_out(outcome_of(got, "v3 65535"), "SNMPv3 GET of the 65535-octet string")
+                expect_timeout(outcome_of(got, "v3 65535"), "SNMPv3 GET of the 65535-octet string")
             attempt(failures, "v3 context", context)
             all_passed(failures)
         report_env(t, outcome(run))
 
-    def go() -> None:
-        s = Script("pathological", steps, finish)
+    def lab_up() -> None:
+        s = Script("pathological", steps, finished)
 
-    gate = LabGate(t, go)
+    gate = LabGate(t, lab_up)
 
 actor _test_snmpsim_slow(t: testing.EnvT):
     """snmpsim's delay variation (P.4: answers after 1 s / 5 s, blocking snmpsim): a long enough timeout,
@@ -1901,22 +1902,22 @@ actor _test_snmpsim_slow(t: testing.EnvT):
         get_step("blocked again", c, [p([1, 1, 0])], Options(timeout=15.0, retries=0)),
         info_step("stats", c)]
 
-    def finish(name: str, got: dict[str, Outcome]) -> None:
+    def finished(name: str, got: dict[str, Outcome]) -> None:
         def run() -> None:
             o1 = outcome_of(got, "1 s")
-            same_lines(got_lines(o1, "1 s"), [".1.3.6.1.4.1.8072.9999.2.4.1.0 = INTEGER: 41"], "1 s delay")
+            same_lines(lines_of(o1, "1 s"), [".1.3.6.1.4.1.8072.9999.2.4.1.0 = INTEGER: 41"], "1 s delay")
             check(o1.elapsed >= 0.9, "answered after %.3f s" % o1.elapsed)
-            e = timed_out(outcome_of(got, "5 s timeout"), "5 s delay with a 2 s timeout")
+            e = expect_timeout(outcome_of(got, "5 s timeout"), "5 s delay with a 2 s timeout")
             check(e.attempts == 1, "one attempt: " + str(e))
             ob = outcome_of(got, "blocked")
-            same_lines(got_lines(ob, "blocked"), [".1.3.6.1.4.1.8072.9999.2.1.1.0 = INTEGER: 1"], "after the delay")
+            same_lines(lines_of(ob, "blocked"), [".1.3.6.1.4.1.8072.9999.2.1.1.0 = INTEGER: 1"], "after the delay")
             check(ob.elapsed >= 2.0, "snmpsim was blocked by the delay: answered after %.3f s" % ob.elapsed)
             ol = outcome_of(got, "5 s late answer")
             r = response(ol, "late answer")
             same_lines(lines(r.varbinds), [".1.3.6.1.4.1.8072.9999.2.4.2.0 = INTEGER: 42"], "late answer")
             check(r.attempts == 3 and r.rtt >= 4.5, "the first attempt's answer: %d attempts, rtt %.3f"
                   % (r.attempts, r.rtt))
-            same_lines(got_lines(outcome_of(got, "blocked again"), "blocked again"),
+            same_lines(lines_of(outcome_of(got, "blocked again"), "blocked again"),
                        [".1.3.6.1.4.1.8072.9999.2.1.1.0 = INTEGER: 1"], "after the retransmissions")
             st = outcome_of(got, "stats").stats
             if st is not None:
@@ -1924,10 +1925,10 @@ actor _test_snmpsim_slow(t: testing.EnvT):
                 check(st.drops_unknown_id == 3 and st.timeouts == 1, "counters: " + str(st))
         report_env(t, outcome(run))
 
-    def go() -> None:
-        s = Script("slow", steps, finish)
+    def lab_up() -> None:
+        s = Script("slow", steps, finished)
 
-    gate = LabGate(t, go)
+    gate = LabGate(t, lab_up)
 
 
 # SNMP over TCP (RFC 3430) #########################################################################
@@ -1975,38 +1976,38 @@ actor _test_snmpd_tcp(t: testing.EnvT):
              get_step("ipv6 v3 get scalars", v6v3, scal_oids),
              get_step("refused", closed, [b([1, 1, 0])])]
 
-    def finish(name: str, got: dict[str, Outcome]) -> None:
+    def finished(name: str, got: dict[str, Outcome]) -> None:
         def run() -> None:
             failures: list[str] = []
 
             def gets() -> None:
-                same_lines(got_lines(outcome_of(got, "v2c get scalars"), "v2c"), scal,
+                same_lines(lines_of(outcome_of(got, "v2c get scalars"), "v2c"), scal,
                            "SNMPv2c GET of the 70 scalars")
-                same_lines(got_lines(outcome_of(got, "v1 get scalars"), "v1"), v1_get_lines(scal),
+                same_lines(lines_of(outcome_of(got, "v1 get scalars"), "v1"), v1_get_lines(scal),
                            "SNMPv1 GET of the 70 scalars")
-                same_lines(got_lines(outcome_of(got, "v3 get scalars"), "v3"), scal, "SNMPv3 GET of the 70 scalars")
-                same_lines(got_lines(outcome_of(got, "ipv6 v3 get scalars"), "ipv6 v3"), scal,
+                same_lines(lines_of(outcome_of(got, "v3 get scalars"), "v3"), scal, "SNMPv3 GET of the 70 scalars")
+                same_lines(lines_of(outcome_of(got, "ipv6 v3 get scalars"), "ipv6 v3"), scal,
                            "SNMPv3 GET of the 70 scalars over IPv6")
             attempt(failures, "GET", gets)
 
             def getnext() -> None:
-                same_lines(got_lines(outcome_of(got, "v2c getnext"), "getnext"),
+                same_lines(lines_of(outcome_of(got, "v2c getnext"), "getnext"),
                            next_lines(full, [BASE, b([1, 19, 0]), b([10, 1, 1])]), "GETNEXT")
-                same_lines(got_lines(outcome_of(got, "v2c getbulk"), "getbulk"),
+                same_lines(lines_of(outcome_of(got, "v2c getbulk"), "getbulk"),
                            next_lines(full, [b([1])]) + under(full, b([10, 1, 2]))[:3], "GETBULK N=1 R=3")
             attempt(failures, "GETNEXT and GETBULK", getnext)
 
             def walks() -> None:
-                same_lines(lines(walked(outcome_of(got, "v2c bulk walk"), "v2c bulk walk")), full,
+                same_lines(lines(walk_result(outcome_of(got, "v2c bulk walk"), "v2c bulk walk")), full,
                            "SNMPv2c bulk walk of B")
-                same_lines(lines(walked(outcome_of(got, "v3 bulk walk"), "v3 bulk walk")), full,
+                same_lines(lines(walk_result(outcome_of(got, "v3 bulk walk"), "v3 bulk walk")), full,
                            "SNMPv3 bulk walk of B")
-                same_lines(lines(walked(outcome_of(got, "v2c getnext walk"), "v2c getnext walk")),
+                same_lines(lines(walk_result(outcome_of(got, "v2c getnext walk"), "v2c getnext walk")),
                            under(full, b([10])), "SNMPv2c GETNEXT walk of B.10")
-                same_lines(lines(walked(outcome_of(got, "v1 walk"), "v1 walk")), under(full_v1, b([11])),
+                same_lines(lines(walk_result(outcome_of(got, "v1 walk"), "v1 walk")), under(full_v1, b([11])),
                            "SNMPv1 walk of B.11")
-                same_lines(lines(walked(outcome_of(got, "ipv6 bulk walk"), "ipv6 bulk walk")), under(full, b([12])),
-                           "bulk walk of B.12 over IPv6")
+                same_lines(lines(walk_result(outcome_of(got, "ipv6 bulk walk"), "ipv6 bulk walk")),
+                           under(full, b([12])), "bulk walk of B.12 over IPv6")
             attempt(failures, "walks", walks)
 
             def one_attempt_each() -> None:
@@ -2025,17 +2026,17 @@ actor _test_snmpd_tcp(t: testing.EnvT):
             attempt(failures, "retries", one_attempt_each)
 
             def refused() -> None:
-                e = timed_out(outcome_of(got, "refused"), "refused")
+                e = expect_timeout(outcome_of(got, "refused"), "refused")
                 check(e.hint == "send error: TCP connection to 127.0.0.1:%d failed: connection refused" % CLOSED_PORT,
                       "hint: " + str(e.hint))
             attempt(failures, "refused", refused)
             all_passed(failures)
         report_env(t, outcome(run))
 
-    def go() -> None:
-        s = Script("tcp", steps, finish)
+    def lab_up() -> None:
+        s = Script("tcp", steps, finished)
 
-    gate = LabGate(t, go)
+    gate = LabGate(t, lab_up)
 
 
 # Notifications: our sender to the lab's snmptrapd #################################################
@@ -2114,7 +2115,7 @@ actor _ToSnmptrapd(t: testing.EnvT, steps: list[Step], want: list[str]):
     var sent: dict[str, Outcome] = {}
     var polls = 0
 
-    def compare(code: int, out: str, err: str) -> None:
+    def last_polled(code: int, out: str, err: str) -> None:
         def run() -> None:
             failures: list[str] = []
             for s in steps:
@@ -2141,13 +2142,13 @@ actor _ToSnmptrapd(t: testing.EnvT, steps: list[Step], want: list[str]):
         if n < len(want) and polls < 30:
             after now 0.5: poll()
         else:
-            after now 1.0: final()
+            after now 1.0: last_poll_due()
 
     def poll() -> None:
         sh = Shell(proc_cap(t), ["interop/trapdcheck.sh", "log"], polled, 60.0)
 
-    def final() -> None:
-        sh = Shell(proc_cap(t), ["interop/trapdcheck.sh", "log"], compare, 60.0)
+    def last_poll_due() -> None:
+        sh = Shell(proc_cap(t), ["interop/trapdcheck.sh", "log"], last_polled, 60.0)
 
     def all_sent(name: str, got: dict[str, Outcome]) -> None:
         sent = got
@@ -2159,11 +2160,11 @@ actor _ToSnmptrapd(t: testing.EnvT, steps: list[Step], want: list[str]):
             return
         s = Script("notifications", steps, all_sent)
 
-    def go() -> None:
+    def lab_up() -> None:
         # a fresh snmptrapd: it keeps the boots and time of every trap sender engine
         sh = Shell(proc_cap(t), ["interop/trapdcheck.sh", "start"], started, 90.0)
 
-    gate = LabGate(t, go)
+    gate = LabGate(t, lab_up)
 
 actor _test_trap_to_snmptrapd(t: testing.EnvT):
     """Client.trap_v1/trap/inform to the lab's snmptrapd: SNMPv1 (every generic-trap), SNMPv2c traps and
@@ -2309,10 +2310,10 @@ actor _Matrix(t: testing.EnvT, flag: str, expected_file: str, address: str=LOCAL
     var srv: ?ServerTransport = None
     var waits = 0
 
-    def on_notification(r: NotificationReceiver, n: Notification) -> None:
+    def received(r: NotificationReceiver, n: Notification) -> None:
         blocks.append(fmt.canon_notification(n))
 
-    def compare(code: int, err: str) -> None:
+    def settled(code: int, err: str) -> None:
         st: dict[str, int] = {}
         r = rcv
         if r is not None:
@@ -2322,9 +2323,9 @@ actor _Matrix(t: testing.EnvT, flag: str, expected_file: str, address: str=LOCAL
             failures: list[str] = []
             if code != 0:
                 failures.append("notifycheck.py --send exited with %d: " % code + clip(err[-2000:]))
-            def received() -> None:
+            def blocks_match() -> None:
                 same_blocks(blocks, want, not tcp, "receiver output")
-            attempt(failures, "received", received)
+            attempt(failures, "received", blocks_match)
 
             def counters() -> None:
                 informs = len([x for x in want if " INFORM " in x])
@@ -2340,7 +2341,7 @@ actor _Matrix(t: testing.EnvT, flag: str, expected_file: str, address: str=LOCAL
         if len(blocks) < len(want) and waits < 40:
             after now 0.25: wait_all(code, err)
         else:
-            after now 0.5: compare(code, err)
+            after now 0.5: settled(code, err)
 
     def sent(code: int, out: str, err: str) -> None:
         wait_all(code, err)
@@ -2354,36 +2355,36 @@ actor _Matrix(t: testing.EnvT, flag: str, expected_file: str, address: str=LOCAL
             cmd += ["--senders", "netsnmp"]
         return cmd
 
-    def on_ready(st: ServerTransport, error: ?str) -> None:
+    def listening(st: ServerTransport, error: ?str) -> None:
         if error is not None:
             t.failure(AssertionError("our receiver cannot listen on " + receiver + ": " + error))
             return
         srv = st
         cfg = ReceiverConfig.from_users_tsv(users_text, h(RECEIVER_ENGINE), ["public"])
-        rcv = NotificationReceiver(st, cfg, on_notification, None)
+        rcv = NotificationReceiver(st, cfg, received, None)
         sh = Shell(proc_cap(t), notifycheck("--send") + ["--receiver", receiver], sent, 280.0)
 
     proc def listen() -> None:
         if tcp:
-            tcp_server_transport(net.TCPListenCap(tcap), address, RECEIVER_PORT, on_ready, None)
+            tcp_server_transport(net.TCPListenCap(tcap), address, RECEIVER_PORT, listening, None)
         else:
-            udp_server_transport(net.UDPListenCap(ucap), address, RECEIVER_PORT, on_ready, None)
+            udp_server_transport(net.UDPListenCap(ucap), address, RECEIVER_PORT, listening, None)
 
-    def expected_blocks(code: int, out: str, err: str) -> None:
+    def got_expected(code: int, out: str, err: str) -> None:
         if code != 0:
             t.failure(AssertionError("notifycheck.py --expected exited with %d: " % code + clip(err)))
             return
         want = blocks_of(out)
         listen()
 
-    def go() -> None:
+    def lab_up() -> None:
         if tcp:
             # the net-snmp half of the matrix, numbered as notifycheck.py sends it
-            sh = Shell(proc_cap(t), notifycheck("--expected"), expected_blocks, 60.0)
+            sh = Shell(proc_cap(t), notifycheck("--expected"), got_expected, 60.0)
         else:
             listen()
 
-    gate = LabGate(t, go)
+    gate = LabGate(t, lab_up)
 
 actor _test_receiver_matrix_quick(t: testing.EnvT):
     """The --quick notification matrix (22) from net-snmp and pysnmp to our NotificationReceiver over UDP"""
@@ -2445,7 +2446,7 @@ actor _test_dispatcher(t: testing.EnvT):
     var disp: ?Dispatcher = None
     var scripts: list[(str, list[Step])] = []
 
-    def finish(results: dict[str, dict[str, Outcome]]) -> None:
+    def gathered(results: dict[str, dict[str, Outcome]]) -> None:
         d = disp
         s = d.stats() if d is not None else None
         if s is not None:
@@ -2458,10 +2459,10 @@ actor _test_dispatcher(t: testing.EnvT):
 
                 def one() -> None:
                     o = outcome_of(got, "walk")
-                    same_lines(lines(walked(o, name)), full_v1 if " v1 " in name else full, "walk of B")
+                    same_lines(lines(walk_result(o, name)), full_v1 if " v1 " in name else full, "walk of B")
                     g = got.get("scalars")
                     if g is not None:
-                        same_lines(got_lines(g, name + " scalars"), v1_get_lines(scal) if " v1 " in name else scal,
+                        same_lines(lines_of(g, name + " scalars"), v1_get_lines(scal) if " v1 " in name else scal,
                                    "GET of the scalars")
                 attempt(failures, name, one)
             if s is not None:
@@ -2474,7 +2475,7 @@ actor _test_dispatcher(t: testing.EnvT):
             d.close()
         report_env(t, outcome(run))
 
-    def disp_ready(d: Dispatcher, error: ?str) -> None:
+    def disp_listening(d: Dispatcher, error: ?str) -> None:
         if error is not None:
             t.failure(AssertionError("dispatcher: " + error))
             return
@@ -2499,11 +2500,11 @@ actor _test_dispatcher(t: testing.EnvT):
             else:
                 cx = via(d, a, LOCAL4, with_context(find_user(lab, "u_sha_aes"), "private"), o)
                 scripts.append(("snmpsim u_sha_aes context private", [walk_step("walk", cx, BASE)]))
-        g = Gather(len(scripts), finish)
+        g = Gather(len(scripts), gathered)
         for sn in scripts:
-            sc = Script(sn.0, sn.1, g.put)
+            sc = Script(sn.0, sn.1, g.script_finished)
 
-    def go() -> None:
-        dispatcher.udp_dispatcher(lcap, "::", 0, disp_ready, None)
+    def lab_up() -> None:
+        dispatcher.udp_dispatcher(lcap, "::", 0, disp_listening, None)
 
-    gate = LabGate(t, go)
+    gate = LabGate(t, lab_up)

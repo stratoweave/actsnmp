@@ -367,7 +367,7 @@ proc def tcp_client_transport(cap: net.TCPConnectCap, o: CliOptions, on_connect:
                          stall_timeout=2.0 * o.timeout, on_connect=on_connect)
 
 proc def tcp_command(cap: net.TCPConnectCap, o: CliOptions, sec: Security, out: action(str) -> None,
-                     err: action(str) -> None, done: action(int) -> None) -> Command:
+                     err: action(str) -> None, on_done: action(int) -> None) -> Command:
     """The Command of a client command over TCP, with a TcpWatch on its transport
 
     The Client sends over tcp_client_transport(). The TcpWatch ends the
@@ -377,7 +377,7 @@ proc def tcp_command(cap: net.TCPConnectCap, o: CliOptions, sec: Security, out: 
     """
     w = TcpWatch()
     tr = w.watch(tcp_client_transport(cap, o, w.connected))
-    cmd = Command(o, new_client(None, o, sec, tr), out, err, done)
+    cmd = Command(o, new_client(None, o, sec, tr), out, err, on_done)
     w.on_failure(cmd.connection_failed)
     w.on_connect(cmd.connected)
     return cmd
@@ -406,25 +406,25 @@ actor HostLookup(cap: net.DNSCap, name: str, ipv6_only: bool, on_done: action(st
     ipv6_only asks for AAAA records only. Otherwise the first IPv4 address
     is the answer, and the first IPv6 address only for a name without one.
     """
-    def _none(host: str, error: str) -> None:
+    def _ipv6_failed(host: str, error: str) -> None:
         on_done("")
 
-    def _first(addresses: list[str]) -> None:
+    def _ipv6_resolved(addresses: list[str]) -> None:
         on_done(addresses[0] if len(addresses) > 0 else "")
 
-    def _no_ipv4(host: str, error: str) -> None:
-        net.lookup_aaaa(cap, name, _first, _none)
+    def _ipv4_failed(host: str, error: str) -> None:
+        net.lookup_aaaa(cap, name, _ipv6_resolved, _ipv6_failed)
 
-    def _first_ipv4(addresses: list[str]) -> None:
+    def _ipv4_resolved(addresses: list[str]) -> None:
         if len(addresses) > 0:
             on_done(addresses[0])
         else:
-            _no_ipv4(name, "no IPv4 address")
+            _ipv4_failed(name, "no IPv4 address")
 
     if ipv6_only:
-        net.lookup_aaaa(cap, name, _first, _none)
+        net.lookup_aaaa(cap, name, _ipv6_resolved, _ipv6_failed)
     else:
-        net.lookup_a(cap, name, _first_ipv4, _no_ipv4)
+        net.lookup_a(cap, name, _ipv4_resolved, _ipv4_failed)
 
 
 actor TcpWatch():
@@ -441,13 +441,13 @@ actor TcpWatch():
     var _on_data: ?action(bytes, str, int) -> None = None
     var _on_error: ?action(str, bool) -> None = None
     var _on_failure: ?action(str) -> None = None
-    var _on_up: ?action() -> None = None
+    var _on_connect: ?action() -> None = None
     var _answered = False
     var _failure = ""
     var _up = False
 
     def watch(tr: Transport) -> Transport:
-        tr.set_receiver(_data, _error)
+        tr.set_receiver(_received, _failed)
         return watched(tr, self)
 
     def set_receiver(on_data: action(bytes, str, int) -> None, on_error: action(str, bool) -> None) -> None:
@@ -460,24 +460,24 @@ actor TcpWatch():
             report(_failure)
 
     def on_connect(report: action() -> None) -> None:
-        _on_up = report
+        _on_connect = report
         if _up:
             report()
 
     def connected() -> None:
         if not _up:
             _up = True
-            report = _on_up
+            report = _on_connect
             if report is not None:
                 report()
 
-    def _data(data: bytes, src_address: str, src_port: int) -> None:
+    def _received(data: bytes, src_address: str, src_port: int) -> None:
         _answered = True
         on_data = _on_data
         if on_data is not None:
             on_data(data, src_address, src_port)
 
-    def _error(text: str, fatal: bool) -> None:
+    def _failed(text: str, fatal: bool) -> None:
         if not _answered and _failure == "":
             _failure = connect_failure(text)
             report = _on_failure
@@ -498,12 +498,12 @@ def watched(tr: Transport, w: TcpWatch) -> Transport:
 # The client commands ################################################################################
 
 actor Command(o: CliOptions, c: Client, out: action(str) -> None, err: action(str) -> None,
-              done: action(int) -> None):
+              on_done: action(int) -> None):
     """Runs one client command (get ... inform) with Client c
 
     out and err receive stdout and stderr text as whole lines, in output
-    order. done is called once with the exit code. The caller owns c and
-    closes it. Over TCP the caller calls connection_failed() when the
+    order. on_done is called once with the exit code. The caller owns c
+    and closes it. Over TCP the caller calls connection_failed() when the
     connection fails before the agent has answered, and connected() when
     it is up (tcp_command() does).
     """
@@ -524,7 +524,7 @@ actor Command(o: CliOptions, c: Client, out: action(str) -> None, err: action(st
     proc def _finish(code: int) -> None:
         if not _finished:
             _finished = True
-            done(code)
+            on_done(code)
 
     proc def _fail(e: errors.SnmpError, period: bool) -> None:
         err(failure_text(o, e, period))
@@ -534,11 +534,11 @@ actor Command(o: CliOptions, c: Client, out: action(str) -> None, err: action(st
 
     proc def _send_get() -> None:
         if o.command == "get":
-            c.get(_on_get, _oids, _opts)
+            c.get(_got, _oids, _opts)
         else:
-            c.get_next(_on_get, _oids, _opts)
+            c.get_next(_got, _oids, _opts)
 
-    def _on_get(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def _got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         if e is not None:
             if isinstance(e, errors.ErrorStatusError):
                 err(error_status_text(o.command != "get", e, o))
@@ -560,7 +560,7 @@ actor Command(o: CliOptions, c: Client, out: action(str) -> None, err: action(st
 
     # bulkget and set ---------------------------------------------------------------------------------
 
-    def _on_simple(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def _completed(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         if e is not None:
             if isinstance(e, errors.ErrorStatusError):
                 if o.command == "bulkget" and e.status == pdu.NO_SUCH_NAME:
@@ -586,7 +586,7 @@ actor Command(o: CliOptions, c: Client, out: action(str) -> None, err: action(st
             err("Total traversal time = %f seconds\n" % time.monotonic().since(_start).to_float())
         _finish(_exit)
 
-    def _on_fallback(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def _got_root(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         # snmp_get_and_print: prints (and counts) the varbinds of a successful answer, ignores everything else
         if e is None and r is not None:
             out(lines_text(o, r.varbinds))
@@ -595,15 +595,15 @@ actor Command(o: CliOptions, c: Client, out: action(str) -> None, err: action(st
 
     proc def _walk_done(success: bool) -> None:
         if _count == 0 and success and not o.dont_get_requested:
-            c.get(_on_fallback, [_root], _opts)
+            c.get(_got_root, [_root], _opts)
         else:
             _walk_report()
 
     proc def _walk_next() -> None:
         if o.command == "bulkwalk":
-            c.get_bulk(_on_walk, [_name], o.non_repeaters, o.max_repetitions, _opts)
+            c.get_bulk(_got_next, [_name], o.non_repeaters, o.max_repetitions, _opts)
         else:
-            c.get_next(_on_walk, [_name], _opts)
+            c.get_next(_got_next, [_name], _opts)
 
     proc def _repeated(vb: VarBind) -> bool:
         # with -Cc only: a repeated OID would make net-snmp loop forever; stop instead
@@ -655,7 +655,7 @@ actor Command(o: CliOptions, c: Client, out: action(str) -> None, err: action(st
             out("".join(buf))
         return running
 
-    def _on_walk(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def _got_next(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         if e is not None:
             if isinstance(e, errors.ErrorStatusError):
                 if e.status == pdu.NO_SUCH_NAME:
@@ -679,7 +679,7 @@ actor Command(o: CliOptions, c: Client, out: action(str) -> None, err: action(st
             else:
                 _walk_done(True)
 
-    def _on_include(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def _got_included(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         # -Ci: snmp_get_and_print of the root; what it prints counts, so the GET of an empty subtree is skipped
         if e is None and r is not None:
             out(lines_text(o, r.varbinds))
@@ -688,7 +688,7 @@ actor Command(o: CliOptions, c: Client, out: action(str) -> None, err: action(st
 
     # table -------------------------------------------------------------------------------------------
 
-    def _on_table(cl: Client, tbl: ?Table, e: ?errors.SnmpError) -> None:
+    def _got_table(cl: Client, tbl: ?Table, e: ?errors.SnmpError) -> None:
         # Client.get_table: the rows found (also before an error), then the error as net-snmp's walks print it
         if tbl is not None:
             out(table_text(o, tbl))
@@ -710,7 +710,7 @@ actor Command(o: CliOptions, c: Client, out: action(str) -> None, err: action(st
         # Over TCP: the connection came up and carried the trap, or did not fail within its connect timeout
         _finish(0)
 
-    def _on_trap(cl: Client, e: ?errors.SnmpError) -> None:
+    def _trap_sent(cl: Client, e: ?errors.SnmpError) -> None:
         if e is not None:
             _fail(e, False)
             return
@@ -723,7 +723,7 @@ actor Command(o: CliOptions, c: Client, out: action(str) -> None, err: action(st
         else:
             _finish(0)
 
-    def _on_inform(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def _acked(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         # snmpinform does not look at the error-status of the acknowledgement
         if e is not None:
             if isinstance(e, errors.TimeoutError):
@@ -759,7 +759,7 @@ actor Command(o: CliOptions, c: Client, out: action(str) -> None, err: action(st
 
     # dispatch ----------------------------------------------------------------------------------------
 
-    def _on_session_discovery(cl: Client, info: ?EngineInfo, e: ?errors.SnmpError) -> None:
+    def _discovered(cl: Client, info: ?EngineInfo, e: ?errors.SnmpError) -> None:
         # net-snmp reports o.session_error when it opens the session, after a successful discovery
         if e is not None:
             _fail(e, False)
@@ -774,7 +774,7 @@ actor Command(o: CliOptions, c: Client, out: action(str) -> None, err: action(st
             err(w + "\n")
         if o.session_error != "":
             if o.engine_id is None:
-                c.discover(_on_session_discovery)
+                c.discover(_discovered)
             else:
                 err(session_error_text(o))
                 _finish(1)
@@ -796,30 +796,30 @@ actor Command(o: CliOptions, c: Client, out: action(str) -> None, err: action(st
                 err(_tool + ": Cannot send V2 PDU on V1 session\n")
                 _finish(1)
             else:
-                c.get_bulk(_on_simple, o.oids, o.non_repeaters, o.max_repetitions, _opts)
+                c.get_bulk(_completed, o.oids, o.non_repeaters, o.max_repetitions, _opts)
         elif cmd == "set":
-            c.set(_on_simple, o.varbinds, _opts)
+            c.set(_completed, o.varbinds, _opts)
         elif cmd == "walk" or cmd == "bulkwalk":
             if cmd == "bulkwalk" and v1:
                 err(_tool + ": Cannot send V2 PDU on V1 session\n")
                 _finish(1)
             elif o.include_requested:
-                c.get(_on_include, [_root], _opts)
+                c.get(_got_included, [_root], _opts)
             else:
                 _walk_next()
         elif cmd == "table":
-            c.get_table(_on_table, o.oids, table_options(o))
+            c.get_table(_got_table, o.oids, table_options(o))
         elif cmd == "trap" and not o.inform:
             if v1:
-                c.trap_v1(_on_trap, o.enterprise, o.agent_addr, o.generic, o.specific, o.varbinds, o.uptime)
+                c.trap_v1(_trap_sent, o.enterprise, o.agent_addr, o.generic, o.specific, o.varbinds, o.uptime)
             else:
-                c.trap(_on_trap, o.trap_oid, o.varbinds, o.uptime)
+                c.trap(_trap_sent, o.trap_oid, o.varbinds, o.uptime)
         elif cmd == "trap" or cmd == "inform":
             if v1:
                 err("Cannot send INFORM as SNMPv1 PDU\n")
                 _finish(1)
             else:
-                c.inform(_on_inform, o.trap_oid, o.varbinds, o.uptime, _opts)
+                c.inform(_acked, o.trap_oid, o.varbinds, o.uptime, _opts)
         else:
             err("actsnmp: " + cmd + " is not a client command\n")
             _finish(1)
@@ -831,7 +831,7 @@ actor Command(o: CliOptions, c: Client, out: action(str) -> None, err: action(st
 
 actor TrapPrinter(o: CliOptions, out: action(str) -> None):
     """Writes notification_text of every notification a NotificationReceiver delivers"""
-    def on_notification(r: NotificationReceiver, n: Notification) -> None:
+    def received(r: NotificationReceiver, n: Notification) -> None:
         out(notification_text(o, n))
 
 
@@ -857,38 +857,38 @@ proc def listen(ucap: net.UDPListenCap, tcap: net.TCPListenCap, o: CliOptions,
 
 
 actor AgentServer(ucap: net.UDPListenCap, tcap: net.TCPListenCap, o: CliOptions, view: MibView, config: AgentConfig,
-                  err: action(str) -> None, done: action(int) -> None):
+                  err: action(str) -> None, on_done: action(int) -> None):
     """Listens (see listen()) and serves view with an Agent until the process ends"""
     var _agent: ?Agent = None
 
-    def _ready(t: ServerTransport, error: ?str) -> None:
+    def _listening(t: ServerTransport, error: ?str) -> None:
         if error is not None:
             err("actsnmp agent: cannot listen on " + listen_text(o, o.listen_port) + ": " + error + "\n")
-            done(1)
+            on_done(1)
             return
         _agent = Agent(t, view, config, None)
         err("actsnmp agent: serving on " + listen_text(o, t.local_port()) + " (engine ID 0x"
             + config.engine_id.hex() + ")\n")
 
-    listen(ucap, tcap, o, _ready)
+    listen(ucap, tcap, o, _listening)
 
 
 actor TrapdServer(ucap: net.UDPListenCap, tcap: net.TCPListenCap, o: CliOptions, config: ReceiverConfig,
-                  out: action(str) -> None, err: action(str) -> None, done: action(int) -> None):
+                  out: action(str) -> None, err: action(str) -> None, on_done: action(int) -> None):
     """Listens (see listen()) and prints every notification until the process ends"""
     var _receiver: ?NotificationReceiver = None
     _printer = TrapPrinter(o, out)
 
-    def _ready(t: ServerTransport, error: ?str) -> None:
+    def _listening(t: ServerTransport, error: ?str) -> None:
         if error is not None:
             err("actsnmp trapd: cannot listen on " + listen_text(o, o.listen_port) + ": " + error + "\n")
-            done(1)
+            on_done(1)
             return
-        _receiver = NotificationReceiver(t, config, _printer.on_notification, None)
+        _receiver = NotificationReceiver(t, config, _printer.received, None)
         err("actsnmp trapd: listening on " + listen_text(o, t.local_port()) + " (engine ID 0x"
             + config.engine_id.hex() + ")\n")
 
-    listen(ucap, tcap, o, _ready)
+    listen(ucap, tcap, o, _listening)
 
 
 # main ################################################################################################
@@ -952,7 +952,7 @@ actor main(env):
         print("", end="", flush=True)
         print(s, end="", err=True, flush=True)
 
-    def finish(code: int) -> None:
+    def finished(code: int) -> None:
         if _trap:
             after TRAP_LINGER: env.exit(code)
         else:
@@ -998,7 +998,7 @@ actor main(env):
                     config = r.1
                     if view is not None:
                         if config is not None:
-                            AgentServer(_udp_listen_cap(), _tcp_listen_cap(), o, view, config, write_err, finish)
+                            AgentServer(_udp_listen_cap(), _tcp_listen_cap(), o, view, config, write_err, finished)
                             return
                     _usage_error("actsnmp agent: " + r.2, False)
 
@@ -1011,7 +1011,7 @@ actor main(env):
         config = r.0
         if config is not None:
             _flush_out = True
-            TrapdServer(_udp_listen_cap(), _tcp_listen_cap(), o, config, write_out, write_err, finish)
+            TrapdServer(_udp_listen_cap(), _tcp_listen_cap(), o, config, write_out, write_err, finished)
         else:
             _usage_error("actsnmp trapd: " + r.1, False)
 
@@ -1054,12 +1054,12 @@ actor main(env):
     proc def _run_client(o: CliOptions, sec: Security) -> None:
         # A client command once its agent's host has been looked up where resolves_name() says so
         if o.is_tcp():
-            tcp_command(net.TCPConnectCap(net.TCPCap(net.NetCap(env.cap))), o, sec, write_out, write_err, finish)
+            tcp_command(net.TCPConnectCap(net.TCPCap(net.NetCap(env.cap))), o, sec, write_out, write_err, finished)
         else:
             # a trap command exits TRAP_LINGER after the datagram was handed over (Command waits over TCP)
             _trap = o.command == "trap" and not o.inform
             ccap = net.UDPConnectCap(net.UDPCap(net.NetCap(env.cap)))
-            Command(o, new_client(ccap, o, sec), write_out, write_err, finish)
+            Command(o, new_client(ccap, o, sec), write_out, write_err, finished)
 
     proc def _mkdirs(path: str) -> None:
         # mkdir -p (errors show when the files are written)

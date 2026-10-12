@@ -760,7 +760,7 @@ actor NotificationReceiver(transport: ServerTransport, config: ReceiverConfig,
         else:
             _drop(DROPPED_DECODE, address, port, problem)
 
-    def _on_data(data: bytes, address: str, port: int) -> None:
+    def _received(data: bytes, address: str, port: int) -> None:
         if _closed:
             return
         _count(RECEIVED)
@@ -803,6 +803,6 @@ actor NotificationReceiver(transport: ServerTransport, config: ReceiverConfig,
             transport.close()
             _log.info("notification receiver closed", None)
 
-    transport.set_receiver(_on_data)
+    transport.set_receiver(_received)
     _log.info("notification receiver started", {"engine_id": config.engine_id.hex(), "users": len(config.users),
                                                 "communities": len(config.communities)})

@@ -983,7 +983,7 @@ actor _test_golden_memnet(t: testing.EnvT):
                               "ipAddressRowStatus", "ipAddressStorageType", "ipAddressPrefix", "ipAddressOrigin", "ipAddressLastChanged"],
                               ["ipv6", "2001:db8::1"], True, tables.Options(inet_text=True))
     assembler2 = tables.Assembler(ix, tables.Options(inet_text=True), [narrow, whole])
-    var walked: list[VarBind] = []
+    var walk_vbs: list[VarBind] = []
     var pending = len(plans) + 5
     var errs: list[str] = []
 
@@ -992,8 +992,8 @@ actor _test_golden_memnet(t: testing.EnvT):
             testing.assertEqual(errs, [])
             testing.assertEqual(narrow.index_prefix, [20])
             testing.assertTrue(whole.complete)
-            b = tables.assemble(ix, walked, tables.Options(conv.Options(opaque_special=True), True))
-            check_memnet(ix, assembler.result(), b, len(walked), assembler2.result())
+            b = tables.assemble(ix, walk_vbs, tables.Options(conv.Options(opaque_special=True), True))
+            check_memnet(ix, assembler.result(), b, len(walk_vbs), assembler2.result())
         report_env(t, outcome(check))
 
     def done() -> None:
@@ -1002,45 +1002,45 @@ actor _test_golden_memnet(t: testing.EnvT):
             c.close()
             finish()
 
-    def on_table(cl: Client, tab: ?Table, err: ?errors.SnmpError) -> None:
+    def got_table(cl: Client, tab: ?Table, err: ?errors.SnmpError) -> None:
         if err is not None:
             errs.append("table: " + str(err))
         if tab is not None:
             assembler.add_table(tab)
         done()
 
-    def on_get(cl: Client, resp: ?Response, err: ?errors.SnmpError) -> None:
+    def got(cl: Client, resp: ?Response, err: ?errors.SnmpError) -> None:
         if err is not None:
             errs.append("get: " + str(err))
         if resp is not None:
             assembler.add_all(resp.varbinds)
         done()
 
-    def on_table2(cl: Client, tab: ?Table, err: ?errors.SnmpError) -> None:
+    def got_narrowed(cl: Client, tab: ?Table, err: ?errors.SnmpError) -> None:
         if err is not None:
             errs.append("narrowed table: " + str(err))
         if tab is not None:
             assembler2.add_table(tab)
         done()
 
-    def on_get2(cl: Client, resp: ?Response, err: ?errors.SnmpError) -> None:
+    def got_row(cl: Client, resp: ?Response, err: ?errors.SnmpError) -> None:
         if err is not None:
             errs.append("row get: " + str(err))
         if resp is not None:
             assembler2.add_all(resp.varbinds)
         done()
 
-    def on_walk(cl: Client, got: list[VarBind], err: ?errors.SnmpError) -> None:
+    def walked(cl: Client, found: list[VarBind], err: ?errors.SnmpError) -> None:
         if err is not None:
             errs.append("walk: " + str(err))
-        for x in got:
-            walked.append(x)
+        for x in found:
+            walk_vbs.append(x)
         done()
 
     for p in plans:
-        c.get_table(on_table, p.oids)
-    c.get(on_get, tables.scalar_oids(ix, ["system", "hrSystemUptime", "hrSystemDate", "hrMemorySize", "hrSystemNumUsers"]))
-    c.walk(on_walk, Oid.parse("1.3.6.1.2.1"))
-    c.walk(on_walk, Oid.parse("1.3.6.1.4.1"))
-    c.get_table(on_table2, narrow.oids, None, narrow.index_prefix)
-    c.get(on_get2, whole.get_oids())
+        c.get_table(got_table, p.oids)
+    c.get(got, tables.scalar_oids(ix, ["system", "hrSystemUptime", "hrSystemDate", "hrMemorySize", "hrSystemNumUsers"]))
+    c.walk(walked, Oid.parse("1.3.6.1.2.1"))
+    c.walk(walked, Oid.parse("1.3.6.1.4.1"))
+    c.get_table(got_narrowed, narrow.oids, None, narrow.index_prefix)
+    c.get(got_row, whole.get_oids())

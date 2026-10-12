@@ -388,7 +388,7 @@ def udp_transport(cap: net.UDPConnectCap, address: str, port: int) -> Transport:
 actor _UdpClient(cap: net.UDPConnectCap, address: str, port: int):
     # The actor behind udp_transport()
     var _conn: ?net.UDPConnection = None
-    var _connected = False
+    var _up = False
     var _failure: ?str = None
     var _closed = False
     var _queue: list[bytes] = []
@@ -415,7 +415,7 @@ actor _UdpClient(cap: net.UDPConnectCap, address: str, port: int):
             return
         conn = _conn
         if conn is not None:
-            if _connected:
+            if _up:
                 conn.write(data)
                 return
         if len(_queue) < MAX_QUEUED:
@@ -443,30 +443,30 @@ actor _UdpClient(cap: net.UDPConnectCap, address: str, port: int):
         if conn is not None:
             conn.close()
 
-    def _on_connect(c: net.UDPConnection) -> None:
+    def _connected(c: net.UDPConnection) -> None:
         if _closed:
             c.close()
             return
-        _connected = True
+        _up = True
         for data in _queue:
             c.write(data)
         _queue = []
 
-    def _on_receive(c: net.UDPConnection, data: bytes, src_address: str, src_port: int) -> None:
+    def _received(c: net.UDPConnection, data: bytes, src_address: str, src_port: int) -> None:
         if not _closed:
             _inbox.put(data, normalize_address(src_address), src_port)
 
-    def _on_net_error(c: net.UDPConnection, error: str) -> None:
+    def _net_failed(c: net.UDPConnection, error: str) -> None:
         if _closed:
             return
-        if _connected:
+        if _up:
             _report(error, False)
         else:
             c.close()
             _fail(_tidy(error))
 
     if port > 0 and port <= 65535:
-        _conn = net.UDPConnection(cap, address, port, _on_connect, _on_receive, _on_net_error)
+        _conn = net.UDPConnection(cap, address, port, _connected, _received, _net_failed)
     else:
         _fail("port %d is outside 1..65535" % port)
 
@@ -533,29 +533,29 @@ actor _UdpServer(cap: net.UDPListenCap, address: str, port: int,
         if listener is not None:
             listener.close()
 
-    proc def _ready(local_port: int, error: ?str) -> None:
+    proc def _report_ready(local_port: int, error: ?str) -> None:
         on_ready(_udp_server_transport(self, local_port), error)
 
-    def _on_listen(l: net.UDPListener, error: ?str) -> None:
+    def _listening(l: net.UDPListener, error: ?str) -> None:
         if error is not None:
             _listener = None
             l.close()
-            _ready(0, "UDP listen on " + _peer_text(address, port) + " failed: " + error)
+            _report_ready(0, "UDP listen on " + _peer_text(address, port) + " failed: " + error)
             return
-        _ready(l.local_port(), None)
+        _report_ready(l.local_port(), None)
 
-    def _on_receive(l: net.UDPListener, data: bytes, src_address: str, src_port: int) -> None:
+    def _received(l: net.UDPListener, data: bytes, src_address: str, src_port: int) -> None:
         if not _closed:
             _inbox.put(data, normalize_address(src_address), src_port)
 
-    def _on_net_error(l: net.UDPListener, error: str) -> None:
+    def _net_failed(l: net.UDPListener, error: str) -> None:
         if not _closed:
             _log.warning("UDP error", {"local": _peer_text(address, port), "error": error})
 
     if port >= 0 and port <= 65535:
-        _listener = net.UDPListener(cap, address, port, _on_listen, _on_receive, _on_net_error)
+        _listener = net.UDPListener(cap, address, port, _listening, _received, _net_failed)
     else:
-        _ready(0, "UDP listen on " + _peer_text(address, port) + " failed: port outside 0..65535")
+        _report_ready(0, "UDP listen on " + _peer_text(address, port) + " failed: port outside 0..65535")
 
 
 # Stream framing ###################################################################################
@@ -843,7 +843,7 @@ actor _TcpClient(cap: net.TCPConnectCap, address: str, port: int, connect_timeou
     _peer = _peer_text(address, port)
     var _conn: ?net.TCPConnection = None
     var _gen = 0
-    var _connected = False
+    var _up = False
     var _failure: ?str = None
     var _closed = False
     var _queue: list[bytes] = []
@@ -873,7 +873,7 @@ actor _TcpClient(cap: net.TCPConnectCap, address: str, port: int, connect_timeou
         _gen += 1
         conn = _conn
         _conn = None
-        _connected = False
+        _up = False
         _queue = []
         _framer = StreamFramer(max_msg_size)
         _unanswered_since = -1.0
@@ -894,12 +894,12 @@ actor _TcpClient(cap: net.TCPConnectCap, address: str, port: int, connect_timeou
         _drop()
         _report(message, False)
 
-    def _on_connect(gen: int, c: net.TCPConnection) -> None:
+    def _connected(gen: int, c: net.TCPConnection) -> None:
         if gen != _gen or _closed:
             # Dropped while it connected: close() does not stop a connect in progress
             c.close(_released)
             return
-        _connected = True
+        _up = True
         _holdoff = connect_timeout
         now = _now()
         _last_traffic = now
@@ -912,9 +912,9 @@ actor _TcpClient(cap: net.TCPConnectCap, address: str, port: int, connect_timeou
         if report is not None:
             report()
         if idle_timeout > 0.0:
-            after now idle_timeout: _idle_check(gen)
+            after now idle_timeout: _idle_expired(gen)
 
-    def _on_receive(gen: int, data: bytes) -> None:
+    def _received(gen: int, data: bytes) -> None:
         if gen != _gen or _closed:
             return
         _last_traffic = _now()
@@ -927,45 +927,45 @@ actor _TcpClient(cap: net.TCPConnectCap, address: str, port: int, connect_timeou
         if lost != "":
             _lost("closed: lost framing (" + lost + ")")
 
-    def _on_net_error(gen: int, error: str) -> None:
+    def _net_failed(gen: int, error: str) -> None:
         if gen == _gen and not _closed:
-            if _connected:
+            if _up:
                 _lost("lost: " + _net_reason(error))
             else:
                 _not_set_up(_net_reason(error))
 
-    def _on_remote_close(gen: int) -> None:
+    def _remote_closed(gen: int) -> None:
         if gen == _gen and not _closed:
             _lost("closed by the peer")
 
     def _connect_expired(gen: int) -> None:
-        if gen == _gen and not _connected and not _closed:
+        if gen == _gen and not _up and not _closed:
             _not_set_up("no connection within %g s" % connect_timeout)
 
-    def _idle_check(gen: int) -> None:
-        if gen != _gen or not _connected or _closed:
+    def _idle_expired(gen: int) -> None:
+        if gen != _gen or not _up or _closed:
             return
         idle = _now() - _last_traffic
         if idle >= idle_timeout:
             _drop()
         else:
             wait = idle_timeout - idle
-            after now wait: _idle_check(gen)
+            after now wait: _idle_expired(gen)
 
     proc def _open() -> None:
         _gen += 1
         gen = _gen
-        _connected = False
+        _up = False
         def connected(c: net.TCPConnection) -> None:
-            _on_connect(gen, c)
-        def on_receive(c: net.TCPConnection, data: bytes) -> None:
-            _on_receive(gen, data)
-        def on_error(c: net.TCPConnection, error: str) -> None:
-            _on_net_error(gen, error)
-        def on_remote_close(c: net.TCPConnection) -> None:
-            _on_remote_close(gen)
+            _connected(gen, c)
+        def received(c: net.TCPConnection, data: bytes) -> None:
+            _received(gen, data)
+        def failed(c: net.TCPConnection, error: str) -> None:
+            _net_failed(gen, error)
+        def remote_closed(c: net.TCPConnection) -> None:
+            _remote_closed(gen)
         net_timeout = connect_timeout if connect_timeout > _NET_CONNECT_TIMEOUT else _NET_CONNECT_TIMEOUT
-        _conn = net.TCPConnection(cap, address, port, connected, on_receive, on_error, on_remote_close,
+        _conn = net.TCPConnection(cap, address, port, connected, received, failed, remote_closed,
                                   connect_timeout=net_timeout)
         after now connect_timeout: _connect_expired(gen)
 
@@ -978,7 +978,7 @@ actor _TcpClient(cap: net.TCPConnectCap, address: str, port: int, connect_timeou
             return
         conn = _conn
         if conn is not None:
-            if _connected:
+            if _up:
                 now = _now()
                 since = _unanswered_since
                 if stall_timeout > 0.0 and since >= 0.0 and now - since >= stall_timeout:
@@ -1099,7 +1099,7 @@ actor _TcpServer(cap: net.TCPListenCap, address: str, port: int,
     _local = _peer_text(address, port)
     var _listener: ?net.TCPListener = None
     var _ready_sent = False
-    var _listening = False
+    var _bound = False
     var _closed = False
     var _inbox = _Inbox()
     var _sessions: dict[int, _Session] = {}
@@ -1122,7 +1122,7 @@ actor _TcpServer(cap: net.TCPListenCap, address: str, port: int,
         if s is not None:
             s.conn.write(data)
             s.last_traffic = _now()
-        elif _listening:
+        elif _bound:
             _log.debug("answer for a closed TCP session dropped", {"local": _local, "session": dst_port})
 
     def set_receiver(on_data: action(bytes, str, int) -> None) -> None:
@@ -1137,23 +1137,23 @@ actor _TcpServer(cap: net.TCPListenCap, address: str, port: int,
         for sid in list(_sessions.keys()):
             _end(sid)
 
-    proc def _ready(local_port: int, error: ?str) -> None:
+    proc def _report_ready(local_port: int, error: ?str) -> None:
         _ready_sent = True
         on_ready(_tcp_server_transport(self, local_port), error)
 
-    def _on_listen(l: net.TCPListener, error: ?str) -> None:
+    def _listening(l: net.TCPListener, error: ?str) -> None:
         if _ready_sent:
             # Later calls report failed accepts
             if error is not None and not _closed:
                 _log.warning("TCP accept failed", {"local": _local, "error": error})
             return
         if error is not None:
-            _ready(0, "TCP listen on " + _local + " failed: " + error)
+            _report_ready(0, "TCP listen on " + _local + " failed: " + error)
             return
-        _listening = True
-        _ready(port, None)
+        _bound = True
+        _report_ready(port, None)
 
-    def _on_receive(sid: int, data: bytes) -> None:
+    def _received(sid: int, data: bytes) -> None:
         s = _sessions.get(sid)
         if s is not None:
             s.last_traffic = _now()
@@ -1165,17 +1165,17 @@ actor _TcpServer(cap: net.TCPListenCap, address: str, port: int,
                                                                      "reason": framer.lost})
                 _end(sid)
 
-    def _on_conn_error(sid: int, error: str) -> None:
+    def _conn_failed(sid: int, error: str) -> None:
         if sid in _sessions:
             _log.warning("TCP connection closed after an error", {"local": _local, "session": sid, "error": error})
             _end(sid)
 
-    def _on_remote_close(sid: int) -> None:
+    def _remote_closed(sid: int) -> None:
         # The connection is closed already
         if sid in _sessions:
             del _sessions[sid]
 
-    def _idle_check(sid: int) -> None:
+    def _idle_expired(sid: int) -> None:
         s = _sessions.get(sid)
         if s is not None:
             idle = _now() - s.last_traffic
@@ -1184,7 +1184,7 @@ actor _TcpServer(cap: net.TCPListenCap, address: str, port: int,
                 _end(sid)
             else:
                 wait = idle_timeout - idle
-                after now wait: _idle_check(sid)
+                after now wait: _idle_expired(sid)
 
     proc def _make_room() -> None:
         # Close the session that has been without traffic longest
@@ -1199,8 +1199,8 @@ actor _TcpServer(cap: net.TCPListenCap, address: str, port: int,
                      {"local": _local, "session": quietest, "limit": max_connections})
         _end(quietest)
 
-    def _on_accept(c: net.TCPListenConnection) -> None:
-        if _closed or not _listening:
+    def _accepted(c: net.TCPListenConnection) -> None:
+        if _closed or not _bound:
             c.close()
             return
         if len(_sessions) >= max_connections:
@@ -1208,23 +1208,23 @@ actor _TcpServer(cap: net.TCPListenCap, address: str, port: int,
         sid = _next_session
         _next_session += 1
         _sessions[sid] = _Session(c, StreamFramer(max_msg_size), _now())
-        def on_receive(conn: net.TCPListenConnection, data: bytes) -> None:
-            _on_receive(sid, data)
-        def on_error(conn: net.TCPListenConnection, error: str) -> None:
-            _on_conn_error(sid, error)
-        def on_remote_close(conn: net.TCPListenConnection) -> None:
-            _on_remote_close(sid)
-        c.cb_install(on_receive, on_error, on_remote_close)
+        def received(conn: net.TCPListenConnection, data: bytes) -> None:
+            _received(sid, data)
+        def failed(conn: net.TCPListenConnection, error: str) -> None:
+            _conn_failed(sid, error)
+        def remote_closed(conn: net.TCPListenConnection) -> None:
+            _remote_closed(sid)
+        c.cb_install(received, failed, remote_closed)
         if idle_timeout > 0.0:
-            after now idle_timeout: _idle_check(sid)
+            after now idle_timeout: _idle_expired(sid)
 
     if port == 0:
-        _ready(0, "TCP listen on " + _local + " failed: port 0 is not supported: the port picked for it "
-               + "cannot be learned")
+        _report_ready(0, "TCP listen on " + _local + " failed: port 0 is not supported: the port picked for it "
+                      + "cannot be learned")
     elif port < 0 or port > 65535:
-        _ready(0, "TCP listen on " + _local + " failed: port outside 1..65535")
+        _report_ready(0, "TCP listen on " + _local + " failed: port outside 1..65535")
     else:
-        _listener = net.TCPListener(cap, address, port, _on_listen, _on_accept)
+        _listener = net.TCPListener(cap, address, port, _listening, _accepted)
 
 
 # In-memory network ################################################################################
@@ -1545,7 +1545,7 @@ actor MemNet(faults: ?NetFaults=None):
         else:
             _deliver_all(unit)
 
-    def _release_held(seq: int, delay: float) -> None:
+    def _hold_expired(seq: int, delay: float) -> None:
         held = _held
         if held is not None:
             if seq == _hold_seq:
@@ -1583,7 +1583,7 @@ actor MemNet(faults: ?NetFaults=None):
             return
         _held = unit
         _hold_seq += 1
-        after now REORDER_HOLD: _release_held(_hold_seq, f.delay)
+        after now REORDER_HOLD: _hold_expired(_hold_seq, f.delay)
 
 
 actor _MemEndpoint(network: MemNet, address: str, port: int, token: int, peer_address: str, peer_port: int):

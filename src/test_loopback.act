@@ -66,7 +66,7 @@ actor _AgentGet(t: testing.EnvT, address: str, sec: Security):
     var srv: ?ServerTransport = None
     var agent: ?Agent = None
 
-    def done(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         c.close()
         s = srv
         if s is not None:
@@ -78,7 +78,7 @@ actor _AgentGet(t: testing.EnvT, address: str, sec: Security):
                 testing.assertEqual(r.varbinds, [VarBind(SYS_DESCR, OctetString(DESCR))])
         report_env(t, outcome(check))
 
-    def on_ready(st: ServerTransport, error: ?str) -> None:
+    def listening(st: ServerTransport, error: ?str) -> None:
         if error is not None:
             t.failure(AssertionError("listen on " + address + " failed: " + error))
             return
@@ -88,9 +88,9 @@ actor _AgentGet(t: testing.EnvT, address: str, sec: Security):
             users = [sec]
         agent = Agent(st, view(), AgentConfig({"public": False}, users, h(AGENT_ENGINE)), t.log_handler)
         c = Client(net.UDPConnectCap(ucap), address, sec, t.log_handler, port=st.local_port(), opts=OPTS)
-        c.get(done, [SYS_DESCR])
+        c.get(got, [SYS_DESCR])
 
-    udp_server_transport(net.UDPListenCap(ucap), address, 0, on_ready, t.log_handler)
+    udp_server_transport(net.UDPListenCap(ucap), address, 0, listening, t.log_handler)
 
 actor _test_v2c_get_ipv4(t: testing.EnvT):
     """SNMPv2c GET over UDP on 127.0.0.1"""
@@ -146,7 +146,7 @@ actor _test_notifications_ipv4(t: testing.EnvT):
             testing.assertEqual(got, want)
         report_env(t, outcome(check))
 
-    def on_notification(r: NotificationReceiver, n: Notification) -> None:
+    def received(r: NotificationReceiver, n: Notification) -> None:
         blocks.append(fmt.canon_notification(n))
         _maybe_done()
 
@@ -168,13 +168,13 @@ actor _test_notifications_ipv4(t: testing.EnvT):
         acks.append("v3")
         _maybe_done()
 
-    def on_ready(st: ServerTransport, error: ?str) -> None:
+    def listening(st: ServerTransport, error: ?str) -> None:
         if error is not None:
             t.failure(AssertionError("listen failed: " + error))
             return
         srv = st
         cfg = ReceiverConfig(["public"], [sha_aes()], [], h(RECEIVER_ENGINE), 1)
-        rcv = NotificationReceiver(st, cfg, on_notification, t.log_handler)
+        rcv = NotificationReceiver(st, cfg, received, t.log_handler)
         port = st.local_port()
         c2 = Client(net.UDPConnectCap(ucap), "127.0.0.1", Community("public"), t.log_handler, port=port, opts=OPTS)
         c3 = Client(net.UDPConnectCap(ucap), "127.0.0.1", sha_aes(), t.log_handler, port=port, opts=OPTS)
@@ -184,7 +184,7 @@ actor _test_notifications_ipv4(t: testing.EnvT):
         c2.inform(acked_v2c, trap_oid, payload, 200)
         c3.inform(acked_v3, trap_oid, payload, 300)
 
-    udp_server_transport(net.UDPListenCap(ucap), "127.0.0.1", 0, on_ready, t.log_handler)
+    udp_server_transport(net.UDPListenCap(ucap), "127.0.0.1", 0, listening, t.log_handler)
 
 
 actor _test_icmp_unreachable(t: testing.EnvT):
@@ -192,7 +192,7 @@ actor _test_icmp_unreachable(t: testing.EnvT):
     t.timeout(15.0)
     ucap = net.UDPCap(net.NetCap(t.env.cap))
 
-    def done(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         c.close()
         def check() -> None:
             if isinstance(e, errors.TimeoutError):
@@ -202,7 +202,7 @@ actor _test_icmp_unreachable(t: testing.EnvT):
                 raise AssertionError("expected a TimeoutError, got " + (str(e) if e is not None else "a response"))
         report_env(t, outcome(check))
 
-    def on_ready(st: ServerTransport, error: ?str) -> None:
+    def listening(st: ServerTransport, error: ?str) -> None:
         if error is not None:
             t.failure(AssertionError("listen failed: " + error))
             return
@@ -211,9 +211,9 @@ actor _test_icmp_unreachable(t: testing.EnvT):
         st.close()
         c = Client(net.UDPConnectCap(ucap), "127.0.0.1", Community("public"), t.log_handler, port=port,
                    opts=Options(timeout=0.3, retries=1))
-        c.get(done, [SYS_DESCR])
+        c.get(got, [SYS_DESCR])
 
-    udp_server_transport(net.UDPListenCap(ucap), "127.0.0.1", 0, on_ready, t.log_handler)
+    udp_server_transport(net.UDPListenCap(ucap), "127.0.0.1", 0, listening, t.log_handler)
 
 
 # TCP ##############################################################################################
@@ -256,12 +256,12 @@ actor _TcpAgent(t: testing.EnvT, first_port: int, view: MibView, users: list[Usm
         if a is not None:
             a.close()
 
-    def _send_late(data: bytes, dst_address: str, dst_port: int) -> None:
+    def _reply_due(data: bytes, dst_address: str, dst_port: int) -> None:
         s = server
         if s is not None:
             s.send_to(data, dst_address, dst_port)
 
-    def on_ready(st: ServerTransport, error: ?str) -> None:
+    def listening(st: ServerTransport, error: ?str) -> None:
         if error is not None:
             t.failure(AssertionError("listen: " + error))
             return
@@ -273,7 +273,7 @@ actor _TcpAgent(t: testing.EnvT, first_port: int, view: MibView, users: list[Usm
             st.set_receiver(recorded)
         def send_to(data: bytes, dst_address: str, dst_port: int) -> None:
             if delay > 0.0:
-                after delay: _send_late(data, dst_address, dst_port)
+                after delay: _reply_due(data, dst_address, dst_port)
             else:
                 st.send_to(data, dst_address, dst_port)
         recording = ServerTransport(send_to, set_receiver, st.close, st.local_port)
@@ -281,7 +281,7 @@ actor _TcpAgent(t: testing.EnvT, first_port: int, view: MibView, users: list[Usm
         on_listening(st.local_port())
 
     listener = ListenTcp(net.TCPListenCap(net.TCPCap(net.NetCap(t.env.cap))), "127.0.0.1", first_port, TCP_RANGE,
-                         on_ready, t.log_handler, max_connections, idle_timeout)
+                         listening, t.log_handler, max_connections, idle_timeout)
 
 
 actor _TcpGet(t: testing.EnvT, k: int, sec: Security):
@@ -289,7 +289,7 @@ actor _TcpGet(t: testing.EnvT, k: int, sec: Security):
     t.timeout(15.0)
     var server: ?_TcpAgent = None
 
-    def conclude(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def settled(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         c.close()
         a = server
         seen: list[(str, int)] = []
@@ -304,11 +304,11 @@ actor _TcpGet(t: testing.EnvT, k: int, sec: Security):
             testing.assertEqual(seen, [("", 1) for _ in range(2 if isinstance(sec, Usm) else 1)])
         report_env(t, outcome(check))
 
-    def done(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-        after now QUIET: conclude(c, r, e)
+    def got(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        after now QUIET: settled(c, r, e)
 
     def listening(port: int) -> None:
-        _tcp_client(t, port, sec).get(done, [SYS_DESCR])
+        _tcp_client(t, port, sec).get(got, [SYS_DESCR])
 
     server = _TcpAgent(t, _tcp_ports(k), view(), _users(sec), listening)
 
@@ -327,7 +327,7 @@ actor _test_tcp_walk(t: testing.EnvT):
     rows = [VarBind(_enterprise([1, 1, i, 0]), Integer(i)) for i in range(1, 61)]
     var server: ?_TcpAgent = None
 
-    def conclude(c: Client, vbs: list[VarBind], e: ?errors.SnmpError) -> None:
+    def settled(c: Client, vbs: list[VarBind], e: ?errors.SnmpError) -> None:
         stats = c.stats()
         c.close()
         a = server
@@ -347,7 +347,7 @@ actor _test_tcp_walk(t: testing.EnvT):
         report_env(t, outcome(check))
 
     def walked(c: Client, vbs: list[VarBind], e: ?errors.SnmpError) -> None:
-        after now QUIET: conclude(c, vbs, e)
+        after now QUIET: settled(c, vbs, e)
 
     def listening(port: int) -> None:
         _tcp_client(t, port, Community("public")).walk(walked, _enterprise([]))
@@ -361,7 +361,7 @@ actor _test_tcp_large_response(t: testing.EnvT):
     big = [VarBind(_enterprise([2, i, 0]), OctetString(pseudo_random(2400, i))) for i in range(1, 26)]
     var server: ?_TcpAgent = None
 
-    def conclude(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def settled(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         c.close()
         a = server
         seen: list[(str, int)] = []
@@ -377,7 +377,7 @@ actor _test_tcp_large_response(t: testing.EnvT):
         report_env(t, outcome(check))
 
     def got(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-        after now QUIET: conclude(c, r, e)
+        after now QUIET: settled(c, r, e)
 
     def listening(port: int) -> None:
         _tcp_client(t, port, Community("public")).get(got, [vb.oid for vb in big])
@@ -391,7 +391,7 @@ actor _test_tcp_server_idle_timeout_reconnects(t: testing.EnvT):
     var server: ?_TcpAgent = None
     var client: ?Client = None
 
-    def second(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got_second(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         stats = c.stats()
         c.close()
         a = server
@@ -406,22 +406,22 @@ actor _test_tcp_server_idle_timeout_reconnects(t: testing.EnvT):
             testing.assertEqual([stats.responses, stats.retries], [2, 0])
         report_env(t, outcome(check))
 
-    def ask_again() -> None:
+    def second_due() -> None:
         c = client
         if c is not None:
-            c.get(second, [SYS_DESCR])
+            c.get(got_second, [SYS_DESCR])
 
-    def first(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got_first(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         if e is not None:
             c.close()
             t.failure(AssertionError("first GET failed: " + str(e)))
             return
-        after now 0.4: ask_again()
+        after now 0.4: second_due()
 
     def listening(port: int) -> None:
         c = _tcp_client(t, port, Community("public"))
         client = c
-        c.get(first, [SYS_DESCR])
+        c.get(got_first, [SYS_DESCR])
 
     server = _TcpAgent(t, _tcp_ports(4), view(), [], listening, idle_timeout=0.15)
 
@@ -430,7 +430,7 @@ actor _test_tcp_refused(t: testing.EnvT):
     """A GET to a closed TCP port times out with the refused connection as the hint"""
     t.timeout(15.0)
 
-    def done(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         stats = c.stats()
         c.close()
         def check() -> None:
@@ -443,7 +443,7 @@ actor _test_tcp_refused(t: testing.EnvT):
         report_env(t, outcome(check))
 
     c = _tcp_client(t, TCP_CLOSED_PORT, Community("public"), Options(timeout=0.3, retries=1))
-    c.get(done, [SYS_DESCR])
+    c.get(got, [SYS_DESCR])
 
 
 actor _test_tcp_max_connections(t: testing.EnvT):
@@ -510,7 +510,7 @@ actor _test_tcp_notifications(t: testing.EnvT):
     var clients: list[Client] = []
     var finished = False
 
-    def conclude() -> None:
+    def settled() -> None:
         for c in clients:
             c.close()
         r = rcv
@@ -534,9 +534,9 @@ actor _test_tcp_notifications(t: testing.EnvT):
         if finished or len(blocks) < 3 or len(acks) < 2:
             return
         finished = True
-        after now QUIET: conclude()
+        after now QUIET: settled()
 
-    def on_notification(r: NotificationReceiver, n: Notification) -> None:
+    def received(r: NotificationReceiver, n: Notification) -> None:
         blocks.append(fmt.canon_notification(n))
         sources.append(n.source())
         addresses.append(n.source_address)
@@ -560,12 +560,12 @@ actor _test_tcp_notifications(t: testing.EnvT):
         acks.append("v3")
         _maybe_done()
 
-    def on_ready(st: ServerTransport, error: ?str) -> None:
+    def listening(st: ServerTransport, error: ?str) -> None:
         if error is not None:
             t.failure(AssertionError("listen failed: " + error))
             return
         cfg = ReceiverConfig(["public"], [sha_aes()], [], h(RECEIVER_ENGINE), 1)
-        rcv = NotificationReceiver(st, cfg, on_notification, t.log_handler)
+        rcv = NotificationReceiver(st, cfg, received, t.log_handler)
         port = st.local_port()
         c2 = _tcp_client(t, port, Community("public"))
         c3 = _tcp_client(t, port, sha_aes())
@@ -576,7 +576,7 @@ actor _test_tcp_notifications(t: testing.EnvT):
         c3.inform(acked_v3, trap_oid, payload, 300)
 
     listener = ListenTcp(net.TCPListenCap(net.TCPCap(net.NetCap(t.env.cap))), "127.0.0.1", _tcp_ports(6), TCP_RANGE,
-                         on_ready, t.log_handler)
+                         listening, t.log_handler)
 
 
 # The CLI over TCP #################################################################################
@@ -596,8 +596,8 @@ class _Step(object):
         self.code = code
         self.seconds = seconds
 
-actor _CliRun(report: action(str, str, int, float) -> None):
-    """The out, err and done callbacks of one command; report(out, err, code, seconds taken) once"""
+actor _CliRun(on_done: action(str, str, int, float) -> None):
+    """The out, err and finished callbacks of one command; on_done(out, err, code, seconds taken) once"""
     _started = _now()
     var _out: list[str] = []
     var _err: list[str] = []
@@ -609,10 +609,10 @@ actor _CliRun(report: action(str, str, int, float) -> None):
     def err(s: str) -> None:
         _err.append(s)
 
-    def done(code: int) -> None:
+    def finished(code: int) -> None:
         if not _done:
             _done = True
-            report("".join(_out), "".join(_err), code, _now() - _started)
+            on_done("".join(_out), "".join(_err), code, _now() - _started)
 
 def _now() -> float:
     # Monotonic time in seconds
@@ -622,14 +622,14 @@ proc def _cli(t: testing.EnvT, args: list[str], run: _CliRun) -> None:
     # A client command over TCP, as `actsnmp` runs it once the agent's host is an IP address
     o = cliopts.parse(["actsnmp"] + args)
     cap = net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap)))
-    actsnmp.tcp_command(cap, o, actsnmp.security_of(o), run.out, run.err, run.done)
+    actsnmp.tcp_command(cap, o, actsnmp.security_of(o), run.out, run.err, run.finished)
 
-actor _CliScript(t: testing.EnvT, steps: list[_Step], report: action(list[str]) -> None):
-    """Runs steps one after the other; report(mismatches) at the end, empty when all passed"""
+actor _CliScript(t: testing.EnvT, steps: list[_Step], on_done: action(list[str]) -> None):
+    """Runs steps one after the other; on_done(mismatches) at the end, empty when all passed"""
     var _i = 0
     var _failures: list[str] = []
 
-    def _step_done(out: str, err: str, code: int, seconds: float) -> None:
+    def _step_finished(out: str, err: str, code: int, seconds: float) -> None:
         s = steps[_i]
         if (out, err, code) != (s.out, s.err, s.code) or seconds > s.seconds:
             _failures.append("actsnmp " + " ".join(s.args) + "\n  expected exit %d, out %r, err %r within %g s"
@@ -640,9 +640,9 @@ actor _CliScript(t: testing.EnvT, steps: list[_Step], report: action(list[str]) 
 
     proc def _next() -> None:
         if _i >= len(steps):
-            report(_failures)
+            on_done(_failures)
         else:
-            _cli(t, steps[_i].args, _CliRun(_step_done))
+            _cli(t, steps[_i].args, _CliRun(_step_finished))
 
     _next()
 
@@ -657,7 +657,7 @@ actor _test_tcp_cli(t: testing.EnvT):
     var script: ?_CliScript = None
     line = ".1.3.6.1.2.1.1.1.0 = STRING: \"actsnmp loopback agent\"\n"
 
-    def conclude(failures: list[str]) -> None:
+    def settled(failures: list[str]) -> None:
         a = server
         if a is not None:
             a.close()
@@ -667,7 +667,7 @@ actor _test_tcp_cli(t: testing.EnvT):
             t.failure(AssertionError("%d step(s) failed:\n" % len(failures) + "\n".join(failures)))
 
     def finished(failures: list[str]) -> None:
-        after now QUIET: conclude(failures)
+        after now QUIET: settled(failures)
 
     def listening(port: int) -> None:
         peer = "tcp:127.0.0.1:%d" % port
@@ -702,7 +702,7 @@ actor _test_tcp_cli_slow_agent(t: testing.EnvT):
     var server: ?_TcpAgent = None
     var run: ?_CliRun = None
 
-    def conclude(out: str, err: str, code: int, seconds: float) -> None:
+    def settled(out: str, err: str, code: int, seconds: float) -> None:
         a = server
         seen: list[(str, int)] = []
         if a is not None:
@@ -715,7 +715,7 @@ actor _test_tcp_cli_slow_agent(t: testing.EnvT):
         report_env(t, outcome(check))
 
     def got(out: str, err: str, code: int, seconds: float) -> None:
-        after now QUIET: conclude(out, err, code, seconds)
+        after now QUIET: settled(out, err, code, seconds)
 
     def listening(port: int) -> None:
         r = _CliRun(got)
@@ -727,10 +727,10 @@ actor _test_tcp_cli_slow_agent(t: testing.EnvT):
 
 
 actor _ServeTcp(t: testing.EnvT, command: str, first_port: int, on_listening: action(int, str) -> None,
-                printed: action(str) -> None):
+                out: action(str) -> None):
     """agent or trapd with --tcp as `actsnmp` runs them, on the first free port of the TCP_RANGE ports from first_port
 
-    on_listening(port, startup line) once it listens; trapd (--canon) prints to printed.
+    on_listening(port, startup line) once it listens; trapd (--canon) prints to out.
     """
     ucap = net.UDPListenCap(net.UDPCap(net.NetCap(t.env.cap)))
     tcap = net.TCPListenCap(net.TCPCap(net.NetCap(t.env.cap)))
@@ -744,7 +744,7 @@ actor _ServeTcp(t: testing.EnvT, command: str, first_port: int, on_listening: ac
         if " serving on " in s or " listening on " in s:
             on_listening(_port, s)
 
-    def done(code: int) -> None:
+    def finished(code: int) -> None:
         if "address already in use" in _line and _port < first_port + TCP_RANGE - 1:
             _port += 1
             _start()
@@ -755,10 +755,10 @@ actor _ServeTcp(t: testing.EnvT, command: str, first_port: int, on_listening: ac
         o = cliopts.parse(["actsnmp", command, "--tcp", "--canon", "--port", str(_port)])
         if command == "agent":
             _agent = actsnmp.AgentServer(ucap, tcap, o, view(), AgentConfig({"public": False}, [], h(AGENT_ENGINE)),
-                                         err, done)
+                                         err, finished)
         else:
             _trapd = actsnmp.TrapdServer(ucap, tcap, o, ReceiverConfig(["public"], [], [], h(RECEIVER_ENGINE), 1),
-                                         printed, err, done)
+                                         out, err, finished)
 
     _start()
 
@@ -803,7 +803,7 @@ actor _test_tcp_cli_servers(t: testing.EnvT):
         trap_seconds = seconds
         _maybe_done()
 
-    def printed(text: str) -> None:
+    def trapd_out(text: str) -> None:
         blocks += text
         _maybe_done()
 
@@ -822,8 +822,8 @@ actor _test_tcp_cli_servers(t: testing.EnvT):
     def trapd_listening(port: int, line: str) -> None:
         listening("trapd", port, line)
 
-    agent = _ServeTcp(t, "agent", _tcp_ports(8), agent_listening, printed)
-    trapd = _ServeTcp(t, "trapd", _tcp_ports(9), trapd_listening, printed)
+    agent = _ServeTcp(t, "agent", _tcp_ports(8), agent_listening, trapd_out)
+    trapd = _ServeTcp(t, "trapd", _tcp_ports(9), trapd_listening, trapd_out)
 
 
 actor _test_host_lookup(t: testing.EnvT):
@@ -847,19 +847,19 @@ actor _test_host_lookup(t: testing.EnvT):
                 testing.assertEqual(found["::1"], "::1")
             report_env(t, outcome(check))
 
-    def v6(address: str) -> None:
+    def resolved_v6(address: str) -> None:
         _found("localhost v6", address)
 
-    def any_family(address: str) -> None:
+    def resolved_any(address: str) -> None:
         _found("localhost", address)
 
-    def v4_as_v6(address: str) -> None:
+    def resolved_v4_as_v6(address: str) -> None:
         _found("127.0.0.1 v6", address)
 
-    def v6_only_name(address: str) -> None:
+    def resolved_v6_only(address: str) -> None:
         _found("::1", address)
 
-    lookups.append(actsnmp.HostLookup(dcap, "localhost", True, v6))
-    lookups.append(actsnmp.HostLookup(dcap, "localhost", False, any_family))
-    lookups.append(actsnmp.HostLookup(dcap, "127.0.0.1", True, v4_as_v6))
-    lookups.append(actsnmp.HostLookup(dcap, "::1", False, v6_only_name))
+    lookups.append(actsnmp.HostLookup(dcap, "localhost", True, resolved_v6))
+    lookups.append(actsnmp.HostLookup(dcap, "localhost", False, resolved_any))
+    lookups.append(actsnmp.HostLookup(dcap, "127.0.0.1", True, resolved_v4_as_v6))
+    lookups.append(actsnmp.HostLookup(dcap, "::1", False, resolved_v6_only))

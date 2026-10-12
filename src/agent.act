@@ -823,7 +823,7 @@ actor Agent(transport: ServerTransport, view: MibView, config: AgentConfig, log_
         elif m is not None:
             _v3(data, m, now, address, port)
 
-    def _on_data(data: bytes, address: str, port: int) -> None:
+    def _received(data: bytes, address: str, port: int) -> None:
         # The transport's receiver: one datagram from address and port
         if _closed:
             return
@@ -886,6 +886,6 @@ actor Agent(transport: ServerTransport, view: MibView, config: AgentConfig, log_
 
     view.set_value(SNMP_ENGINE_ID_0, values.OctetString(config.engine_id))
     _set_uptime(_start)
-    transport.set_receiver(_on_data)
+    transport.set_receiver(_received)
     _log.info("Agent started", {"engine_id": config.engine_id.hex(), "boots": config.engine_boots,
                                 "variables": view.size(), "port": transport.local_port()})

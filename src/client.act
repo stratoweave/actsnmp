@@ -9,11 +9,12 @@ for SNMPv1/v2c, security.Usm for SNMPv3.
 
 Operations take the callback first, and the Client is the callback's
 first argument so that callers can tell stale clients apart. Every
-request callback is called exactly once: cb(c, r, None) on success,
-cb(c, r, errors.ErrorStatusError) when the agent answered with an
-error-status (error_response(e) returns r), and cb(c, None, e) for any
-other error. Invalid arguments are reported as errors.EncodeError, never
-raised; cancel() and close() deliver errors.CancelledError.
+request callback is called exactly once: on_done(c, r, None) on
+success, on_done(c, r, errors.ErrorStatusError) when the agent answered
+with an error-status (error_response(e) returns r), and
+on_done(c, None, e) for any other error. Invalid arguments are reported
+as errors.EncodeError, never raised; cancel() and close() deliver
+errors.CancelledError.
 
 Each attempt gets a fresh random id (the request-id for SNMPv1/v2c, the
 msgID for SNMPv3), and all ids of a request stay valid until it ends, so a
@@ -1111,13 +1112,13 @@ actor Client(cap: ?net.UDPConnectCap,
         # Register with tr; callbacks of an earlier transport (one replaced by _rebuild) are ignored
         _transport_gen += 1
         gen = _transport_gen
-        def on_data(data: bytes, src_address: str, src_port: int) -> None:
+        def received(data: bytes, src_address: str, src_port: int) -> None:
             if gen == _transport_gen:
-                _on_data(data, src_address, src_port)
-        def on_error(text: str, fatal: bool) -> None:
+                _received(data, src_address, src_port)
+        def failed(text: str, fatal: bool) -> None:
             if gen == _transport_gen:
-                _on_transport_error(text, fatal)
-        tr.set_receiver(on_data, on_error)
+                _transport_failed(text, fatal)
+        tr.set_receiver(received, failed)
 
     proc def _retry_wait() -> float:
         # Seconds after a failed setup before the next try: TRANSPORT_RETRY, doubled per failure in a row
@@ -1224,21 +1225,21 @@ actor Client(cap: ?net.UDPConnectCap,
         # a queued op stays in _queue and a waiting one in _disc_waiters: both skip handles that
         # are no longer in _ops (or no longer waiting), so completing many ops costs O(1) each
         _unwait(op)
-        cb = _cbs.get(h)
-        if cb is not None:
+        on_done = _cbs.get(h)
+        if on_done is not None:
             del _cbs[h]
             if e is not None:
                 _log.debug("request failed", {"handle": h, "error": e.error_message})
-            cb(self, r, e)
+            on_done(self, r, e)
         elif op.job != 0:
-            _job_answer(op, r, e)
+            _job_request_completed(op, r, e)
         _pump()
 
     proc def _fail_engine_cbs(e: errors.SnmpError) -> None:
         cbs = _engine_cbs
         _engine_cbs = []
-        for cb in cbs:
-            cb(self, None, e)
+        for on_done in cbs:
+            on_done(self, None, e)
 
     proc def _exchange_failed(ex: _Exchange, e: errors.SnmpError) -> None:
         _end_exchange(ex)
@@ -1492,7 +1493,7 @@ actor Client(cap: ?net.UDPConnectCap,
             if new_attempt:
                 serial = ex.serial
                 generation = ex.attempt
-                after now ex.opts.attempt_timeout(ex.retries_used): _on_timer(serial, generation)
+                after now ex.opts.attempt_timeout(ex.retries_used): _attempt_expired(serial, generation)
         else:
             _exchange_failed(ex, errors.TransportError("no transport: neither cap nor transport was given", False))
 
@@ -1537,7 +1538,7 @@ actor Client(cap: ?net.UDPConnectCap,
             if ex is not None:
                 _redraw_attempt(ex, id)
 
-    def _on_timer(serial: int, attempt: int) -> None:
+    def _attempt_expired(serial: int, attempt: int) -> None:
         ex = _exchanges.get(serial)
         if ex is not None:
             if ex.attempt == attempt:
@@ -1610,8 +1611,8 @@ actor Client(cap: ?net.UDPConnectCap,
         info = _engine_info()
         cbs = _engine_cbs
         _engine_cbs = []
-        for cb in cbs:
-            cb(self, info, None)
+        for on_done in cbs:
+            on_done(self, info, None)
         for op in _take_waiters():
             if op.handle in _ops:
                 _next_chunk(op)
@@ -1641,7 +1642,7 @@ actor Client(cap: ?net.UDPConnectCap,
 
     # Receiving #####################################################################################
 
-    def _on_data(data: bytes, src_address: str, src_port: int) -> None:
+    def _received(data: bytes, src_address: str, src_port: int) -> None:
         if _closed:
             return
         _setup_failures = 0          # the transport works
@@ -1650,7 +1651,7 @@ actor Client(cap: ?net.UDPConnectCap,
         except Exception as e:
             _log.error("internal error while processing a datagram", {"error": str(e)})
 
-    def _on_transport_error(text: str, fatal: bool) -> None:
+    def _transport_failed(text: str, fatal: bool) -> None:
         if _closed:
             return
         if fatal:
@@ -1782,7 +1783,7 @@ actor Client(cap: ?net.UDPConnectCap,
             if p.pdu_type == pdu.REPORT:
                 # A Report at the request's level, encrypted (RFC 3412 7.2 step 11b allows it):
                 # engine ID, user and level were checked above, the MAC and time window by _process
-                _on_report(m, scoped, ex, _report_kind(scoped), (m.flags & message.FLAG_AUTH) != 0, now)
+                _reported(m, scoped, ex, _report_kind(scoped), (m.flags & message.FLAG_AUTH) != 0, now)
             elif p.pdu_type != pdu.RESPONSE:
                 _drops_pdu += 1
             elif p.request_id != ex.request_id:
@@ -1822,7 +1823,7 @@ actor Client(cap: ?net.UDPConnectCap,
         if scoped is not None and record is not None:
             if authenticated:
                 _times[eid] = record
-            _on_report(m, s, ex, kind, authenticated, now)
+            _reported(m, s, ex, kind, authenticated, now)
         else:
             _drop_auth(failure, m.msg_id)
 
@@ -1879,7 +1880,7 @@ actor Client(cap: ?net.UDPConnectCap,
             _forget_engine(why)
         _next_chunk(op)
 
-    proc def _on_report(m: V3Message, s: ScopedPdu, ex: _Exchange, kind: str, authenticated: bool, now: float) -> None:
+    proc def _reported(m: V3Message, s: ScopedPdu, ex: _Exchange, kind: str, authenticated: bool, now: float) -> None:
         # Act on a Report that passed the checks
         eid = m.usm.engine_id
         _reports += 1
@@ -1945,9 +1946,9 @@ actor Client(cap: ?net.UDPConnectCap,
             op.answered_reps = reps if reps is not None else ex.max_repetitions
             op.context_engine_id = ceid
             op.context_name = cname
-            _on_pdu(op, ex, p)
+            _op_answered(op, ex, p)
 
-    proc def _on_pdu(op: _Op, ex: _Exchange, p: Pdu) -> None:
+    proc def _op_answered(op: _Op, ex: _Exchange, p: Pdu) -> None:
         # Error statuses that the engine handles itself (tooBig, SNMPv1 noSuchName), the shape
         # check, then the next chunk
         status = p.error_status
@@ -2047,50 +2048,50 @@ actor Client(cap: ?net.UDPConnectCap,
             return e.error_message
         return ""
 
-    proc def _submit(cb: action(Client, ?Response, ?errors.SnmpError) -> None, kind: int, vbs: list[VarBind],
+    proc def _submit(on_done: action(Client, ?Response, ?errors.SnmpError) -> None, kind: int, vbs: list[VarBind],
                      non_repeaters: int, max_repetitions: int, o: ?Options) -> int:
         h = _next_handle
         _next_handle += 1
         if _closed:
-            cb(self, None, errors.CancelledError("client closed"))
+            on_done(self, None, errors.CancelledError("client closed"))
             return h
         eff = o if o is not None else _opts
         mr = max_repetitions if max_repetitions != -1 else eff.max_repetitions
         problem = _validate(kind, vbs, non_repeaters, mr)
         if problem != "":
-            cb(self, None, errors.EncodeError(problem))
+            on_done(self, None, errors.EncodeError(problem))
             return h
         queued = len(_ops) - _active
         if _opts.max_queued > 0 and queued >= _opts.max_queued:
-            cb(self, None, errors.QueueFullError("request queue full: %d requests queued" % queued))
+            on_done(self, None, errors.QueueFullError("request queue full: %d requests queued" % queued))
             return h
         op = _Op(h, kind, eff, vbs, non_repeaters, mr, _plan(kind, len(vbs), eff.max_oids_per_request))
         _ops[h] = op
-        _cbs[h] = cb
+        _cbs[h] = on_done
         _queue.append(h)
         _requests += 1
         _pump()
         return h
 
-    def get(cb: action(Client, ?Response, ?errors.SnmpError) -> None, oids: list[Oid], opts: ?Options=None) -> int:
+    def get(on_done: action(Client, ?Response, ?errors.SnmpError) -> None, oids: list[Oid], opts: ?Options=None) -> int:
         """Send a GetRequest for oids; returns a handle for cancel()
 
         The response varbinds are in the order of oids. More than
         opts.max_oids_per_request OIDs, or a tooBig answer, split the
         request into several PDUs, whose answers are merged.
         """
-        return _submit(cb, pdu.GET, [VarBind(o) for o in oids], 0, 0, opts)
+        return _submit(on_done, pdu.GET, [VarBind(o) for o in oids], 0, 0, opts)
 
-    def get_next(cb: action(Client, ?Response, ?errors.SnmpError) -> None, oids: list[Oid],
+    def get_next(on_done: action(Client, ?Response, ?errors.SnmpError) -> None, oids: list[Oid],
                  opts: ?Options=None) -> int:
         """Send a GetNextRequest for oids; returns a handle for cancel()
 
         Like get(). An SNMPv1 noSuchName answer becomes EndOfMibView for that
         varbind (with Options.v1_fix_errors).
         """
-        return _submit(cb, pdu.GETNEXT, [VarBind(o) for o in oids], 0, 0, opts)
+        return _submit(on_done, pdu.GETNEXT, [VarBind(o) for o in oids], 0, 0, opts)
 
-    def get_bulk(cb: action(Client, ?Response, ?errors.SnmpError) -> None, oids: list[Oid], non_repeaters: int=0,
+    def get_bulk(on_done: action(Client, ?Response, ?errors.SnmpError) -> None, oids: list[Oid], non_repeaters: int=0,
                  max_repetitions: int=-1, opts: ?Options=None) -> int:
         """Send a GetBulkRequest for oids; returns a handle for cancel()
 
@@ -2101,9 +2102,9 @@ actor Client(cap: ?net.UDPConnectCap,
         request is sent as a GETNEXT of oids (RFC 3584 section 4.2.1), so
         the response has one varbind per OID.
         """
-        return _submit(cb, pdu.GETBULK, [VarBind(o) for o in oids], non_repeaters, max_repetitions, opts)
+        return _submit(on_done, pdu.GETBULK, [VarBind(o) for o in oids], non_repeaters, max_repetitions, opts)
 
-    def set(cb: action(Client, ?Response, ?errors.SnmpError) -> None, varbinds: list[VarBind],
+    def set(on_done: action(Client, ?Response, ?errors.SnmpError) -> None, varbinds: list[VarBind],
             opts: ?Options=None) -> int:
         """Send a SetRequest with varbinds; returns a handle for cancel()
 
@@ -2112,9 +2113,9 @@ actor Client(cap: ?net.UDPConnectCap,
         reported as an ErrorStatusError. A retried SET may fail although an
         earlier attempt succeeded at the agent; consider opts with retries=0.
         """
-        return _submit(cb, pdu.SET, varbinds, 0, 0, opts)
+        return _submit(on_done, pdu.SET, varbinds, 0, 0, opts)
 
-    def inform(cb: action(Client, ?Response, ?errors.SnmpError) -> None, trap_oid: Oid, varbinds: list[VarBind],
+    def inform(on_done: action(Client, ?Response, ?errors.SnmpError) -> None, trap_oid: Oid, varbinds: list[VarBind],
                uptime: int=-1, opts: ?Options=None) -> int:
         """Send an InformRequest (SNMPv2c or SNMPv3) to the receiver; returns a handle for cancel()
 
@@ -2127,9 +2128,9 @@ actor Client(cap: ?net.UDPConnectCap,
         InformRequest: the callback gets an EncodeError.
         """
         up = uptime if uptime != -1 else _uptime()
-        return _submit(cb, pdu.INFORM, notify.build_trap_v2(up, trap_oid, varbinds), 0, 0, opts)
+        return _submit(on_done, pdu.INFORM, notify.build_trap_v2(up, trap_oid, varbinds), 0, 0, opts)
 
-    def discover(cb: action(Client, ?EngineInfo, ?errors.SnmpError) -> None) -> None:
+    def discover(on_done: action(Client, ?EngineInfo, ?errors.SnmpError) -> None) -> None:
         """Discover the agent's SNMPv3 engine now, and report what was learned
 
         Sends the discovery probe (or joins the one that is running) even
@@ -2140,16 +2141,16 @@ actor Client(cap: ?net.UDPConnectCap,
         early. The callback gets an EncodeError for SNMPv1/v2c.
         """
         if _closed:
-            cb(self, None, errors.CancelledError("client closed"))
+            on_done(self, None, errors.CancelledError("client closed"))
             return
         if _usm is None:
-            cb(self, None, errors.EncodeError("discover() needs SNMPv3 (Usm) security"))
+            on_done(self, None, errors.EncodeError("discover() needs SNMPv3 (Usm) security"))
             return
         fatal = _transport_down()
         if fatal is not None:
-            cb(self, None, _transport_error(fatal))
+            on_done(self, None, _transport_error(fatal))
             return
-        _engine_cbs.append(cb)
+        _engine_cbs.append(on_done)
         _start_discovery(_opts)
 
     # Walks and tables ###############################################################################
@@ -2260,7 +2261,7 @@ actor Client(cap: ?net.UDPConnectCap,
         else:
             _job_request(job, si, pdu.GETNEXT, oids, 0)
 
-    proc def _job_answer(op: _Op, r: ?Response, e: ?errors.SnmpError) -> None:
+    proc def _job_request_completed(op: _Op, r: ?Response, e: ?errors.SnmpError) -> None:
         # A request of a job completed (_complete); requests of finished jobs are ignored
         if op.job not in _jobs:
             return
@@ -2270,7 +2271,7 @@ actor Client(cap: ?net.UDPConnectCap,
             return
         st.op = 0
         if op.kind == pdu.GET:
-            _root_answer(job, r, e)
+            _got_root(job, r, e)
             return
         if e is not None:
             if op.kind == pdu.GETBULK and job.adaptive:
@@ -2370,7 +2371,7 @@ actor Client(cap: ?net.UDPConnectCap,
             return
         _job_finish(job, None)
 
-    proc def _root_answer(job: _Job, r: ?Response, e: ?errors.SnmpError) -> None:
+    proc def _got_root(job: _Job, r: ?Response, e: ?errors.SnmpError) -> None:
         # The GET of an empty walk's root: its varbind, unless it is an exception (no such object)
         if e is not None:
             if isinstance(e, errors.ErrorStatusError):
@@ -2389,11 +2390,11 @@ actor Client(cap: ?net.UDPConnectCap,
     proc def _job_flush(job: _Job) -> None:
         # walk_stream: hand the varbinds taken since the last batch to on_batch
         if job.kind == _JOB_STREAM and len(job.found) > 0:
-            cb = _batch_cbs.get(job.handle)
-            if cb is not None:
+            on_batch = _batch_cbs.get(job.handle)
+            if on_batch is not None:
                 batch = job.found
                 job.found = []
-                cb(self, batch)
+                on_batch(self, batch)
 
     proc def _job_finish(job: _Job, e: ?errors.SnmpError) -> None:
         # End a job and call its callback (walk_stream: the last batch, then on_done); a second
@@ -2421,27 +2422,27 @@ actor Client(cap: ?net.UDPConnectCap,
             else:
                 _log.debug("walk done", {"handle": h, "varbinds": job.count})
         if job.kind == _JOB_WALK:
-            cb = _walk_cbs.get(h)
-            if cb is not None:
+            on_walk_done = _walk_cbs.get(h)
+            if on_walk_done is not None:
                 del _walk_cbs[h]
-                cb(self, job.found, e)
+                on_walk_done(self, job.found, e)
         elif job.kind == _JOB_STREAM:
             _job_flush(job)
             if h in _batch_cbs:
                 del _batch_cbs[h]
-            done = _done_cbs.get(h)
-            if done is not None:
+            on_stream_done = _done_cbs.get(h)
+            if on_stream_done is not None:
                 del _done_cbs[h]
-                done(self, job.count, e)
+                on_stream_done(self, job.count, e)
         else:
-            tcb = _table_cbs.get(h)
-            if tcb is not None:
+            on_table_done = _table_cbs.get(h)
+            if on_table_done is not None:
                 del _table_cbs[h]
-                tcb(self, _table_of(job), e)
+                on_table_done(self, _table_of(job), e)
         _pump()
 
-    def walk(cb: action(Client, list[VarBind], ?errors.SnmpError) -> None, root: Oid, opts: ?Options=None) -> int:
-        """Walk the subtree below root and call cb(c, varbinds, error) once; returns a handle for cancel()
+    def walk(on_done: action(Client, list[VarBind], ?errors.SnmpError) -> None, root: Oid, opts: ?Options=None) -> int:
+        """Walk the subtree below root and call on_done(c, varbinds, error) once; returns a handle for cancel()
 
         varbinds are those found in the subtree, in OID order, without the
         one that ended the walk. error is None when the walk ended normally:
@@ -2461,9 +2462,9 @@ actor Client(cap: ?net.UDPConnectCap,
         _next_handle += 1
         refusal = _job_refusal([root], [root], False)
         if refusal is not None:
-            cb(self, [], refusal)
+            on_done(self, [], refusal)
             return h
-        _walk_cbs[h] = cb
+        _walk_cbs[h] = on_done
         _start_job(_new_job(h, _JOB_WALK, [root], [root], opts))
         return h
 
@@ -2491,9 +2492,9 @@ actor Client(cap: ?net.UDPConnectCap,
         _start_job(_new_job(h, _JOB_STREAM, [root], [root], opts))
         return h
 
-    def get_table(cb: action(Client, ?Table, ?errors.SnmpError) -> None, columns: list[Oid],
+    def get_table(on_done: action(Client, ?Table, ?errors.SnmpError) -> None, columns: list[Oid],
                   opts: ?Options=None, index_prefix: list[int]=[]) -> int:
-        """Fetch table columns and call cb(c, table, error) once; returns a handle for cancel()
+        """Fetch table columns and call on_done(c, table, error) once; returns a handle for cancel()
 
         columns are column OIDs of one table, or of tables that share its
         index (ifEntry and the augmenting ifXEntry). They are walked in
@@ -2510,39 +2511,39 @@ actor Client(cap: ?net.UDPConnectCap,
         for walk(), per column. max_walk_varbinds counts the values of all
         columns and sets Table.truncated.
 
-        On an error cb gets the rows found so far. No columns, a column that
-        cannot be encoded, or a column inside another one gives EncodeError
-        with table None.
+        On an error on_done gets the rows found so far. No columns, a
+        column that cannot be encoded, or a column inside another one gives
+        EncodeError with table None.
         """
         h = _next_handle
         _next_handle += 1
         roots = columns
         if len(index_prefix) > 0:
             if not _arcs_ok(index_prefix):
-                cb(self, None, errors.EncodeError("index_prefix arcs must be 0 to 4294967295"))
+                on_done(self, None, errors.EncodeError("index_prefix arcs must be 0 to 4294967295"))
                 return h
             roots = [Oid(c.arcs + index_prefix) for c in columns]
         refusal = _job_refusal(roots, columns, True)
         if refusal is not None:
-            cb(self, None, refusal)
+            on_done(self, None, refusal)
             return h
-        _table_cbs[h] = cb
+        _table_cbs[h] = on_done
         _start_job(_new_job(h, _JOB_TABLE, roots, columns, opts))
         return h
 
     # Notifications #################################################################################
 
-    proc def _emit(cb: action(Client, ?errors.SnmpError) -> None, data: bytes) -> None:
+    proc def _emit(on_done: action(Client, ?errors.SnmpError) -> None, data: bytes) -> None:
         # Hand an unacknowledged notification to the transport
         fatal = _transport_down()
         tr = _transport
         if fatal is not None:
-            cb(self, _transport_error(fatal))
+            on_done(self, _transport_error(fatal))
         elif tr is not None:
             tr.send(data)
-            cb(self, None)
+            on_done(self, None)
         else:
-            cb(self, errors.TransportError("no transport: neither cap nor transport was given", False))
+            on_done(self, errors.TransportError("no transport: neither cap nor transport was given", False))
 
     proc def _encode_trap_v3(u: Usm, p: Pdu) -> bytes:
         # We are the authoritative engine of an SNMPv3 trap: our engine ID, boots and time
@@ -2569,23 +2570,24 @@ actor Client(cap: ?net.UDPConnectCap,
         salt = _salt.next() if (level & message.FLAG_PRIV) != 0 else u64(0)
         return usm.protect(hdr, message.encode_scoped(scoped), keys, salt)
 
-    def trap(cb: action(Client, ?errors.SnmpError) -> None, trap_oid: Oid, varbinds: list[VarBind],
+    def trap(on_done: action(Client, ?errors.SnmpError) -> None, trap_oid: Oid, varbinds: list[VarBind],
              uptime: int=-1) -> None:
         """Send an SNMPv2-Trap (SNMPv2c or SNMPv3); unacknowledged
 
         The varbinds sent are sysUpTime.0 = uptime (-1: hundredths of a
         second since the Client started), snmpTrapOID.0 = trap_oid, then
-        varbinds. cb(c, None) once the datagram is handed to the transport;
-        cb(c, error) for content that cannot be encoded (EncodeError), an
-        SNMPv1 Client (use trap_v1), or a failed transport. With SNMPv3 we
-        are the authoritative engine (local_engine_id, local_engine_boots,
-        time since the Client started): no discovery.
+        varbinds. on_done(c, None) once the datagram is handed to the
+        transport; on_done(c, error) for content that cannot be encoded
+        (EncodeError), an SNMPv1 Client (use trap_v1), or a failed
+        transport. With SNMPv3 we are the authoritative engine
+        (local_engine_id, local_engine_boots, time since the Client
+        started): no discovery.
         """
         if _closed:
-            cb(self, errors.CancelledError("client closed"))
+            on_done(self, errors.CancelledError("client closed"))
             return
         if _version == message.SNMP_V1:
-            cb(self, errors.EncodeError("an SNMPv2-Trap needs SNMPv2c or SNMPv3; use trap_v1() with SNMPv1"))
+            on_done(self, errors.EncodeError("an SNMPv2-Trap needs SNMPv2c or SNMPv3; use trap_v1() with SNMPv1"))
             return
         up = uptime if uptime != -1 else _uptime()
         p = Pdu(pdu.TRAP_V2, _random_id(_mask(_opts)), 0, 0, notify.build_trap_v2(up, trap_oid, varbinds))
@@ -2602,25 +2604,25 @@ actor Client(cap: ?net.UDPConnectCap,
         except ValueError as e:
             failure = errors.EncodeError(e.error_message)
         if failure is not None:
-            cb(self, failure)
+            on_done(self, failure)
             return
         _log.debug("sending trap", {"trap_oid": trap_oid.dotted(), "id": p.request_id})
-        _emit(cb, data)
+        _emit(on_done, data)
 
-    def trap_v1(cb: action(Client, ?errors.SnmpError) -> None, enterprise: Oid, agent_addr: bytes,
+    def trap_v1(on_done: action(Client, ?errors.SnmpError) -> None, enterprise: Oid, agent_addr: bytes,
                 generic_trap: int, specific_trap: int, varbinds: list[VarBind], uptime: int=-1) -> None:
         """Send an SNMPv1 Trap-PDU (SNMPv1 Client only); unacknowledged
 
         agent_addr is the sender's IPv4 address (4 octets), generic_trap
         0..6 and specific_trap the enterprise-specific code; uptime -1 is
-        the time since the Client started. cb as for trap(); an SNMPv2c or
-        SNMPv3 Client gets an EncodeError (use trap()).
+        the time since the Client started. on_done as for trap(); an
+        SNMPv2c or SNMPv3 Client gets an EncodeError (use trap()).
         """
         if _closed:
-            cb(self, errors.CancelledError("client closed"))
+            on_done(self, errors.CancelledError("client closed"))
             return
         if _version != message.SNMP_V1:
-            cb(self, errors.EncodeError("an SNMPv1 Trap-PDU needs an SNMPv1 Community; use trap()"))
+            on_done(self, errors.EncodeError("an SNMPv1 Trap-PDU needs an SNMPv1 Community; use trap()"))
             return
         up = uptime if uptime != -1 else _uptime()
         t = TrapV1Pdu(enterprise, agent_addr, generic_trap, specific_trap, up, varbinds)
@@ -2631,11 +2633,11 @@ actor Client(cap: ?net.UDPConnectCap,
         except errors.EncodeError as e:
             failure = e
         if failure is not None:
-            cb(self, failure)
+            on_done(self, failure)
             return
         _log.debug("sending SNMPv1 trap", {"enterprise": enterprise.dotted(), "generic": generic_trap,
                                            "specific": specific_trap})
-        _emit(cb, data)
+        _emit(on_done, data)
 
     # Control #######################################################################################
 

@@ -286,11 +286,11 @@ actor Bench(network: MemNet, cfg: ReceiverConfig, log_handler: ?logging.Handler,
     var _replies: list[bytes] = []
     var _finished = False
 
-    def _on_notification(r: NotificationReceiver, n: Notification) -> None:
+    def _received(r: NotificationReceiver, n: Notification) -> None:
         if n.trap_oid != SENTINEL_OID:
             _notifications.append(n)
 
-    def _on_reply(data: bytes, address: str, port: int) -> None:
+    def _peer_received(data: bytes, address: str, port: int) -> None:
         if _is_sentinel_ack(data):
             _finished = True
             on_done(self)
@@ -298,8 +298,8 @@ actor Bench(network: MemNet, cfg: ReceiverConfig, log_handler: ?logging.Handler,
             _replies.append(data)
 
     _peer = network.server(PEER, PEER_PORT)
-    _receiver = NotificationReceiver(network.server(RCV, RCV_PORT), cfg, _on_notification, log_handler)
-    _peer.set_receiver(_on_reply)
+    _receiver = NotificationReceiver(network.server(RCV, RCV_PORT), cfg, _received, log_handler)
+    _peer.set_receiver(_peer_received)
 
     def send(data: bytes, src_address: str=PEER, src_port: int=PEER_PORT) -> None:
         network.send(data, src_address, src_port, RCV, RCV_PORT)
@@ -483,7 +483,7 @@ actor _test_v1_traps(t: testing.AsyncT):
              + [TrapV1Pdu(o("1.3.6.1.4.1.8072.9999.3"), h("0a000001"), g, 0, g * 100, v1_payload(g)) for g in range(6)]
              + [TrapV1Pdu(o("1.3.6.1.4.1.8072.9999.3"), h("00000000"), 6, 2147483647, 4294967295, [])])
 
-    def done(b: Bench) -> None:
+    def finished(b: Bench) -> None:
         def check() -> None:
             ns = b.notifications()
             testing.assertEqual(len(ns), len(traps))
@@ -506,7 +506,7 @@ actor _test_v1_traps(t: testing.AsyncT):
             check_stats(b.stats(), {"received": len(traps), "delivered": len(traps)})
         report(t, outcome(check))
 
-    b = Bench(MemNet(), config(), t.log_handler, done)
+    b = Bench(MemNet(), config(), t.log_handler, finished)
     for i in range(len(traps)):
         b.send(v1_message(b"public", traps[i]), "198.51.100.%d" % i, 1000 + i)
     b.finish()
@@ -518,7 +518,7 @@ actor _test_v2c_traps_and_informs(t: testing.AsyncT):
     inform = v2_pdu(pdu.INFORM, 3, 23)
     empty = Pdu(pdu.INFORM, -5, 0, 0, notify.build_trap_v2(1, trap_oid(24), []))
 
-    def done(b: Bench) -> None:
+    def finished(b: Bench) -> None:
         def check() -> None:
             ns = b.notifications()
             testing.assertEqual(len(ns), 4)
@@ -537,7 +537,7 @@ actor _test_v2c_traps_and_informs(t: testing.AsyncT):
             check_stats(b.stats(), {"received": 4, "delivered": 4, "acked": 2})
         report(t, outcome(check))
 
-    b = Bench(MemNet(), config(), t.log_handler, done)
+    b = Bench(MemNet(), config(), t.log_handler, finished)
     for p in [cold, trap, inform, empty]:
         b.send(v2c_message(b"public", p))
     b.finish()
@@ -548,7 +548,7 @@ actor _test_v2c_inform_not_encodable(t: testing.AsyncT):
     datagram = v2c_message(b"public", Pdu(pdu.INFORM, 9, 0, 0, notify.build_trap_v2(5, notify.TRAP_COLD_START, [
         vb("1.3.6.1.4.1.8072.1", raw_value(0x02, "01 00 00 00 00"))])))
 
-    def done(b: Bench) -> None:
+    def finished(b: Bench) -> None:
         def check() -> None:
             ns = b.notifications()
             testing.assertEqual(len(ns), 1)
@@ -559,13 +559,13 @@ actor _test_v2c_inform_not_encodable(t: testing.AsyncT):
             check_stats(b.stats(), {"received": 1, "delivered": 1, "acked": 1})
         report(t, outcome(check))
 
-    b = Bench(MemNet(), config(), t.log_handler, done)
+    b = Bench(MemNet(), config(), t.log_handler, finished)
     b.send(datagram)
     b.finish()
 
 actor _test_communities(t: testing.AsyncT):
     """Only the configured communities are accepted; others are dropped without an answer"""
-    def done(b: Bench) -> None:
+    def finished(b: Bench) -> None:
         def check() -> None:
             ns = b.notifications()
             testing.assertEqual([(n.version, n.community) for n in ns],
@@ -575,7 +575,7 @@ actor _test_communities(t: testing.AsyncT):
             check_stats(b.stats(), {"received": 8, "delivered": 3, "acked": 1, "dropped_community": 5})
         report(t, outcome(check))
 
-    b = Bench(MemNet(), config(communities=["public", "private"]), t.log_handler, done)
+    b = Bench(MemNet(), config(communities=["public", "private"]), t.log_handler, finished)
     b.send(v1_message(b"private", v1_example()))
     b.send(v1_message(b"secret", v1_example()))
     b.send(v2c_message(b"public", v2_pdu(pdu.TRAP_V2, 1, 1)))
@@ -588,13 +588,13 @@ actor _test_communities(t: testing.AsyncT):
 
 actor _test_any_community(t: testing.AsyncT):
     """The community "*" accepts any community"""
-    def done(b: Bench) -> None:
+    def finished(b: Bench) -> None:
         def check() -> None:
             testing.assertEqual([n.community for n in b.notifications()], [b"", b"anything", b"\x00\xff"])
             check_stats(b.stats(), {"received": 3, "delivered": 3})
         report(t, outcome(check))
 
-    b = Bench(MemNet(), config(communities=["*"]), t.log_handler, done)
+    b = Bench(MemNet(), config(communities=["*"]), t.log_handler, finished)
     b.send(v2c_message(b"", v2_pdu(pdu.TRAP_V2, 1, 1)))
     b.send(v1_message(b"anything", v1_example()))
     b.send(v2c_message(b"\x00\xff", v2_pdu(pdu.TRAP_V2, 2, 2)))
@@ -617,14 +617,14 @@ actor _test_wrong_pdu_for_version(t: testing.AsyncT):
         v2c_message(b"public", Pdu(pdu.RESPONSE, 7, 0, 0, [])),
         v2c_message(b"public", Pdu(pdu.REPORT, 8, 0, 0, []))]
 
-    def done(b: Bench) -> None:
+    def finished(b: Bench) -> None:
         def check() -> None:
             testing.assertEqual(b.notifications(), [])
             testing.assertEqual(b.replies(), [])
             check_stats(b.stats(), {"received": len(datagrams), "dropped_pdu": len(datagrams)})
         report(t, outcome(check))
 
-    b = Bench(MemNet(), config(), t.log_handler, done)
+    b = Bench(MemNet(), config(), t.log_handler, finished)
     for d in datagrams:
         b.send(d)
     b.finish()
@@ -644,7 +644,7 @@ actor _test_malformed(t: testing.AsyncT):
     bad_value = v2c_message(b"public", Pdu(pdu.TRAP_V2, 4, 0, 0, notify.build_trap_v2(5, notify.TRAP_COLD_START, [
         vb("1.3.6.1.4.1.8072.1", raw_value(0x41, "01 00 00 00 00"))])))
 
-    def done(b: Bench) -> None:
+    def finished(b: Bench) -> None:
         def check() -> None:
             ns = b.notifications()
             testing.assertEqual(len(ns), 2)
@@ -659,7 +659,7 @@ actor _test_malformed(t: testing.AsyncT):
                                     "dropped_decode": len(undecodable)})
         report(t, outcome(check))
 
-    b = Bench(MemNet(), config(), t.log_handler, done)
+    b = Bench(MemNet(), config(), t.log_handler, finished)
     for d in undecodable:
         b.send(d)
     b.send(v2c_message(b"public", odd))
@@ -708,7 +708,7 @@ actor _v3_traps_test(t: testing.AsyncT, auth_name: str, with_noauth: bool):
     datagrams = r.1
     want = r.2
 
-    def done(b: Bench) -> None:
+    def finished(b: Bench) -> None:
         def check() -> None:
             ns = b.notifications()
             testing.assertEqual(len(ns), len(want))
@@ -721,7 +721,7 @@ actor _v3_traps_test(t: testing.AsyncT, auth_name: str, with_noauth: bool):
                                     "trap_keys_derived": 2 * auth_users})
         report(t, outcome(check))
 
-    b = Bench(MemNet(), config(users), t.log_handler, done)
+    b = Bench(MemNet(), config(users), t.log_handler, finished)
     for d in datagrams:
         b.send(d)
     b.finish()
@@ -760,7 +760,7 @@ actor _test_v3_trap_canon(t: testing.AsyncT):
                  v3_trap(users[2], keys_for(users[2], sender_a()), sender_a(), 1, 9,
                          Pdu(pdu.TRAP_V2, 3, 0, 0, notify.build_trap_v2(42, notify.TRAP_LINK_UP, [])), u64(1), b"ctx \"1\"")]
 
-    def done(b: Bench) -> None:
+    def finished(b: Bench) -> None:
         def check() -> None:
             got = [fmt.canon_notification(n) for n in b.notifications()]
             testing.assertEqual(got, [
@@ -776,7 +776,7 @@ actor _test_v3_trap_canon(t: testing.AsyncT):
                        "END"])])
         report(t, outcome(check))
 
-    b = Bench(MemNet(), config(users), t.log_handler, done)
+    b = Bench(MemNet(), config(users), t.log_handler, finished)
     for d in datagrams:
         b.send(d)
     b.finish()
@@ -821,7 +821,7 @@ actor _test_v3_trap_refusals(t: testing.AsyncT):
         v3_trap(noauth, None, a, 1, 0, Pdu(pdu.REPORT, 11, 0, 0, [])),
         v3_trap(noauth, None, our_engine(), 1, 0, p)]
 
-    def done(b: Bench) -> None:
+    def finished(b: Bench) -> None:
         def check() -> None:
             testing.assertEqual(b.notifications(), [])
             testing.assertEqual(b.replies(), [], "nothing is answered")
@@ -835,7 +835,7 @@ actor _test_v3_trap_refusals(t: testing.AsyncT):
                                     "trap_keys_derived": 1})
         report(t, outcome(check))
 
-    b = Bench(MemNet(), config([noauth, sha, sha_aes, md5_aes256c]), t.log_handler, done)
+    b = Bench(MemNet(), config([noauth, sha, sha_aes, md5_aes256c]), t.log_handler, finished)
     for d in datagrams:
         b.send(d)
     b.finish()
@@ -880,7 +880,7 @@ actor _test_v3_trap_time_window(t: testing.AsyncT):
     steps = time_window_steps(sha, sha_aes, noauth)
     accepted = [i + 1 for i in range(len(steps)) if steps[i].1]
 
-    def done(b: Bench) -> None:
+    def finished(b: Bench) -> None:
         def check() -> None:
             testing.assertEqual([n.request_id for n in b.notifications()], accepted)
             n = len(steps) - len(accepted)
@@ -888,7 +888,7 @@ actor _test_v3_trap_time_window(t: testing.AsyncT):
                                     "usmStatsNotInTimeWindows": n, "trap_keys_derived": 4})
         report(t, outcome(check))
 
-    b = Bench(MemNet(), config([sha, sha_aes, noauth]), t.log_handler, done)
+    b = Bench(MemNet(), config([sha, sha_aes, noauth]), t.log_handler, finished)
     for d in steps:
         b.send(d.0)
     b.finish()
@@ -898,14 +898,14 @@ actor _test_v3_trap_engines(t: testing.AsyncT):
     sha = keyed("u_sha")
     noauth = keyed("u_noauth")
 
-    def done(b: Bench) -> None:
+    def finished(b: Bench) -> None:
         def check() -> None:
             testing.assertEqual([(n.engine_id, n.request_id) for n in b.notifications()], [(sender_a(), 1), (sender_a(), 3)])
             check_stats(b.stats(), {"received": 4, "delivered": 2, "dropped_engine_id": 2,
                                     "usmStatsUnknownEngineIDs": 2, "trap_keys_derived": 1})
         report(t, outcome(check))
 
-    b = Bench(MemNet(), config([sha, noauth], trap_engines=[sender_a()]), t.log_handler, done)
+    b = Bench(MemNet(), config([sha, noauth], trap_engines=[sender_a()]), t.log_handler, finished)
     b.send(v3_trap(sha, sha.localized(sender_a()), sender_a(), 1, 0, v2_pdu(pdu.TRAP_V2, 1, 1)))
     b.send(v3_trap(sha, sha.localized(sender_b()), sender_b(), 1, 0, v2_pdu(pdu.TRAP_V2, 2, 2)))
     b.send(v3_trap(noauth, None, sender_a(), 1, 0, v2_pdu(pdu.TRAP_V2, 3, 3)))
@@ -921,7 +921,7 @@ actor _test_v3_trap_users_per_engine(t: testing.AsyncT):
     dev_b = keyed("u_sha", 2)
     shared = keyed("u_sha")
 
-    def done(b: Bench) -> None:
+    def finished(b: Bench) -> None:
         def check() -> None:
             got = [(n.engine_id, n.request_id) for n in b.notifications()]
             testing.assertEqual(got, [(sender_a(), 1), (sender_b(), 2), (sender_c(), 3)])
@@ -931,7 +931,7 @@ actor _test_v3_trap_users_per_engine(t: testing.AsyncT):
 
     cfg = ReceiverConfig(["public"], [shared], [], our_engine(), BOOTS, 0.0,
                          [TrapUser(sender_a(), dev_a), TrapUser(sender_b(), dev_b)])
-    b = Bench(MemNet(), cfg, t.log_handler, done)
+    b = Bench(MemNet(), cfg, t.log_handler, finished)
     b.send(v3_trap(dev_a, dev_a.localized(sender_a()), sender_a(), 1, 0, v2_pdu(pdu.TRAP_V2, 1, 1)))
     b.send(v3_trap(dev_b, dev_b.localized(sender_b()), sender_b(), 1, 0, v2_pdu(pdu.TRAP_V2, 2, 2)))
     b.send(v3_trap(shared, shared.localized(sender_c()), sender_c(), 1, 0, v2_pdu(pdu.TRAP_V2, 3, 3)))
@@ -973,7 +973,7 @@ actor _test_v3_informs(t: testing.AsyncT):
     # net-snmp's discovery probe: empty engine ID and user, noAuthNoPriv, reportable, no varbinds
     probe = v3_message(None, b"", message.FLAG_REPORTABLE, b"", 0, 0, Pdu(pdu.GET, 4242, 0, 0, []), 77)
 
-    def done(b: Bench) -> None:
+    def finished(b: Bench) -> None:
         def check() -> None:
             rs = b.replies()
             testing.assertEqual(len(rs), 1 + len(users))
@@ -993,7 +993,7 @@ actor _test_v3_informs(t: testing.AsyncT):
                                     "delivered": len(users), "acked": len(users), "usmStatsUnknownEngineIDs": 1})
         report(t, outcome(check))
 
-    b = Bench(MemNet(), config(users), t.log_handler, done)
+    b = Bench(MemNet(), config(users), t.log_handler, finished)
     b.send(probe)
     for i in range(len(users)):
         b.send(v3_inform(users[i], keys[i], informs[i], 60 + i, u64(i), b"ctx"))
@@ -1021,7 +1021,7 @@ actor _test_v3_inform_refusals(t: testing.AsyncT):
         v3_message(None, b"u_noauth", 0, our_engine(), BOOTS, 0, v2_pdu(pdu.TRAP_V2, 902, 9), 8),  # trap: no Report
         v3_inform(sha_aes, keys_for(with_priv_key(sha_aes, 77), our_engine()), p, 9)]             # wrong privacy key
 
-    def done(b: Bench) -> None:
+    def finished(b: Bench) -> None:
         def check() -> None:
             testing.assertEqual(b.notifications(), [])
             rs = b.replies()
@@ -1046,7 +1046,7 @@ actor _test_v3_inform_refusals(t: testing.AsyncT):
                                     "snmpUnknownPDUHandlers": 2, "usmStatsDecryptionErrors": 1})
         report(t, outcome(check))
 
-    b = Bench(MemNet(), config([sha, sha_aes, noauth]), t.log_handler, done)
+    b = Bench(MemNet(), config([sha, sha_aes, noauth]), t.log_handler, finished)
     for d in datagrams:
         b.send(d)
     b.finish()
@@ -1057,7 +1057,7 @@ actor _test_v3_inform_too_big(t: testing.AsyncT):
     keys = keys_for(u, our_engine())
     inform = big_inform(77, 7)
 
-    def done(b: Bench) -> None:
+    def finished(b: Bench) -> None:
         def check() -> None:
             testing.assertEqual(len(b.notifications()), 1)
             rs = b.replies()
@@ -1066,7 +1066,7 @@ actor _test_v3_inform_too_big(t: testing.AsyncT):
             check_stats(b.stats(), {"received": 1, "delivered": 1, "acked": 1})
         report(t, outcome(check))
 
-    b = Bench(MemNet(), config([u]), t.log_handler, done)
+    b = Bench(MemNet(), config([u]), t.log_handler, finished)
     b.send(v3_inform(u, keys, inform, 3, u64(1), b"", 484))
     b.finish()
 
@@ -1091,7 +1091,7 @@ actor _test_dedup(t: testing.AsyncT):
         (trap, "198.51.100.1", 1162),               # delivered
         (trap, "198.51.100.1", 1162)]               # duplicated by the network
 
-    def done(b: Bench) -> None:
+    def finished(b: Bench) -> None:
         def check() -> None:
             testing.assertEqual([(n.request_id, n.source_port) for n in b.notifications()],
                                 [(10, PEER_PORT), (10, PEER_PORT + 1), (13, PEER_PORT), (11, PEER_PORT),
@@ -1105,7 +1105,7 @@ actor _test_dedup(t: testing.AsyncT):
             check_stats(b.stats(), {"received": 9, "delivered": 5, "duplicates": 4, "acked": 7})
         report(t, outcome(check))
 
-    b = Bench(MemNet(), config([u], dedup=60.0), t.log_handler, done)
+    b = Bench(MemNet(), config([u], dedup=60.0), t.log_handler, finished)
     for d in sends:
         b.send(d.0, d.1, d.2)
     b.finish()
@@ -1114,14 +1114,14 @@ actor _test_no_dedup(t: testing.AsyncT):
     """Without dedup_window every copy is delivered"""
     inform = v2c_message(b"public", v2_pdu(pdu.INFORM, 10, 1))
 
-    def done(b: Bench) -> None:
+    def finished(b: Bench) -> None:
         def check() -> None:
             testing.assertEqual(len(b.notifications()), 3)
             testing.assertEqual(len(b.replies()), 3)
             check_stats(b.stats(), {"received": 3, "delivered": 3, "acked": 3})
         report(t, outcome(check))
 
-    b = Bench(MemNet(), config(), t.log_handler, done)
+    b = Bench(MemNet(), config(), t.log_handler, finished)
     for i in range(3):
         b.send(inform)
     b.finish()
@@ -1131,19 +1131,19 @@ actor _test_no_dedup(t: testing.AsyncT):
 
 actor _test_close(t: testing.AsyncT):
     """After close() nothing more is received; close() is idempotent and stats() still answers"""
-    def final(b: Bench) -> None:
+    def settled(b: Bench) -> None:
         def check() -> None:
             testing.assertEqual(len(b.notifications()), 1)
             check_stats(b.stats(), {"received": 1, "delivered": 1})
         report(t, outcome(check))
 
-    def done(b: Bench) -> None:
+    def finished(b: Bench) -> None:
         # the receiver gets close() before the datagram, which travels through MemNet
         b.close_receiver()
         b.send(v2c_message(b"public", v2_pdu(pdu.TRAP_V2, 2, 2)))
-        after NOTHING_WAIT: final(b)
+        after NOTHING_WAIT: settled(b)
 
-    b = Bench(MemNet(), config(), t.log_handler, done)
+    b = Bench(MemNet(), config(), t.log_handler, finished)
     b.send(v2c_message(b"public", v2_pdu(pdu.TRAP_V2, 1, 1)))
     b.finish()
 
@@ -1188,7 +1188,7 @@ actor _test_fuzz(t: testing.AsyncT):
     seeds = fuzz_seeds()
     count = 600
 
-    def done(b: Bench) -> None:
+    def finished(b: Bench) -> None:
         def check() -> None:
             s = b.stats()
             testing.assertEqual(s[receiver.RECEIVED], count + len(seeds))
@@ -1199,7 +1199,7 @@ actor _test_fuzz(t: testing.AsyncT):
         report(t, outcome(check))
 
     b = Bench(MemNet(), config([keyed("u_noauth"), keyed("u_sha"), keyed("u_sha_aes"), keyed("u_md5_des")],
-                               dedup=1.0), t.log_handler, done)
+                               dedup=1.0), t.log_handler, finished)
     for d in seeds:
         b.send(d)
     for d in mutants(seeds, count):
@@ -1229,34 +1229,34 @@ actor _test_udp_loopback(t: testing.EnvT):
             r.close()
         report_env(t, error)
 
-    def on_notification(r: NotificationReceiver, n: Notification) -> None:
+    def received(r: NotificationReceiver, n: Notification) -> None:
         got.append(n)
 
-    def on_reply(data: bytes, address: str, port: int) -> None:
+    def client_received(data: bytes, address: str, port: int) -> None:
         # the receiver called on_notification before it sent the Response
         def check() -> None:
             check_v2c_ack(data, b"public", inform)
             testing.assertEqual([(n.request_id, n.source_address) for n in got], [(31, "127.0.0.1")])
         finish(outcome(check))
 
-    def on_error(message: str, fatal: bool) -> None:
+    def client_failed(message: str, fatal: bool) -> None:
         finish(AssertionError("client: " + message))
 
-    def on_ready(s: ServerTransport, error: ?str) -> None:
+    def listening(s: ServerTransport, error: ?str) -> None:
         if error is not None:
             finish(AssertionError("listen: " + error))
             return
-        rcv = NotificationReceiver(s, config(), on_notification, t.log_handler)
+        rcv = NotificationReceiver(s, config(), received, t.log_handler)
         c = transport.udp_transport(net.UDPConnectCap(ucap), "127.0.0.1", s.local_port())
         client = c
-        c.set_receiver(on_reply, on_error)
+        c.set_receiver(client_received, client_failed)
         c.send(v2c_message(b"public", inform))
 
-    def on_timeout() -> None:
+    def timed_out() -> None:
         finish(AssertionError("no Response within 8 s"))
 
-    after 8.0: on_timeout()
-    transport.udp_server_transport(net.UDPListenCap(ucap), "127.0.0.1", 0, on_ready, t.log_handler)
+    after 8.0: timed_out()
+    transport.udp_server_transport(net.UDPListenCap(ucap), "127.0.0.1", 0, listening, t.log_handler)
 
 
 # The lab ##########################################################################################
@@ -1359,7 +1359,7 @@ actor _test_lab_matrix(t: testing.EnvT):
     datagrams = [block_datagram(blocks[i], i, view, keys) for i in range(len(blocks))]
     informs = len([b for b in blocks if " INFORM " in b[0]])
 
-    def done(b: Bench) -> None:
+    def finished(b: Bench) -> None:
         def check() -> None:
             testing.assertEqual(len(blocks), 86, "blocks in " + MATRIX)
             testing.assertEqual(len(cfg.users), 15, "users in the matrix")
@@ -1375,7 +1375,7 @@ actor _test_lab_matrix(t: testing.EnvT):
                                     "trap_keys_derived": 2 * 14})
         report_env(t, outcome(check))
 
-    b = Bench(MemNet(), cfg, t.log_handler, done)
+    b = Bench(MemNet(), cfg, t.log_handler, finished)
     for d in datagrams:
         b.send(d)
     b.finish()
@@ -1414,20 +1414,20 @@ actor _test_no_community_v3_only(t: testing.AsyncT):
     var got: list[Notification] = []
     var replies: list[bytes] = []
 
-    def on_n(r: NotificationReceiver, n: Notification) -> None:
+    def received(r: NotificationReceiver, n: Notification) -> None:
         got.append(n)
 
-    def on_reply(data: bytes, address: str, port: int) -> None:
+    def peer_received(data: bytes, address: str, port: int) -> None:
         replies.append(data)
 
-    rcv = NotificationReceiver(net0.server(RCV, RCV_PORT), cfg, on_n, t.log_handler)
-    peer.set_receiver(on_reply)
+    rcv = NotificationReceiver(net0.server(RCV, RCV_PORT), cfg, received, t.log_handler)
+    peer.set_receiver(peer_received)
     net0.send(v2c_message(b"public", v2_pdu(pdu.TRAP_V2, 1, 1)), PEER, PEER_PORT, RCV, RCV_PORT)
     net0.send(v1_message(b"public", v1_example()), PEER, PEER_PORT, RCV, RCV_PORT)
     net0.send(v2c_message(b"public", v2_pdu(pdu.INFORM, 2, 2)), PEER, PEER_PORT, RCV, RCV_PORT)
     net0.send(v3_trap(u, keys_for(u, a), a, 1, 10, v2_pdu(pdu.TRAP_V2, 3, 3)), PEER, PEER_PORT, RCV, RCV_PORT)
 
-    def verify() -> None:
+    def settled() -> None:
         st = rcv.stats()
         def check() -> None:
             testing.assertEqual([n.version for n in got], [message.SNMP_V3])
@@ -1435,7 +1435,7 @@ actor _test_no_community_v3_only(t: testing.AsyncT):
             testing.assertEqual((st["dropped_community"], st["delivered"], st["received"]), (3, 1, 4))
         report(t, outcome(check))
 
-    after now NOTHING_WAIT: verify()
+    after now NOTHING_WAIT: settled()
 
 actor _test_time_record_per_user(t: testing.AsyncT):
     """Another configured user claiming the device's engine with huge boots does not lock the device's user out"""
@@ -1445,12 +1445,12 @@ actor _test_time_record_per_user(t: testing.AsyncT):
     kd = keys_for(device, a)
     ko = keys_for(other, a)
 
-    def done(b: Bench) -> None:
+    def finished(b: Bench) -> None:
         def check() -> None:
             testing.assertEqual([n.request_id for n in b.notifications()], [1, 2, 3, 4])
         report(t, outcome(check))
 
-    b = Bench(MemNet(), config([device, other]), t.log_handler, done)
+    b = Bench(MemNet(), config([device, other]), t.log_handler, finished)
     b.send(v3_trap(device, kd, a, 1, 100, v2_pdu(pdu.TRAP_V2, 1, 1), u64(1)))
     b.send(v3_trap(other, ko, a, 2147483646, 0, v2_pdu(pdu.TRAP_V2, 2, 2), u64(2)))
     b.send(v3_trap(device, kd, a, 1, 101, v2_pdu(pdu.TRAP_V2, 3, 3), u64(3)))
@@ -1465,10 +1465,10 @@ actor _test_reset_engine(t: testing.AsyncT):
     mn = MemNet()
     var got: list[int] = []
 
-    def on_n(r: NotificationReceiver, n: Notification) -> None:
+    def received(r: NotificationReceiver, n: Notification) -> None:
         got.append(n.request_id)
 
-    rcv = NotificationReceiver(mn.server(RCV, RCV_PORT), config([device]), on_n, t.log_handler)
+    rcv = NotificationReceiver(mn.server(RCV, RCV_PORT), config([device]), received, t.log_handler)
 
     def send(boots: int, etime: int, rid: int) -> None:
         mn.send(v3_trap(device, kd, a, boots, etime, v2_pdu(pdu.TRAP_V2, rid, 1), u64(rid)), PEER, PEER_PORT,
@@ -1483,7 +1483,7 @@ actor _test_reset_engine(t: testing.AsyncT):
     send(1, 4, 3)                 # accepted: the clock is learned again
     send(1, 5, 4)
 
-    def verify() -> None:
+    def settled() -> None:
         st2 = rcv.stats()
         def check() -> None:
             testing.assertEqual(st["dropped_time_window"], 1)
@@ -1491,7 +1491,7 @@ actor _test_reset_engine(t: testing.AsyncT):
             testing.assertEqual(got, [1, 3, 4])
         report(t, outcome(check))
 
-    after now NOTHING_WAIT: verify()
+    after now NOTHING_WAIT: settled()
 
 def engine_n(i: int) -> bytes:
     return ("engine%05d" % i).encode()
@@ -1505,14 +1505,14 @@ actor _test_evicted_time_record_no_replay(t: testing.AsyncT):
     old = v3_trap(sha, ka, a, 1, 1000, v2_pdu(pdu.TRAP_V2, 1, 1), u64(1))
     new = v3_trap(sha, ka, a, 1, 100000, v2_pdu(pdu.TRAP_V2, 2, 2), u64(2))
 
-    def done(b: Bench) -> None:
+    def finished(b: Bench) -> None:
         def check() -> None:
             got = [n.request_id for n in b.notifications()]
             testing.assertEqual(len([r for r in got if r >= 10000]), receiver.MAX_TRAP_SENDERS, "the other engines")
             testing.assertEqual(len([r for r in got if r == 1]), 1, "the old trap is delivered once, never replayed")
         report(t, outcome(check))
 
-    b = Bench(MemNet(), config([sha]), t.log_handler, done)
+    b = Bench(MemNet(), config([sha]), t.log_handler, finished)
     b.send(old)
     b.send(new)
     b.send(old)
@@ -1530,14 +1530,14 @@ actor _test_key_cache_lru(t: testing.AsyncT):
     ka = keys_for(sha, a)
     n = receiver.MAX_TRAP_SENDERS + 200
 
-    def done(b: Bench) -> None:
+    def finished(b: Bench) -> None:
         def check() -> None:
             st = b.stats()
             testing.assertEqual(st["delivered"], n + n // 8 + 1)
             testing.assertEqual(st["trap_keys_derived"], n + 1, "engine A's keys derived once")
         report(t, outcome(check))
 
-    b = Bench(MemNet(), config([sha]), t.log_handler, done)
+    b = Bench(MemNet(), config([sha]), t.log_handler, finished)
     b.send(v3_trap(sha, ka, a, 1, 10, v2_pdu(pdu.TRAP_V2, 1, 1), u64(1)))
     for i in range(n):
         e = engine_n(i)
@@ -1555,7 +1555,7 @@ actor _test_encrypted_trap_reportable(t: testing.AsyncT):
     stale = v3_message(keys_for(u, a), b"u_sha_aes", usm.LEVEL_AUTH_PRIV | message.FLAG_REPORTABLE, a, 1, 10,
                        v2_pdu(pdu.INFORM, 6, 6), 10, u64(4))
 
-    def done(b: Bench) -> None:
+    def finished(b: Bench) -> None:
         def check() -> None:
             st = b.stats()
             testing.assertEqual([n.request_id for n in b.notifications()], [5])
@@ -1563,7 +1563,7 @@ actor _test_encrypted_trap_reportable(t: testing.AsyncT):
             testing.assertEqual(len(b.replies()), 1, "the stale inform gets a Report")
         report(t, outcome(check))
 
-    b = Bench(MemNet(), config([u]), t.log_handler, done)
+    b = Bench(MemNet(), config([u]), t.log_handler, finished)
     b.send(trap)
     b.send(stale)
     b.finish()
@@ -1583,11 +1583,11 @@ actor _test_dedup_large_same_key(t: testing.AsyncT):
     sink = MemNet()
     var count = 0
 
-    def on_n(r: NotificationReceiver, n: Notification) -> None:
+    def received(r: NotificationReceiver, n: Notification) -> None:
         count += 1
 
     def run(window: float, port: int) -> float:
-        rcv = NotificationReceiver(sink.server(RCV, port), config(dedup=window), on_n, None)
+        rcv = NotificationReceiver(sink.server(RCV, port), config(dedup=window), received, None)
         st0 = rcv.stats()
         t0 = float(time.monotonic_ns()) / 1e9
         for d in datagrams:

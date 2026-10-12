@@ -127,11 +127,11 @@ actor ListenTcp(cap: net.TCPListenCap, address: str, first_port: int, count: int
     """
     var _port = first_port
 
-    def _ready(s: ServerTransport, error: ?str) -> None:
+    def _listening(s: ServerTransport, error: ?str) -> None:
         if error is not None and "address already in use" in error and _port < first_port + count - 1:
             _port += 1
-            transport.tcp_server_transport(cap, address, _port, _ready, log_handler, max_connections, idle_timeout)
+            transport.tcp_server_transport(cap, address, _port, _listening, log_handler, max_connections, idle_timeout)
             return
         on_ready(s, error)
 
-    transport.tcp_server_transport(cap, address, _port, _ready, log_handler, max_connections, idle_timeout)
+    transport.tcp_server_transport(cap, address, _port, _listening, log_handler, max_connections, idle_timeout)

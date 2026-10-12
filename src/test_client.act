@@ -256,16 +256,16 @@ actor _test_get_v2c(t: testing.AsyncT):
         testing.assertEqual((s.requests, s.responses, s.retries, s.timeouts), (1, 1, 0, 0))
         testing.assertTrue(c.engine_info() is None, "no engine for v2c")
 
-    def on_request(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         req = _cm(data)
         seen.append(req)
         p.server.send_to(_reply(req, _answer(_pdu(req).varbinds)), address, port)
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         _finish(t, lambda: check(r, e))
 
-    p.server.set_receiver(on_request)
-    c.get(done, oids)
+    p.server.set_receiver(received)
+    c.get(got, oids)
 
 
 actor _test_get_next_and_bulk_v2c(t: testing.AsyncT):
@@ -274,9 +274,9 @@ actor _test_get_next_and_bulk_v2c(t: testing.AsyncT):
     p = mem_pair(mn)
     c = Client(None, AGENT, Community("public"), t.log_handler, opts=SLOW.with_(max_repetitions=4), transport=p.client)
     var seen: list[Pdu] = []
-    var got: list[Response] = []
+    var responses: list[Response] = []
 
-    def on_request(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         req = _cm(data)
         q = _pdu(req)
         seen.append(q)
@@ -288,21 +288,21 @@ actor _test_get_next_and_bulk_v2c(t: testing.AsyncT):
 
     def check() -> None:
         testing.assertEqual([q.pdu_type for q in seen], [pdu.GETNEXT, pdu.GETBULK, pdu.GETBULK])
-        testing.assertEqual(got[0].varbinds, _answer_next([VarBind(o) for o in _oids(2)]))
+        testing.assertEqual(responses[0].varbinds, _answer_next([VarBind(o) for o in _oids(2)]))
         testing.assertEqual((seen[1].non_repeaters(), seen[1].max_repetitions()), (0, 4), "default max-repetitions")
         testing.assertEqual((seen[2].non_repeaters(), seen[2].max_repetitions()), (1, 9))
-        testing.assertEqual(len(got[1].varbinds), 4)
-        testing.assertEqual(len(got[2].varbinds), 9)
+        testing.assertEqual(len(responses[1].varbinds), 4)
+        testing.assertEqual(len(responses[2].varbinds), 9)
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-        got.append(_ok(r, e))
-        if len(got) == 3:
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        responses.append(_ok(r, e))
+        if len(responses) == 3:
             _finish(t, check)
 
-    p.server.set_receiver(on_request)
-    c.get_next(done, _oids(2))
-    c.get_bulk(done, _oids(1))
-    c.get_bulk(done, _oids(2), 1, 9)
+    p.server.set_receiver(received)
+    c.get_next(got, _oids(2))
+    c.get_bulk(got, _oids(1))
+    c.get_bulk(got, _oids(2), 1, 9)
 
 
 actor _test_set_v2c(t: testing.AsyncT):
@@ -313,7 +313,7 @@ actor _test_set_v2c(t: testing.AsyncT):
     vbs = [VarBind(Oid.parse("1.3.6.1.2.1.1.5.0"), OctetString(b"name")), VarBind(Oid.parse("1.3.6.1.2.1.1.6.0"), Integer(3))]
     var seen: list[Pdu] = []
 
-    def on_request(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         req = _cm(data)
         seen.append(_pdu(req))
         p.server.send_to(_reply(req, _pdu(req).varbinds), address, port)
@@ -323,11 +323,11 @@ actor _test_set_v2c(t: testing.AsyncT):
         testing.assertEqual(resp.varbinds, vbs)
         testing.assertEqual((seen[0].pdu_type, seen[0].varbinds), (pdu.SET, vbs))
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def written(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         _finish(t, lambda: check(r, e))
 
-    p.server.set_receiver(on_request)
-    c.set(done, vbs)
+    p.server.set_receiver(received)
+    c.set(written, vbs)
 
 
 actor _test_error_status_keeps_response(t: testing.AsyncT):
@@ -337,7 +337,7 @@ actor _test_error_status_keeps_response(t: testing.AsyncT):
     c = Client(None, AGENT, Community("public"), t.log_handler, opts=SLOW, transport=p.client)
     oids = _oids(3)
 
-    def on_request(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         req = _cm(data)
         p.server.send_to(_reply(req, _pdu(req).varbinds, pdu.GEN_ERR, 2), address, port)
 
@@ -358,11 +358,11 @@ actor _test_error_status_keeps_response(t: testing.AsyncT):
         else:
             testing.error("not an ErrorStatusError: " + str(err))
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         _finish(t, lambda: check(r, e))
 
-    p.server.set_receiver(on_request)
-    c.get(done, oids)
+    p.server.set_receiver(received)
+    c.get(got, oids)
 
 
 # Retries, timers and ids ##########################################################################
@@ -378,7 +378,7 @@ actor _test_retries_backoff_fresh_ids(t: testing.AsyncT):
     var at: list[float] = []
     var start = _now()
 
-    def on_request(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         ids.append(_pdu(_cm(data)).request_id)
         at.append(_now())
 
@@ -403,12 +403,12 @@ actor _test_retries_backoff_fresh_ids(t: testing.AsyncT):
         s = c.stats()
         testing.assertEqual((s.retries, s.timeouts, s.responses), (3, 1, 0))
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         _finish(t, lambda: check(r, e))
 
-    p.server.set_receiver(on_request)
+    p.server.set_receiver(received)
     start = _now()
-    c.get(done, _oids(1))
+    c.get(got, _oids(1))
 
 
 actor _test_retry_then_answer(t: testing.AsyncT):
@@ -418,7 +418,7 @@ actor _test_retry_then_answer(t: testing.AsyncT):
     c = Client(None, AGENT, Community("public"), t.log_handler, opts=Options(timeout=0.05, retries=5), transport=p.client)
     var ids: list[int] = []
 
-    def on_request(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         req = _cm(data)
         ids.append(_pdu(req).request_id)
         if len(ids) == 3:
@@ -430,11 +430,11 @@ actor _test_retry_then_answer(t: testing.AsyncT):
         testing.assertEqual(resp.request_id, ids[2])
         testing.assertEqual(c.stats().retries, 2)
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         _finish(t, lambda: check(r, e))
 
-    p.server.set_receiver(on_request)
-    c.get(done, _oids(1))
+    p.server.set_receiver(received)
+    c.get(got, _oids(1))
 
 
 actor _test_late_reply_to_earlier_attempt(t: testing.AsyncT):
@@ -446,7 +446,7 @@ actor _test_late_reply_to_earlier_attempt(t: testing.AsyncT):
     var ids: list[int] = []
     var done_count = 0
 
-    def on_request(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         req = _cm(data)
         ids.append(_pdu(req).request_id)
         f = first
@@ -462,24 +462,24 @@ actor _test_late_reply_to_earlier_attempt(t: testing.AsyncT):
         testing.assertEqual(resp.request_id, ids[0], "the answer to attempt 1 was accepted")
         testing.assertEqual(resp.attempts, 2)
 
-    def barrier_done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got_barrier(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         def check2() -> None:
             _ok(r, e)
             testing.assertEqual(done_count, 1)
             testing.assertEqual(c.stats().drops_unknown_id, 1, "the second answer is dropped")
         _finish(t, check2)
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         done_count += 1
         try:
             check(r, e)
         except Exception as ex:
             t.failure(ex)
             return
-        c.get(barrier_done, _oids(1))
+        c.get(got_barrier, _oids(1))
 
-    p.server.set_receiver(on_request)
-    c.get(done, _oids(1))
+    p.server.set_receiver(received)
+    c.get(got, _oids(1))
 
 
 actor _test_duplicate_response_ignored(t: testing.AsyncT):
@@ -489,7 +489,7 @@ actor _test_duplicate_response_ignored(t: testing.AsyncT):
     c = Client(None, AGENT, Community("public"), t.log_handler, opts=SLOW, transport=p.client)
     var calls = 0
 
-    def on_request(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         req = _cm(data)
         p.server.send_to(_reply(req, _answer(_pdu(req).varbinds)), address, port)
 
@@ -498,16 +498,16 @@ actor _test_duplicate_response_ignored(t: testing.AsyncT):
         s = c.stats()
         testing.assertEqual((s.responses, s.drops_unknown_id), (2, 2))
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         calls += 1
         _ok(r, e)
         if calls == 1:
-            c.get(done, _oids(1))
+            c.get(got, _oids(1))
         else:
             after now QUIET: _finish(t, verify)
 
-    p.server.set_receiver(on_request)
-    c.get(done, _oids(2))
+    p.server.set_receiver(received)
+    c.get(got, _oids(2))
 
 
 actor _test_wrong_id_dropped(t: testing.AsyncT):
@@ -516,7 +516,7 @@ actor _test_wrong_id_dropped(t: testing.AsyncT):
     p = mem_pair(mn)
     c = Client(None, AGENT, Community("public"), t.log_handler, opts=SLOW, transport=p.client)
 
-    def on_request(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         req = _cm(data)
         rid = _pdu(req).request_id
         p.server.send_to(_reply(req, _answer(_pdu(req).varbinds), request_id=rid ^ 0x5a5a), address, port)
@@ -526,11 +526,11 @@ actor _test_wrong_id_dropped(t: testing.AsyncT):
         _ok(r, e)
         testing.assertEqual(c.stats().drops_unknown_id, 1)
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         _finish(t, lambda: check(r, e))
 
-    p.server.set_receiver(on_request)
-    c.get(done, _oids(1))
+    p.server.set_receiver(received)
+    c.get(got, _oids(1))
 
 
 actor _test_spoofed_source_dropped(t: testing.AsyncT):
@@ -539,7 +539,7 @@ actor _test_spoofed_source_dropped(t: testing.AsyncT):
     p = mem_pair(mn)
     c = Client(None, AGENT, Community("public"), t.log_handler, opts=SLOW, transport=p.client)
 
-    def on_request(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         req = _cm(data)
         answer = _reply(req, _answer(_pdu(req).varbinds))
         mn.send(answer, "10.9.9.9", 161, address, port)       # same id, another address
@@ -550,11 +550,11 @@ actor _test_spoofed_source_dropped(t: testing.AsyncT):
         # the injected datagram from 10.9.9.9 gets a forged copy (port 162) too
         testing.assertEqual(c.stats().drops_source, 3)
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         _finish(t, lambda: check(r, e))
 
-    p.server.set_receiver(on_request)
-    c.get(done, _oids(1))
+    p.server.set_receiver(received)
+    c.get(got, _oids(1))
 
 
 actor _test_corrupt_datagrams_dropped(t: testing.AsyncT):
@@ -563,7 +563,7 @@ actor _test_corrupt_datagrams_dropped(t: testing.AsyncT):
     p = mem_pair(mn)
     c = Client(None, AGENT, Community("public"), t.log_handler, opts=SLOW, transport=p.client)
 
-    def on_request(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         req = _cm(data)
         answer = _reply(req, _answer(_pdu(req).varbinds))
         p.server.send_to(b"\x30\x03\x02\x01", address, port)
@@ -576,11 +576,11 @@ actor _test_corrupt_datagrams_dropped(t: testing.AsyncT):
         _ok(r, e)
         testing.assertEqual(c.stats().drops_decode, 4)
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         _finish(t, lambda: check(r, e))
 
-    p.server.set_receiver(on_request)
-    c.get(done, _oids(1))
+    p.server.set_receiver(received)
+    c.get(got, _oids(1))
 
 
 actor _test_wrong_version_and_pdu_type_dropped(t: testing.AsyncT):
@@ -589,7 +589,7 @@ actor _test_wrong_version_and_pdu_type_dropped(t: testing.AsyncT):
     p = mem_pair(mn)
     c = Client(None, AGENT, Community("public"), t.log_handler, opts=SLOW, transport=p.client)
 
-    def on_request(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         req = _cm(data)
         vbs = _answer(_pdu(req).varbinds)
         p.server.send_to(_reply(req, vbs, version=message.SNMP_V1), address, port)
@@ -604,11 +604,11 @@ actor _test_wrong_version_and_pdu_type_dropped(t: testing.AsyncT):
         s = c.stats()
         testing.assertEqual((s.drops_version, s.drops_pdu), (2, 2))
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         _finish(t, lambda: check(r, e))
 
-    p.server.set_receiver(on_request)
-    c.get(done, _oids(1))
+    p.server.set_receiver(received)
+    c.get(got, _oids(1))
 
 
 actor _test_community_check_option(t: testing.AsyncT):
@@ -618,20 +618,20 @@ actor _test_community_check_option(t: testing.AsyncT):
     c = Client(None, AGENT, Community("public"), t.log_handler, opts=SLOW, transport=p.client)
     var phase = 0
 
-    def on_request(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         req = _cm(data)
         vbs = _answer(_pdu(req).varbinds)
         p.server.send_to(_reply(req, vbs, community=b"other"), address, port)
         if phase == 1:
             p.server.send_to(_reply(req, vbs), address, port)
 
-    def checked(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got_checked(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         def verify() -> None:
             _ok(r, e)
             testing.assertEqual(c.stats().drops_auth, 1, "the other community was dropped")
         _finish(t, verify)
 
-    def unchecked(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got_unchecked(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         try:
             _ok(r, e)
             testing.assertEqual(c.stats().drops_auth, 0)
@@ -639,10 +639,10 @@ actor _test_community_check_option(t: testing.AsyncT):
             t.failure(ex)
             return
         phase = 1
-        c.get(checked, _oids(1), SLOW.with_(check_community=True))
+        c.get(got_checked, _oids(1), SLOW.with_(check_community=True))
 
-    p.server.set_receiver(on_request)
-    c.get(unchecked, _oids(1))
+    p.server.set_receiver(received)
+    c.get(got_unchecked, _oids(1))
 
 
 actor _test_timeout_hint_drops(t: testing.AsyncT):
@@ -652,7 +652,7 @@ actor _test_timeout_hint_drops(t: testing.AsyncT):
     c = Client(None, AGENT, Community("public"), t.log_handler, opts=Options(timeout=0.05, retries=1, check_community=True),
                transport=p.client)
 
-    def on_request(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         req = _cm(data)
         p.server.send_to(_reply(req, _answer(_pdu(req).varbinds), community=b"wrong"), address, port)
         p.server.send_to(b"junk", address, port)
@@ -665,11 +665,11 @@ actor _test_timeout_hint_drops(t: testing.AsyncT):
         else:
             testing.error("not a TimeoutError: " + str(err))
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         _finish(t, lambda: check(r, e))
 
-    p.server.set_receiver(on_request)
-    c.get(done, _oids(1))
+    p.server.set_receiver(received)
+    c.get(got, _oids(1))
 
 
 actor _test_icmp_unreachable_hint(t: testing.AsyncT):
@@ -687,10 +687,10 @@ actor _test_icmp_unreachable_hint(t: testing.AsyncT):
             testing.error("not a TimeoutError: " + str(err))
         testing.assertEqual(c.stats().unreachable, 2)
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         _finish(t, lambda: check(r, e))
 
-    c.get(done, _oids(1))
+    c.get(got, _oids(1))
 
 
 actor _test_request_id_bits_16(t: testing.AsyncT):
@@ -701,7 +701,7 @@ actor _test_request_id_bits_16(t: testing.AsyncT):
                transport=p.client)
     var ids: list[int] = []
 
-    def on_request(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         ids.append(_pdu(_cm(data)).request_id)
 
     def check(r: ?Response, e: ?errors.SnmpError) -> None:
@@ -710,11 +710,11 @@ actor _test_request_id_bits_16(t: testing.AsyncT):
         for i in ids:
             testing.assertTrue(i >= 1 and i <= 0x7fff, "id %d" % i)
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         _finish(t, lambda: check(r, e))
 
-    p.server.set_receiver(on_request)
-    c.get(done, _oids(1))
+    p.server.set_receiver(received)
+    c.get(got, _oids(1))
 
 
 # Shape checks ######################################################################################
@@ -727,7 +727,7 @@ actor _test_shape_checks(t: testing.AsyncT):
     var step = 0
     var results: list[str] = []
 
-    def on_request(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         req = _cm(data)
         vbs = _pdu(req).varbinds
         if step == 0 or step == 1:      # GET answered with another OID (strict, then lenient)
@@ -749,24 +749,24 @@ actor _test_shape_checks(t: testing.AsyncT):
     def check() -> None:
         testing.assertEqual(results, ["invalid", "ok", "invalid", "invalid", "invalid", "ok"])
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         results.append(outcome(r, e))
         step += 1
         if step == 1:
-            c.get(done, _oids(2), SLOW.with_(strict_response_oids=False))
+            c.get(got, _oids(2), SLOW.with_(strict_response_oids=False))
         elif step == 2:
-            c.get(done, _oids(2))
+            c.get(got, _oids(2))
         elif step == 3:
-            c.get_next(done, _oids(2))
+            c.get_next(got, _oids(2))
         elif step == 4:
-            c.get_bulk(done, _oids(2), 1, 2)
+            c.get_bulk(got, _oids(2), 1, 2)
         elif step == 5:
-            c.get_next(done, _oids(2))
+            c.get_next(got, _oids(2))
         else:
             _finish(t, check)
 
-    p.server.set_receiver(on_request)
-    c.get(done, _oids(2))
+    p.server.set_receiver(received)
+    c.get(got, _oids(2))
 
 
 # tooBig and splitting ###############################################################################
@@ -779,7 +779,7 @@ actor _test_too_big_split(t: testing.AsyncT):
     oids = _oids(5)
     var sizes: list[int] = []
 
-    def on_request(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         req = _cm(data)
         vbs = _pdu(req).varbinds
         sizes.append(len(vbs))
@@ -794,11 +794,11 @@ actor _test_too_big_split(t: testing.AsyncT):
         testing.assertEqual(sizes, [5, 2, 1, 1, 3, 1, 2, 1, 1])
         testing.assertEqual(resp.attempts, 9)
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         _finish(t, lambda: check(r, e))
 
-    p.server.set_receiver(on_request)
-    c.get(done, oids)
+    p.server.set_receiver(received)
+    c.get(got, oids)
 
 
 actor _test_too_big_single_and_set(t: testing.AsyncT):
@@ -809,7 +809,7 @@ actor _test_too_big_single_and_set(t: testing.AsyncT):
     var sizes: list[int] = []
     var statuses: list[int] = []
 
-    def on_request(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         req = _cm(data)
         sizes.append(len(_pdu(req).varbinds))
         p.server.send_to(_reply(req, [], pdu.TOO_BIG, 0), address, port)
@@ -825,16 +825,16 @@ actor _test_too_big_single_and_set(t: testing.AsyncT):
         testing.assertEqual(statuses, [pdu.TOO_BIG, pdu.TOO_BIG])
         testing.assertEqual(sizes, [1, 40])
 
-    def set_done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def written(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         statuses.append(status_of(r, e))
         _finish(t, check)
 
-    def get_done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         statuses.append(status_of(r, e))
-        c.set(set_done, [VarBind(o, Integer(1)) for o in _oids(40)])
+        c.set(written, [VarBind(o, Integer(1)) for o in _oids(40)])
 
-    p.server.set_receiver(on_request)
-    c.get(get_done, _oids(1))
+    p.server.set_receiver(received)
+    c.get(got, _oids(1))
 
 
 actor _test_max_oids_per_request(t: testing.AsyncT):
@@ -846,7 +846,7 @@ actor _test_max_oids_per_request(t: testing.AsyncT):
     var sizes: list[int] = []
     var fail_part = False
 
-    def on_request(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         req = _cm(data)
         vbs = _pdu(req).varbinds
         sizes.append(len(vbs))
@@ -871,10 +871,10 @@ actor _test_max_oids_per_request(t: testing.AsyncT):
             testing.error("not an ErrorStatusError: " + str(err))
         testing.assertEqual(sizes, [2, 2, 1, 2, 2])
 
-    def failed_done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got_error(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         _finish(t, lambda: check_error(r, e))
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         try:
             resp = _ok(r, e)
             testing.assertEqual(resp.varbinds, _answer([VarBind(o) for o in oids]))
@@ -884,10 +884,10 @@ actor _test_max_oids_per_request(t: testing.AsyncT):
             t.failure(ex)
             return
         fail_part = True
-        c.get(failed_done, oids)
+        c.get(got_error, oids)
 
-    p.server.set_receiver(on_request)
-    c.get(done, oids)
+    p.server.set_receiver(received)
+    c.get(got, oids)
 
 
 actor _test_bulk_too_big_halves(t: testing.AsyncT):
@@ -897,7 +897,7 @@ actor _test_bulk_too_big_halves(t: testing.AsyncT):
     c = Client(None, AGENT, Community("public"), t.log_handler, opts=SLOW, transport=p.client)
     var reps: list[int] = []
 
-    def on_request(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         req = _cm(data)
         q = _pdu(req)
         reps.append(q.max_repetitions())
@@ -911,11 +911,11 @@ actor _test_bulk_too_big_halves(t: testing.AsyncT):
         testing.assertEqual(reps, [9, 4, 2])
         testing.assertEqual(len(resp.varbinds), 2)
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         _finish(t, lambda: check(r, e))
 
-    p.server.set_receiver(on_request)
-    c.get_bulk(done, _oids(1), 0, 9)
+    p.server.set_receiver(received)
+    c.get_bulk(got, _oids(1), 0, 9)
 
 
 actor _test_too_big_no_split(t: testing.AsyncT):
@@ -931,7 +931,7 @@ actor _test_too_big_no_split(t: testing.AsyncT):
     var reps: list[int] = []
     var statuses: list[(int, int)] = []
 
-    def on_request(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         req = _cm(data)
         q = _pdu(req)
         sizes.append(len(q.varbinds))
@@ -951,16 +951,16 @@ actor _test_too_big_no_split(t: testing.AsyncT):
         testing.assertTrue(Options().split_too_big)
         testing.assertFalse(opts.with_(retries=2).split_too_big)
 
-    def bulk_done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got_bulk(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         statuses.append(status_of(e))
         _finish(t, check)
 
-    def get_done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         statuses.append(status_of(e))
-        c.get_bulk(bulk_done, _oids(1), 0, 9)
+        c.get_bulk(got_bulk, _oids(1), 0, 9)
 
-    p.server.set_receiver(on_request)
-    c.get(get_done, _oids(5))
+    p.server.set_receiver(received)
+    c.get(got, _oids(5))
 
 
 # SNMPv1 normalisation ##############################################################################
@@ -972,7 +972,7 @@ actor _test_v1_bulk_as_getnext(t: testing.AsyncT):
     c = Client(None, AGENT, Community("public", message.SNMP_V1), t.log_handler, opts=SLOW, transport=p.client)
     var seen: list[CommunityMessage] = []
 
-    def on_request(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         req = _cm(data)
         seen.append(req)
         p.server.send_to(_reply(req, _answer_next(_pdu(req).varbinds)), address, port)
@@ -984,11 +984,11 @@ actor _test_v1_bulk_as_getnext(t: testing.AsyncT):
         testing.assertEqual((req.version, q.pdu_type, q.error_status, q.error_index), (message.SNMP_V1, pdu.GETNEXT, 0, 0))
         testing.assertEqual(resp.varbinds, _answer_next([VarBind(o) for o in _oids(2)]))
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         _finish(t, lambda: check(r, e))
 
-    p.server.set_receiver(on_request)
-    c.get_bulk(done, _oids(2), 0, 10)
+    p.server.set_receiver(received)
+    c.get_bulk(got, _oids(2), 0, 10)
 
 
 actor _test_v1_get_no_such_name_fixed(t: testing.AsyncT):
@@ -1000,7 +1000,7 @@ actor _test_v1_get_no_such_name_fixed(t: testing.AsyncT):
     missing = [oids[1], oids[3]]
     var sizes: list[int] = []
 
-    def on_request(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         req = _cm(data)
         vbs = _pdu(req).varbinds
         sizes.append(len(vbs))
@@ -1018,10 +1018,10 @@ actor _test_v1_get_no_such_name_fixed(t: testing.AsyncT):
         else:
             testing.error("not an ErrorStatusError: " + str(err))
 
-    def unfixed_done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got_unfixed(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         _finish(t, lambda: check_unfixed(r, e))
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         try:
             resp = _ok(r, e)
             testing.assertEqual(resp.varbinds, [VarBind(oids[0], _val(oids[0])), VarBind(oids[1], NoSuchObject()),
@@ -1031,10 +1031,10 @@ actor _test_v1_get_no_such_name_fixed(t: testing.AsyncT):
         except Exception as ex:
             t.failure(ex)
             return
-        c.get(unfixed_done, oids, SLOW.with_(v1_fix_errors=False))
+        c.get(got_unfixed, oids, SLOW.with_(v1_fix_errors=False))
 
-    p.server.set_receiver(on_request)
-    c.get(done, oids)
+    p.server.set_receiver(received)
+    c.get(got, oids)
 
 
 actor _test_v1_getnext_no_such_name_end(t: testing.AsyncT):
@@ -1045,9 +1045,9 @@ actor _test_v1_getnext_no_such_name_end(t: testing.AsyncT):
     last = Oid.parse("1.3.6.1.9.9.9")
     first = _oids(1)[0]
     var sizes: list[int] = []
-    var got: list[Response] = []
+    var responses: list[Response] = []
 
-    def on_request(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         req = _cm(data)
         vbs = _pdu(req).varbinds
         sizes.append(len(vbs))
@@ -1058,20 +1058,20 @@ actor _test_v1_getnext_no_such_name_end(t: testing.AsyncT):
         p.server.send_to(_reply(req, _answer_next(vbs)), address, port)
 
     def check() -> None:
-        testing.assertEqual(got[0].varbinds, [VarBind(_successor(first), _val(_successor(first))),
+        testing.assertEqual(responses[0].varbinds, [VarBind(_successor(first), _val(_successor(first))),
                                               VarBind(last, EndOfMibView())])
-        testing.assertEqual(got[1].varbinds, [VarBind(last, EndOfMibView())])
+        testing.assertEqual(responses[1].varbinds, [VarBind(last, EndOfMibView())])
         testing.assertEqual(sizes, [2, 1, 1])
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-        got.append(_ok(r, e))
-        if len(got) == 1:
-            c.get_next(done, [last])
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        responses.append(_ok(r, e))
+        if len(responses) == 1:
+            c.get_next(got, [last])
         else:
             _finish(t, check)
 
-    p.server.set_receiver(on_request)
-    c.get_next(done, [first, last])
+    p.server.set_receiver(received)
+    c.get_next(got, [first, last])
 
 
 # Cancel, close, queueing, invalid arguments, transport failures #######################################
@@ -1085,7 +1085,7 @@ actor _test_cancel_exactly_once(t: testing.AsyncT):
     var log: list[str] = []
     var h1 = 0
 
-    def on_request(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         held.append(_cm(data))
 
     def outcome(name: str, r: ?Response, e: ?errors.SnmpError) -> str:
@@ -1100,7 +1100,7 @@ actor _test_cancel_exactly_once(t: testing.AsyncT):
         testing.assertEqual(len(held), 2, "the queued second request was never sent")
         testing.assertEqual(c.stats().drops_unknown_id, 1, "the late answer to the first")
 
-    def third(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got_third(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         log.append(outcome("third", r, e))
         after now QUIET: _finish(t, verify)
 
@@ -1111,15 +1111,15 @@ actor _test_cancel_exactly_once(t: testing.AsyncT):
         else:
             after now 0.01: answer_third()
 
-    def first(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got_first(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         log.append(outcome("first", r, e))
         req = held[0]
         p.server.send_to(_reply(req, _answer(_pdu(req).varbinds)), MANAGER, 40000)      # too late
         c.cancel(h1)                                                                    # no second callback
-        c.get(third, _oids(1))
+        c.get(got_third, _oids(1))
         answer_third()
 
-    def second(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got_second(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         log.append(outcome("second", r, e))
 
     def cancel_first() -> None:
@@ -1131,9 +1131,9 @@ actor _test_cancel_exactly_once(t: testing.AsyncT):
         else:
             after now 0.01: cancel_first()
 
-    p.server.set_receiver(on_request)
-    h1 = c.get(first, _oids(1))
-    h2 = c.get(second, _oids(2))
+    p.server.set_receiver(received)
+    h1 = c.get(got_first, _oids(1))
+    h2 = c.get(got_second, _oids(2))
     c.cancel(h2)
     cancel_first()
 
@@ -1146,7 +1146,7 @@ actor _test_close_exactly_once(t: testing.AsyncT):
     var log: list[str] = []
     var sent = 0
 
-    def on_request(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         sent += 1
 
     def name_of(e: ?errors.SnmpError) -> str:
@@ -1161,33 +1161,33 @@ actor _test_close_exactly_once(t: testing.AsyncT):
                                           "c:cancelled"])
         testing.assertEqual(sent, 2, "max_in_flight 2: the third stayed queued")
 
-    def cb_a(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got_a(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         log.append("a:" + name_of(e))
 
-    def cb_b(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got_b(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         log.append("b:" + name_of(e))
 
-    def cb_c(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got_c(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         log.append("c:" + name_of(e))
 
-    def cb_after(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got_after_close(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         log.append("after-get:" + name_of(e))
 
-    def trap_done(cl: Client, e: ?errors.SnmpError) -> None:
+    def trap_sent(cl: Client, e: ?errors.SnmpError) -> None:
         log.append("after-trap:" + name_of(e))
 
-    def closing() -> None:
+    def close_due() -> None:
         c.close()
         c.close()
-        c.get(cb_after, _oids(1))
-        c.trap(trap_done, TRAP_OID, [])
+        c.get(got_after_close, _oids(1))
+        c.trap(trap_sent, TRAP_OID, [])
         after now QUIET: _finish(t, verify)
 
-    p.server.set_receiver(on_request)
-    c.get(cb_a, _oids(1))
-    c.get(cb_b, _oids(1))
-    c.get(cb_c, _oids(1))
-    after now 0.05: closing()
+    p.server.set_receiver(received)
+    c.get(got_a, _oids(1))
+    c.get(got_b, _oids(1))
+    c.get(got_c, _oids(1))
+    after now 0.05: close_due()
 
 
 actor _test_queueing_max_in_flight(t: testing.AsyncT):
@@ -1201,7 +1201,7 @@ actor _test_queueing_max_in_flight(t: testing.AsyncT):
     var order: list[Oid] = []
     var done_order: list[Oid] = []
 
-    def on_request(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         req = _cm(data)
         order.append(_pdu(req).varbinds[0].oid)
         held.append((req, address, port))
@@ -1217,14 +1217,14 @@ actor _test_queueing_max_in_flight(t: testing.AsyncT):
         testing.assertEqual(done_order, oids)
         testing.assertEqual(outstanding_max, 2)
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         done_order.append(_ok(r, e).varbinds[0].oid)
         if len(done_order) == 5:
             _finish(t, check)
 
-    p.server.set_receiver(on_request)
+    p.server.set_receiver(received)
     for o in oids:
-        c.get(done, [o])
+        c.get(got, [o])
 
 
 actor _test_queueing_one_at_a_time(t: testing.AsyncT):
@@ -1234,7 +1234,7 @@ actor _test_queueing_one_at_a_time(t: testing.AsyncT):
     c = Client(None, AGENT, Community("public"), t.log_handler, opts=SLOW, transport=p.client)
     var count = 0
 
-    def on_request(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         req = _cm(data)
         p.server.send_to(_reply(req, _answer(_pdu(req).varbinds)), address, port)
 
@@ -1243,15 +1243,15 @@ actor _test_queueing_one_at_a_time(t: testing.AsyncT):
         directions = ["req" if d.dst_address == AGENT else "resp" for d in hist]
         testing.assertEqual(directions, ["req", "resp", "req", "resp", "req", "resp"])
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         _ok(r, e)
         count += 1
         if count == 3:
             _finish(t, check)
 
-    p.server.set_receiver(on_request)
+    p.server.set_receiver(received)
     for o in _oids(3):
-        c.get(done, [o])
+        c.get(got, [o])
 
 
 actor _test_invalid_arguments(t: testing.AsyncT):
@@ -1264,7 +1264,7 @@ actor _test_invalid_arguments(t: testing.AsyncT):
     var log: list[str] = []
     expected = 13
 
-    def on_request(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         log.append("sent")
 
     def name_of(e: ?errors.SnmpError) -> str:
@@ -1282,29 +1282,29 @@ actor _test_invalid_arguments(t: testing.AsyncT):
         if len(log) == expected:
             after now QUIET: _finish(t, check)
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def completed(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         note(name_of(e))
 
-    def trap_done(cl: Client, e: ?errors.SnmpError) -> None:
+    def trap_sent(cl: Client, e: ?errors.SnmpError) -> None:
         note(name_of(e))
 
-    def engine_done(cl: Client, i: ?EngineInfo, e: ?errors.SnmpError) -> None:
+    def discovered(cl: Client, i: ?EngineInfo, e: ?errors.SnmpError) -> None:
         note(name_of(e))
 
-    p.server.set_receiver(on_request)
-    c2.get(done, [])                                                      # no OIDs
-    c2.get(done, [Oid([1])])                                              # one arc
-    c2.get_next(done, [Oid([3, 1])])                                      # first arc above 2
-    c2.get(done, [Oid([1, 3] + list(range(127)))])                        # 129 arcs
-    c2.get_bulk(done, _oids(1), -1, 5)                                    # negative non-repeaters
-    c2.get_bulk(done, _oids(1), 0, -2)                                    # negative max-repetitions
-    c2.set(done, [VarBind(_oids(1)[0], Integer(1 << 40))])                # not an Integer32
-    c1.set(done, [VarBind(_oids(1)[0], Counter64(u64(5)))])               # Counter64 in SNMPv1
-    c1.inform(done, TRAP_OID, [])                                         # no InformRequest in SNMPv1
-    c1.trap(trap_done, TRAP_OID, [])                                      # SNMPv2-Trap in SNMPv1
-    c2.trap_v1(trap_done, ENTERPRISE, b"\x0a\x00\x00\x01", 6, 1, [])      # Trap-PDU in SNMPv2c
-    c1.trap_v1(trap_done, ENTERPRISE, b"\x0a\x00\x01", 6, 1, [])          # agent-addr of 3 octets
-    c2.discover(engine_done)                                              # discovery is SNMPv3 only
+    p.server.set_receiver(received)
+    c2.get(completed, [])                                                 # no OIDs
+    c2.get(completed, [Oid([1])])                                         # one arc
+    c2.get_next(completed, [Oid([3, 1])])                                 # first arc above 2
+    c2.get(completed, [Oid([1, 3] + list(range(127)))])                   # 129 arcs
+    c2.get_bulk(completed, _oids(1), -1, 5)                               # negative non-repeaters
+    c2.get_bulk(completed, _oids(1), 0, -2)                               # negative max-repetitions
+    c2.set(completed, [VarBind(_oids(1)[0], Integer(1 << 40))])           # not an Integer32
+    c1.set(completed, [VarBind(_oids(1)[0], Counter64(u64(5)))])          # Counter64 in SNMPv1
+    c1.inform(completed, TRAP_OID, [])                                    # no InformRequest in SNMPv1
+    c1.trap(trap_sent, TRAP_OID, [])                                      # SNMPv2-Trap in SNMPv1
+    c2.trap_v1(trap_sent, ENTERPRISE, b"\x0a\x00\x00\x01", 6, 1, [])      # Trap-PDU in SNMPv2c
+    c1.trap_v1(trap_sent, ENTERPRISE, b"\x0a\x00\x01", 6, 1, [])          # agent-addr of 3 octets
+    c2.discover(discovered)                                               # discovery is SNMPv3 only
 
 
 proc def _no_send(data: bytes) -> None:
@@ -1342,33 +1342,33 @@ actor _test_transport_failures(t: testing.AsyncT):
         if len(log) == 4:
             _finish(t, check)
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         note(name_of(e))
 
-    def trap_done(cl: Client, e: ?errors.SnmpError) -> None:
+    def trap_sent(cl: Client, e: ?errors.SnmpError) -> None:
         note(name_of(e))
 
-    c.get(done, _oids(1))
-    c.trap(trap_done, TRAP_OID, [])
-    none.get(done, _oids(1))
-    none.trap(trap_done, TRAP_OID, [])
+    c.get(got, _oids(1))
+    c.trap(trap_sent, TRAP_OID, [])
+    none.get(got, _oids(1))
+    none.trap(trap_sent, TRAP_OID, [])
 
 
 actor _TransportSwitch():
     # Holds the error callback a Client registered, so a test can fail the transport later
-    var on_error: ?action(str, bool) -> None = None
+    var _on_error: ?action(str, bool) -> None = None
     var sent = 0
 
-    def register(cb: action(str, bool) -> None) -> None:
-        on_error = cb
+    def register(on_error: action(str, bool) -> None) -> None:
+        _on_error = on_error
 
     def send(data: bytes) -> None:
         sent += 1
 
     def fail(text: str) -> None:
-        cb = on_error
-        if cb is not None:
-            cb(text, True)
+        on_error = _on_error
+        if on_error is not None:
+            on_error(text, True)
 
 def _switch_transport(s: _TransportSwitch) -> Transport:
     def _send(data: bytes) -> None:
@@ -1386,17 +1386,17 @@ actor _test_transport_fails_pending(t: testing.AsyncT):
     def check() -> None:
         testing.assertEqual(log, ["transport", "transport"])
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         log.append("transport" if isinstance(e, errors.TransportError) else "other")
         if len(log) == 2:
             _finish(t, check)
 
-    def fail() -> None:
+    def failure_due() -> None:
         sw.fail("socket died")
 
-    c.get(done, _oids(1))
-    c.get(done, _oids(1))
-    after now 0.05: fail()
+    c.get(got, _oids(1))
+    c.get(got, _oids(1))
+    after now 0.05: failure_due()
 
 
 # Logging ###########################################################################################
@@ -1435,7 +1435,7 @@ actor _test_logs_never_show_the_community(t: testing.AsyncT):
     c = Client(None, AGENT, Community("s3cr3t-community"), handler, opts=SLOW, transport=p.client)
     var count = 0
 
-    def on_request(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         req = _cm(data)
         p.server.send_to(_reply(req, [], pdu.TOO_BIG, 0), address, port)
         p.server.send_to(_reply(req, _answer(_pdu(req).varbinds)), address, port)
@@ -1447,14 +1447,14 @@ actor _test_logs_never_show_the_community(t: testing.AsyncT):
         testing.assertFalse("s3cr3t" in joined, joined)
         testing.assertFalse(b"s3cr3t-community".hex() in joined)
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         count += 1
         if count == 2:
             after now QUIET: _finish(t, check)
 
-    p.server.set_receiver(on_request)
-    c.get(done, _oids(2))
-    c.get(done, _oids(1))
+    p.server.set_receiver(received)
+    c.get(got, _oids(2))
+    c.get(got, _oids(1))
 
 
 # SNMPv3 ############################################################################################
@@ -1613,7 +1613,7 @@ actor _V3Agent(srv: ServerTransport, users: list[Usm], engine_id: bytes, pdu_typ
         else:
             log.append("dropped:" + inc.counter)
 
-    def on_request(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         c, m = message.decode(data)
         if m is not None:
             if m.usm.engine_id == b"":
@@ -1646,7 +1646,7 @@ actor _V3Agent(srv: ServerTransport, users: list[Usm], engine_id: bytes, pdu_typ
     def seen() -> list[str]:
         return log
 
-    srv.set_receiver(on_request)
+    srv.set_receiver(received)
 
 
 actor _test_v3_discovery_hint_two_round_trips(t: testing.AsyncT):
@@ -1673,10 +1673,10 @@ actor _test_v3_discovery_hint_two_round_trips(t: testing.AsyncT):
         s = c.stats()
         testing.assertEqual((s.reports, s.responses, s.drops_auth), (1, 1, 0))
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         _finish(t, lambda: check(r, e))
 
-    c.get(done, oids)
+    c.get(got, oids)
 
 
 actor _test_v3_every_user_level(t: testing.AsyncT):
@@ -1691,7 +1691,7 @@ actor _test_v3_every_user_level(t: testing.AsyncT):
     def check() -> None:
         testing.assertEqual(log, ["noauth:ok", "shaonly:ok", "shaaes:ok", "md5des:ok"])
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         name = users[n].user
         log.append(name + ":" + _describe(e))
         n += 1
@@ -1703,7 +1703,7 @@ actor _test_v3_every_user_level(t: testing.AsyncT):
     def next_client() -> None:
         tr = mn.client(MANAGER, 41000 + n, AGENT, 161)
         cl = Client(None, AGENT, users[n], t.log_handler, opts=SLOW, transport=tr)
-        cl.get(done, _oids(1))
+        cl.get(got, _oids(1))
 
     next_client()
 
@@ -1727,10 +1727,10 @@ actor _test_v3_time_sync_fallback(t: testing.AsyncT):
         else:
             testing.error("no engine info")
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         _finish(t, lambda: check(r, e))
 
-    c.get(done, _oids(1))
+    c.get(got, _oids(1))
 
 
 actor _test_v3_resync_after_reboot(t: testing.AsyncT):
@@ -1749,19 +1749,19 @@ actor _test_v3_resync_after_reboot(t: testing.AsyncT):
         else:
             testing.error("no engine info")
 
-    def second(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got_second(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         _finish(t, lambda: check(r, e))
 
-    def first(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got_first(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         try:
             _ok(r, e)
         except Exception as ex:
             t.failure(ex)
             return
         agent.reboot(2)
-        c.get(second, _oids(1))
+        c.get(got_second, _oids(1))
 
-    c.get(first, _oids(1))
+    c.get(got_first, _oids(1))
 
 
 actor _test_v3_resync_budget(t: testing.AsyncT):
@@ -1785,10 +1785,10 @@ actor _test_v3_resync_budget(t: testing.AsyncT):
         testing.assertEqual(agent.seen(), ["probe", usm.USM_STATS_NOT_IN_TIME_WINDOWS, usm.USM_STATS_NOT_IN_TIME_WINDOWS])
         testing.assertTrue(c.engine_info() is None, "engine state reset")
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         _finish(t, lambda: check(r, e))
 
-    c.get(done, _oids(1))
+    c.get(got, _oids(1))
 
 
 actor _test_v3_rediscovery_on_engine_change(t: testing.AsyncT):
@@ -1808,19 +1808,19 @@ actor _test_v3_rediscovery_on_engine_change(t: testing.AsyncT):
         else:
             testing.error("no engine info")
 
-    def second(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got_second(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         _finish(t, lambda: check(r, e))
 
-    def first(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got_first(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         try:
             _ok(r, e)
         except Exception as ex:
             t.failure(ex)
             return
         agent.change_engine(h(ENGINE2_HEX))
-        c.get(second, _oids(1))
+        c.get(got_second, _oids(1))
 
-    c.get(first, _oids(1))
+    c.get(got_first, _oids(1))
 
 
 actor _test_v3_report_kinds(t: testing.AsyncT):
@@ -1848,7 +1848,7 @@ actor _test_v3_report_kinds(t: testing.AsyncT):
         testing.assertEqual(arcs[0], usm.report_oid(usm.USM_STATS_UNKNOWN_USER_NAMES).arcs)
         testing.assertEqual(arcs[4], [1, 3, 6, 1, 4, 1, 99, 99, 0])
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         if isinstance(e, errors.ReportError):
             names.append(e.name)
             arcs.append(e.oid)
@@ -1869,7 +1869,7 @@ actor _test_v3_report_kinds(t: testing.AsyncT):
             agent.set_report(Oid.parse("1.3.6.1.4.1.99.99.0"))
         tr = mn.client(MANAGER, 41000 + n, AGENT, 161)
         cl = Client(None, AGENT, clients[n], t.log_handler, opts=SLOW, transport=tr)
-        cl.get(done, _oids(1))
+        cl.get(got, _oids(1))
 
     next_client()
 
@@ -1887,10 +1887,10 @@ actor _test_v3_forged_response_dropped(t: testing.AsyncT):
         _ok(r, e)
         testing.assertEqual(c.stats().drops_auth, 3)
 
-    def third(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got_third(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         _finish(t, lambda: check3(r, e))
 
-    def second(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got_second(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         try:
             _ok(r, e)
             testing.assertEqual(c.stats().drops_auth, 2)
@@ -1898,9 +1898,9 @@ actor _test_v3_forged_response_dropped(t: testing.AsyncT):
             t.failure(ex)
             return
         agent.set_mode(OTHER_ENGINE_FIRST)
-        c.get(third, _oids(1))
+        c.get(got_third, _oids(1))
 
-    def first(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got_first(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         try:
             _ok(r, e)
             testing.assertEqual(c.stats().drops_auth, 1)
@@ -1908,9 +1908,9 @@ actor _test_v3_forged_response_dropped(t: testing.AsyncT):
             t.failure(ex)
             return
         agent.set_mode(UNAUTH_FIRST)
-        c.get(second, _oids(1))
+        c.get(got_second, _oids(1))
 
-    c.get(first, _oids(1))
+    c.get(got_first, _oids(1))
 
 
 actor _test_v3_reset_after_timeouts(t: testing.AsyncT):
@@ -1925,26 +1925,26 @@ actor _test_v3_reset_after_timeouts(t: testing.AsyncT):
         _ok(r, e)
         testing.assertEqual(agent.seen(), ["probe", "ok", "silent", "silent", "probe", "ok"])
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         step += 1
         if step == 1:
             agent.set_mode(SILENT)
-            c.get(done, _oids(1), FAST)
+            c.get(got, _oids(1), FAST)
         elif step == 2:
             if c.engine_info() is None:
                 t.failure(AssertionError("reset after one timeout"))
                 return
-            c.get(done, _oids(1), FAST)
+            c.get(got, _oids(1), FAST)
         elif step == 3:
             if c.engine_info() is not None:
                 t.failure(AssertionError("no reset after two timeouts"))
                 return
             agent.set_mode(NORMAL)
-            c.get(done, _oids(1))
+            c.get(got, _oids(1))
         else:
             _finish(t, lambda: check(r, e))
 
-    c.get(done, _oids(1))
+    c.get(got, _oids(1))
 
 
 actor _test_v3_discovery_failures(t: testing.AsyncT):
@@ -1976,25 +1976,25 @@ actor _test_v3_discovery_failures(t: testing.AsyncT):
         else:
             next_case()
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         note(name_of(e))
 
-    def engine_done(cl: Client, info: ?EngineInfo, e: ?errors.SnmpError) -> None:
+    def discovered(cl: Client, info: ?EngineInfo, e: ?errors.SnmpError) -> None:
         note(name_of(e))
 
     def next_case() -> None:
         tr = mn.client(MANAGER, 41000 + n, AGENT, 161)
         cl = Client(None, AGENT, _shaaes(), t.log_handler, opts=FAST, transport=tr)
         if n == 0:
-            cl.get(done, _oids(1))
+            cl.get(got, _oids(1))
         elif n == 1:
-            cl.discover(engine_done)
+            cl.discover(discovered)
         elif n == 2:
             agent.set_mode(PROBE_RESPONSE)
-            cl.get(done, _oids(1))
+            cl.get(got, _oids(1))
         else:
             agent.set_mode(SHORT_ENGINE_ID)
-            cl.get(done, _oids(1))
+            cl.get(got, _oids(1))
 
     next_case()
 
@@ -2015,17 +2015,17 @@ actor _test_v3_discover(t: testing.AsyncT):
         testing.assertTrue(infos[0].time >= 1000 and infos[0].time < 1010)
         testing.assertEqual(agent.seen(), ["probe", "ok"])
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         _finish(t, lambda: check(r, e))
 
-    def engine_done(cl: Client, info: ?EngineInfo, e: ?errors.SnmpError) -> None:
+    def discovered(cl: Client, info: ?EngineInfo, e: ?errors.SnmpError) -> None:
         if info is not None:
             infos.append(info)
         if len(infos) == 2:
-            c.get(done, _oids(1))
+            c.get(got, _oids(1))
 
-    c.discover(engine_done)
-    c.discover(engine_done)
+    c.discover(discovered)
+    c.discover(discovered)
 
 
 actor _test_v3_seeded_engine(t: testing.AsyncT):
@@ -2040,10 +2040,10 @@ actor _test_v3_seeded_engine(t: testing.AsyncT):
         _ok(r, e)
         testing.assertEqual(agent.seen(), ["ok"])
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         _finish(t, lambda: check(r, e))
 
-    c.get(done, _oids(1))
+    c.get(got, _oids(1))
 
 
 actor _test_v3_concurrent_requests_share_discovery(t: testing.AsyncT):
@@ -2057,14 +2057,14 @@ actor _test_v3_concurrent_requests_share_discovery(t: testing.AsyncT):
     def check() -> None:
         testing.assertEqual(agent.seen(), ["probe", "ok", "ok", "ok"])
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         _ok(r, e)
         count += 1
         if count == 3:
             _finish(t, check)
 
     for o in _oids(3):
-        c.get(done, [o])
+        c.get(got, [o])
 
 
 actor _test_v3_wire_format(t: testing.AsyncT):
@@ -2078,7 +2078,7 @@ actor _test_v3_wire_format(t: testing.AsyncT):
     var msgs: list[V3Message] = []
     var scoped: list[ScopedPdu] = []
 
-    def on_request(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         m = _v3(data)
         msgs.append(m)
         if m.usm.engine_id == b"":
@@ -2115,11 +2115,11 @@ actor _test_v3_wire_format(t: testing.AsyncT):
         else:
             testing.error("not a TimeoutError")
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         _finish(t, lambda: check(r, e))
 
-    p.server.set_receiver(on_request)
-    c.get(done, _oids(1))
+    p.server.set_receiver(received)
+    c.get(got, _oids(1))
 
 
 actor _test_v3_context(t: testing.AsyncT):
@@ -2135,16 +2135,16 @@ actor _test_v3_context(t: testing.AsyncT):
         resp = _ok(r, e)
         testing.assertEqual((resp.context_engine_id, resp.context_name), (h("8000000001"), b"vrf1"))
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         _finish(t, lambda: check(r, e))
 
-    c.get(done, _oids(1))
+    c.get(got, _oids(1))
 
 
 # Notifications #####################################################################################
 
 actor _test_trap_v2c(t: testing.AsyncT):
-    """trap(): an SNMPv2-Trap with sysUpTime.0, snmpTrapOID.0 and the payload; cb once handed over"""
+    """trap(): an SNMPv2-Trap with sysUpTime.0, snmpTrapOID.0 and the payload; on_done once handed over"""
     mn = MemNet()
     p = mem_pair(mn, server_port=162)
     c = Client(None, AGENT, Community("public"), t.log_handler, port=162, opts=SLOW, transport=p.client)
@@ -2152,7 +2152,7 @@ actor _test_trap_v2c(t: testing.AsyncT):
     var got: list[notify.Notification] = []
     var errs: list[str] = []
 
-    def on_request(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         cm = _cm(data)
         got.append(notify.notification_from_v2c(_pdu(cm), cm.community, address, port))
 
@@ -2166,14 +2166,14 @@ actor _test_trap_v2c(t: testing.AsyncT):
         testing.assertTrue(got[1].uptime >= 0 and got[1].uptime < 300, "uptime since the Client started: %d" % got[1].uptime)
         testing.assertEqual(c.stats().requests, 0, "traps are not requests")
 
-    def done(cl: Client, e: ?errors.SnmpError) -> None:
+    def trap_sent(cl: Client, e: ?errors.SnmpError) -> None:
         errs.append(_describe(e))
         if len(errs) == 2:
             after now QUIET: _finish(t, check)
 
-    p.server.set_receiver(on_request)
-    c.trap(done, TRAP_OID, payload, 12345)
-    c.trap(done, TRAP_OID, payload)
+    p.server.set_receiver(received)
+    c.trap(trap_sent, TRAP_OID, payload, 12345)
+    c.trap(trap_sent, TRAP_OID, payload)
 
 
 actor _test_trap_v1(t: testing.AsyncT):
@@ -2184,7 +2184,7 @@ actor _test_trap_v1(t: testing.AsyncT):
     payload = [VarBind(Oid.parse("1.3.6.1.4.1.8072.9999.1.1.1.0"), Integer(0))]
     var got: list[CommunityMessage] = []
 
-    def on_request(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         got.append(_cm(data))
 
     def check() -> None:
@@ -2197,14 +2197,14 @@ actor _test_trap_v1(t: testing.AsyncT):
         else:
             testing.error("not a Trap-PDU")
 
-    def done(cl: Client, e: ?errors.SnmpError) -> None:
+    def trap_sent(cl: Client, e: ?errors.SnmpError) -> None:
         if e is not None:
             t.failure(AssertionError("trap failed: " + str(e)))
             return
         after now QUIET: _finish(t, check)
 
-    p.server.set_receiver(on_request)
-    c.trap_v1(done, ENTERPRISE, b"\xc0\x00\x02\x01", 6, 42, payload, 12345)
+    p.server.set_receiver(received)
+    c.trap_v1(trap_sent, ENTERPRISE, b"\xc0\x00\x02\x01", 6, 42, payload, 12345)
 
 
 actor _test_trap_v3(t: testing.AsyncT):
@@ -2218,7 +2218,7 @@ actor _test_trap_v3(t: testing.AsyncT):
     var got: list[(V3Message, ScopedPdu)] = []
     var errs: list[str] = []
 
-    def on_request(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         m = _v3(data)
         user = _shaaes() if m.usm.user == b"shaaes" else _users()[0]
         keys = user.localized(m.usm.engine_id)
@@ -2243,14 +2243,14 @@ actor _test_trap_v3(t: testing.AsyncT):
         testing.assertEqual(len(m2.usm.engine_id), 13, "default local engine ID: RFC 3411 format 5")
         testing.assertEqual(m2.usm.engine_id[:5], h("80001f8805"))
 
-    def done(cl: Client, e: ?errors.SnmpError) -> None:
+    def trap_sent(cl: Client, e: ?errors.SnmpError) -> None:
         errs.append(_describe(e))
         if len(errs) == 2:
             after now QUIET: _finish(t, check)
 
-    p.server.set_receiver(on_request)
-    c.trap(done, TRAP_OID, payload, 99)
-    d.trap(done, TRAP_OID, payload, 99)
+    p.server.set_receiver(received)
+    c.trap(trap_sent, TRAP_OID, payload, 99)
+    d.trap(trap_sent, TRAP_OID, payload, 99)
 
 
 actor _test_inform_v2c(t: testing.AsyncT):
@@ -2262,7 +2262,7 @@ actor _test_inform_v2c(t: testing.AsyncT):
     payload = [VarBind(Oid.parse("1.3.6.1.4.1.8072.2.3.2.1"), Integer(42))]
     var seen: list[Pdu] = []
 
-    def on_request(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         cm = _cm(data)
         q = _pdu(cm)
         seen.append(q)
@@ -2278,11 +2278,11 @@ actor _test_inform_v2c(t: testing.AsyncT):
         testing.assertEqual(seen[0].request_id, seen[1].request_id, "a retransmitted inform keeps its request-id")
         testing.assertEqual(resp.varbinds, notify.build_trap_v2(500, TRAP_OID, payload))
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def acked(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         _finish(t, lambda: check(r, e))
 
-    p.server.set_receiver(on_request)
-    c.inform(done, TRAP_OID, payload, 500)
+    p.server.set_receiver(received)
+    c.inform(acked, TRAP_OID, payload, 500)
 
 
 actor _test_inform_v3(t: testing.AsyncT):
@@ -2298,10 +2298,10 @@ actor _test_inform_v3(t: testing.AsyncT):
         testing.assertEqual(rcv.seen(), ["probe", "ok"])
         testing.assertEqual(resp.varbinds, notify.build_trap_v2(77, TRAP_OID, payload))
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def acked(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         _finish(t, lambda: check(r, e))
 
-    c.inform(done, TRAP_OID, payload, 77)
+    c.inform(acked, TRAP_OID, payload, 77)
 
 
 actor _test_inform_wrong_echo(t: testing.AsyncT):
@@ -2310,18 +2310,18 @@ actor _test_inform_wrong_echo(t: testing.AsyncT):
     p = mem_pair(mn, server_port=162)
     c = Client(None, AGENT, Community("public"), t.log_handler, port=162, opts=SLOW, transport=p.client)
 
-    def on_request(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         cm = _cm(data)
         p.server.send_to(_reply(cm, _answer(_pdu(cm).varbinds[1:])), address, port)
 
     def check(r: ?Response, e: ?errors.SnmpError) -> None:
         testing.assertTrue(isinstance(_failed(r, e), errors.InvalidResponseError))
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def acked(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         _finish(t, lambda: check(r, e))
 
-    p.server.set_receiver(on_request)
-    c.inform(done, TRAP_OID, [])
+    p.server.set_receiver(received)
+    c.inform(acked, TRAP_OID, [])
 
 
 actor _test_v3_unknown_engine_twice(t: testing.AsyncT):
@@ -2342,10 +2342,10 @@ actor _test_v3_unknown_engine_twice(t: testing.AsyncT):
         u = usm.USM_STATS_UNKNOWN_ENGINE_IDS
         testing.assertEqual(agent.seen(), ["probe", u, "probe", u])
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         _finish(t, lambda: check(r, e))
 
-    c.get(done, _oids(1))
+    c.get(got, _oids(1))
 
 
 actor _test_v3_forged_discovery_cannot_lock_out(t: testing.AsyncT):
@@ -2365,10 +2365,10 @@ actor _test_v3_forged_discovery_cannot_lock_out(t: testing.AsyncT):
         else:
             testing.error("no engine info")
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         _finish(t, lambda: check(r, e))
 
-    c.get(done, _oids(1))
+    c.get(got, _oids(1))
 
 
 actor _test_v3_boots_went_down_resyncs(t: testing.AsyncT):
@@ -2395,19 +2395,19 @@ actor _test_v3_boots_went_down_resyncs(t: testing.AsyncT):
         s = c.stats()
         testing.assertEqual((s.reports, s.responses, s.timeouts, s.drops_auth), (2, 2, 0, 0), str(s))
 
-    def second(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got_second(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         _finish(t, lambda: check(r, e))
 
-    def first(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got_first(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         try:
             _ok(r, e)
         except Exception as ex:
             t.failure(ex)
             return
         agent.reboot(1)
-        c.get(second, _oids(1))
+        c.get(got_second, _oids(1))
 
-    c.get(first, _oids(1))
+    c.get(got_first, _oids(1))
 
 
 actor _test_v3_time_went_back_resyncs(t: testing.AsyncT):
@@ -2432,10 +2432,10 @@ actor _test_v3_time_went_back_resyncs(t: testing.AsyncT):
         s = c.stats()
         testing.assertEqual((s.timeouts, s.drops_auth), (0, 0), str(s))
 
-    def second(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got_second(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         _finish(t, lambda: check(r, e))
 
-    def first(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got_first(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         try:
             _ok(r, e)
             info = c.engine_info()
@@ -2445,9 +2445,9 @@ actor _test_v3_time_went_back_resyncs(t: testing.AsyncT):
             t.failure(ex)
             return
         agent.reboot(1)
-        c.get(second, _oids(1))
+        c.get(got_second, _oids(1))
 
-    c.get(first, _oids(1))
+    c.get(got_first, _oids(1))
 
 
 actor _test_v3_clock_back_once_per_request(t: testing.AsyncT):
@@ -2473,7 +2473,7 @@ actor _test_v3_clock_back_once_per_request(t: testing.AsyncT):
         n = usm.USM_STATS_NOT_IN_TIME_WINDOWS
         testing.assertEqual(agent.seen(), ["probe", "ok", n, n, "probe", "ok"])
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         step += 1
         if step == 1:
             try:
@@ -2482,7 +2482,7 @@ actor _test_v3_clock_back_once_per_request(t: testing.AsyncT):
                 t.failure(ex)
                 return
             agent.set_mode(CLOCK_BACK)
-            c.get(done, _oids(1), FAST.with_(timeout=0.1))
+            c.get(got, _oids(1), FAST.with_(timeout=0.1))
         elif step == 2:
             try:
                 check_timeout(r, e)
@@ -2490,11 +2490,11 @@ actor _test_v3_clock_back_once_per_request(t: testing.AsyncT):
                 t.failure(ex)
                 return
             agent.set_mode(NORMAL)
-            c.get(done, _oids(1))
+            c.get(got, _oids(1))
         else:
             _finish(t, lambda: check_last(r, e))
 
-    c.get(done, _oids(1))
+    c.get(got, _oids(1))
 
 
 actor _test_v3_duplicated_time_window_report(t: testing.AsyncT):
@@ -2519,16 +2519,16 @@ actor _test_v3_duplicated_time_window_report(t: testing.AsyncT):
         # Report and of both Responses have unknown msgIDs by then
         testing.assertEqual((s.reports, s.drops_unknown_id, s.timeouts, s.drops_auth), (3, 3, 0, 0), str(s))
 
-    def second(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got_second(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         outcomes.append(_describe(e))
         after now QUIET: _finish(t, check)
 
-    def first(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got_first(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         outcomes.append(_describe(e))
         agent.reboot(2)
-        c.get(second, _oids(1))
+        c.get(got_second, _oids(1))
 
-    c.get(first, _oids(1))
+    c.get(got_first, _oids(1))
 
 
 actor _test_v3_stale_engine_user_report_rediscovers(t: testing.AsyncT):
@@ -2555,10 +2555,10 @@ actor _test_v3_stale_engine_user_report_rediscovers(t: testing.AsyncT):
         s = c.stats()
         testing.assertEqual((s.reports, s.timeouts, s.drops_auth), (2, 0, 0), str(s))
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         _finish(t, lambda: check(r, e))
 
-    c.get(done, _oids(1))
+    c.get(got, _oids(1))
 
 
 actor _test_v3_other_engine_report_bounded(t: testing.AsyncT):
@@ -2579,14 +2579,14 @@ actor _test_v3_other_engine_report_bounded(t: testing.AsyncT):
         s = c.stats()
         testing.assertEqual((s.reports, s.timeouts), (4, 0), str(s))
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         if isinstance(e, errors.ReportError):
             outcomes.append("ReportError " + e.name + (" transient" if e.transient else " permanent"))
         else:
             outcomes.append("not a ReportError: " + _describe(e))
         after now QUIET: _finish(t, check)
 
-    c.get(done, _oids(1))
+    c.get(got, _oids(1))
 
 
 actor _test_v3_late_reply_and_wrong_request_id(t: testing.AsyncT):
@@ -2608,11 +2608,11 @@ actor _test_v3_late_reply_and_wrong_request_id(t: testing.AsyncT):
         s = c.stats()
         testing.assertEqual((s.drops_pdu, s.drops_unknown_id), (1, 1))
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         step += 1
         if step == 1:
             agent.set_mode(HOLD_FIRST)
-            c.get(done, _oids(1))
+            c.get(got, _oids(1))
         elif step == 2:
             try:
                 check_late(r, e)
@@ -2620,11 +2620,11 @@ actor _test_v3_late_reply_and_wrong_request_id(t: testing.AsyncT):
                 t.failure(ex)
                 return
             agent.set_mode(WRONG_RID_FIRST)
-            c.get(done, _oids(1))
+            c.get(got, _oids(1))
         else:
             _finish(t, lambda: check_wrong(r, e))
 
-    c.get(done, _oids(1))
+    c.get(got, _oids(1))
 
 
 actor _test_v3_cancel_and_close_while_discovering(t: testing.AsyncT):
@@ -2648,21 +2648,21 @@ actor _test_v3_cancel_and_close_while_discovering(t: testing.AsyncT):
     def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         log.append("get:" + name_of(e))
 
-    def got2(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got_second(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         log.append("get2:" + name_of(e))
 
     def discovered(cl: Client, info: ?EngineInfo, e: ?errors.SnmpError) -> None:
         log.append("discover:" + name_of(e))
 
-    def later() -> None:
+    def close_due() -> None:
         c.close()
         after now QUIET: _finish(t, check)
 
     h1 = c.get(got, _oids(1))
     c.discover(discovered)
-    c.get(got2, _oids(1))
+    c.get(got_second, _oids(1))
     c.cancel(h1)
-    after now 0.05: later()
+    after now 0.05: close_due()
 
 
 # UDP loopback ######################################################################################
@@ -2676,7 +2676,7 @@ actor _test_udp_loopback(t: testing.EnvT):
     var closed_port = 0
     var phase = 0
 
-    def on_request(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         req = _cm(data)
         s = srv
         if s is not None:
@@ -2689,14 +2689,14 @@ actor _test_udp_loopback(t: testing.EnvT):
         else:
             testing.error("not a TimeoutError: " + str(err))
 
-    def refused_done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got_refused(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         cl.close()
         s = srv
         if s is not None:
             s.close()
         _finish_env(t, lambda: check_refused(r, e))
 
-    def ok_done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got_answer(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         cl.close()
         try:
             resp = _ok(r, e)
@@ -2709,9 +2709,9 @@ actor _test_udp_loopback(t: testing.EnvT):
     def start_refused() -> None:
         c2 = Client(net.UDPConnectCap(ucap), "127.0.0.1", Community("public"), t.log_handler, port=closed_port,
                     opts=Options(timeout=0.2, retries=1))
-        c2.get(refused_done, _oids(1))
+        c2.get(got_refused, _oids(1))
 
-    def on_closed_ready(st: ServerTransport, error: ?str) -> None:
+    def closed_port_listening(st: ServerTransport, error: ?str) -> None:
         # bind, note the port, close: nothing listens there afterwards
         closed_port = st.local_port()
         st.close()
@@ -2719,17 +2719,17 @@ actor _test_udp_loopback(t: testing.EnvT):
         if s is not None:
             c = Client(net.UDPConnectCap(ucap), "127.0.0.1", Community("public"), t.log_handler,
                        port=s.local_port(), opts=Options(timeout=1.0, retries=2))
-            c.get(ok_done, _oids(2))
+            c.get(got_answer, _oids(2))
 
-    def on_ready(st: ServerTransport, error: ?str) -> None:
+    def listening(st: ServerTransport, error: ?str) -> None:
         if error is not None:
             t.failure(AssertionError("listen failed: " + error))
             return
         srv = st
-        st.set_receiver(on_request)
-        udp_server_transport(net.UDPListenCap(ucap), "127.0.0.1", 0, on_closed_ready)
+        st.set_receiver(received)
+        udp_server_transport(net.UDPListenCap(ucap), "127.0.0.1", 0, closed_port_listening)
 
-    udp_server_transport(net.UDPListenCap(ucap), "127.0.0.1", 0, on_ready)
+    udp_server_transport(net.UDPListenCap(ucap), "127.0.0.1", 0, listening)
 
 
 # Edge cases: Reports, long queues, discovery budgets, trap boots ##################################
@@ -2749,7 +2749,7 @@ actor _test_rv_encrypted_report(t: testing.AsyncT):
                engine=EngineInfo(eid, 1, 1000, _now()))
     var started = _now()
 
-    def on_request(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         cm, m = message.decode(data)
         if m is not None:
             hdr = V3Message(m.msg_id, 65507, message.FLAG_AUTH | message.FLAG_PRIV,
@@ -2763,14 +2763,14 @@ actor _test_rv_encrypted_report(t: testing.AsyncT):
             raise AssertionError("expected ReportError(snmpUnknownContexts), got " + _describe(e)
                                  + " after %.3f s; " % elapsed + s)
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         elapsed = _now() - started
         s = str(c.stats())
         _finish(t, lambda: check(e, elapsed, s))
 
-    p.server.set_receiver(on_request)
+    p.server.set_receiver(received)
     started = _now()
-    c.get(done, _oids(1))
+    c.get(got, _oids(1))
 
 
 # Fatal transport error with a long queue: no recursion, no quadratic work ##########################
@@ -2778,7 +2778,7 @@ actor _test_rv_encrypted_report(t: testing.AsyncT):
 actor _BigQueue(t: testing.AsyncT, n: int, use_close: bool, limit: float):
     sw = _TransportSwitch()
     c = Client(None, AGENT, Community("public"), None, opts=Options(timeout=60.0, retries=0), transport=_switch_transport(sw))
-    var got = 0
+    var calls = 0
     var wrong = 0
     var t0 = 0.0
 
@@ -2786,14 +2786,14 @@ actor _BigQueue(t: testing.AsyncT, n: int, use_close: bool, limit: float):
         testing.assertEqual(wrong, 0)
         testing.assertTrue(elapsed < limit, "%d queued requests: the callbacks took %.3f s after the trigger" % (n, elapsed))
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         if use_close:
             if not isinstance(e, errors.CancelledError):
                 wrong += 1
         elif not isinstance(e, errors.TransportError):
             wrong += 1
-        got += 1
-        if got == n:
+        calls += 1
+        if calls == n:
             elapsed = _now() - t0
             _finish(t, lambda: check(elapsed))
 
@@ -2804,13 +2804,13 @@ actor _BigQueue(t: testing.AsyncT, n: int, use_close: bool, limit: float):
         else:
             sw.fail("socket died")
 
-    def submitted(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def ignored(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         pass
 
     for i in range(n):
-        c.get(done, _oids(1))
+        c.get(got, _oids(1))
     # a synchronous call: every get() above has been queued when it returns
-    h = c.get(submitted, _oids(1))
+    h = c.get(ignored, _oids(1))
     c.cancel(h)
     trigger()
 
@@ -2840,7 +2840,7 @@ actor _test_rv_discovery_uses_request_opts(t: testing.AsyncT):
     var started = _now()
     var probes = 0
 
-    def on_request(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         probes += 1           # a silent agent
 
     def check(e: ?errors.SnmpError, elapsed: float) -> None:
@@ -2848,13 +2848,13 @@ actor _test_rv_discovery_uses_request_opts(t: testing.AsyncT):
         testing.assertTrue(elapsed < 0.6, "the 0.1 s request failed after %.3f s and %d probes: " % (elapsed, probes)
                            + _describe(e))
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         elapsed = _now() - started
         _finish(t, lambda: check(e, elapsed))
 
-    p.server.set_receiver(on_request)
+    p.server.set_receiver(received)
     started = _now()
-    c.get(done, _oids(1), Options(timeout=0.1, retries=0))
+    c.get(got, _oids(1), Options(timeout=0.1, retries=0))
 
 
 # SNMPv3 traps after a sender restart (local_engine_boots) ##########################################
@@ -2874,10 +2874,10 @@ actor _test_rv_trap_v3_after_restart(t: testing.AsyncT):
     cfg = ReceiverConfig([], [u], [eid], h("80001f8880616374736e6d7072"), 1)
     var delivered: list[Notification] = []
 
-    def on_notification(r: NotificationReceiver, n: Notification) -> None:
+    def received(r: NotificationReceiver, n: Notification) -> None:
         delivered.append(n)
 
-    rcv = NotificationReceiver(mn.server("10.0.0.9", 162), cfg, on_notification, t.log_handler)
+    rcv = NotificationReceiver(mn.server("10.0.0.9", 162), cfg, received, t.log_handler)
     keys = u.localized(eid)
     hdr = V3Message(4711, 65507, message.FLAG_AUTH, UsmSecurityParameters(eid, 1, 100000, b"shaonly"))
     old = Pdu(pdu.TRAP_V2, 1, 0, 0, notify.build_trap_v2(10000000, TRAP_OID, []))
@@ -2890,13 +2890,13 @@ actor _test_rv_trap_v3_after_restart(t: testing.AsyncT):
         s = rcv.stats()
         testing.assertEqual(len(delivered), 2, "delivered %d; receiver stats %s" % (len(delivered), str(s)))
 
-    def sent(cl: Client, e: ?errors.SnmpError) -> None:
+    def trap_sent(cl: Client, e: ?errors.SnmpError) -> None:
         after now 0.3: _finish(t, check)
 
-    def go() -> None:
-        c.trap(sent, TRAP_OID, [])
+    def trap_due() -> None:
+        c.trap(trap_sent, TRAP_OID, [])
 
-    after now 0.1: go()
+    after now 0.1: trap_due()
 
 
 
@@ -2908,7 +2908,7 @@ actor _TooBigV3Agent(srv: ServerTransport, u: Usm, eid: bytes):
     salt = SaltCounter(u64(5))
     var sizes: list[int] = []
 
-    def on_request(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         c, m = message.decode(data)
         if m is not None:
             now = _now()
@@ -2932,7 +2932,7 @@ actor _TooBigV3Agent(srv: ServerTransport, u: Usm, eid: bytes):
     def seen() -> list[int]:
         return sizes
 
-    srv.set_receiver(on_request)
+    srv.set_receiver(received)
 
 actor _test_rv_v3_too_big_split(t: testing.AsyncT):
     """SNMPv3 authPriv: tooBig splits like v2c, each part a new exchange; merged in order"""
@@ -2952,11 +2952,11 @@ actor _test_rv_v3_too_big_split(t: testing.AsyncT):
             testing.assertEqual([vb.value for vb in r.varbinds], [OctetString(o.dotted().encode()) for o in oids])
         testing.assertEqual(sizes, [3, 1, 2, 1, 1])
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         sizes = agent.seen()
         _finish(t, lambda: check(r, e, sizes))
 
-    c.get(done, oids)
+    c.get(got, oids)
 
 
 actor _test_rv_fatal_during_discovery(t: testing.AsyncT):
@@ -2975,15 +2975,15 @@ actor _test_rv_fatal_during_discovery(t: testing.AsyncT):
         if len(log) == 3:
             after now 0.2: _finish(t, verify)
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         note("get:" + ("transport" if isinstance(e, errors.TransportError) else _describe(e)))
 
-    def disc(cl: Client, i: ?EngineInfo, e: ?errors.SnmpError) -> None:
+    def discovered(cl: Client, i: ?EngineInfo, e: ?errors.SnmpError) -> None:
         note("disc:" + ("transport" if isinstance(e, errors.TransportError) else _describe(e)))
 
-    c.get(done, _oids(1))
-    c.get(done, _oids(1))
-    c.discover(disc)
+    c.get(got, _oids(1))
+    c.get(got, _oids(1))
+    c.discover(discovered)
     after now 0.1: sw.fail("socket died")
 
 actor _test_rv_error_index_outside_part(t: testing.AsyncT):
@@ -2994,7 +2994,7 @@ actor _test_rv_error_index_outside_part(t: testing.AsyncT):
                max_oids_per_request=2), transport=p.client)
     var parts = 0
 
-    def on_request(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         cm = _cm(data)
         parts += 1
         if parts == 2:
@@ -3012,11 +3012,11 @@ actor _test_rv_error_index_outside_part(t: testing.AsyncT):
         else:
             raise AssertionError("expected ErrorStatusError, got " + _describe(e))
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         _finish(t, lambda: check(e))
 
-    p.server.set_receiver(on_request)
-    c.get(done, _oids(5))
+    p.server.set_receiver(received)
+    c.get(got, _oids(5))
 
 actor _test_rv_stats_queue(t: testing.AsyncT):
     """Stats.queued and Stats.in_flight show the backlog of a slow agent"""
@@ -3025,11 +3025,11 @@ actor _test_rv_stats_queue(t: testing.AsyncT):
     c = Client(None, AGENT, Community("public"), t.log_handler, opts=Options(timeout=5.0, retries=0, max_in_flight=2),
                transport=p.client)
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def ignored(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         pass
 
     for i in range(5):
-        c.get(done, _oids(1))
+        c.get(ignored, _oids(1))
     s = c.stats()
     c.close()
     _finish(t, lambda: testing.assertEqual((s.queued, s.in_flight, s.requests), (3, 2, 5)))
@@ -3047,7 +3047,7 @@ actor _test_rv_trap_boots_validated(t: testing.AsyncT):
     var log: list[str] = []
     var boots = -1
 
-    def on_data(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         boots = _v3(data).usm.boots
         log.append("received")
         if len(log) == 3:
@@ -3057,19 +3057,19 @@ actor _test_rv_trap_boots_validated(t: testing.AsyncT):
         testing.assertEqual(sorted(log), ["bad:EncodeError", "good:ok", "received"])
         testing.assertEqual(boots, 77)
 
-    def bad_done(cl: Client, e: ?errors.SnmpError) -> None:
+    def bad_trap_sent(cl: Client, e: ?errors.SnmpError) -> None:
         log.append("bad:" + ("EncodeError" if isinstance(e, errors.EncodeError) else _describe(e)))
         if len(log) == 3:
             _finish(t, verify)
 
-    def good_done(cl: Client, e: ?errors.SnmpError) -> None:
+    def good_trap_sent(cl: Client, e: ?errors.SnmpError) -> None:
         log.append("good:" + _describe(e))
         if len(log) == 3:
             _finish(t, verify)
 
-    srv.set_receiver(on_data)
-    bad.trap(bad_done, TRAP_OID, [])
-    good.trap(good_done, TRAP_OID, [])
+    srv.set_receiver(received)
+    bad.trap(bad_trap_sent, TRAP_OID, [])
+    good.trap(good_trap_sent, TRAP_OID, [])
 
 def _test_rv_options_repr_complete() -> None:
     """repr(Options()) names every field"""
@@ -3095,14 +3095,14 @@ actor _test_rv_max_queued(t: testing.AsyncT):
         if st is not None:
             testing.assertEqual((st.queued, st.in_flight, st.requests), (2, 1, 3))
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         log.append("cancelled" if isinstance(e, errors.CancelledError) else
                    ("full" if isinstance(e, errors.QueueFullError) else _describe(e)))
         if len(log) == 4:
             _finish(t, check)
 
     for i in range(4):
-        c.get(done, _oids(1))
+        c.get(got, _oids(1))
     s = c.stats()
     c.close()
 
@@ -3122,17 +3122,17 @@ actor _test_v3_many_discovery_waiters(t: testing.AsyncT):
     var wrong = 0
     var t0 = 0.0
 
-    def on_request(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         pass
 
-    def first(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got_first(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         pass
 
     def check(elapsed: float) -> None:
         testing.assertEqual(wrong, 0, "callbacks that were not a TimeoutError")
         testing.assertTrue(elapsed < 8.0, "the last of 20000 callbacks came %.2f s after the first request" % elapsed)
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         if not isinstance(e, errors.TimeoutError):
             wrong += 1
         n += 1
@@ -3141,11 +3141,11 @@ actor _test_v3_many_discovery_waiters(t: testing.AsyncT):
             c.close()
             _finish(t, lambda: check(elapsed))
 
-    p.server.set_receiver(on_request)
+    p.server.set_receiver(received)
     t0 = _now()
-    c.get(first, _oids(1), Options(timeout=30.0, retries=0))
+    c.get(got_first, _oids(1), Options(timeout=30.0, retries=0))
     for i in range(20000):
-        c.get(done, _oids(1))
+        c.get(got, _oids(1))
 
 actor _test_v3_late_joiner_keeps_budget(t: testing.AsyncT):
     """A request that joins a running discovery probe late keeps its whole budget (4 s), although the probe
@@ -3159,10 +3159,10 @@ actor _test_v3_late_joiner_keeps_budget(t: testing.AsyncT):
     var a_waited = 0.0
     var t0 = 0.0
 
-    def on_request(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         pass
 
-    def a_done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got_a(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         a_waited = _now() - t0
 
     def check(e: ?errors.SnmpError, waited: float) -> None:
@@ -3170,25 +3170,25 @@ actor _test_v3_late_joiner_keeps_budget(t: testing.AsyncT):
         testing.assertTrue(waited >= 3.9, "B (budget 4 s) failed after %.2f s: " % waited + _describe(e))
         testing.assertTrue(a_waited >= 0.95 and a_waited < 1.5, "A (budget 1 s) failed after %.2f s" % a_waited)
 
-    def b_done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got_b(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         waited = _now() - t_b
         _finish(t, lambda: check(e, waited))
 
-    def start_b() -> None:
+    def request_b_due() -> None:
         t_b = _now()
-        c.get(b_done, _oids(1), Options(timeout=2.0, retries=1))
+        c.get(got_b, _oids(1), Options(timeout=2.0, retries=1))
 
-    p.server.set_receiver(on_request)
+    p.server.set_receiver(received)
     t0 = _now()
-    c.get(a_done, _oids(1))
-    after now 0.8: start_b()
+    c.get(got_a, _oids(1))
+    after now 0.8: request_b_due()
 
 actor _Ipv6Agent(srv: ServerTransport):
     """Answers every SNMPv2c GET (a v2c responder on an IPv6 address)"""
-    def on_request(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         c = _cm(data)
         srv.send_to(_reply(c, _answer(_pdu(c).varbinds)), address, port)
-    srv.set_receiver(on_request)
+    srv.set_receiver(received)
 
 actor _test_ipv6_address_forms(t: testing.AsyncT):
     """With a supplied transport the Client checks the source address itself: an IPv6 address written in
@@ -3212,17 +3212,17 @@ actor _test_ipv6_address_forms(t: testing.AsyncT):
     def one(addr: str) -> None:
         c = Client(None, addr, Community("public"), t.log_handler, opts=SLOW,
                    transport=mn.client("2001:db8::2", 0, "2001:db8::1", 161))
-        def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
             finish(addr, r, e)
-        c.get(done, _oids(1))
+        c.get(got, _oids(1))
 
     for a in ["2001:DB8:0:0::1", "2001:0DB8:0000:0000:0000:0000:0000:0001", "2001:db8::0.0.0.1"]:
         one(a)
     c4 = Client(None, "::ffff:10.0.0.1", Community("public"), t.log_handler, opts=SLOW,
                 transport=mn.client("::ffff:a00:2", 0, "::ffff:a00:1", 161))
-    def done4(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got_mapped(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         finish("::ffff:10.0.0.1", r, e)
-    c4.get(done4, _oids(1))
+    c4.get(got_mapped, _oids(1))
 
 actor _test_id16_exhaustion(t: testing.AsyncT):
     """request_id_bits=16 with more pending attempts than ids (32767): the attempt that finds no free
@@ -3237,18 +3237,18 @@ actor _test_id16_exhaustion(t: testing.AsyncT):
     var full: list[str] = []
     var others = 0
 
-    def on_request(data: bytes, address: str, port: int) -> None:
+    def received(data: bytes, address: str, port: int) -> None:
         pass
 
-    def done(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         if isinstance(e, errors.QueueFullError):
             full.append(e.error_message)
         else:
             others += 1
 
-    p.server.set_receiver(on_request)
+    p.server.set_receiver(received)
     for i in range(32768):
-        c.get(done, _oids(1))
+        c.get(got, _oids(1))
     # a synchronous call: it returns only once every get() above has been handled
     s = c.stats()
 
@@ -3258,12 +3258,12 @@ actor _test_id16_exhaustion(t: testing.AsyncT):
         testing.assertEqual(n_others, 0, "no other callback yet")
         testing.assertEqual((s.in_flight, s.queued), (32767, 0), str(s))
 
-    def finish() -> None:
+    def settled() -> None:
         texts = full
         n_others = others
         c.close()
         _finish(t, lambda: check(texts, n_others))
-    after now QUIET: finish()
+    after now QUIET: settled()
 
 actor _test_v3_context_per_request(t: testing.AsyncT):
     """Options.context_name selects the SNMPv3 context of one request (BRIDGE-MIB per VLAN with one Client);
@@ -3286,24 +3286,24 @@ actor _test_v3_context_per_request(t: testing.AsyncT):
         if len(got) == 4:
             _finish(t, check)
 
-    def d0(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got_default(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         one(r, e)
-        c.get(d1, _oids(1), SLOW.with_(context_name=b"vlan-10"))
+        c.get(got_vlan_10, _oids(1), SLOW.with_(context_name=b"vlan-10"))
 
-    def d1(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got_vlan_10(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         one(r, e)
-        c.get(d2, _oids(1), Options(timeout=2.0, retries=0, context_name=b"vlan-20"))
+        c.get(got_vlan_20, _oids(1), Options(timeout=2.0, retries=0, context_name=b"vlan-20"))
 
-    def d2(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got_vlan_20(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         one(r, e)
         c2 = Client(None, AGENT, u.with_context("vrf-blue"), t.log_handler, opts=SLOW,
                     transport=mn.client(MANAGER, 0, AGENT, 161))
-        c2.get(d3, _oids(1))
+        c2.get(got_vrf_blue, _oids(1))
 
-    def d3(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got_vrf_blue(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         one(r, e)
 
-    c.get(d0, _oids(1))
+    c.get(got_default, _oids(1))
 
 actor _test_transport_set_up_again(t: testing.EnvT):
     """A Client whose UDP socket could not be set up (a name that does not resolve: a DNS outage, or too
@@ -3320,22 +3320,22 @@ actor _test_transport_set_up_again(t: testing.EnvT):
             testing.assertTrue(x.startswith("transient "), x)
         testing.assertEqual(s.transport_failures, 2, "a setup, a failure, a new setup after the wait: " + str(s))
 
-    def third(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got_third(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         note(e)
         s = c.stats()
         _finish_env(t, lambda: check(s))
 
-    def again() -> None:
-        c.get(third, _oids(1))
+    def retry_due() -> None:
+        c.get(got_third, _oids(1))
 
-    def second(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got_second(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         # right after the failure: fails at once, no new setup yet
         note(e)
-        after now client_mod.TRANSPORT_RETRY + 0.2: again()
+        after now client_mod.TRANSPORT_RETRY + 0.2: retry_due()
 
-    def first(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+    def got_first(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         note(e)
-        c.get(second, _oids(1))
+        c.get(got_second, _oids(1))
 
     def note(e: ?errors.SnmpError) -> None:
         if isinstance(e, errors.TransportError):
@@ -3343,4 +3343,4 @@ actor _test_transport_set_up_again(t: testing.EnvT):
         else:
             seen.append("not a TransportError: " + _describe(e))
 
-    c.get(first, _oids(1))
+    c.get(got_first, _oids(1))
