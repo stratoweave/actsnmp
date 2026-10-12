@@ -8,14 +8,16 @@
 #   build     acton build src/actsnmp.act (copied to RESULTS/bin/actsnmp for the other phases),
 #             interop/up.sh (rebuilds the image when the lab sources changed)
 #   library   acton test --tag interop --module test_interop: the library against snmpd, snmpsim
-#             and snmptrapd (~5 min)
+#             and snmptrapd, over UDP and TCP (~5 min)
 #   cli       interop/clicheck.sh: the CLI side by side with net-snmp's tools (~3 min)
 #   agent     interop/agentcheck.sh (full, all users, IPv4 and IPv6): net-snmp and pysnmp against
-#             our agent (actsnmp agent on 127.0.0.1:16163 and [::1]:16163)
+#             our agent (actsnmp agent on 127.0.0.1:16163 and [::1]:16163), then net-snmp against
+#             our agent over TCP (actsnmp agent --tcp on the same addresses)
 #   notify    interop/notifycheck.sh --all-users: net-snmp and pysnmp senders to our receiver
-#             (actsnmp trapd --canon on 127.0.0.1:16165)
+#             (actsnmp trapd --canon on 127.0.0.1:16165), then net-snmp's senders over TCP
+#             (actsnmp trapd --canon --tcp)
 #   trapd     interop/trapdcheck.sh cli --all-users: our CLI as the sender, the lab's snmptrapd as
-#             the receiver
+#             the receiver, over UDP and over TCP
 # Default: all phases in this order. --phases takes a comma separated subset (build is needed once
 # for a fresh binary; without it the existing out/bin/actsnmp is used).
 #
@@ -31,8 +33,9 @@
 # CLI_FLAGS (extra flags of the CLI build, e.g. --fast), PHASE_TIMEOUT (seconds per phase, 840).
 #
 # Output: RESULTS/LATEST.md (the summary: per phase PASS/FAIL, run time in the lock, lock wait and key
-# numbers), RESULTS/<phase>.log (the whole output of each phase), the reports RESULTS/clicheck.md and
-# RESULTS/agentcheck.md, and what our servers printed (agent4.err, agent6.err, receiver.out/.err).
+# numbers), RESULTS/<phase>.log (the whole output of each phase), the reports RESULTS/clicheck.md,
+# RESULTS/agentcheck.md and RESULTS/agentcheck-tcp.md, and what our servers printed (agent4.err,
+# agent6.err, agent4-tcp.err, agent6-tcp.err, receiver.out/.err, receiver-tcp.out/.err).
 set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 REPO="$(cd "$INTEROP_DIR/.." && pwd)"
@@ -56,7 +59,7 @@ while [ $# -gt 0 ]; do
         --no-lock) LOCK="" ;;
         --results) results="$2"; shift ;;
         --in-phase) in_phase="$2"; shift ;;     # internal: run one phase (under the caller's lock)
-        -h|--help) sed -n '2,35p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,38p' "$0"; exit 0 ;;
         *) die "unknown argument $1 (see --help)" ;;
     esac
     shift
@@ -144,8 +147,12 @@ phase_agent() {
     [ $quick -eq 1 ] && q=(--quick)
     start_server serving "$results/agent4.err" /dev/null "$CLI" agent || return 1
     start_server serving "$results/agent6.err" /dev/null "$CLI" agent --bind ::1 || return 1
+    start_server serving "$results/agent4-tcp.err" /dev/null "$CLI" agent --tcp || return 1
+    start_server serving "$results/agent6-tcp.err" /dev/null "$CLI" agent --tcp --bind ::1 || return 1
     "$INTEROP_DIR/agentcheck.sh" "${q[@]}" 'acton=127.0.0.1:16163,udp6:[::1]:16163' >"$results/agentcheck.md" \
         || rc=1
+    "$INTEROP_DIR/agentcheck.sh" "${q[@]}" 'acton-tcp=tcp:127.0.0.1:16163,tcp6:[::1]:16163' \
+        >"$results/agentcheck-tcp.md" || rc=1
     stop_servers
     return $rc
 }
@@ -154,15 +161,20 @@ phase_notify() {
     local m=(--all-users) rc=0
     [ $quick -eq 1 ] && m=()
     start_server listening "$results/receiver.err" "$results/receiver.out" "$CLI" trapd --canon || return 1
+    start_server listening "$results/receiver-tcp.err" "$results/receiver-tcp.out" "$CLI" trapd --canon --tcp \
+        || return 1
     "$INTEROP_DIR/notifycheck.sh" "${m[@]}" --log "$results/receiver.out" --wait 30 || rc=1
+    "$INTEROP_DIR/notifycheck.sh" --tcp "${m[@]}" --log "$results/receiver-tcp.out" --wait 30 || rc=1
     stop_servers
     return $rc
 }
 
 phase_trapd() {
-    local m=(--all-users)
+    local m=(--all-users) rc=0
     [ $quick -eq 1 ] && m=()
-    "$INTEROP_DIR/trapdcheck.sh" cli "${m[@]}" "$CLI"
+    "$INTEROP_DIR/trapdcheck.sh" cli "${m[@]}" "$CLI" || rc=1
+    "$INTEROP_DIR/trapdcheck.sh" cli --tcp "${m[@]}" "$CLI" || rc=1
+    return $rc
 }
 
 # The key numbers of a phase, from its log and reports
@@ -174,14 +186,19 @@ detail_library() {
     echo "test_interop: $ok OK, $bad failed;" "$(grep -E "tests? (passed|failed)" "$1" | tail -1 | xargs)"
 }
 detail_cli() { tail -1 "$results/clicheck.md" 2>/dev/null; }
-detail_agent() { grep -E "^[0-9]+ passed, " "$results/agentcheck.md" 2>/dev/null | tail -1; }
-detail_notify() {
-    echo "$(grep -E '^sent [0-9]+ notifications' "$1" | tail -1);" \
-        "receiver output $(grep -E '^receiver log ' "$1" | sed 's/^receiver log [^ ]* //' | tail -1)"
+detail_agent() {
+    echo "UDP: $(grep -E "^[0-9]+ passed, " "$results/agentcheck.md" 2>/dev/null | tail -1);" \
+        "TCP: $(grep -E "^[0-9]+ passed, " "$results/agentcheck-tcp.md" 2>/dev/null | tail -1)"
+}
+detail_notify() {  # the UDP run, then the TCP run
+    local sent received
+    mapfile -t sent < <(grep -E '^sent [0-9]+ notifications' "$1")
+    mapfile -t received < <(grep -E '^receiver log ' "$1" | sed 's/^receiver log [^ ]* //')
+    echo "UDP: ${sent[0]:-?}; receiver output ${received[0]:-?};" \
+        "TCP: ${sent[1]:-?}; receiver output ${received[1]:-?}"
 }
 detail_trapd() {
-    echo "$(grep -c '^\[PASS\]' "$1") sent, $(grep -c '^\[FAIL\]' "$1") failed;" \
-        "$(grep -E 'snmptrapd (received|log)' "$1" | tail -1)"
+    grep -E '^[0-9]+ sent, [0-9]+ failed over |^snmptrapd (received|log)' "$1" | paste -sd ';' | sed 's/;/; /g'
 }
 
 run_phase() {  # name: this script again with --in-phase NAME, in one hold of the lock

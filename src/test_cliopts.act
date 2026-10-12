@@ -367,12 +367,22 @@ def _test_agent_specs() -> None:
         ("fe80::1", "udp", "fe80::1", 161),
         ("udp6:host6:162", "udp6", "host6", 162),
         ("udpv6:[2001:db8::1]:10161", "udp6", "2001:db8::1", 10161),
+        ("udpipv6:[::1]:161", "udp6", "::1", 161),
+        ("tcp:127.0.0.1:1161", "tcp", "127.0.0.1", 1161),
+        ("TCP:host", "tcp", "host", 161),
+        ("tcp:[::1]:16161", "tcp", "::1", 16161),
+        ("tcp6:[::1]:161", "tcp6", "::1", 161),
+        ("tcp6:::1", "tcp6", "::1", 161),
+        ("tcp6:host6:162", "tcp6", "host6", 162),
+        ("tcpv6:[2001:db8::1]:10161", "tcp6", "2001:db8::1", 10161),
+        ("TcpIpV6:[::1]", "tcp6", "::1", 161),
     ]
     for c in cases:
         r = parse_agent(c.0, 161)
         testing.assertEqual((r.domain, r.host, r.port), (c.1, c.2, c.3), "agent " + c.0)
     for bad in ["", "udp:", "host:", "host:0", "host:65536", "host:x", "[::1", "[::1]x", "[::1]:", "[]:161",
-                "tcp:host", "unix:/tmp/s", "udp6:"]:
+                "unix:/tmp/s", "udp6:", "tcp:", "tcp6:", "tcp:host:0", "tcp6:[::1]:65536", "tls:host", "dtls:host",
+                "dtlsudp:host", "tlstcp:host:10161"]:
         try:
             parse_agent(bad, 161)
             raise AssertionError("no CliError for " + repr(bad))
@@ -380,12 +390,23 @@ def _test_agent_specs() -> None:
             pass
     o = p(["get", "-c", "x", "udp6:[::1]:1161", "1.3"])
     testing.assertEqual((o.address, o.port, o.transport_domain, o.peer), ("::1", 1161, "udp6", "udp6:[::1]:1161"))
-    fails(["get", "-c", "x", "tcp:h:161", "1.3"], "Unsupported transport in agent address: tcp:h:161 (only udp and udp6)")
+    testing.assertFalse(o.is_tcp())
+    o = p(["get", "-c", "x", "tcp:h:1161", "1.3"])
+    testing.assertEqual((o.address, o.port, o.transport_domain, o.peer), ("h", 1161, "tcp", "tcp:h:1161"))
+    testing.assertTrue(o.is_tcp())
+    o = p(["walk", "-c", "x", "tcpv6:[::1]", "1.3"])
+    testing.assertEqual((o.address, o.port, o.transport_domain, o.peer), ("::1", 161, "tcp6", "tcpv6:[::1]"))
+    testing.assertTrue(o.is_tcp())
+    testing.assertFalse(p(["get", "-c", "x", "h", "1.3"]).is_tcp())
+    fails(["get", "-c", "x", "tls:h:161", "1.3"],
+          "Unsupported transport in agent address: tls:h:161 (only udp, udp6, tcp and tcp6)")
+    fails(["get", "-c", "x", "tcp:h:0", "1.3"], "Invalid port in agent address: tcp:h:0")
     fails(["get", "-c", "x", "h:99999", "1.3"], "Invalid port in agent address: h:99999")
-    # traps and informs default to port 162
+    # traps and informs default to port 162, over TCP too
     testing.assertEqual(p(["trap", "-c", "x", "h", "", "1.3"]).port, 162)
     testing.assertEqual(p(["inform", "-c", "x", "h", "", "1.3"]).port, 162)
     testing.assertEqual(p(["trap", "-c", "x", "h:16164", "", "1.3"]).port, 16164)
+    testing.assertEqual(p(["trap", "-c", "x", "tcp:h", "", "1.3"]).port, 162)
 
 def _test_oids() -> None:
     o = p(["getnext", "-c", "x", "h", "1.3.6.1.2.1.1.1.0", ".1.3.6.1.2.1.1.5.0", "0.0", "2.999.4294967295"])
@@ -686,6 +707,8 @@ def _test_trap_v3() -> None:
 
 # agent and trapd ###################################################################################
 
+PORT_0_TCP = "--port 0 is not supported with --tcp (the port picked for it cannot be learned)"
+
 def _test_agent_options() -> None:
     a = p(["agent"])
     testing.assertEqual(a.snmprec, "interop/dataset/actsnmp.snmprec")
@@ -694,6 +717,7 @@ def _test_agent_options() -> None:
     testing.assertFalse(a.users_given)
     testing.assertEqual(a.server_engine_id, h("80001f8880616374736e6d7061"))
     testing.assertEqual((a.bind_address, a.listen_port), ("127.0.0.1", 16163))
+    testing.assertFalse(a.listen_tcp)
     b = p(["agent", "--snmprec", "x.snmprec", "--write-rules=r.tsv", "--users", "u.tsv", "--engine-id",
            "0x8000000001020304", "--port=0", "--bind", "::1", "-c", "ro", "-w", "rw"])
     testing.assertEqual((b.snmprec, b.write_rules, b.users), ("x.snmprec", "r.tsv", "u.tsv"))
@@ -706,6 +730,12 @@ def _test_agent_options() -> None:
     fails(["agent", "--port", "70000"], "Invalid port after --port: 70000")
     fails(["agent", "--engine-id", "12"], "Bad engine ID value after --engine-id flag.")
     fails(["agent", "--bind="], "Invalid address after --bind")
+    c = p(["agent", "--tcp", "--port", "1161", "--bind", "::1"])
+    testing.assertTrue(c.listen_tcp)
+    testing.assertEqual((c.bind_address, c.listen_port), ("::1", 1161))
+    testing.assertTrue(p(["agent", "--tcp"]).listen_tcp)
+    testing.assertTrue(fails(["agent", "--tcp", "--port", "0"], PORT_0_TCP).usage)
+    fails(["agent", "--port=0", "--tcp"], PORT_0_TCP)
 
 def _test_trapd_options() -> None:
     t = p(["trapd"])
@@ -720,6 +750,11 @@ def _test_trapd_options() -> None:
     testing.assertTrue(u.users_given)
     testing.assertEqual(u.output.string_format, fmt.STRING_HEX)
     fails(["trapd", "--snmprec", "x"], "unrecognized option '--snmprec'")
+    v = p(["trapd", "--tcp", "--port", "16166"])
+    testing.assertTrue(v.listen_tcp)
+    testing.assertEqual(v.listen_port, 16166)
+    testing.assertFalse(t.listen_tcp)
+    fails(["trapd", "--tcp", "--port", "0"], PORT_0_TCP)
     fails(["trapd", "-w", "x"], "actsnmp trapd: invalid option -- 'w'")
 
 
@@ -742,6 +777,10 @@ def _test_commands() -> None:
     testing.assertTrue(p(["set", "-h"]).help)
     testing.assertTrue("TYPE" in cliopts.usage("set"))
     testing.assertTrue("-Cr<N>" in cliopts.usage("bulkwalk"))
+    for c in ["get", "walk", "trap", "inform"]:
+        testing.assertTrue("AGENT                 [udp:|udp6:|tcp:|tcp6:]HOST[:PORT]" in cliopts.usage(c), c)
+    for c in ["agent", "trapd"]:
+        testing.assertTrue("[--tcp]" in cliopts.usage(c) and "\n  --tcp " in cliopts.usage(c), c)
 
 def _test_repr_hides_secrets() -> None:
     o = p(["get", "-v3", "-l", "authPriv", "-u", "u", "-A", "secretpass1", "-X", "secretpass2", "h", "1.3"])

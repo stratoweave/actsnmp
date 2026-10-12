@@ -7,6 +7,7 @@ for byte.
 """
 
 import testing
+import time
 
 import actsnmp
 import agent
@@ -21,7 +22,7 @@ import notify
 import pdu
 import security
 import values
-from actsnmp import Command, TrapPrinter
+from actsnmp import Command, TcpWatch, TrapPrinter
 from agent import Agent, AgentConfig, Faults
 from client import Client
 from cliopts import CliOptions
@@ -30,9 +31,9 @@ from notify import Notification
 from oid import Oid
 from receiver import NotificationReceiver, ReceiverConfig
 from security import Usm
-from transport import MemNet
+from transport import MemNet, Transport
 from values import Counter64, Integer, IpAddress, ObjectIdentifier, OctetString, Opaque, VarBind
-from testutil import h, read_text
+from testutil import h, outcome, read_text, report
 
 AGENT = "10.0.0.1"
 MANAGER = "10.0.0.2"
@@ -631,6 +632,241 @@ def _test_trapd_text() -> None:
                         "NOTIFICATION v1 TRAP community=\"public\" enterprise=.1.3.6.1.4.1.8072.9999 agent=192.0.2.1"
                         + " generic=6 specific=42 uptime=12345 trapoid=.1.3.6.1.4.1.8072.9999.0.42\n"
                         + EP + ".2.1.0 = Hex-STRING: 61 00\nEND\n")
+
+
+# TCP ###############################################################################################
+
+def _now() -> float:
+    # Monotonic time in seconds
+    return float(time.monotonic_ns()) / 1000000000.0
+
+proc def start_cli(mn: MemNet, port: int, args: list[str], report: action(Result) -> None) -> Command:
+    """Start one client command over MemNet from MANAGER:port, like run_cli, and return its Command"""
+    cap = Capture(report)
+    o = cliopts.parse(["actsnmp"] + args)
+    c = actsnmp.new_client(None, o, actsnmp.security_of(o), mn.client(MANAGER, port, o.address, o.port))
+    return Command(o, c, cap.out, cap.err, cap.done)
+
+def _test_tcp_texts() -> None:
+    """Failed TCP connections in net-snmp's words, the connect timeouts, host lookups and the listening texts"""
+    refused = "TCP connection to 127.0.0.1:161 failed: connection refused"
+    testing.assertEqual(actsnmp.connect_failure(refused), "Connection refused")
+    testing.assertEqual(actsnmp.connect_failure("TCP connection to [::1]:161 failed: host is unreachable"),
+                        "No route to host")
+    testing.assertEqual(actsnmp.connect_failure("TCP connection to 10.0.0.1:161 failed: no connection within 3 s"),
+                        "Connection timed out")
+    testing.assertEqual(actsnmp.connect_failure("TCP connection to 10.0.0.1:161 failed: network is unreachable"),
+                        "Network is unreachable")
+    for other in ["TCP connection to 10.0.0.1:161 closed by the peer",
+                  "TCP connection to 10.0.0.1:161 lost: broken pipe",
+                  "TCP setup for localhost:161 failed: not an IPv4 or IPv6 address",
+                  "TCP connection to 10.0.0.1:161 presumed dead: nothing received for 1.0 s after sending; reconnecting",
+                  "TCP send queue for 10.0.0.1:161 is full; message dropped",
+                  "TCP setup for 10.0.0.1:0 failed: port 0 is outside 1..65535",
+                  "UDP receive error: connection refused"]:
+        testing.assertEqual(actsnmp.connect_failure(other), "", other)
+    o = cliopts.parse(["actsnmp", "get", "-c", "public", "-t", "2", "-r", "3", "tcp:h:1161", "1.3"])
+    testing.assertEqual(actsnmp.unknown_host_text(o, "Connection refused"),
+                        "snmpget: Unknown host (tcp:h:1161) (Connection refused)\n")
+    testing.assertEqual(actsnmp.unknown_host_text(o, ""), "snmpget: Unknown host (tcp:h:1161)\n")
+    # a request's connection may take longer than all its tries, a trap's one -t
+    testing.assertEqual(actsnmp.tcp_connect_timeout(o), 10.0)
+    trap = cliopts.parse(["actsnmp", "trap", "-c", "public", "-t", "2", "-r", "3", "tcp:h", "", "1.3"])
+    testing.assertEqual(actsnmp.tcp_connect_timeout(trap), 2.0)
+    inform = cliopts.parse(["actsnmp", "trap", "-Ci", "-c", "public", "-t", "2", "-r", "3", "tcp:h", "", "1.3"])
+    testing.assertEqual(actsnmp.tcp_connect_timeout(inform), 10.0)
+    slow = cliopts.parse(["actsnmp", "get", "-c", "public", "-t", "100", "tcp:h", "1.3"])
+    testing.assertEqual(actsnmp.tcp_connect_timeout(slow), actsnmp.TCP_CONNECT_MAX)
+    # udp6: and tcp6: hosts that are not IPv6 addresses, and tcp: names, are looked up
+    lookups: list[(str, bool)] = [("h", False), ("udp:h", False), ("127.0.0.1", False), ("udp6:h", True),
+                                  ("udp6:[::1]", False), ("udp6:127.0.0.1", True), ("tcp:h", True),
+                                  ("tcp:127.0.0.1", False), ("tcp:[::1]:161", False), ("tcp6:h", True),
+                                  ("tcp6:[::1]", False), ("tcp6:127.0.0.1", True), ("tcpv6:::ffff:10.0.0.1", False)]
+    for k in lookups:
+        a = cliopts.parse(["actsnmp", "get", "-c", "public", k.0, "1.3"])
+        testing.assertEqual(actsnmp.resolves_name(a), k.1, k.0)
+    # agent and trapd: the agent address of the TCP listener
+    texts: list[(list[str], str)] = [(["agent"], "127.0.0.1:16163"), (["agent", "--bind", "::1"], "::1:16163"),
+                                     (["agent", "--tcp"], "tcp:127.0.0.1:16163"),
+                                     (["trapd", "--tcp", "--bind", "::1"], "tcp6:[::1]:16165")]
+    for x in texts:
+        s = cliopts.parse(["actsnmp"] + x.0)
+        testing.assertEqual(actsnmp.listen_text(s, s.listen_port), x.1, " ".join(x.0))
+
+
+actor FakeLink():
+    """The far side of a fake transport: the test hands its receiver messages and errors"""
+    var _on_data: ?action(bytes, str, int) -> None = None
+    var _on_error: ?action(str, bool) -> None = None
+
+    def set_receiver(on_data: action(bytes, str, int) -> None, on_error: action(str, bool) -> None) -> None:
+        _on_data = on_data
+        _on_error = on_error
+
+    def deliver(data: bytes) -> None:
+        on_data = _on_data
+        if on_data is not None:
+            on_data(data, "10.0.0.1", 161)
+
+    def fail(text: str) -> None:
+        on_error = _on_error
+        if on_error is not None:
+            on_error(text, False)
+
+def fake_transport(f: FakeLink) -> Transport:
+    """A Transport whose receiver gets what the test hands f; sending does nothing"""
+    def _send(data: bytes) -> None:
+        pass
+    def _set_receiver(on_data: action(bytes, str, int) -> None, on_error: action(str, bool) -> None) -> None:
+        f.set_receiver(on_data, on_error)
+    def _close() -> None:
+        pass
+    return Transport(_send, _set_receiver, _close, source_checked=True)
+
+actor Recorder():
+    """What the owner of a watched transport and the failure callback received, in order"""
+    var _events: list[str] = []
+
+    def data(data: bytes, src_address: str, src_port: int) -> None:
+        _events.append("data %d octets from " % len(data) + src_address + ":%d" % src_port)
+
+    def error(text: str, fatal: bool) -> None:
+        _events.append("error " + text + (" (fatal)" if fatal else ""))
+
+    def failed(reason: str) -> None:
+        _events.append("failed: " + reason)
+
+    def up() -> None:
+        _events.append("up")
+
+    def events() -> list[str]:
+        return _events
+
+actor _test_tcp_watch(t: testing.AsyncT):
+    """TcpWatch passes everything on and reports a failed connection before any message, and one that is up, once"""
+    t.timeout(10.0)
+    refused = "TCP connection to 10.0.0.1:161 failed: connection refused"
+    closed = "TCP connection to 10.0.0.1:161 closed by the peer"
+    broken = "TCP connection to 10.0.0.1:161 lost: broken pipe"
+
+    f1 = FakeLink()
+    w1 = TcpWatch()
+    t1 = w1.watch(fake_transport(f1))
+    r1 = Recorder()
+    f2 = FakeLink()
+    w2 = TcpWatch()
+    t2 = w2.watch(fake_transport(f2))
+    r2 = Recorder()
+
+    def check() -> None:
+        e1 = r1.events()
+        e2 = r2.events()
+        def checks() -> None:
+            # a connection lost after it was up is no failed connection; registered after the
+            # failure, the callback still gets it, once
+            testing.assertEqual(e1, ["error " + closed, "error " + broken, "error " + refused,
+                                     "error TCP connection to 10.0.0.1:161 failed: network is unreachable",
+                                     "failed: Connection refused"])
+            # once the agent has answered, a failed connection is only passed on; the connection that
+            # came up is reported once, also to a callback registered afterwards
+            testing.assertEqual(e2, ["data 2 octets from 10.0.0.1:161", "error " + refused, "up"])
+        report(t, outcome(checks))
+
+    def late_registration() -> None:
+        w1.on_failure(r1.failed)
+        w2.on_connect(r2.up)
+        after 0.1: check()
+
+    t1.set_receiver(r1.data, r1.error)
+    t2.set_receiver(r2.data, r2.error)
+    w2.on_failure(r2.failed)
+    f1.fail(closed)
+    f1.fail(broken)
+    f1.fail(refused)
+    f1.fail("TCP connection to 10.0.0.1:161 failed: network is unreachable")
+    f2.deliver(b"\x30\x00")
+    f2.fail(refused)
+    w2.connected()
+    w2.connected()
+    after 0.2: late_registration()
+
+actor _test_tcp_commands(t: testing.AsyncT):
+    """Over TCP: connection_failed() ends a command with net-snmp's Unknown host; a trap waits for connected() or -t"""
+    t.timeout(30.0)
+    mn = MemNet()
+    var results: dict[str, Result] = {}
+    var trap_cmd: ?Command = None
+    var started = 0.0
+    var trap_wait = 0.0
+    var up_wait = 0.0
+    var blocks = ""
+
+    def check() -> None:
+        def checks() -> None:
+            g = results["get"]
+            testing.assertEqual((g.out, g.err, g.code),
+                                ("", "snmpget: Unknown host (tcp:10.0.0.77) (Connection refused)\n", 1))
+            f = results["failed trap"]
+            testing.assertEqual((f.out, f.err, f.code),
+                                ("", "snmptrap: Unknown host (tcp:" + RECEIVER + ") (Connection refused)\n", 1))
+            w = results["trap"]
+            testing.assertEqual((w.out, w.err, w.code), ("", "", 0))
+            # without a report from the connection, the trap waited -t plus TRAP_LINGER
+            testing.assertTrue(trap_wait >= 0.2 + actsnmp.TRAP_LINGER - 0.05, "trap waited %f s" % trap_wait)
+            u = results["trap after connected"]
+            testing.assertEqual((u.out, u.err, u.code), ("", "", 0))
+            # with -t 5, TRAP_LINGER after the connection came up
+            testing.assertTrue(up_wait >= actsnmp.TRAP_LINGER - 0.05 and up_wait < 2.0, "trap waited %f s" % up_wait)
+            # MemNet carried the three traps; only the TCP connection of the second one was reported failed
+            testing.assertEqual(sorted([b for b in blocks.split("END\n") if b != ""]),
+                                ["NOTIFICATION v2c TRAP2 community=\"public\" uptime=%d trapoid=.1.3.6.1.6.3.1.1.5.1\n" % u
+                                 for u in [7, 8, 9]])
+        report(t, outcome(checks))
+
+    proc def _done(name: str, r: Result) -> None:
+        results[name] = r
+        if len(results) == 4:
+            check()
+
+    def got(r: Result) -> None:
+        _done("get", r)
+
+    def trapped(r: Result) -> None:
+        trap_wait = _now() - started
+        _done("trap", r)
+
+    def trap_failed(r: Result) -> None:
+        _done("failed trap", r)
+
+    def trapped_up(r: Result) -> None:
+        up_wait = _now() - started
+        _done("trap after connected", r)
+
+    def printed(text: str) -> None:
+        blocks = text
+
+    def refuse_trap() -> None:
+        c = trap_cmd
+        if c is not None:
+            c.connection_failed("Connection refused")
+
+    trapd = cliopts.parse(["actsnmp", "trapd", "--canon"])
+    printer = TrapPrinter(trapd, Blocks(3, printed).out)
+    config = ReceiverConfig(["public"], [], [], h(RECEIVER_ENGINE), 1)
+    rcv = NotificationReceiver(mn.server(RECEIVER, 162), config, printer.on_notification, None)
+    # nothing listens on 10.0.0.77, and the request would time out only after 5 s
+    get_cmd = start_cli(mn, 45000, ["get", "-v2c", "-c", "public", "-t", "5", "tcp:10.0.0.77", "1.3.6.1.2.1.1.1.0"],
+                        got)
+    get_cmd.connection_failed("Connection refused")
+    started = _now()
+    start_cli(mn, 45001, ["trap", "-v2c", "-c", "public", "-t", "0.2", "tcp:" + RECEIVER, "7", "1.3.6.1.6.3.1.1.5.1"],
+              trapped)
+    trap_cmd = start_cli(mn, 45002, ["trap", "-v2c", "-c", "public", "-t", "0.2", "tcp:" + RECEIVER, "8",
+                                     "1.3.6.1.6.3.1.1.5.1"], trap_failed)
+    up_cmd = start_cli(mn, 45003, ["trap", "-v2c", "-c", "public", "-t", "5", "tcp:" + RECEIVER, "9",
+                                   "1.3.6.1.6.3.1.1.5.1"], trapped_up)
+    up_cmd.connected()
+    after 0.05: refuse_trap()
 
 
 # Helpers ###########################################################################################

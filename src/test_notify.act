@@ -592,6 +592,18 @@ def _test_notification_eq() -> None:
     b.context_name = b"x"
     testing.assertNotEqual(a, b)
 
+def _test_notification_source() -> None:
+    a = sample()
+    testing.assertEqual(a.source(), "10.0.0.1:162")
+    a.source_address = "2001:db8::1"
+    testing.assertEqual(a.source(), "[2001:db8::1]:162")
+    # a notification that arrived on TCP session 3 (transport.tcp_server_transport())
+    a.source_address = ""
+    a.source_port = 3
+    testing.assertEqual(a.source(), "session-3")
+    testing.assertTrue(repr(a).startswith("Notification(version=0, TRAP, source=session-3, community=<6 octets>"),
+                       repr(a))
+
 def _test_notification_repr() -> None:
     r = repr(sample())
     testing.assertFalse("secret" in r, r)

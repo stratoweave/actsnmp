@@ -7,10 +7,10 @@
 #   interop/up.sh snmpd tools     # only some services
 #
 # Services (all --network host, loopback only):
-#   snmpd      net-snmp agent        udp 127.0.0.1:16161, udp6 [::1]:16161, tcp 127.0.0.1:16161
+#   snmpd      net-snmp agent        udp/tcp 127.0.0.1:16161, udp6/tcp6 [::1]:16161
 #   snmpsim    snmpsim responder     udp 127.0.0.1:16162, udp6 [::1]:16162
-#   snmptrapd  net-snmp trap rcvr    udp 127.0.0.1:16164, udp6 [::1]:16164
-# (udp 127.0.0.1:16163 / 16165 are left free for actsnmp agent / actsnmp trapd)
+#   snmptrapd  net-snmp trap rcvr    udp/tcp 127.0.0.1:16164, udp6/tcp6 [::1]:16164
+# (ports 16163 / 16165 are left free for actsnmp agent / actsnmp trapd)
 #   tools      idle container used by nsnmp.sh / pysnmp.sh (docker exec)
 set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"

@@ -9,7 +9,9 @@ interop/clicheck.sh. Every case runs the same argument list twice:
 
 against the lab agents (snmpd 127.0.0.1:16161, snmpsim 127.0.0.1:16162, both
 with host networking), a closed port (127.0.0.1:16169) or the lab snmptrapd,
-and compares stdout, stderr and the exit code byte for byte.
+and compares stdout, stderr and the exit code byte for byte. The "tcp" section
+runs the same kind of cases with tcp: and tcp6: addresses (RFC 3430) against
+snmpd and snmptrapd, which listen on TCP too (snmpsim does not).
 
 A case marked "known" is a documented difference (its reason is printed): it
 is reported as KNOWN when the outputs differ, and as FIXED? when they no
@@ -28,7 +30,7 @@ usage: clicheck.py [--cli PATH] [--quick] [--filter REGEX] [--section LIST] [--l
   --quick         skip the slow whole-dataset GETNEXT walks
   --filter REGEX  only cases whose "section/name" matches
   --section LIST  only these sections (comma separated): dataset, output, walk-options, address, timeout,
-                  v3-errors, error-status, pathological, local-errors, set, mib
+                  v3-errors, error-status, pathological, local-errors, set, tcp, mib
   --list          print the cases and exit
   --report FILE   also write the markdown report to FILE
   --jobs N        cases of read-only sections run N at a time (default 4)
@@ -56,6 +58,12 @@ D6 = "udp6:[::1]:16161"
 S6 = "udp6:[::1]:16162"
 X = "127.0.0.1:16169"                    # nothing listens here
 TRAPD = "127.0.0.1:16164"                # the lab's snmptrapd
+DT = "tcp:" + D                          # snmpd and snmptrapd over TCP, a closed TCP port
+DT6 = "tcp6:[::1]:16161"
+XT = "tcp:" + X
+XT6 = "tcp6:[::1]:16169"
+TRAPDT = "tcp:" + TRAPD
+TRAPDT6 = "tcp6:[::1]:16164"
 SNMPD_ENGINE = "0x80001f8880616374736e6d7064"
 SNMPSIM_ENGINE = "0x80004fb805616374736e6d7073696d"
 AUTH = "authpass123"
@@ -111,6 +119,9 @@ K_TRAP_UPTIME = ("snmptrap ignores a v2c UPTIME it cannot read (the trap goes ou
 K_NO_DNS = "actsnmp resolves no host names in values (a v1 AGENT-ADDR must be an IPv4 address)"
 K_ERRNO = "net-snmp appends a stale errno text (No such file or directory) to this error"
 K_CE_LAST = "-CE as the last argument crashes snmpwalk (SIGSEGV); actsnmp reports the missing end OID"
+K_TCP_REFUSED = ("snmptrap and snmpinform print an empty error (\"snmptrap: \") when the TCP connection is refused; "
+                 "actsnmp prints the reason as snmpget does (\"snmptrap: Unknown host (tcp:HOST:PORT) (Connection "
+                 "refused)\")")
 
 
 class Case:
@@ -135,6 +146,9 @@ class Case:
 
 
 CASES = []
+# the scalars B.1 .. B.9 of the dataset
+SCALARS = ["%s.%d.%d.0" % (B, g, n) for g, cnt in ((1, 19), (2, 16), (3, 8), (4, 4), (5, 5), (6, 4), (7, 4), (8, 7),
+                                                  (9, 3)) for n in range(1, cnt + 1)]
 
 
 def case(section, name, tool, args, **kw):
@@ -156,12 +170,10 @@ def dataset_cases():
         case(sec, "%s bulkwalk v2c IPv6 B.12" % ag, "bulkwalk", ["-On"] + V2 + [a6, B + ".12"])
         case(sec, "%s bulkwalk v3 SHA-512/AES-256-C IPv6 B.1" % ag, "bulkwalk",
              ["-On"] + U_SHA512_AES256C + [a6, B + ".1"])
-        scalars = ["%s.%d.%d.0" % (B, g, n) for g, cnt in ((1, 19), (2, 16), (3, 8), (4, 4), (5, 5), (6, 4),
-                                                          (7, 4), (8, 7), (9, 3)) for n in range(1, cnt + 1)]
-        case(sec, "%s get 70 scalars v2c" % ag, "get", ["-On"] + V2 + [a] + scalars)
-        case(sec, "%s get 70 scalars v3 MD5/AES-192" % ag, "get", ["-On"] + U_MD5_AES192 + [a] + scalars)
+        case(sec, "%s get 70 scalars v2c" % ag, "get", ["-On"] + V2 + [a] + SCALARS)
+        case(sec, "%s get 70 scalars v3 MD5/AES-192" % ag, "get", ["-On"] + U_MD5_AES192 + [a] + SCALARS)
         case(sec, "%s get 70 scalars v1 (Counter64: noSuchName, fixed and resent)" % ag, "get",
-             ["-On"] + V1 + [a] + scalars)
+             ["-On"] + V1 + [a] + SCALARS)
         case(sec, "%s getnext 3 varbinds" % ag, "getnext", ["-On"] + V2 + [a, B, B + ".1.19.0", B + ".10.1.1"])
         case(sec, "%s getnext 3 varbinds v1" % ag, "getnext", ["-On"] + V1 + [a, B + ".7.4.0", B + ".1.19.0",
                                                                              B + ".10.1.1"])
@@ -262,8 +274,7 @@ def address_cases():
     case(sec, "localhost", "get", ["-On"] + V2 + ["localhost:16161", B + ".1.2.0"])
     case(sec, "default port 161 (timeout)", "get", ["-On"] + V2 + QUICK_FAIL + ["127.0.0.1", B + ".1.2.0"])
     case(sec, "udp6: timeout text", "walk", ["-On"] + V2 + QUICK_FAIL + ["udp6:[::1]:16169", B])
-    case(sec, "tcp: transport", "get", ["-On"] + V2 + ["tcp:" + D, B + ".1.2.0"],
-         known="actsnmp supports UDP only (snmpd also listens on TCP)")
+    case(sec, "tcp: prefix", "get", ["-On"] + V2 + [DT, B + ".1.2.0"])
 
 
 def timeout_cases():
@@ -412,6 +423,83 @@ def set_cases():
     for ag, a in (("snmpd", D), ("snmpsim", S)):
         case(sec, "%s restore the initial values" % ag, "set", ["-On"] + V2W + [a] + restore, serial=True)
         case(sec, "%s initial values" % ag, "bulkwalk", ["-On"] + V2 + [a, W], serial=True)
+
+
+def tcp_cases():
+    # SNMP over TCP (RFC 3430): snmpd and snmptrapd on tcp:127.0.0.1 and tcp6:[::1], nothing on port 16169. net-snmp's
+    # tools use one connection per command; so does actsnmp, unless a request goes 2 x -t without an answer.
+    sec = "tcp"
+    W = B + ".20"
+    case(sec, "get 70 scalars v2c", "get", ["-On"] + V2 + [DT] + SCALARS)
+    case(sec, "get 70 scalars v3 SHA-256/AES (discovery)", "get", ["-On"] + U_SHA256_AES + [DT] + SCALARS)
+    case(sec, "get 70 scalars v1 (Counter64: noSuchName, fixed and resent)", "get", ["-On"] + V1 + [DT] + SCALARS)
+    case(sec, "get missing objects v2c", "get", ["-On"] + V2 + [DT, B + ".1.1.1", B + ".99.0", B + ".1.1.0"])
+    case(sec, "getnext 3 varbinds", "getnext", ["-On"] + V2 + [DT, B, B + ".1.19.0", B + ".10.1.1"])
+    case(sec, "bulkget N=1 R=3", "bulkget", ["-On", "-Cn1", "-Cr3"] + V2 + [DT, B + ".1", B + ".10.1.2"])
+    case(sec, "bulkget R=200 (agent cap)", "bulkget", ["-On", "-Cr200"] + V2 + [DT, B + ".12"])
+    case(sec, "bulkwalk v2c B", "bulkwalk", ["-On"] + V2 + [DT, B])
+    case(sec, "bulkwalk v3 SHA-256/AES B", "bulkwalk", ["-On"] + U_SHA256_AES + [DT, B])
+    case(sec, "bulkwalk v3 noAuthNoPriv B.10", "bulkwalk", ["-On"] + U_NOAUTH + [DT, B + ".10"])
+    case(sec, "walk v2c B.10", "walk", ["-On"] + V2 + [DT, B + ".10"])
+    case(sec, "walk v1 B.11", "walk", ["-On"] + V1 + [DT, B + ".11"])
+    case(sec, "walk v3 MD5/DES B.11", "walk", ["-On"] + U_MD5_DES + [DT, B + ".11"])
+    case(sec, "table B.10 v2c (sorted, vs snmpbulkwalk)", "table",
+         ["-On"] + V2 + [DT] + ["%s.10.1.%d" % (B, c) for c in range(1, 8)],
+         cmp="sorted", net_tool="snmpbulkwalk", net_args=["-On"] + V2 + [DT, B + ".10.1"])
+    case(sec, "tcp6: bulkwalk v2c B.12", "bulkwalk", ["-On"] + V2 + [DT6, B + ".12"])
+    case(sec, "tcp6: get v3 SHA-512/AES-256-C", "get", ["-On"] + U_SHA512_AES256C + [DT6] + SCALARS[:5])
+    case(sec, "tcp: localhost", "get", ["-On"] + V2 + ["tcp:localhost:16161", B + ".1.2.0"])
+    case(sec, "tcp6: localhost", "get", ["-On"] + V2 + ["tcp6:localhost:16161", B + ".1.2.0"])
+    case(sec, "tcp: unknown host", "get", ["-On"] + V2 + ["tcp:nosuchhost.invalid:161", B + ".1.1.0"])
+    # the agent does not answer: timeouts on a live connection
+    case(sec, "unknown community", "get", ["-On", "-v2c", "-c", "nosuch"] + QUICK_FAIL + [DT, B + ".1.1.0"])
+    case(sec, "unknown community v1 walk", "walk", ["-On", "-v1", "-c", "nosuch"] + QUICK_FAIL + [DT, B])
+    case(sec, "v3 wrong priv password", "get",
+         ["-On"] + v3("u_sha_aes", "authPriv", "SHA", "AES", privpass="wrongpass1") + QUICK_FAIL + [DT, B + ".1.1.0"])
+    # Reports
+    case(sec, "v3 unknown user", "get", ["-On"] + v3("u_nosuch", "noAuthNoPriv") + QUICK_FAIL + [DT, B + ".1.1.0"])
+    case(sec, "v3 wrong auth password", "get", ["-On"] + v3("u_sha", "authNoPriv", "SHA", authpass="wrongpass1")
+         + QUICK_FAIL + [DT, B + ".1.1.0"])
+    case(sec, "v3 level above the user's", "get", ["-On"] + v3("u_sha", "authPriv", "SHA", "AES") + QUICK_FAIL
+         + [DT, B + ".1.1.0"])
+    # a refused connection ends the command at once (-t 5: a timeout would take 30 s)
+    for t, extra in (("get", [B + ".1.1.0"]), ("getnext", [B + ".1.1.0"]), ("bulkget", [B + ".1"]),
+                     ("walk", [B + ".1"]), ("bulkwalk", [B + ".1"]), ("set", [W + ".1.0", "i", "1"])):
+        case(sec, "%s refused" % t, t, ["-On", "-t", "5"] + V2 + [XT] + extra, timeout=10)
+    case(sec, "get v3 refused (discovery)", "get", ["-On", "-t", "5"] + U_SHA + [XT, B + ".1.1.0"], timeout=10)
+    case(sec, "walk tcp6: refused", "walk", ["-On", "-t", "5"] + V2 + [XT6, B + ".1"], timeout=10)
+    # (each tool names itself in the error)
+    case(sec, "table refused", "table", ["-On", "-t", "5"] + V2 + [XT, B + ".10.1.1"], timeout=10,
+         net_tool="snmpbulkwalk", net_args=["-On", "-t", "5"] + V2 + [XT, B + ".10.1.1"],
+         normalize=[(r"(?m)^snmp(?:bulkwalk|table): ", "snmp<TOOL>: ")])
+    case(sec, "trap refused", "trap", ["-On", "-t", "5"] + V2 + [XT, "1", ".1.3.6.1.6.3.1.1.5.1"], timeout=10,
+         known=K_TCP_REFUSED)
+    case(sec, "trap v1 refused", "trap", ["-On", "-t", "5"] + V1 + [XT, ".1.3.6.1.4.1.8072", "192.0.2.1", "6", "1",
+                                                                   "1"], timeout=10, known=K_TCP_REFUSED)
+    case(sec, "inform refused", "inform", ["-On", "-t", "5"] + V2 + [XT, "1", ".1.3.6.1.6.3.1.1.5.1"], timeout=10,
+         known=K_TCP_REFUSED)
+    # notifications to snmptrapd: both tools print nothing (trapdcheck.sh checks what snmptrapd receives)
+    case(sec, "trap v2c to snmptrapd", "trap", ["-On"] + V2 + [TRAPDT, "1", ".1.3.6.1.4.1.8072.9999.3.0.98",
+                                                              B + ".1.1.0", "i", "1"])
+    case(sec, "trap v1 to snmptrapd", "trap", ["-On"] + V1 + [TRAPDT, ".1.3.6.1.4.1.8072.9999", "192.0.2.1", "6",
+                                                             "98", "1"])
+    case(sec, "trap tcp6: to snmptrapd", "trap", ["-On"] + V2 + [TRAPDT6, "1", ".1.3.6.1.4.1.8072.9999.3.0.98"])
+    case(sec, "inform to snmptrapd", "inform", ["-On"] + V2 + [TRAPDT, "1", ".1.3.6.1.4.1.8072.9999.3.0.99"])
+    case(sec, "inform tcp6: to snmptrapd", "inform", ["-On"] + V2 + [TRAPDT6, "1", ".1.3.6.1.4.1.8072.9999.3.0.99"])
+    case(sec, "inform v3 to snmptrapd (discovery)", "inform", ["-On"] + U_SHA_AES
+         + [TRAPDT, "1", ".1.3.6.1.4.1.8072.9999.3.0.99"])
+    case(sec, "inform v3 wrong password to snmptrapd", "inform",
+         ["-On"] + v3("u_sha", "authNoPriv", "SHA", authpass="wrongpass1") + QUICK_FAIL
+         + [TRAPDT, "1", ".1.3.6.1.4.1.8072.9999.3.0.99"])
+    # SET, then the initial values again
+    case(sec, "set INTEGER", "set", ["-On"] + V2W + [DT, W + ".1.0", "i", "99"], serial=True)
+    case(sec, "set v3 two varbinds", "set", ["-On"] + U_SHA_AES + [DT, W + ".1.0", "i", "1234", W + ".2.0", "s",
+                                                                    "tcp"], serial=True)
+    case(sec, "set read-only object", "set", ["-On"] + V2W + [DT, W + ".7.0", "i", "1"], serial=True)
+    case(sec, "set v1 wrong type", "set", ["-On"] + V1W + [DT, W + ".1.0", "s", "foo"], serial=True)
+    case(sec, "restore the initial values", "set", ["-On"] + V2W + [DT, W + ".1.0", "i", "42", W + ".2.0", "s",
+                                                                    "initial"], serial=True)
+    case(sec, "initial values", "bulkwalk", ["-On"] + V2 + [DT, W], serial=True)
 
 
 def pathological_cases():
@@ -657,6 +745,7 @@ def build_cases():
     pathological_cases()
     local_error_cases()
     set_cases()
+    tcp_cases()
     mib_cases()
 
 
@@ -1196,7 +1285,7 @@ def main(argv):
 
 
 SECTIONS = ("dataset", "output", "walk-options", "address", "timeout", "v3-errors", "error-status", "pathological",
-            "local-errors", "set", "mib")
+            "local-errors", "set", "tcp", "mib")
 
 
 def run_all(cli, quick, filt, sections, listing, report, jobs, verbose):

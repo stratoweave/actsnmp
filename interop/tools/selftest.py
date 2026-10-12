@@ -21,6 +21,8 @@ Agent mode - only the generic checks against the given agent(s):
               [--users u_noauth,u_sha_aes,...] [--skip v1,set,negative,...]
   The agent must serve the shared dataset below 1.3.6.1.4.1.8072.9999.1 with
   communities public (ro) / private (rw on .20) and the lab's v3 users.
+  An agent over TCP (--agent acton=tcp:127.0.0.1:16163,tcp6:[::1]:16163) is
+  checked with net-snmp's tools alone (the lab's pysnmp tools speak UDP only).
 
 usage: selftest.py [--quick] [--record OUTDIR] [--agent NAME=ADDR[,ADDR6]]...
                    [--users LIST] [--skip LIST]
@@ -58,6 +60,8 @@ SKIP = set()
 class Agent:
     def __init__(self, name, addr, addr6=None, kind="custom"):
         self.name, self.addr, self.addr6, self.kind = name, addr, addr6, kind
+        # pysnmp_client.py speaks SNMP over UDP only
+        self.pysnmp = addr.split(":", 1)[0].lower() not in ("tcp", "tcp6", "tcpv6", "tcpipv6")
 
 
 LAB_AGENTS = [Agent("snmpd", "127.0.0.1:16161", "udp6:[::1]:16161", "snmpd"),
@@ -189,16 +193,20 @@ def test_communities(agents):
         for ver, comm, expect in cases:
             ok1, d1 = probe_ns(ag.addr, ["-v" + ver, "-c", comm])
             record(sec, "%s v%s %s net-snmp" % (ag.name, ver, comm), ok1 == expect, d1)
-            ok2, d2 = probe_py(ag.addr, ["-v", ver, "-c", comm])
-            record(sec, "%s v%s %s pysnmp" % (ag.name, ver, comm), ok2 == expect, d2)
+            if ag.pysnmp:
+                ok2, d2 = probe_py(ag.addr, ["-v", ver, "-c", comm])
+                record(sec, "%s v%s %s pysnmp" % (ag.name, ver, comm), ok2 == expect, d2)
         if ag.addr6:
             ok1, d1 = probe_ns(ag.addr6, ["-v2c", "-c", "public"])
             record(sec, "%s ipv6 v2c public net-snmp" % ag.name, ok1, d1)
-            ok2, d2 = probe_py(ag.addr6, ["-v", "2c", "-c", "public"])
-            record(sec, "%s ipv6 v2c public pysnmp" % ag.name, ok2, d2)
+            if ag.pysnmp:
+                ok2, d2 = probe_py(ag.addr6, ["-v", "2c", "-c", "public"])
+                record(sec, "%s ipv6 v2c public pysnmp" % ag.name, ok2, d2)
         if ag.kind == "snmpd":
             ok1, d1 = probe_ns("tcp:" + ag.addr, ["-v2c", "-c", "public"])
             record(sec, "snmpd tcp v2c public net-snmp", ok1, d1)
+            ok1, d1 = probe_ns("tcp6:" + ag.addr6.split(":", 1)[1], ["-v2c", "-c", "public"])
+            record(sec, "snmpd tcp6 v2c public net-snmp", ok1, d1)
             rc, lines, _ = ns("snmpget", ["-v2c", "-c", "sysonly", ag.addr,
                                           "1.3.6.1.2.1.1.5.0", PROBE_OID])
             record(sec, "snmpd v2c sysonly view", rc == 0 and len(lines) == 2
@@ -237,6 +245,9 @@ def test_v3_matrix(agents, quick, only_users):
                     continue
                 if client == "net-snmp" and u["level"] == "authPriv" and u["priv"] == "-":
                     row[key] = "n/a"   # 3DES: not supported by net-snmp
+                    continue
+                if client == "pysnmp" and not ag.pysnmp:
+                    row[key] = "n/a"   # the lab's pysnmp tools speak UDP only
                     continue
                 if client == "pysnmp" and quick:
                     row[key] = "skip"
@@ -320,21 +331,24 @@ def test_gets(agents):
         a = ag.addr
         rc, got, _ = ns("snmpget", ["-v2c", "-c", "public", a] + oids)
         compare(sec, "%s net-snmp GET %d scalars in one PDU" % (ag.name, len(oids)), got, exp)
-        rc, got, _ = py(["get", a] + oids)
-        compare(sec, "%s pysnmp GET %d scalars in one PDU" % (ag.name, len(oids)), got, exp)
+        if ag.pysnmp:
+            rc, got, _ = py(["get", a] + oids)
+            compare(sec, "%s pysnmp GET %d scalars in one PDU" % (ag.name, len(oids)), got, exp)
         rc, got, _ = ns("snmpgetnext", ["-v2c", "-c", "public", a, B, B + ".1.19.0",
                                         B + ".10.1.1"])
         e = [ds.canon_line(*recs[0]), ds.canon_line(*subtree(recs, ds.BASE + (2,))[0]),
              ds.canon_line(*subtree(recs, ds.BASE + (10, 1, 1))[0])]
         compare(sec, "%s net-snmp GETNEXT 3 varbinds" % ag.name, got, e)
-        rc, got, _ = py(["getnext", a, B, B + ".1.19.0", B + ".10.1.1"])
-        compare(sec, "%s pysnmp GETNEXT 3 varbinds" % ag.name, got, e)
+        if ag.pysnmp:
+            rc, got, _ = py(["getnext", a, B, B + ".1.19.0", B + ".10.1.1"])
+            compare(sec, "%s pysnmp GETNEXT 3 varbinds" % ag.name, got, e)
         rc, got, _ = ns("snmpbulkget", ["-v2c", "-c", "public", "-Cn1", "-Cr3", a,
                                         B + ".1", B + ".10.1.2"])
         e = [ds.canon_line(*recs[0])] + expected_lines(subtree(recs, ds.BASE + (10, 1, 2))[:3])
         compare(sec, "%s net-snmp GETBULK N=1 R=3" % ag.name, got, e)
-        rc, got, _ = py(["-Cn", "1", "-Cr", "3", "getbulk", a, B + ".1", B + ".10.1.2"])
-        compare(sec, "%s pysnmp GETBULK N=1 R=3" % ag.name, got, e)
+        if ag.pysnmp:
+            rc, got, _ = py(["-Cn", "1", "-Cr", "3", "getbulk", a, B + ".1", B + ".10.1.2"])
+            compare(sec, "%s pysnmp GETBULK N=1 R=3" % ag.name, got, e)
         rc, got, _ = ns("snmpget", ["-v2c", "-c", "public", a, B + ".99.0", B + ".1.1.0"])
         record(sec, "%s GET missing -> noSuch*" % ag.name,
                len(got) == 2 and got[0].split(" = ")[1] in ("noSuchObject", "noSuchInstance")
@@ -409,6 +423,8 @@ def test_walks(agents, quick):
                     ("net-snmp walk v1", lambda: ns("snmpwalk", ["-v1", "-c", "public", a, B]), exp_v1),
                     ("pysnmp walk v1", lambda: py(["-v", "1", "walk", a, B]), exp_v1),
                 ]
+        if not ag.pysnmp:
+            cases = [c for c in cases if not c[0].startswith("pysnmp ")]
         for name, fn, e in cases:
             t0 = time.time()
             rc, got, err = fn()
@@ -451,12 +467,13 @@ def test_sets(agents):
             ok = rc == 0 and got == [e] and get1(args[0]) == e
             record(sec, "%s net-snmp v2c set %s %s" % (ag.name, args[1], args[2] or '""'), ok,
                    " | ".join(got) or err.strip()[:150])
-        rc, got, err = py(v3args(U["u_sha_aes"]) + ["set", a, W + ".1.0", "i", "1234",
-                                                   W + ".2.0", "s", "py\"set"])
-        e = ["." + W + ".1.0 = INTEGER: 1234", "." + W + '.2.0 = STRING: "py\\"set"']
-        record(sec, "%s pysnmp v3 set 2 varbinds" % ag.name, rc == 0 and got == e
-               and get1(W + ".1.0") == e[0], " | ".join(got) or err[:150])
-        if "v1" not in SKIP:
+        if ag.pysnmp:
+            rc, got, err = py(v3args(U["u_sha_aes"]) + ["set", a, W + ".1.0", "i", "1234",
+                                                       W + ".2.0", "s", "py\"set"])
+            e = ["." + W + ".1.0 = INTEGER: 1234", "." + W + '.2.0 = STRING: "py\\"set"']
+            record(sec, "%s pysnmp v3 set 2 varbinds" % ag.name, rc == 0 and got == e
+                   and get1(W + ".1.0") == e[0], " | ".join(got) or err[:150])
+        if "v1" not in SKIP and ag.pysnmp:
             rc, got, err = py(["-v", "1", "-c", "private", "set", a, W + ".5.0", "g", "7"])
             e = ["." + W + ".5.0 = Gauge32: 7"]
             record(sec, "%s pysnmp v1 set" % ag.name, rc == 0 and got == e and get1(W + ".5.0") == e[0],

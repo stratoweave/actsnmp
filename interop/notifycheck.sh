@@ -4,9 +4,9 @@
 # to a receiver, normally "actsnmp trapd --canon" on udp 127.0.0.1:16165, and
 # compare what the receiver printed with the expected canonical blocks.
 #
-#   interop/notifycheck.sh [--receiver HOST:PORT] [--quick|--all-users] [--log FILE] [--wait SEC]
+#   interop/notifycheck.sh [--receiver ADDRESS] [--tcp] [--quick|--all-users] [--log FILE] [--wait SEC]
 #                          [--senders netsnmp,pysnmp]
-#   interop/notifycheck.sh --selftest [--quick|--all-users]
+#   interop/notifycheck.sh --selftest [--tcp] [--quick|--all-users]
 #                                                  # validate the sending side + the expected
 #                                                  # file against net-snmp snmptrapd (stand-in
 #                                                  # receiver on 16165 in the tools container)
@@ -18,6 +18,12 @@
 #   interop/expected/notify/matrix-all.txt    --all-users: v3 for all 43 net-snmp users (198)
 # (with --senders other than both, the expected subset goes to a temp file).
 #
+# --tcp        the receiver listens on TCP ("actsnmp trapd --tcp --canon"): the default
+#              receiver is tcp:127.0.0.1:16165, and only net-snmp sends (the lab's pysnmp
+#              tools speak UDP only); the expected subset goes to a temp file. Every notification
+#              comes on a connection of its own, and the receiver may take the connections
+#              in any order, so the blocks are compared in any order. A tcp: or tcp6:
+#              --receiver implies --tcp.
 # --log FILE   the receiver's --canon output; after sending, waits (max --wait SEC,
 #              default 10) until FILE holds as many NOTIFICATION blocks as expected,
 #              then compares the NOTIFICATION..END blocks of FILE (other lines are
@@ -32,7 +38,8 @@
 set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-receiver="127.0.0.1:$ACTSNMP_TRAPD_PORT"
+receiver=""
+tcp=0
 quick=()
 logfile=""
 selftest=0
@@ -42,18 +49,26 @@ senders="netsnmp,pysnmp"
 while [ $# -gt 0 ]; do
     case "$1" in
         --receiver) receiver="$2"; shift ;;
+        --tcp) tcp=1 ;;
         --quick|--all-users) quick=("$1") ;;
         --log) logfile="$2"; shift ;;
         --wait) wait_s="$2"; shift ;;
         --senders) senders="$2"; shift ;;
         --selftest) selftest=1 ;;
         --no-send) send=0 ;;
-        -h|--help) sed -n '2,34p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,37p' "$0"; exit 0 ;;
         *) die "unknown argument $1 (see --help)" ;;
     esac
     shift
 done
 if [ $send -eq 0 ] && [ -z "$logfile" ]; then die "--no-send needs --log FILE"; fi
+case "$receiver" in [Tt][Cc][Pp]*:*) tcp=1 ;; esac
+if [ $tcp -eq 1 ]; then
+    [ -n "$receiver" ] || receiver="tcp:127.0.0.1:$ACTSNMP_TRAPD_PORT"
+    [ "$senders" = "netsnmp,pysnmp" ] && senders=netsnmp
+    [ "$senders" = netsnmp ] || die "--tcp: only net-snmp sends over TCP (--senders netsnmp)"
+fi
+[ -n "$receiver" ] || receiver="127.0.0.1:$ACTSNMP_TRAPD_PORT"
 
 "$INTEROP_DIR/up.sh" tools
 NC=("$INTEROP_DIR/nsnmp.sh" python3 /opt/actsnmp/tools/notifycheck.py)
@@ -82,9 +97,22 @@ blocks() {  # only the NOTIFICATION ... END blocks of a receiver log
     awk '/^NOTIFICATION /{inb=1} inb{print} /^END$/{inb=0}' "$1"
 }
 
+sorted_blocks() {  # the NOTIFICATION ... END blocks of a file, sorted as wholes
+    awk '/^NOTIFICATION /{b=$0; next} /^END$/{print b "\037END"; next} {b=b "\037" $0}' "$1" \
+        | LC_ALL=C sort | tr '\037' '\n'
+}
+
 compare() {  # name got-file
-    if diff -u --label "$expected" --label "$1" "$expected" "$2" > "$tmp/diff"; then
-        echo "$1 == $(basename "$expected") ($nexp notifications): PASS"
+    local want="$expected" got="$2" order=""
+    if [ $tcp -eq 1 ]; then
+        sorted_blocks "$expected" > "$tmp/want-sorted.txt"
+        sorted_blocks "$2" > "$tmp/got-sorted.txt"
+        want="$tmp/want-sorted.txt"
+        got="$tmp/got-sorted.txt"
+        order=", in any order"
+    fi
+    if diff -u --label "$expected" --label "$1" "$want" "$got" > "$tmp/diff"; then
+        echo "$1 == $(basename "$expected") ($nexp notifications$order): PASS"
         return 0
     fi
     echo "$1 differs from $expected: **FAIL**"

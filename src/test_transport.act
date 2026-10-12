@@ -2,22 +2,34 @@
 
 The MemNet tests depend only on message order, except where a test waits
 NOTHING_WAIT seconds to see that nothing arrives or exercises delays. The
-UDP tests use loopback and skip IPv6 when the host has none.
+UDP and TCP tests use loopback and skip IPv6 when the host has none; the
+TCP connect timeout is a SYN to TEST-NET-1 (192.0.2.1), skipped when the
+host has no route there. A TCP listening socket cannot be closed or bound
+to port 0, so every TCP test listens on a port of its own range from
+TCP_PORTS on (testutil.ListenTcp).
 """
 
+import file
 import net
 import testing
 import time
 import transport
-from transport import Datagram, MemNet, NetFaults, NetStats, ServerTransport, Transport
-from transport import ip_octets, is_unreachable, mem_pair, normalize_address
-from testutil import pseudo_random, value_fails, outcome, report, report_env
+from transport import Datagram, MemNet, NetFaults, NetStats, ServerTransport, StreamFramer, Transport
+from transport import ip_octets, is_unreachable, mem_pair, message_length, normalize_address
+from testutil import Lcg, ListenTcp, h, pseudo_random, value_fails, outcome, report, report_env
 
 # Seconds a test waits to see that nothing (more) is delivered
 NOTHING_WAIT = 0.2
 
-# Watchdog for the UDP tests, below the timeout they ask the runner for
-UDP_WATCHDOG = 8.0
+# Watchdog for the UDP and TCP tests, below the timeout they ask the runner for
+SOCKET_WATCHDOG = 8.0
+
+# The TCP tests' ports: each test listens on the first free one of its own
+# TCP_RANGE ports from TCP_PORTS + k * TCP_RANGE, and TCP_CLOSED_PORT is
+# never listened on
+TCP_PORTS = 26100
+TCP_RANGE = 40
+TCP_CLOSED_PORT = 26099
 
 def _numbered(n: int) -> list[bytes]:
     return [str(i).encode() for i in range(n)]
@@ -38,6 +50,10 @@ proc def _skip_env(t: testing.EnvT, reason: str) -> None:
         t.skip(reason)
     except testing.AbortTest:
         pass
+
+proc def _open_fds(t: testing.EnvT) -> int:
+    # The number of open file descriptors of this process (the entries of /proc/self/fd)
+    return len(file.FS(file.FileCap(t.env.cap)).listdir("/proc/self/fd"))
 
 def _ipv6_unavailable(error: str) -> bool:
     # The errors a host without usable IPv6 loopback gives when binding ::1 or ::
@@ -77,6 +93,7 @@ def _test_ip_octets() -> None:
 def _test_is_unreachable() -> None:
     testing.assertTrue(is_unreachable(transport.REFUSED))
     testing.assertTrue(is_unreachable("UDP receive error: connection refused"))
+    testing.assertFalse(is_unreachable("TCP connection to 127.0.0.1:16161 failed: connection refused"))
     testing.assertFalse(is_unreachable("Failed to send UDP datagram: message too long"))
     testing.assertFalse(is_unreachable("UDP setup for 127.0.0.1:0 failed: port 0 is outside 1..65535"))
     testing.assertFalse(is_unreachable(""))
@@ -772,7 +789,7 @@ actor _test_fault_set_faults_releases_delayed(t: testing.AsyncT):
 actor _udp_roundtrip(t: testing.EnvT, listen_address: str, connect_address: str, optional_ipv6: bool):
     # Server on listen_address port 0; client to connect_address; one
     # datagram each way, sent before the client is connected
-    t.timeout(UDP_WATCHDOG + 2.0)
+    t.timeout(SOCKET_WATCHDOG + 2.0)
     ucap = net.UDPCap(net.NetCap(t.env.cap))
     var done = False
     var srv: ?ServerTransport = None
@@ -835,7 +852,7 @@ actor _udp_roundtrip(t: testing.EnvT, listen_address: str, connect_address: str,
     def watchdog() -> None:
         finish(AssertionError("UDP roundtrip timed out"))
 
-    after now UDP_WATCHDOG: watchdog()
+    after now SOCKET_WATCHDOG: watchdog()
     transport.udp_server_transport(net.UDPListenCap(ucap), listen_address, 0, on_ready, t.log_handler)
 
 
@@ -854,7 +871,7 @@ actor _test_udp_dual_stack_source_normalized(t: testing.EnvT):
 
 actor _test_udp_unreachable_then_usable(t: testing.EnvT):
     """ICMP port unreachable is a non-fatal error; the same transport then reaches a server on that port"""
-    t.timeout(UDP_WATCHDOG + 2.0)
+    t.timeout(SOCKET_WATCHDOG + 2.0)
     ucap = net.UDPCap(net.NetCap(t.env.cap))
     var done = False
     var port = 0
@@ -943,13 +960,13 @@ actor _test_udp_unreachable_then_usable(t: testing.EnvT):
     def watchdog() -> None:
         finish(AssertionError("timed out; errors: " + str(errors)))
 
-    after now UDP_WATCHDOG: watchdog()
+    after now SOCKET_WATCHDOG: watchdog()
     transport.udp_server_transport(net.UDPListenCap(ucap), "127.0.0.1", 0, on_first_ready, t.log_handler)
 
 
 actor _test_udp_hostname_queues_until_connected(t: testing.EnvT):
     """Datagrams sent while the client resolves a host name are queued and sent in order"""
-    t.timeout(UDP_WATCHDOG + 2.0)
+    t.timeout(SOCKET_WATCHDOG + 2.0)
     ucap = net.UDPCap(net.NetCap(t.env.cap))
     var done = False
     var cl: ?Transport = None
@@ -1004,7 +1021,7 @@ actor _test_udp_hostname_queues_until_connected(t: testing.EnvT):
     def watchdog() -> None:
         finish(AssertionError("timed out; got " + str(got)))
 
-    after now UDP_WATCHDOG: watchdog()
+    after now SOCKET_WATCHDOG: watchdog()
     # "::" takes the A and the AAAA answer for localhost alike
     transport.udp_server_transport(net.UDPListenCap(ucap), "::", 0, on_ready, t.log_handler)
 
@@ -1013,7 +1030,7 @@ actor _udp_setup_failure(t: testing.EnvT, address: str, port: int, expect: str):
     # The transport reports a fatal error (when the receiver is registered or
     # later), then again for every send and every new receiver, and never
     # anything else
-    t.timeout(UDP_WATCHDOG + 2.0)
+    t.timeout(SOCKET_WATCHDOG + 2.0)
     ucap = net.UDPCap(net.NetCap(t.env.cap))
     c = transport.udp_transport(net.UDPConnectCap(ucap), address, port)
     var done = False
@@ -1051,7 +1068,7 @@ actor _udp_setup_failure(t: testing.EnvT, address: str, port: int, expect: str):
     def watchdog() -> None:
         finish(AssertionError("timed out; errors: " + str(errors)))
 
-    after now UDP_WATCHDOG: watchdog()
+    after now SOCKET_WATCHDOG: watchdog()
     c.set_receiver(on_data, on_error)
 
 actor _test_udp_invalid_port_is_fatal(t: testing.EnvT):
@@ -1069,7 +1086,7 @@ actor _test_udp_name_resolution_failure_is_fatal(t: testing.EnvT):
 
 actor _test_udp_server_failures(t: testing.EnvT):
     """A port outside 0..65535 and a port in use make on_ready report an error with an unusable transport"""
-    t.timeout(UDP_WATCHDOG + 2.0)
+    t.timeout(SOCKET_WATCHDOG + 2.0)
     ucap = net.UDPCap(net.NetCap(t.env.cap))
     var done = False
     var first: ?ServerTransport = None
@@ -1116,13 +1133,13 @@ actor _test_udp_server_failures(t: testing.EnvT):
     def watchdog() -> None:
         finish(AssertionError("timed out; log: " + str(log)))
 
-    after now UDP_WATCHDOG: watchdog()
+    after now SOCKET_WATCHDOG: watchdog()
     transport.udp_server_transport(net.UDPListenCap(ucap), "127.0.0.1", 70000, on_bad_port, t.log_handler)
 
 
 actor _test_udp_close_idempotent(t: testing.EnvT):
     """close() twice is fine, also before connecting; nothing is delivered or sent after close()"""
-    t.timeout(UDP_WATCHDOG + 2.0)
+    t.timeout(SOCKET_WATCHDOG + 2.0)
     ucap = net.UDPCap(net.NetCap(t.env.cap))
     var log: list[str] = []
     var srv: ?ServerTransport = None
@@ -1173,3 +1190,839 @@ actor _test_udp_close_idempotent(t: testing.EnvT):
         after now NOTHING_WAIT: finish()
 
     transport.udp_server_transport(net.UDPListenCap(ucap), "127.0.0.1", 0, on_ready, t.log_handler)
+
+
+# Stream framing ###################################################################################
+
+# An SNMPv2c GET of sysDescr.0 as it goes on a TCP stream: the message alone, without anything around it
+GET_SYS_DESCR = h("30 26 02 01 01 04 06 70 75 62 6c 69 63 a0 19 02 01 01 02 01 00 02 01 00"
+                  + "30 0e 30 0c 06 08 2b 06 01 02 01 01 01 00 05 00")
+
+def _seq(content: int, length_octets: int, seed: int) -> bytes:
+    # A SEQUENCE of content pseudo-random octets: the short form of the length for length_octets 0,
+    # else the long form with that many length octets (more than needed is allowed)
+    if length_octets == 0:
+        return bytes([0x30, content]) + pseudo_random(content, seed)
+    size = [(content >> (8 * (length_octets - 1 - i))) & 0xff for i in range(length_octets)]
+    return bytes([0x30, 0x80 | length_octets] + size) + pseudo_random(content, seed)
+
+def _stream_messages() -> list[bytes]:
+    # Lengths in the short and the long form, minimal and not, and an empty SEQUENCE
+    return [GET_SYS_DESCR, _seq(200, 1, 1), _seq(30, 4, 2), _seq(300, 2, 3), b"\x30\x00", _seq(5, 1, 4),
+            _seq(127, 0, 5), _seq(128, 3, 6)]
+
+def _framer() -> StreamFramer:
+    return StreamFramer(transport.MIN_TCP_MESSAGE)
+
+def _test_message_length() -> None:
+    testing.assertEqual(message_length(b""), 0)
+    testing.assertEqual(message_length(b"\x30"), 0)
+    testing.assertEqual(message_length(b"\x30\x00"), 2)
+    testing.assertEqual(message_length(b"\x30\x26"), 40)
+    testing.assertEqual(message_length(b"\x30\x7f"), 129)
+    testing.assertEqual(message_length(b"\x30\x81"), 0)
+    testing.assertEqual(message_length(b"\x30\x81\x05"), 8)
+    testing.assertEqual(message_length(b"\x30\x81\x80"), 131)
+    testing.assertEqual(message_length(b"\x30\x82\x01"), 0)
+    testing.assertEqual(message_length(b"\x30\x82\x01\x2c"), 304)
+    testing.assertEqual(message_length(b"\x30\x84\x00\x00\x00"), 0)
+    testing.assertEqual(message_length(b"\x30\x84\x00\x00\x00\x26"), 44)
+    testing.assertEqual(message_length(b"\x30\x84\xff\xff\xff\xff"), 6 + 0xffffffff)
+    testing.assertEqual(message_length(GET_SYS_DESCR), 40)
+    for bad in [b"\x04", b"\x02\x01\x00", b"\xa0\x19", b"\x30\x80", b"\x30\x85\x00\x00\x00\x00\x26", b"\x30\xff"]:
+        testing.assertEqual(message_length(bad), -1, bad.hex())
+
+def _test_framer_every_split_point() -> None:
+    msgs = _stream_messages()
+    stream = b"".join(msgs)
+    ends: list[int] = []
+    total = 0
+    for m in msgs:
+        total += len(m)
+        ends.append(total)
+    for i in range(len(stream) + 1):
+        f = _framer()
+        first = f.feed(stream[:i])
+        testing.assertEqual(len(first), len([e for e in ends if e <= i]), "messages before %d" % i)
+        testing.assertEqual(first + f.feed(stream[i:]), msgs, "split at %d" % i)
+        testing.assertEqual(f.lost, "")
+
+def _test_framer_one_octet_chunks() -> None:
+    msgs = _stream_messages()
+    stream = b"".join(msgs)
+    f = _framer()
+    got: list[bytes] = []
+    for i in range(len(stream)):
+        for m in f.feed(stream[i:i + 1]):
+            got.append(m)
+    testing.assertEqual(got, msgs)
+
+def _test_framer_random_chunks() -> None:
+    # Chunks of 1 to 64 octets, cut at pseudo-random places
+    msgs = _stream_messages()
+    stream = b"".join(msgs)
+    rng = Lcg(3430)
+    got: list[bytes] = []
+    for n in range(200):
+        f = _framer()
+        got = []
+        pos = 0
+        while pos < len(stream):
+            k = 1 + rng.below(64)
+            for m in f.feed(stream[pos:pos + k]):
+                got.append(m)
+            pos += k
+        testing.assertEqual(got, msgs, "round %d" % n)
+
+def _test_framer_whole_stream_and_empty_chunks() -> None:
+    msgs = _stream_messages()
+    f = _framer()
+    testing.assertEqual(f.feed(b""), [])
+    testing.assertEqual(f.feed(b"".join(msgs) + b"\x30\x84\x00"), msgs)
+    testing.assertEqual(f.feed(b""), [])
+    testing.assertEqual(f.feed(b"\x00\x00\x01"), [])
+    testing.assertEqual(f.feed(b"\x2a"), [b"\x30\x84\x00\x00\x00\x01\x2a"])
+    testing.assertEqual(f.lost, "")
+
+def _test_framer_large_message() -> None:
+    # 70000 content octets, cut as TCP reads deliver them: 65536 octets, then the rest together with
+    # the start of the next message
+    big = _seq(70000, 3, 7)
+    small = _seq(10, 0, 8)
+    stream = big + small
+    f = StreamFramer(1048576)
+    testing.assertEqual(f.feed(stream[:65536]), [])
+    testing.assertEqual(f.feed(stream[65536:len(big) + 3]), [big])
+    testing.assertEqual(f.feed(stream[len(big) + 3:]), [small])
+    g = StreamFramer(1048576)
+    got: list[bytes] = []
+    for i in range(0, len(stream), 1000):
+        for m in g.feed(stream[i:i + 1000]):
+            got.append(m)
+    testing.assertEqual(got, [big, small])
+
+def _test_framer_trickle() -> None:
+    # A message of 70000 content octets and the next one, one octet at a time: the octets waiting
+    # are kept in few parts, and the messages come out whole
+    big = _seq(70000, 3, 13)
+    small = _seq(10, 0, 14)
+    stream = big + small
+    f = StreamFramer(1048576)
+    got: list[bytes] = []
+    most = 0
+    for i in range(len(stream)):
+        for m in f.feed(stream[i:i + 1]):
+            got.append(m)
+        if len(f._parts) > most:
+            most = len(f._parts)
+    testing.assertTrue(got == [big, small], "the messages changed on their way through")
+    # one part per 4096 octets, and the shorter ones after the last of them
+    testing.assertTrue(most <= len(big) // 4096 + 12, "%d parts" % most)
+
+def _test_framer_megabyte_in_64k_chunks() -> None:
+    # A message of exactly max_msg_size octets passes; one that is longer loses framing at its header
+    limit = 1048576
+    block = pseudo_random(4096, 9)
+    content = b"".join([block for _ in range(256)])[:limit - 5]
+    big = b"\x30\x83\x0f\xff\xfb" + content
+    testing.assertEqual(len(big), limit)
+    f = StreamFramer(limit)
+    got: list[bytes] = []
+    for i in range(0, len(big), 65536):
+        for m in f.feed(big[i:i + 65536]):
+            got.append(m)
+    testing.assertEqual(len(got), 1)
+    testing.assertTrue(got[0] == big, "the message changed on its way through")
+    testing.assertEqual(f.lost, "")
+    g = StreamFramer(limit)
+    testing.assertEqual(g.feed(b"\x30\x83\x0f\xff\xfc"), [])
+    testing.assertEqual(g.lost, "message of 1048577 octets, longer than the limit of 1048576")
+
+def _test_framer_oversize() -> None:
+    f = _framer()
+    at_limit = _seq(8188, 2, 10)
+    testing.assertEqual(len(at_limit), 8192)
+    testing.assertEqual(f.feed(at_limit), [at_limit])
+    # 8193 octets: known from the header alone, before any content arrives
+    testing.assertEqual(f.feed(b"\x30\x82\x1f\xfd"), [])
+    testing.assertEqual(f.lost, "message of 8193 octets, longer than the limit of 8192")
+    testing.assertEqual(f.feed(GET_SYS_DESCR), [])
+    testing.assertEqual(f.lost, "message of 8193 octets, longer than the limit of 8192")
+
+def _test_framer_indefinite_length() -> None:
+    f = _framer()
+    testing.assertEqual(f.feed(GET_SYS_DESCR + b"\x30\x80\x02\x01\x00\x00\x00"), [GET_SYS_DESCR])
+    testing.assertEqual(f.lost, "indefinite length")
+
+def _test_framer_wrong_tag() -> None:
+    f = _framer()
+    testing.assertEqual(f.feed(GET_SYS_DESCR[:39]), [])
+    testing.assertEqual(f.feed(GET_SYS_DESCR[39:] + b"\x02\x01\x00" + GET_SYS_DESCR), [GET_SYS_DESCR])
+    testing.assertEqual(f.lost, "tag 0x02 where a SEQUENCE (0x30) must start")
+    testing.assertEqual(f.feed(GET_SYS_DESCR), [])
+    # One octet tells
+    g = _framer()
+    testing.assertEqual(g.feed(b"\xa0"), [])
+    testing.assertEqual(g.lost, "tag 0xa0 where a SEQUENCE (0x30) must start")
+
+def _test_framer_too_many_length_octets() -> None:
+    f = _framer()
+    testing.assertEqual(f.feed(b"\x30"), [])
+    testing.assertEqual(f.lost, "")
+    testing.assertEqual(f.feed(b"\x85\x00\x00\x00\x00\x26"), [])
+    testing.assertEqual(f.lost, "5 length octets, at most 4 allowed")
+
+
+# TCP ##############################################################################################
+
+def _tcp_port_range(k: int) -> int:
+    # The first port of the k-th TCP test's range
+    return TCP_PORTS + k * TCP_RANGE
+
+actor _tcp_roundtrip(t: testing.EnvT, address: str, first_port: int, optional_ipv6: bool):
+    # Messages sent before the connection is up, one of 100000 octets, come back in order and
+    # nothing else follows; the server sees session 1, the client the address and port it
+    # connected to. A copy sent to the client's address instead of the session is dropped.
+    t.timeout(SOCKET_WATCHDOG + 2.0)
+    tcap = net.TCPCap(net.NetCap(t.env.cap))
+    sent = [GET_SYS_DESCR, _seq(100000, 3, 11), b"\x30\x00", _seq(300, 2, 12)]
+    var done = False
+    var srv: ?ServerTransport = None
+    var cl: ?Transport = None
+    var srv_port = 0
+    var server_saw: list[(str, int)] = []
+    var got: list[bytes] = []
+    var sources: list[(str, int)] = []
+
+    def finish(error: ?Exception) -> None:
+        if done:
+            return
+        done = True
+        c = cl
+        if c is not None:
+            c.close()
+            c.close()
+        s = srv
+        if s is not None:
+            s.close()
+            s.close()
+        report_env(t, error)
+
+    def conclude() -> None:
+        def check() -> None:
+            testing.assertTrue(got == sent, "the echoes differ from what was sent")
+            testing.assertEqual(server_saw, [("", 1) for _ in sent])
+            testing.assertEqual(sources, [(address, srv_port) for _ in sent])
+        finish(outcome(check))
+
+    def on_client(data: bytes, address_seen: str, port_seen: int) -> None:
+        got.append(data)
+        sources.append((address_seen, port_seen))
+        if len(got) == len(sent):
+            after now NOTHING_WAIT: conclude()
+
+    def on_client_error(message: str, fatal: bool) -> None:
+        finish(AssertionError("client error: " + message))
+
+    def on_server(data: bytes, src_address: str, src_port: int) -> None:
+        server_saw.append((src_address, src_port))
+        s = srv
+        if s is not None:
+            s.send_to(data, address, src_port)
+            s.send_to(data, src_address, src_port)
+
+    def on_ready(s: ServerTransport, error: ?str) -> None:
+        if error is not None:
+            if optional_ipv6 and _ipv6_unavailable(error):
+                done = True
+                _skip_env(t, "no IPv6: " + error)
+                return
+            finish(AssertionError("listen: " + error))
+            return
+        srv = s
+        srv_port = s.local_port()
+        s.set_receiver(on_server)
+        c = transport.tcp_transport(net.TCPConnectCap(tcap), address, srv_port)
+        cl = c
+        c.set_receiver(on_client, on_client_error)
+        for m in sent:
+            c.send(m)
+
+    def watchdog() -> None:
+        finish(AssertionError("TCP roundtrip timed out; got %d of %d" % (len(got), len(sent))))
+
+    after now SOCKET_WATCHDOG: watchdog()
+    listener = ListenTcp(net.TCPListenCap(tcap), address, first_port, TCP_RANGE, on_ready, t.log_handler)
+
+actor _test_tcp_ipv4_roundtrip(t: testing.EnvT):
+    """TCP client and server over 127.0.0.1: messages of any size in order, the server sees a session"""
+    _tcp_roundtrip(t, "127.0.0.1", _tcp_port_range(0), False)
+
+actor _test_tcp_ipv6_roundtrip(t: testing.EnvT):
+    """TCP client and server over ::1"""
+    _tcp_roundtrip(t, "::1", _tcp_port_range(1), True)
+
+
+actor _tcp_pair(t: testing.EnvT, first_port: int, server_idle_timeout: float, client_idle_timeout: float,
+                stall_timeout: float, quiet: list[bytes], on_event: action(_tcp_pair, str) -> None):
+    # A TCP server on 127.0.0.1 that answers every message but those in quiet with the message
+    # itself, and a tcp_transport() client of it. It records what the server saw (message, session)
+    # and what the client got and reported, and tells on_event about each: "ready" once the client
+    # exists, then "server", "data" and "error". The test drives the client with send().
+    t.timeout(SOCKET_WATCHDOG + 2.0)
+    tcap = net.TCPCap(net.NetCap(t.env.cap))
+    var done = False
+    var srv: ?ServerTransport = None
+    var cl: ?Transport = None
+    var port = 0
+    var server_saw: list[(bytes, int)] = []
+    var client_got: list[bytes] = []
+    var errors: list[(str, bool)] = []
+
+    def finish(error: ?Exception) -> None:
+        if done:
+            return
+        done = True
+        c = cl
+        if c is not None:
+            c.close()
+        s = srv
+        if s is not None:
+            s.close()
+        report_env(t, error)
+
+    def send(data: bytes) -> None:
+        c = cl
+        if c is not None:
+            c.send(data)
+
+    def close_server() -> None:
+        s = srv
+        if s is not None:
+            s.close()
+
+    def local_port() -> int:
+        return port
+
+    def server_log() -> list[(bytes, int)]:
+        return server_saw
+
+    def client_log() -> list[bytes]:
+        return client_got
+
+    def error_log() -> list[(str, bool)]:
+        return errors
+
+    def on_client(data: bytes, address_seen: str, port_seen: int) -> None:
+        client_got.append(data)
+        on_event(self, "data")
+
+    def on_client_error(message: str, fatal: bool) -> None:
+        errors.append((message, fatal))
+        on_event(self, "error")
+
+    def on_server(data: bytes, src_address: str, src_port: int) -> None:
+        server_saw.append((data, src_port))
+        s = srv
+        if s is not None:
+            if data not in quiet:
+                s.send_to(data, src_address, src_port)
+        on_event(self, "server")
+
+    def on_ready(s: ServerTransport, error: ?str) -> None:
+        if error is not None:
+            finish(AssertionError("listen: " + error))
+            return
+        srv = s
+        port = s.local_port()
+        s.set_receiver(on_server)
+        c = transport.tcp_transport(net.TCPConnectCap(tcap), "127.0.0.1", port, idle_timeout=client_idle_timeout,
+                                    stall_timeout=stall_timeout)
+        cl = c
+        c.set_receiver(on_client, on_client_error)
+        on_event(self, "ready")
+
+    def watchdog() -> None:
+        finish(AssertionError("timed out; server saw %d, client got %d, errors %s"
+                              % (len(server_saw), len(client_got), str(errors))))
+
+    after now SOCKET_WATCHDOG: watchdog()
+    listener = ListenTcp(net.TCPListenCap(tcap), "127.0.0.1", first_port, TCP_RANGE, on_ready, t.log_handler,
+                         idle_timeout=server_idle_timeout)
+
+
+actor _test_tcp_lost_framing(t: testing.EnvT):
+    """The server closes a connection that loses framing; the client reports it and reconnects for its next message"""
+    var sent_again = False
+
+    def conclude(pair: _tcp_pair) -> None:
+        saw = pair.server_log()
+        errors = pair.error_log()
+        p = pair.local_port()
+        def check() -> None:
+            testing.assertEqual(saw, [(GET_SYS_DESCR, 2)])
+            testing.assertEqual(errors, [("TCP connection to 127.0.0.1:%d closed by the peer" % p, False)])
+        pair.finish(outcome(check))
+
+    def on_event(pair: _tcp_pair, event: str) -> None:
+        if event == "ready":
+            # An INTEGER where the message's SEQUENCE belongs
+            pair.send(b"\x02\x01\x00")
+        elif event == "error" and not sent_again:
+            sent_again = True
+            pair.send(GET_SYS_DESCR)
+        elif event == "data":
+            after now NOTHING_WAIT: conclude(pair)
+
+    pair = _tcp_pair(t, _tcp_port_range(2), 300.0, 60.0, 1.0, [], on_event)
+
+
+actor _test_tcp_stall_reconnects(t: testing.EnvT):
+    """A message sent while those before it had nothing back for stall_timeout goes out on a new connection
+
+    An answer resets the rule: the second message, sent well after the
+    first one's answer, stays on the first connection. Each message is
+    sent a while after the server saw the one before, so the order does
+    not depend on how timers fire.
+    """
+    ping = _seq(4, 0, 21)
+    unanswered = _seq(4, 0, 22)
+    next_one = _seq(4, 0, 23)
+
+    def later(pair: _tcp_pair, data: bytes) -> None:
+        pair.send(data)
+
+    def conclude(pair: _tcp_pair) -> None:
+        saw = pair.server_log()
+        errors = pair.error_log()
+        p = pair.local_port()
+        def check() -> None:
+            testing.assertEqual(saw, [(ping, 1), (unanswered, 1), (next_one, 2)])
+            testing.assertEqual(len(errors), 1)
+            prefix = "TCP connection to 127.0.0.1:%d presumed dead: nothing received for " % p
+            testing.assertTrue(errors[0].0.startswith(prefix), errors[0].0)
+            testing.assertTrue(errors[0].0.endswith(" s after sending; reconnecting"), errors[0].0)
+            testing.assertFalse(errors[0].1, "fatal")
+        pair.finish(outcome(check))
+
+    def on_event(pair: _tcp_pair, event: str) -> None:
+        if event == "ready":
+            pair.send(ping)
+        elif event == "data":
+            after now 0.3: later(pair, unanswered)
+        elif event == "server" and len(pair.server_log()) == 2:
+            # twice stall_timeout after unanswered went out
+            after now 0.3: later(pair, next_one)
+        elif event == "server" and len(pair.server_log()) == 3:
+            after now NOTHING_WAIT: conclude(pair)
+
+    pair = _tcp_pair(t, _tcp_port_range(3), 300.0, 60.0, 0.15, [unanswered, next_one], on_event)
+
+
+actor _test_tcp_client_idle_timeout(t: testing.EnvT):
+    """The client closes a connection idle for idle_timeout, without an error; its next message opens a new one"""
+    first = _seq(4, 0, 31)
+    second = _seq(4, 0, 32)
+
+    def later(pair: _tcp_pair, data: bytes) -> None:
+        pair.send(data)
+
+    def conclude(pair: _tcp_pair) -> None:
+        saw = pair.server_log()
+        got = pair.client_log()
+        errors = pair.error_log()
+        def check() -> None:
+            testing.assertEqual(saw, [(first, 1), (second, 2)])
+            testing.assertEqual(got, [first, second])
+            testing.assertEqual(errors, [])
+        pair.finish(outcome(check))
+
+    def on_event(pair: _tcp_pair, event: str) -> None:
+        if event == "ready":
+            pair.send(first)
+        elif event == "data":
+            if len(pair.client_log()) == 1:
+                after now 0.35: later(pair, second)
+            else:
+                after now NOTHING_WAIT: conclude(pair)
+
+    pair = _tcp_pair(t, _tcp_port_range(4), 300.0, 0.1, 1.0, [], on_event)
+
+
+actor _test_tcp_server_idle_timeout(t: testing.EnvT):
+    """The server closes a connection idle for idle_timeout; the client reports it, its next message opens a new one"""
+    first = _seq(4, 0, 41)
+    second = _seq(4, 0, 42)
+    var sent_again = False
+
+    def conclude(pair: _tcp_pair) -> None:
+        saw = pair.server_log()
+        got = pair.client_log()
+        errors = pair.error_log()
+        p = pair.local_port()
+        def check() -> None:
+            testing.assertEqual(saw, [(first, 1), (second, 2)])
+            testing.assertEqual(got, [first, second])
+            testing.assertEqual(errors, [("TCP connection to 127.0.0.1:%d closed by the peer" % p, False)])
+        pair.finish(outcome(check))
+
+    def on_event(pair: _tcp_pair, event: str) -> None:
+        if event == "ready":
+            pair.send(first)
+        elif event == "error" and not sent_again:
+            sent_again = True
+            pair.send(second)
+        elif event == "data" and len(pair.client_log()) == 2:
+            # now, before the second connection idles out as well
+            conclude(pair)
+
+    pair = _tcp_pair(t, _tcp_port_range(5), 0.1, 60.0, 1.0, [], on_event)
+
+
+actor _test_tcp_server_close(t: testing.EnvT):
+    """close() of the server closes its sessions and every later connection at once; nothing more arrives"""
+    first = _seq(4, 0, 51)
+    second = _seq(4, 0, 52)
+    var sent_again = False
+
+    def conclude(pair: _tcp_pair) -> None:
+        saw = pair.server_log()
+        got = pair.client_log()
+        errors = pair.error_log()
+        p = pair.local_port()
+        def check() -> None:
+            testing.assertEqual(saw, [(first, 1)])
+            testing.assertEqual(got, [first])
+            # the connection opened after close() is closed at once; whether the client can tell
+            # depends on whether its message arrived before the close
+            testing.assertTrue(len(errors) >= 1, "no error")
+            testing.assertEqual(errors[0], ("TCP connection to 127.0.0.1:%d closed by the peer" % p, False))
+        pair.finish(outcome(check))
+
+    def on_event(pair: _tcp_pair, event: str) -> None:
+        if event == "ready":
+            pair.send(first)
+        elif event == "data":
+            pair.close_server()
+        elif event == "error" and not sent_again:
+            sent_again = True
+            pair.send(second)
+            after now 0.3: conclude(pair)
+
+    pair = _tcp_pair(t, _tcp_port_range(6), 300.0, 60.0, 1.0, [], on_event)
+
+
+actor _test_tcp_refused(t: testing.EnvT):
+    """A refused connection is a non-fatal error; for connect_timeout, sends report it again without a new socket"""
+    t.timeout(SOCKET_WATCHDOG + 2.0)
+    tcap = net.TCPCap(net.NetCap(t.env.cap))
+    c = transport.tcp_transport(net.TCPConnectCap(tcap), "127.0.0.1", TCP_CLOSED_PORT, connect_timeout=1.0)
+    var errors: list[(str, bool)] = []
+    var fds_before = 0
+    var fds_after = 0
+    var done = False
+
+    def finish(error: ?Exception) -> None:
+        if not done:
+            done = True
+            c.close()
+            report_env(t, error)
+
+    def conclude() -> None:
+        def check() -> None:
+            text = "TCP connection to 127.0.0.1:%d failed: connection refused" % TCP_CLOSED_PORT
+            # the first connection with its two messages, 50 sends while it is held off, one connection after
+            # the hold-off; only the connections took a socket each
+            testing.assertEqual(errors, [(text, False) for _ in range(52)])
+            testing.assertFalse(is_unreachable(text))
+            testing.assertTrue(fds_after - fds_before < 10, "%d more file descriptors" % (fds_after - fds_before))
+        finish(outcome(check))
+
+    def try_again() -> None:
+        c.send(GET_SYS_DESCR)
+
+    def on_data(data: bytes, address: str, port: int) -> None:
+        finish(AssertionError("unexpected message"))
+
+    def on_error(message: str, fatal: bool) -> None:
+        errors.append((message, fatal))
+        n = len(errors)
+        if n == 1:
+            fds_before = _open_fds(t)
+        if n <= 50:
+            # each send after the failure was reported, as a Client's retries come
+            c.send(GET_SYS_DESCR)
+        elif n == 51:
+            fds_after = _open_fds(t)
+            after now 1.2: try_again()
+        elif n == 52:
+            after now NOTHING_WAIT: conclude()
+
+    def watchdog() -> None:
+        finish(AssertionError("timed out; errors: " + str(errors)))
+
+    after now SOCKET_WATCHDOG: watchdog()
+    c.set_receiver(on_data, on_error)
+    c.send(GET_SYS_DESCR)
+    c.send(GET_SYS_DESCR)
+
+
+actor _test_tcp_connect_timeout(t: testing.EnvT):
+    """A connection that does not come up within connect_timeout (a SYN to TEST-NET-1) is a non-fatal error"""
+    t.timeout(SOCKET_WATCHDOG + 2.0)
+    tcap = net.TCPCap(net.NetCap(t.env.cap))
+    c = transport.tcp_transport(net.TCPConnectCap(tcap), "192.0.2.1", 161, connect_timeout=0.2)
+    start = time.monotonic_ns()
+    expected = "TCP connection to 192.0.2.1:161 failed: no connection within 0.2 s"
+    var errors: list[(str, bool)] = []
+    var elapsed = 0.0
+    var done = False
+
+    def finish(error: ?Exception) -> None:
+        if not done:
+            done = True
+            c.close()
+            report_env(t, error)
+
+    def conclude() -> None:
+        def check() -> None:
+            testing.assertEqual(errors, [(expected, False)])
+            testing.assertTrue(elapsed >= 0.15, "error after %f s" % elapsed)
+        finish(outcome(check))
+
+    def on_data(data: bytes, address: str, port: int) -> None:
+        finish(AssertionError("unexpected message"))
+
+    def on_error(message: str, fatal: bool) -> None:
+        errors.append((message, fatal))
+        if len(errors) == 1:
+            elapsed = _elapsed(start)
+            if message != expected and elapsed < 0.15:
+                # the host has no route to TEST-NET-1 and says so at once
+                done = True
+                c.close()
+                _skip_env(t, "no route to 192.0.2.1: " + message)
+                return
+            after now NOTHING_WAIT: conclude()
+
+    def watchdog() -> None:
+        finish(AssertionError("timed out; errors: " + str(errors)))
+
+    after now SOCKET_WATCHDOG: watchdog()
+    c.set_receiver(on_data, on_error)
+    c.send(GET_SYS_DESCR)
+
+
+actor _tcp_setup_failure(t: testing.EnvT, address: str, port: int, expect: str):
+    # As _udp_setup_failure: a fatal error when the receiver is registered, again for every send and
+    # every new receiver, and nothing else
+    t.timeout(SOCKET_WATCHDOG + 2.0)
+    tcap = net.TCPCap(net.NetCap(t.env.cap))
+    c = transport.tcp_transport(net.TCPConnectCap(tcap), address, port)
+    var done = False
+    var errors: list[(str, bool)] = []
+
+    def check() -> None:
+        testing.assertEqual(errors, [(expect, True), (expect, True), (expect, True)])
+
+    def conclude() -> None:
+        finish(outcome(check))
+
+    def finish(error: ?Exception) -> None:
+        if not done:
+            done = True
+            c.close()
+            report_env(t, error)
+
+    def on_data(data: bytes, address_seen: str, port_seen: int) -> None:
+        finish(AssertionError("unexpected message"))
+
+    def on_error(message: str, fatal: bool) -> None:
+        errors.append((message, fatal))
+        if len(errors) == 1:
+            c.send(GET_SYS_DESCR)
+        elif len(errors) == 2:
+            c.set_receiver(on_data, on_error)
+        else:
+            after now NOTHING_WAIT: conclude()
+
+    def watchdog() -> None:
+        finish(AssertionError("timed out; errors: " + str(errors)))
+
+    after now SOCKET_WATCHDOG: watchdog()
+    c.set_receiver(on_data, on_error)
+
+actor _test_tcp_invalid_port_is_fatal(t: testing.EnvT):
+    """Port 0 cannot be connected to: a fatal error, repeated for each send"""
+    _tcp_setup_failure(t, "127.0.0.1", 0, "TCP setup for 127.0.0.1:0 failed: port 0 is outside 1..65535")
+
+actor _test_tcp_port_too_high_is_fatal(t: testing.EnvT):
+    """Port 65536 cannot be connected to: a fatal error, repeated for each send"""
+    _tcp_setup_failure(t, "127.0.0.1", 65536, "TCP setup for 127.0.0.1:65536 failed: port 65536 is outside 1..65535")
+
+actor _test_tcp_host_name_is_fatal(t: testing.EnvT):
+    """A host name is not looked up: a fatal error, repeated for each send"""
+    _tcp_setup_failure(t, "localhost", 161, "TCP setup for localhost:161 failed: not an IPv4 or IPv6 address")
+
+
+actor _test_tcp_option_validation(t: testing.EnvT):
+    """tcp_transport() and tcp_server_transport() raise ValueError for invalid options"""
+    tcap = net.TCPCap(net.NetCap(t.env.cap))
+    ccap = net.TCPConnectCap(tcap)
+    lcap = net.TCPListenCap(tcap)
+    var accepted: list[str] = []
+
+    def ignore(s: ServerTransport, error: ?str) -> None:
+        pass
+
+    try:
+        transport.tcp_transport(ccap, "127.0.0.1", 161, connect_timeout=0.0)
+        accepted.append("connect_timeout 0")
+    except ValueError:
+        pass
+    try:
+        transport.tcp_transport(ccap, "127.0.0.1", 161, stall_timeout=-1.0)
+        accepted.append("stall_timeout -1")
+    except ValueError:
+        pass
+    try:
+        transport.tcp_transport(ccap, "127.0.0.1", 161, idle_timeout=float("nan"))
+        accepted.append("idle_timeout NaN")
+    except ValueError:
+        pass
+    try:
+        transport.tcp_transport(ccap, "127.0.0.1", 161, max_msg_size=transport.MIN_TCP_MESSAGE - 1)
+        accepted.append("max_msg_size 8191")
+    except ValueError:
+        pass
+    try:
+        transport.tcp_server_transport(lcap, "127.0.0.1", TCP_CLOSED_PORT, ignore, max_connections=0)
+        accepted.append("max_connections 0")
+    except ValueError:
+        pass
+    try:
+        transport.tcp_server_transport(lcap, "127.0.0.1", TCP_CLOSED_PORT, ignore, idle_timeout=-0.5)
+        accepted.append("server idle_timeout -0.5")
+    except ValueError:
+        pass
+    smallest = transport.tcp_transport(ccap, "127.0.0.1", 161, max_msg_size=transport.MIN_TCP_MESSAGE, idle_timeout=0.0,
+                                       stall_timeout=0.0)
+    smallest.close()
+
+    def check() -> None:
+        testing.assertEqual(accepted, [])
+
+    report_env(t, outcome(check))
+
+
+actor _test_tcp_server_failures(t: testing.EnvT):
+    """Port 0, a port outside 1..65535, a host name and a port in use: on_ready reports an error with an unusable transport"""
+    t.timeout(SOCKET_WATCHDOG + 2.0)
+    tcap = net.TCPCap(net.NetCap(t.env.cap))
+    lcap = net.TCPListenCap(tcap)
+    busy = _tcp_port_range(7)
+    var done = False
+    var log: list[str] = []
+    var ports: list[int] = []
+    var first: ?ServerTransport = None
+
+    def finish(error: ?Exception) -> None:
+        if done:
+            return
+        done = True
+        f = first
+        if f is not None:
+            f.close()
+        report_env(t, error)
+
+    def failed(s: ServerTransport, error: ?str) -> None:
+        log.append(error if error is not None else "listening")
+        ports.append(s.local_port())
+        s.send_to(GET_SYS_DESCR, "", 1)
+        s.close()
+        s.close()
+        n = len(log)
+        if n == 1:
+            transport.tcp_server_transport(lcap, "127.0.0.1", 70000, failed, t.log_handler)
+        elif n == 2:
+            transport.tcp_server_transport(lcap, "localhost", TCP_CLOSED_PORT, failed, t.log_handler)
+        elif n == 3:
+            # Bound by this listener, or by the same test's run before in this process
+            transport.tcp_server_transport(lcap, "127.0.0.1", busy, on_first, t.log_handler)
+        else:
+            def check() -> None:
+                testing.assertEqual(log[0], "TCP listen on 127.0.0.1:0 failed: port 0 is not supported: the port "
+                                    + "picked for it cannot be learned")
+                testing.assertEqual(log[1], "TCP listen on 127.0.0.1:70000 failed: port outside 1..65535")
+                testing.assertIn("TCP listen on localhost:%d failed: " % TCP_CLOSED_PORT, log[2])
+                testing.assertIn("not an IPv4 or IPv6 address", log[2])
+                testing.assertIn("address already in use", log[3])
+                testing.assertEqual(ports, [0, 0, 0, 0])
+            finish(outcome(check))
+
+    def on_first(s: ServerTransport, error: ?str) -> None:
+        if error is not None:
+            if "address already in use" not in error:
+                finish(AssertionError("listen: " + error))
+                return
+        else:
+            first = s
+        transport.tcp_server_transport(lcap, "127.0.0.1", busy, failed, t.log_handler)
+
+    def watchdog() -> None:
+        finish(AssertionError("timed out; log: " + str(log)))
+
+    after now SOCKET_WATCHDOG: watchdog()
+    transport.tcp_server_transport(lcap, "127.0.0.1", 0, failed, t.log_handler)
+
+
+actor _test_tcp_close_idempotent(t: testing.EnvT):
+    """close() twice is fine, also before connecting; nothing is delivered or sent after close()"""
+    t.timeout(SOCKET_WATCHDOG + 2.0)
+    tcap = net.TCPCap(net.NetCap(t.env.cap))
+    var log: list[str] = []
+    var srv: ?ServerTransport = None
+
+    def on_server(data: bytes, address: str, port: int) -> None:
+        log.append("server got %d octets" % len(data))
+
+    def on_data(data: bytes, address: str, port: int) -> None:
+        log.append("data")
+
+    def on_error(message: str, fatal: bool) -> None:
+        log.append("error " + message)
+
+    def check() -> None:
+        testing.assertEqual(log, [])
+
+    def finish() -> None:
+        s = srv
+        if s is not None:
+            s.close()
+        report_env(t, outcome(check))
+
+    def on_ready(s: ServerTransport, error: ?str) -> None:
+        if error is not None:
+            report_env(t, AssertionError("listen: " + error))
+            return
+        srv = s
+        s.set_receiver(on_server)
+        port = s.local_port()
+        # Dropped: a session that does not exist
+        s.send_to(GET_SYS_DESCR, "", 7)
+        # Closed right away, while it connects: the message queued for it is dropped
+        early = transport.tcp_transport(net.TCPConnectCap(tcap), "127.0.0.1", port)
+        early.set_receiver(on_data, on_error)
+        early.send(GET_SYS_DESCR)
+        early.close()
+        early.close()
+        early.send(GET_SYS_DESCR)
+        # Closed first, then used
+        c = transport.tcp_transport(net.TCPConnectCap(tcap), "127.0.0.1", port)
+        c.close()
+        c.set_receiver(on_data, on_error)
+        c.send(GET_SYS_DESCR)
+        c.close()
+        after now NOTHING_WAIT: finish()
+
+    listener = ListenTcp(net.TCPListenCap(tcap), "127.0.0.1", _tcp_port_range(8), TCP_RANGE, on_ready, t.log_handler)

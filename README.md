@@ -21,6 +21,8 @@ written in Acton. The Acton package name is `snmp`.
     IPv6.
 - **Dispatcher:** many clients share one UDP socket, for polling large
   numbers of devices without one socket per device.
+- **Transports:** UDP over IPv4 and IPv6, and TCP (RFC 3430) for the
+  client, the agent and the notification receiver.
 - **Notification receiver:** SNMPv1/v2c traps, SNMPv2c informs, and SNMPv3
   traps and informs.
 - **Agent:** a small command responder that serves values from an
@@ -193,6 +195,20 @@ socket:
 
 Addresses given to `attach` must be IP literals.
 
+### Over TCP
+
+`tcp_transport` connects to the agent when the first request is sent,
+and again after the connection was lost:
+
+```python
+    cap = net.TCPConnectCap(net.TCPCap(net.NetCap(env.cap)))
+    tr = snmp.transport.tcp_transport(cap, "192.0.2.1", 161)
+    c = snmp.client.Client(None, "192.0.2.1", sec, None, transport=tr)
+```
+
+`tcp_server_transport` is the listening side for an `Agent` or a
+`NotificationReceiver`.
+
 ## Command-line tool
 
 `actsnmp` accepts net-snmp's options, for example `-v`, `-c`, `-u`, `-l`,
@@ -216,6 +232,10 @@ out/bin/actsnmp trap -v2c -c public 192.0.2.10 '' 1.3.6.1.6.3.1.1.5.4 1.3.6.1.2.
 ```
 
 ```bash
+out/bin/actsnmp walk -v2c -c public tcp:192.0.2.1 1.3.6.1.2.1.1
+```
+
+```bash
 out/bin/actsnmp trapd --port 1162
 ```
 
@@ -224,7 +244,9 @@ out/bin/actsnmp agent --snmprec data.snmprec --port 1161
 ```
 
 The SNMP commands are `get`, `getnext`, `bulkget`, `walk`, `bulkwalk`,
-`set`, `table`, `trap`, `inform`, `trapd` and `agent`.
+`set`, `table`, `trap`, `inform`, `trapd` and `agent`. Agent addresses
+take net-snmp's `udp:`, `udp6:`, `tcp:` and `tcp6:` prefixes, and `agent`
+and `trapd` listen on TCP with `--tcp`.
 
 ### MIB files
 

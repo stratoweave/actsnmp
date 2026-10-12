@@ -1,40 +1,56 @@
-"""Datagram transports: UDP sockets, and an in-memory network for tests
+"""Transports: UDP sockets, TCP connections, and an in-memory network for tests
 
-A Transport carries datagrams between its owner (a Client) and one peer;
-a ServerTransport carries them between its owner (an Agent or a
+A Transport carries SNMP messages between its owner (a Client) and one
+peer; a ServerTransport carries them between its owner (an Agent or a
 NotificationReceiver) and any number of peers. Both are classes of procs
 that wrap an actor doing the work, so anything that provides the procs is
 a transport. A test can wrap one to record or rewrite traffic by building
 a new Transport from its own procs and those of the wrapped one.
 
 udp_transport() is a connected socket to one agent and
-udp_server_transport() a listening socket. MemNet (with MemNet.client(),
-MemNet.server() and mem_pair()) is a deterministic in-process network with
-packet-level fault injection (NetFaults), for testing retries, late and
-duplicate replies, reordering, corruption and spoofing without sockets.
+udp_server_transport() a listening socket; each datagram is one message.
+tcp_transport() and tcp_server_transport() carry messages over TCP
+connections (RFC 3430): the messages follow each other on the stream and
+the receiving side splits it again by their BER length (StreamFramer).
+MemNet (with MemNet.client(), MemNet.server() and mem_pair()) is a
+deterministic in-process datagram network with packet-level fault
+injection (NetFaults), for testing retries, late and duplicate replies,
+reordering, corruption and spoofing without sockets.
 dispatcher.Dispatcher.attach() gives many Clients one shared
 ServerTransport.
 
 All implementations follow the same contract. A transport never waits for
-its owner, and calls back asynchronously in the order in which datagrams
-and errors arrived. Up to MAX_BUFFERED datagrams that arrive before a
+its owner, and calls back asynchronously in the order in which messages
+and errors arrived. Up to MAX_BUFFERED messages that arrive before a
 receiver is registered are kept and handed over in order. close() is
 idempotent; afterwards nothing is delivered and sending does nothing.
 Errors go to the error callback, never raised, and say whether they are
 fatal. Source addresses are text as the network reports them, with an
 IPv4-mapped IPv6 address given as plain IPv4 (see normalize_address()).
+tcp_transport() gives the address and port it connects to;
+tcp_server_transport() gives src_address "" and the session number as
+src_port.
 """
 
 import logging
 import net
+import time
 import ber
 
-# Datagrams kept for a receiver that is not registered yet; more are dropped
+# Messages kept for a receiver that is not registered yet; more are dropped
 MAX_BUFFERED = 64
 
-# Datagrams udp_transport() queues while its socket connects; more are
-# dropped with a non-fatal error
+# Messages udp_transport() and tcp_transport() queue while their socket
+# connects; more are dropped with a non-fatal error
 MAX_QUEUED = 256
+
+# The smallest max_msg_size of the TCP transports: RFC 3430 section 2.2
+# requires every engine to accept messages of at least 8192 octets over TCP
+MIN_TCP_MESSAGE = 8192
+
+# Longest wait, in seconds, of tcp_transport() after connections that could
+# not be set up before it opens another (see tcp_transport())
+MAX_TCP_HOLDOFF = 60.0
 
 # Largest datagram MemNet carries: the IPv4 UDP maximum, as in net-snmp
 MAX_DATAGRAM = 65507
@@ -54,6 +70,15 @@ ID_IN_USE = "request id in use by another client of the peer, not sent: "
 # MemNet's ephemeral ports, as in the IANA dynamic range
 _EPHEMERAL_FIRST = 49152
 _EPHEMERAL_COUNT = 16384
+
+# Connect timeout given to net.TCPConnection, in seconds: longer than Linux retries an
+# unanswered SYN (about 127 s), so that every connect ends with a connection or an error.
+# tcp_transport() runs its own connect_timeout and closes a connection that comes up after it.
+_NET_CONNECT_TIMEOUT = 135.0
+
+# StreamFramer joins a buffered chunk shorter than this many octets with the part before it (see
+# StreamFramer._append())
+_FRAMER_JOIN = 4096
 
 
 def normalize_address(address: str) -> str:
@@ -181,15 +206,22 @@ def is_unreachable(error: str) -> bool:
 
     A connected UDP socket reports ICMP port unreachable as "connection
     refused" (REFUSED); MemNet does the same when nothing is bound to the
-    destination. The error is not fatal: the transport stays usable.
+    destination. The error is not fatal: the transport stays usable. A
+    refused TCP connection ("TCP connection to ... failed: connection
+    refused") is not this hint: tcp_transport() reports it as a failed
+    connection.
     """
-    return "connection refused" in error
+    return "connection refused" in error and not error.startswith("TCP ")
 
 def _peer_text(address: str, port: int) -> str:
     # address:port, with an IPv6 address in brackets
     if ":" in address:
         return "[" + address + "]:" + str(port)
     return address + ":" + str(port)
+
+def _now() -> float:
+    # Monotonic time in seconds
+    return float(time.monotonic_ns()) / 1000000000.0
 
 def _tidy(error: str) -> str:
     # net.UDPConnection joins the A and AAAA lookup errors with two spaces,
@@ -202,31 +234,33 @@ def _tidy(error: str) -> str:
 
 
 class Transport(object):
-    """Datagrams to and from one peer: the manager side
+    """Messages to and from one peer: the manager side
 
-    send(data) sends one datagram to the peer. It never blocks and never
+    send(data) sends one message to the peer. It never blocks and never
     raises; problems are reported to the error callback.
 
     set_receiver(on_data, on_error) registers the callbacks, replacing any
     earlier ones:
 
-    - on_data(data, src_address, src_port) for every datagram. The source is
+    - on_data(data, src_address, src_port) for every message. The source is
       not guaranteed to be the peer: a UDP socket only accepts the peer (the
       kernel filters), but MemNet delivers everything addressed to the
       transport, so that the owner's own source checks can be tested.
     - on_error(message, fatal) for every error. fatal False is a hint and
       the transport stays usable: ICMP port unreachable (see
-      is_unreachable()), a datagram that could not be sent, a full send
-      queue. fatal True means the transport cannot send because setting it
-      up failed (name resolution, socket, port); every later send(), and
-      every later set_receiver(), reports the same error again at once.
+      is_unreachable()), a message that could not be sent, a full send
+      queue, a TCP connection that failed or closed. fatal True means the
+      transport cannot send because setting it up failed (name resolution,
+      socket, port); every later send(), and every later set_receiver(),
+      reports the same error again at once.
 
     close() releases the socket. It is idempotent; afterwards nothing is
     delivered and send() does nothing.
 
-    source_checked is True for a transport that delivers only datagrams it
+    source_checked is True for a transport that delivers only messages it
     has accepted as the peer's (dispatcher.Dispatcher, which routes by
-    source and, with strict_source=False, by request id); the Client then
+    source and, with strict_source=False, by request id; tcp_transport(),
+    whose connection carries only the peer's messages); the Client then
     does not compare sources itself. False (the default) for a transport
     that delivers whatever arrives (MemNet), so the Client checks.
 
@@ -260,15 +294,18 @@ class Transport(object):
 
 
 class ServerTransport(object):
-    """Datagrams to and from any number of peers: the agent side
+    """Messages to and from any number of peers: the agent side
 
-    send_to(data, address, port) sends one datagram. address must be an IP
+    send_to(data, address, port) sends one message. address must be an IP
     address (no name resolution); reply to the src_address and src_port the
-    datagram came with. There is no error callback: udp_server_transport()
-    logs send failures.
+    message came with. tcp_server_transport() gives a session number
+    instead of a source (src_address "", src_port the session) and answers
+    on that session; it drops a message for any other address. There is no
+    error callback: udp_server_transport()
+    and tcp_server_transport() log send failures.
 
     set_receiver(on_data) registers the callback, replacing any earlier one;
-    on_data(data, src_address, src_port) is called for every datagram.
+    on_data(data, src_address, src_port) is called for every message.
 
     close() releases the socket. It is idempotent; afterwards nothing is
     delivered and send_to() does nothing.
@@ -297,7 +334,7 @@ class ServerTransport(object):
 
 
 class _Inbox(object):
-    # The data callback of an endpoint, and the datagrams that arrived
+    # The data callback of an endpoint, and the messages that arrived
     # before one was registered. Owned by one endpoint actor.
     @property
     on_data: ?action(bytes, str, int) -> None
@@ -519,6 +556,675 @@ actor _UdpServer(cap: net.UDPListenCap, address: str, port: int,
         _listener = net.UDPListener(cap, address, port, _on_listen, _on_receive, _on_net_error)
     else:
         _ready(0, "UDP listen on " + _peer_text(address, port) + " failed: port outside 0..65535")
+
+
+# Stream framing ###################################################################################
+
+def message_length(header: bytes) -> int:
+    """Return the total length of the SNMP message that header starts
+
+    header is the start of the message as far as it has arrived. The result
+    counts the tag, the length octets and the contents; 0 means header is
+    too short to tell, -1 that it cannot start a message. SNMP sends the
+    outer SEQUENCE (tag 0x30) with a definite length; the long form may use
+    more length octets than needed (RFC 3417 section 8). The short form and
+    the long form with 1 to 4 length octets are accepted; the indefinite
+    length 0x80 is not. At most 6 octets of header are read.
+    """
+    if len(header) == 0:
+        return 0
+    if header[0] != 0x30:
+        return -1
+    if len(header) < 2:
+        return 0
+    first = header[1]
+    if first < 0x80:
+        return 2 + first
+    count = first & 0x7f
+    if count == 0 or count > 4:
+        return -1
+    if len(header) < 2 + count:
+        return 0
+    n = 0
+    for i in range(count):
+        n = n * 256 + header[2 + i]
+    return 2 + count + n
+
+def _framing_problem(header: bytes) -> str:
+    # Why message_length(header) is -1
+    if header[0] != 0x30:
+        return "tag 0x%02x where a SEQUENCE (0x30) must start" % header[0]
+    if header[1] == 0x80:
+        return "indefinite length"
+    return "%d length octets, at most 4 allowed" % (header[1] & 0x7f)
+
+
+class StreamFramer(object):
+    """Splits a byte stream into SNMP messages by their BER length (RFC 3430 section 2.1)
+
+    feed(data) takes the octets that arrived next, in chunks of any size,
+    and returns the messages they complete, in order; the rest is kept for
+    the next feed(). Over TCP the messages follow each other without
+    anything in between, so the outer SEQUENCE of each (message_length())
+    tells where the next one starts.
+
+    A header that cannot start a message (message_length() -1) or a
+    message longer than max_msg_size octets loses framing: there is no way
+    to find the next message, so the owner closes the connection (RFC 3430
+    section 2.1). lost then says why (it is "" while framing holds), the
+    messages completed before that point are still returned, and every
+    later feed() returns nothing. The length is checked as soon as the
+    header is there, so an oversize message is never buffered.
+    """
+    max_msg_size: int
+    lost: str
+    _parts: list[bytes]
+    _offset: int
+    _buffered: int
+    _need: int
+
+    def __init__(self, max_msg_size: int):
+        self.max_msg_size = max_msg_size
+        self.lost = ""
+        # The octets not delivered yet: the chunks as they arrived, short ones
+        # joined (_append()), the first of them from _offset on; _buffered
+        # octets in all. _need is the total length of the message they start,
+        # 0 while its header is incomplete.
+        self._parts = []
+        self._offset = 0
+        self._buffered = 0
+        self._need = 0
+
+    def feed(self, data: bytes) -> list[bytes]:
+        """Take the next octets of the stream; return the messages they complete"""
+        out: list[bytes] = []
+        if self.lost != "" or len(data) == 0:
+            return out
+        self._append(data)
+        self._buffered += len(data)
+        while self._buffered > 0:
+            need = self._need
+            if need == 0:
+                header = self._peek(6)
+                need = message_length(header)
+                if need < 0:
+                    self._lose(_framing_problem(header))
+                    return out
+                if need == 0:
+                    return out
+                if need > self.max_msg_size:
+                    self._lose("message of %d octets, longer than the limit of %d" % (need, self.max_msg_size))
+                    return out
+                self._need = need
+            if self._buffered < need:
+                return out
+            out.append(self._take(need))
+            self._need = 0
+        return out
+
+    def _append(self, data: bytes) -> None:
+        # Keep data after the buffered octets. A chunk shorter than _FRAMER_JOIN is joined with the
+        # part before it while that part is no longer, so the short parts after the last long one
+        # shrink from first to last. A message that trickles in a few octets at a time is then held
+        # in about one part per _FRAMER_JOIN octets, each octet copied about log2(_FRAMER_JOIN)
+        # times, rather than in one part per chunk.
+        self._parts.append(data)
+        n = len(self._parts)
+        while n >= 2:
+            last = self._parts[n - 1]
+            before = self._parts[n - 2]
+            start = self._offset if n == 2 else 0
+            if len(last) >= _FRAMER_JOIN or len(before) - start > len(last):
+                return
+            self._parts[n - 2] = before[start:] + last
+            del self._parts[n - 1]
+            if n == 2:
+                self._offset = 0
+            n -= 1
+
+    def _peek(self, n: int) -> bytes:
+        # The first n buffered octets, fewer if fewer are there
+        pieces: list[bytes] = []
+        got = 0
+        offset = self._offset
+        for p in self._parts:
+            piece = p[offset:offset + n - got]
+            pieces.append(piece)
+            got += len(piece)
+            offset = 0
+            if got >= n:
+                break
+        return b"".join(pieces)
+
+    def _take(self, n: int) -> bytes:
+        # Remove the first n buffered octets (n <= _buffered) and return them
+        pieces: list[bytes] = []
+        rest = n
+        used = 0
+        offset = self._offset
+        while rest > 0:
+            p = self._parts[used]
+            available = len(p) - offset
+            if available <= rest:
+                pieces.append(p[offset:] if offset > 0 else p)
+                rest -= available
+                used += 1
+                offset = 0
+            else:
+                pieces.append(p[offset:offset + rest])
+                offset += rest
+                rest = 0
+        if used > 0:
+            self._parts = self._parts[used:]
+        self._offset = offset
+        self._buffered -= n
+        if len(pieces) == 1:
+            return pieces[0]
+        return b"".join(pieces)
+
+    def _lose(self, reason: str) -> None:
+        self.lost = reason
+        self._parts = []
+        self._offset = 0
+        self._buffered = 0
+        self._need = 0
+
+
+def _check_tcp_options(max_msg_size: int, idle_timeout: float) -> None:
+    # The checks that tcp_transport() and tcp_server_transport() share
+    if max_msg_size < MIN_TCP_MESSAGE:
+        raise ValueError("max_msg_size must be at least %d octets (RFC 3430), got %d"
+                         % (MIN_TCP_MESSAGE, max_msg_size))
+    if not (idle_timeout >= 0.0):
+        raise ValueError("idle_timeout must be 0 (never) or a number of seconds")
+
+def _net_reason(error: str) -> str:
+    # The reason in an error of net.TCPConnection without its prefixes: "Error in TCP connect over
+    # IPv4: connection refused" gives "connection refused", "Failed to write to TCP socket: broken
+    # pipe" gives "broken pipe". Errors joined with two spaces keep each distinct reason once.
+    reasons: list[str] = []
+    for part in error.split("  "):
+        i = part.rfind(": ")
+        reason = part[i + 2:] if i >= 0 else part
+        if reason != "" and reason not in reasons:
+            reasons.append(reason)
+    return "; ".join(reasons)
+
+
+# TCP ##############################################################################################
+
+def tcp_transport(cap: net.TCPConnectCap, address: str, port: int, connect_timeout: float=5.0,
+                  idle_timeout: float=60.0, stall_timeout: float=2.0, max_msg_size: int=1048576,
+                  on_connect: ?action() -> None=None) -> Transport:
+    """Return a Transport over TCP connections to address and port (RFC 3430)
+
+    The transport keeps one connection at a time. It opens it for the first
+    send() and again for the first send() after the connection was lost;
+    messages sent while it connects are queued (at most MAX_QUEUED) and
+    sent once it is up. Each message is written in one piece, so messages
+    never interleave on the stream; the messages that arrive are split by
+    their BER length (StreamFramer) and delivered with the address and port
+    given to tcp_transport() as their source. on_connect, if given, is
+    called each time a connection has come up and the messages queued for
+    it have been written. A connection carries only its peer's messages,
+    so source_checked is True.
+
+    address is an IPv4 or IPv6 address: look a host name up first (with
+    net.lookup_a() or net.lookup_aaaa()). A host name, like a port outside
+    1..65535, is a fatal error.
+
+    A connection that cannot be set up (refused, unreachable, nothing
+    within connect_timeout seconds) is reported as a non-fatal error, such
+    as "TCP connection to 127.0.0.1:16161 failed: connection refused", and
+    the messages queued for it are dropped. RFC 3430 section 2.3 makes such a
+    connection a timeout of the request, and that is what the Client sees:
+    the error is the hint of its TimeoutError. The socket of a connection
+    that did not come up stays open until the process exits, so the
+    transport does not try again at once: for connect_timeout seconds
+    after the failure, doubled with each further failure in a row up to
+    MAX_TCP_HOLDOFF, send() drops the message and reports the failure
+    again.
+
+    A connection that is up is lost on a write error ("TCP connection to
+    ... lost: broken pipe"), a close by the peer ("... closed by the
+    peer") or an arriving message that loses framing (a header that is not
+    a definite-length SEQUENCE, a message longer than max_msg_size octets).
+    Each is reported as a non-fatal error, and the next send() opens a new
+    connection.
+
+    A connection reset by the peer is not reported. The transport therefore
+    drops a connection when a message is to be sent while the messages sent
+    before it have had nothing back for stall_timeout seconds, counted from
+    the first send after the last message that arrived. It reports a
+    non-fatal error that says so and sends the message on a new connection.
+    Answers flowing back keep a busy connection alive; 0 turns the rule off.
+    A retry sent within stall_timeout of the first attempt stays on the
+    connection, so an answer later than the Client's timeout still counts,
+    as over UDP; a later retry goes out on a new connection. Twice the
+    Client's timeout gives both. A sender of traps alone gets no answers and
+    opens a new connection for each trap sent more than stall_timeout after
+    the one before.
+
+    The Client resends a request after its timeout whether the connection
+    is up or not, and each try has a request-id of its own. Tries sent
+    while a connection comes up are queued and written together once it is
+    up, so a connection that comes up late (after a lost SYN) delivers
+    every try queued for it, and the agent carries out each of them, a SET
+    included. A connect_timeout below the Client's timeout queues at most
+    one try of a request for each connection.
+
+    A connection without traffic for idle_timeout seconds is closed (0:
+    never); either side may close a connection at any time (RFC 3430
+    section 2.3). close() closes the connection; it is idempotent.
+
+    Raises ValueError for a connect_timeout that is not positive, a
+    negative idle_timeout or stall_timeout, or a max_msg_size below
+    MIN_TCP_MESSAGE.
+    """
+    if not (connect_timeout > 0.0):
+        raise ValueError("connect_timeout must be positive")
+    if not (stall_timeout >= 0.0):
+        raise ValueError("stall_timeout must be 0 (off) or a number of seconds")
+    _check_tcp_options(max_msg_size, idle_timeout)
+    ep = _TcpClient(cap, address, port, connect_timeout, idle_timeout, stall_timeout, max_msg_size, on_connect)
+    def _send(data: bytes) -> None:
+        ep.send(data)
+    def _set_receiver(on_data: action(bytes, str, int) -> None, on_error: action(str, bool) -> None) -> None:
+        ep.set_receiver(on_data, on_error)
+    def _close() -> None:
+        ep.close()
+    return Transport(_send, _set_receiver, _close, source_checked=True)
+
+
+actor _TcpClient(cap: net.TCPConnectCap, address: str, port: int, connect_timeout: float, idle_timeout: float,
+                 stall_timeout: float, max_msg_size: int, on_connect: ?action() -> None):
+    # The actor behind tcp_transport(). _gen numbers the connections: the callbacks and timers of a
+    # connection carry its number, and those of a connection that was dropped do nothing.
+    _peer = _peer_text(address, port)
+    var _conn: ?net.TCPConnection = None
+    var _gen = 0
+    var _connected = False
+    var _failure: ?str = None
+    var _closed = False
+    var _queue: list[bytes] = []
+    var _framer = StreamFramer(max_msg_size)
+    # When the first message after the last one that arrived was sent; -1.0: none since
+    var _unanswered_since = -1.0
+    var _last_traffic = 0.0
+    # The error of the last connection that could not be set up, the time before which no new one
+    # is opened, and how long to wait after the next one that cannot be set up
+    var _connect_error = ""
+    var _hold_until = 0.0
+    var _holdoff = connect_timeout
+    var _on_error: ?action(str, bool) -> None = None
+    var _inbox = _Inbox()
+
+    proc def _report(message: str, fatal: bool) -> None:
+        on_error = _on_error
+        if on_error is not None:
+            on_error(message, fatal)
+
+    def _released(c: net.TCPConnection) -> None:
+        # The close() callback: nothing is left to do
+        pass
+
+    proc def _drop() -> None:
+        # Close the connection, if any, and forget it and its queue
+        _gen += 1
+        conn = _conn
+        _conn = None
+        _connected = False
+        _queue = []
+        _framer = StreamFramer(max_msg_size)
+        _unanswered_since = -1.0
+        if conn is not None:
+            conn.close(_released)
+
+    proc def _lost(what: str) -> None:
+        _drop()
+        _report("TCP connection to " + _peer + " " + what, False)
+
+    proc def _not_set_up(reason: str) -> None:
+        # The connection did not come up: no new one before the hold-off has passed
+        message = "TCP connection to " + _peer + " failed: " + reason
+        longest = MAX_TCP_HOLDOFF if MAX_TCP_HOLDOFF > connect_timeout else connect_timeout
+        _connect_error = message
+        _hold_until = _now() + _holdoff
+        _holdoff = 2.0 * _holdoff if 2.0 * _holdoff < longest else longest
+        _drop()
+        _report(message, False)
+
+    def _on_connect(gen: int, c: net.TCPConnection) -> None:
+        if gen != _gen or _closed:
+            # Dropped while it connected: close() does not stop a connect in progress
+            c.close(_released)
+            return
+        _connected = True
+        _holdoff = connect_timeout
+        now = _now()
+        _last_traffic = now
+        if len(_queue) > 0:
+            _unanswered_since = now
+            for data in _queue:
+                c.write(data)
+            _queue = []
+        report = on_connect
+        if report is not None:
+            report()
+        if idle_timeout > 0.0:
+            after now idle_timeout: _idle_check(gen)
+
+    def _on_receive(gen: int, data: bytes) -> None:
+        if gen != _gen or _closed:
+            return
+        _last_traffic = _now()
+        messages = _framer.feed(data)
+        if len(messages) > 0:
+            _unanswered_since = -1.0
+        for m in messages:
+            _inbox.put(m, address, port)
+        lost = _framer.lost
+        if lost != "":
+            _lost("closed: lost framing (" + lost + ")")
+
+    def _on_net_error(gen: int, error: str) -> None:
+        if gen == _gen and not _closed:
+            if _connected:
+                _lost("lost: " + _net_reason(error))
+            else:
+                _not_set_up(_net_reason(error))
+
+    def _on_remote_close(gen: int) -> None:
+        if gen == _gen and not _closed:
+            _lost("closed by the peer")
+
+    def _connect_expired(gen: int) -> None:
+        if gen == _gen and not _connected and not _closed:
+            _not_set_up("no connection within %g s" % connect_timeout)
+
+    def _idle_check(gen: int) -> None:
+        if gen != _gen or not _connected or _closed:
+            return
+        idle = _now() - _last_traffic
+        if idle >= idle_timeout:
+            _drop()
+        else:
+            wait = idle_timeout - idle
+            after now wait: _idle_check(gen)
+
+    proc def _open() -> None:
+        _gen += 1
+        gen = _gen
+        _connected = False
+        def connected(c: net.TCPConnection) -> None:
+            _on_connect(gen, c)
+        def on_receive(c: net.TCPConnection, data: bytes) -> None:
+            _on_receive(gen, data)
+        def on_error(c: net.TCPConnection, error: str) -> None:
+            _on_net_error(gen, error)
+        def on_remote_close(c: net.TCPConnection) -> None:
+            _on_remote_close(gen)
+        net_timeout = connect_timeout if connect_timeout > _NET_CONNECT_TIMEOUT else _NET_CONNECT_TIMEOUT
+        _conn = net.TCPConnection(cap, address, port, connected, on_receive, on_error, on_remote_close,
+                                  connect_timeout=net_timeout)
+        after now connect_timeout: _connect_expired(gen)
+
+    def send(data: bytes) -> None:
+        if _closed:
+            return
+        failure = _failure
+        if failure is not None:
+            _report(failure, True)
+            return
+        conn = _conn
+        if conn is not None:
+            if _connected:
+                now = _now()
+                since = _unanswered_since
+                if stall_timeout > 0.0 and since >= 0.0 and now - since >= stall_timeout:
+                    _lost("presumed dead: nothing received for %.1f s after sending; reconnecting" % (now - since))
+                else:
+                    conn.write(data)
+                    _last_traffic = now
+                    if since < 0.0:
+                        _unanswered_since = now
+                    return
+        if _conn is None:
+            if _now() < _hold_until:
+                _report(_connect_error, False)
+                return
+            _open()
+        if len(_queue) < MAX_QUEUED:
+            _queue.append(data)
+        else:
+            _report("TCP send queue for " + _peer + " is full; message dropped", False)
+
+    def set_receiver(on_data: action(bytes, str, int) -> None, on_error: action(str, bool) -> None) -> None:
+        if _closed:
+            return
+        _on_error = on_error
+        failure = _failure
+        if failure is not None:
+            on_error(failure, True)
+        _inbox.register(on_data)
+
+    def close() -> None:
+        if _closed:
+            return
+        _closed = True
+        _on_error = None
+        _inbox.clear()
+        _drop()
+
+    if port <= 0 or port > 65535:
+        _failure = "TCP setup for " + _peer + " failed: port %d is outside 1..65535" % port
+    elif not (net.is_ipv4(address) or net.is_ipv6(address)):
+        _failure = "TCP setup for " + _peer + " failed: not an IPv4 or IPv6 address"
+
+
+def tcp_server_transport(cap: net.TCPListenCap, address: str, port: int,
+                         on_ready: action(ServerTransport, ?str) -> None,
+                         log_handler: ?logging.Handler=None, max_connections: int=256,
+                         idle_timeout: float=300.0, max_msg_size: int=1048576) -> None:
+    """Listen for TCP connections on address and port (RFC 3430), then call on_ready once
+
+    on_ready(transport, None) means the transport is listening;
+    on_ready(transport, error) means it could not (address in use, an
+    address that is not an IP address, port 0 or a port outside 1..65535),
+    and that transport's local_port() is 0 and it ignores sends. Port 0 is
+    refused because the port picked for it cannot be learned.
+
+    Each accepted connection is a session, numbered 1, 2, 3, ... The peer
+    address of an accepted connection is not available, so on_data gets
+    src_address "" and the session number as src_port, and send_to(data,
+    "", session) writes to that session; a message for any other address
+    is dropped with a warning. An answer for a session that has closed is
+    dropped: only the initiator opens connections (RFC 3430 section 2.3),
+    so an answer goes out on the connection its request came on or not at
+    all. A NotificationReceiver's dedup_window therefore matches a
+    retransmitted inform only on the same connection.
+
+    Each connection has its own StreamFramer: a connection that loses
+    framing is closed, with a warning that does not show the message. A
+    connection without traffic for idle_timeout seconds is closed (0:
+    never). A connection reset by the peer is not reported, so its session
+    stays open until then. With max_connections sessions open, a new
+    connection takes the place of the session that has been without
+    traffic longest, which is closed with a warning (either side may close
+    a connection at any time, RFC 3430 section 2.3).
+
+    The listening socket cannot be closed: close() stops serving, so it
+    closes every session and, from then on, every new connection at once,
+    while the port stays bound until the process exits. Errors after
+    listening (an accept or a write that failed) are logged to log_handler
+    as warnings.
+
+    Raises ValueError for max_connections below 1, a negative idle_timeout
+    or a max_msg_size below MIN_TCP_MESSAGE.
+    """
+    if max_connections < 1:
+        raise ValueError("max_connections must be at least 1, got %d" % max_connections)
+    _check_tcp_options(max_msg_size, idle_timeout)
+    _TcpServer(cap, address, port, on_ready, log_handler, max_connections, idle_timeout, max_msg_size)
+
+
+def _tcp_server_transport(ep: _TcpServer, local_port: int) -> ServerTransport:
+    # Built at module level like _udp_server_transport()
+    def _send_to(data: bytes, dst_address: str, dst_port: int) -> None:
+        ep.send_to(data, dst_address, dst_port)
+    def _set_receiver(on_data: action(bytes, str, int) -> None) -> None:
+        ep.set_receiver(on_data)
+    def _close() -> None:
+        ep.close()
+    return ServerTransport(_send_to, _set_receiver, _close, lambda: local_port)
+
+
+class _Session(object):
+    # An accepted connection of tcp_server_transport(), its framer, and when it last carried a message
+    conn: net.TCPListenConnection
+    framer: StreamFramer
+    last_traffic: float
+
+    def __init__(self, conn: net.TCPListenConnection, framer: StreamFramer, last_traffic: float):
+        self.conn = conn
+        self.framer = framer
+        self.last_traffic = last_traffic
+
+
+actor _TcpServer(cap: net.TCPListenCap, address: str, port: int,
+                 on_ready: action(ServerTransport, ?str) -> None,
+                 log_handler: ?logging.Handler, max_connections: int, idle_timeout: float, max_msg_size: int):
+    # The actor behind tcp_server_transport(); sessions are numbered from 1 and never reused
+    _log = logging.Logger(log_handler)
+    _local = _peer_text(address, port)
+    var _listener: ?net.TCPListener = None
+    var _ready_sent = False
+    var _listening = False
+    var _closed = False
+    var _inbox = _Inbox()
+    var _sessions: dict[int, _Session] = {}
+    var _next_session = 1
+
+    proc def _end(sid: int) -> None:
+        s = _sessions.get(sid)
+        if s is not None:
+            del _sessions[sid]
+            s.conn.close()
+
+    def send_to(data: bytes, dst_address: str, dst_port: int) -> None:
+        if _closed:
+            return
+        if dst_address != "":
+            _log.warning("message dropped: a TCP session is addressed as \"\" and its number, not by an address",
+                         {"local": _local, "address": dst_address, "port": dst_port})
+            return
+        s = _sessions.get(dst_port)
+        if s is not None:
+            s.conn.write(data)
+            s.last_traffic = _now()
+        elif _listening:
+            _log.debug("answer for a closed TCP session dropped", {"local": _local, "session": dst_port})
+
+    def set_receiver(on_data: action(bytes, str, int) -> None) -> None:
+        if not _closed:
+            _inbox.register(on_data)
+
+    def close() -> None:
+        if _closed:
+            return
+        _closed = True
+        _inbox.clear()
+        for sid in list(_sessions.keys()):
+            _end(sid)
+
+    proc def _ready(local_port: int, error: ?str) -> None:
+        _ready_sent = True
+        on_ready(_tcp_server_transport(self, local_port), error)
+
+    def _on_listen(l: net.TCPListener, error: ?str) -> None:
+        if _ready_sent:
+            # Later calls report failed accepts
+            if error is not None and not _closed:
+                _log.warning("TCP accept failed", {"local": _local, "error": error})
+            return
+        if error is not None:
+            _ready(0, "TCP listen on " + _local + " failed: " + error)
+            return
+        _listening = True
+        _ready(port, None)
+
+    def _on_receive(sid: int, data: bytes) -> None:
+        s = _sessions.get(sid)
+        if s is not None:
+            s.last_traffic = _now()
+            framer = s.framer
+            for m in framer.feed(data):
+                _inbox.put(m, "", sid)
+            if framer.lost != "":
+                _log.warning("TCP connection closed: lost framing", {"local": _local, "session": sid,
+                                                                     "reason": framer.lost})
+                _end(sid)
+
+    def _on_conn_error(sid: int, error: str) -> None:
+        if sid in _sessions:
+            _log.warning("TCP connection closed after an error", {"local": _local, "session": sid, "error": error})
+            _end(sid)
+
+    def _on_remote_close(sid: int) -> None:
+        # The connection is closed already
+        if sid in _sessions:
+            del _sessions[sid]
+
+    def _idle_check(sid: int) -> None:
+        s = _sessions.get(sid)
+        if s is not None:
+            idle = _now() - s.last_traffic
+            if idle >= idle_timeout:
+                _log.debug("idle TCP connection closed", {"local": _local, "session": sid})
+                _end(sid)
+            else:
+                wait = idle_timeout - idle
+                after now wait: _idle_check(sid)
+
+    proc def _make_room() -> None:
+        # Close the session that has been without traffic longest
+        quietest = 0
+        since = 0.0
+        for sid in _sessions.keys():
+            t = _sessions[sid].last_traffic
+            if quietest == 0 or t < since:
+                quietest = sid
+                since = t
+        _log.warning("TCP connection closed for a new one: too many connections",
+                     {"local": _local, "session": quietest, "limit": max_connections})
+        _end(quietest)
+
+    def _on_accept(c: net.TCPListenConnection) -> None:
+        if _closed or not _listening:
+            c.close()
+            return
+        if len(_sessions) >= max_connections:
+            _make_room()
+        sid = _next_session
+        _next_session += 1
+        _sessions[sid] = _Session(c, StreamFramer(max_msg_size), _now())
+        def on_receive(conn: net.TCPListenConnection, data: bytes) -> None:
+            _on_receive(sid, data)
+        def on_error(conn: net.TCPListenConnection, error: str) -> None:
+            _on_conn_error(sid, error)
+        def on_remote_close(conn: net.TCPListenConnection) -> None:
+            _on_remote_close(sid)
+        c.cb_install(on_receive, on_error, on_remote_close)
+        if idle_timeout > 0.0:
+            after now idle_timeout: _idle_check(sid)
+
+    if port == 0:
+        _ready(0, "TCP listen on " + _local + " failed: port 0 is not supported: the port picked for it "
+               + "cannot be learned")
+    elif port < 0 or port > 65535:
+        _ready(0, "TCP listen on " + _local + " failed: port outside 1..65535")
+    else:
+        _listener = net.TCPListener(cap, address, port, _on_listen, _on_accept)
 
 
 # In-memory network ################################################################################

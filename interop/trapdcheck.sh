@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Notification interop, sending side: what did the lab's net-snmp snmptrapd
-# (udp 127.0.0.1:16164, container actsnmp-snmptrapd) receive from actsnmp?
+# (udp and tcp 127.0.0.1:16164, container actsnmp-snmptrapd) receive from actsnmp?
 # Its log is converted to the canonical NOTIFICATION blocks with
 # tools/snmptrapd2canon.py and compared with an expected file.
 #
@@ -11,14 +11,16 @@
 #                                                compare the received notifications with EXPECTED
 #                                                (waits max SEC, default 10, until as many
 #                                                notifications as expected arrived)
-#   interop/trapdcheck.sh cli [--quick|--all-users] CMD...
+#   interop/trapdcheck.sh cli [--tcp] [--quick|--all-users] CMD...
 #                                                start, send the net-snmp half of the notifycheck
 #                                                matrix with a net-snmp compatible CLI, e.g.
 #                                                "out/bin/actsnmp" (runs "CMD trap ARGS" /
-#                                                "CMD inform ARGS" on the host), then check
-#   interop/trapdcheck.sh selftest [--quick|--all-users]
+#                                                "CMD inform ARGS" on the host), then check;
+#                                                --tcp sends to tcp:127.0.0.1:16164
+#   interop/trapdcheck.sh selftest [--tcp] [--quick|--all-users]
 #                                                start, send the notifycheck matrix with net-snmp
-#                                                and pysnmp, then check (validates this script)
+#                                                and pysnmp (--tcp: net-snmp alone, over TCP),
+#                                                then check (validates this script)
 #
 # Typical use from a test: "trapdcheck.sh start", send notifications with our
 # Client, "trapdcheck.sh check FILE".
@@ -36,7 +38,7 @@
 set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-usage() { sed -n '2,38p' "$0"; exit "${1:-0}"; }
+usage() { sed -n '2,37p' "$0"; exit "${1:-0}"; }
 [ $# -ge 1 ] || usage 2
 cmd="$1"; shift
 
@@ -51,10 +53,16 @@ start() {
     "$INTEROP_DIR/up.sh" snmptrapd
 }
 
-check() {  # expected-file [--wait SEC]
-    local exp="$1" wait_s=10 n nexp tmp rc=0
+check() {  # expected-file [--wait SEC] [--over WHAT]
+    local exp="$1" wait_s=10 over="" n nexp tmp rc=0
     shift
-    if [ "${1:-}" = "--wait" ]; then wait_s="$2"; fi
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --wait) wait_s="$2"; shift ;;
+            --over) over=" over $2"; shift ;;
+        esac
+        shift
+    done
     [ -f "$exp" ] || die "expected file $exp not found"
     container_running "$C_SNMPTRAPD" || die "$C_SNMPTRAPD is not running (trapdcheck.sh start)"
     nexp="$(grep -c '^NOTIFICATION ' "$exp" || true)"
@@ -67,9 +75,9 @@ check() {  # expected-file [--wait SEC]
     tmp="$(mktemp)"
     canon_log > "$tmp" || { echo "snmptrapd log contains lines that could not be converted: **FAIL**"; rc=1; }
     if diff -u --label "$exp" --label "snmptrapd log (canonical)" "$exp" "$tmp"; then
-        echo "snmptrapd received exactly $(basename "$exp") ($nexp notifications): PASS"
+        echo "snmptrapd received exactly $(basename "$exp") ($nexp notifications$over): PASS"
     else
-        echo "snmptrapd log (canonical) differs from $exp: **FAIL**"; rc=1
+        echo "snmptrapd log (canonical) differs from $exp$over: **FAIL**"; rc=1
     fi
     rm -f "$tmp"
     return $rc
@@ -85,42 +93,56 @@ expected_for() {  # matrix-flag senders -> temp file with the expected blocks
     echo "$f"
 }
 
+# the leading options of selftest and cli: the matrix (--quick, --all-users) and the transport (--tcp)
+q=()
+receiver="127.0.0.1:$SNMPTRAPD_PORT"
+over=UDP
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --quick|--all-users) q=("$1") ;;
+        --tcp) receiver="tcp:127.0.0.1:$SNMPTRAPD_PORT"; over=TCP ;;
+        *) break ;;
+    esac
+    shift
+done
+
 case "$cmd" in
     start) start ;;
     log) canon_log ;;
     raw) docker logs "$C_SNMPTRAPD" 2>&1 ;;
     check) [ $# -ge 1 ] || usage 2; check "$@" ;;
     selftest)
-        q=(); case "${1:-}" in --quick|--all-users) q=("$1") ;; esac
+        senders=netsnmp,pysnmp
+        [ $over = TCP ] && senders=netsnmp      # the lab's pysnmp tools speak UDP only
         start
         rc=0
         "$INTEROP_DIR/nsnmp.sh" python3 /opt/actsnmp/tools/notifycheck.py --send "${q[@]}" \
-            --receiver "127.0.0.1:$SNMPTRAPD_PORT" || rc=1
-        exp="$(expected_for "${q[0]:-}" netsnmp,pysnmp)"
-        check "$exp" || rc=1
+            --senders "$senders" --receiver "$receiver" || rc=1
+        exp="$(expected_for "${q[0]:-}" "$senders")"
+        check "$exp" --over $over || rc=1
         rm -rf "$(dirname "$exp")"
         exit $rc
         ;;
     cli)
-        q=(); case "${1:-}" in --quick|--all-users) q=("$1"); shift ;; esac
         [ $# -ge 1 ] || usage 2
         cli=("$@")
         start
         exp="$(expected_for "${q[0]:-}" netsnmp)"
         cmds="$(mktemp)"
         "$INTEROP_DIR/nsnmp.sh" python3 /opt/actsnmp/tools/notifycheck.py --commands "${q[@]}" \
-            --senders netsnmp --receiver "127.0.0.1:$SNMPTRAPD_PORT" > "$cmds"
-        rc=0; k=0
+            --senders netsnmp --receiver "$receiver" > "$cmds"
+        rc=0; k=0; failed=0
         while IFS= read -r line; do
             k=$((k + 1))
             eval "set -- $line"   # shell quoted by notifycheck.py (shlex.join)
             if "${cli[@]}" "$@" </dev/null; then
                 echo "[PASS] $k ${cli[*]} $1 ${*:2:4} ..."
             else
-                echo "[FAIL] $k ${cli[*]} $line"; rc=1
+                echo "[FAIL] $k ${cli[*]} $line"; rc=1; failed=$((failed + 1))
             fi
         done < "$cmds"
-        check "$exp" || rc=1
+        echo "$((k - failed)) sent, $failed failed over $over"
+        check "$exp" --over $over || rc=1
         rm -rf "$(dirname "$exp")" "$cmds"
         exit $rc
         ;;

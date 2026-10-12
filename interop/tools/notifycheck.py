@@ -19,10 +19,12 @@ A fixed, deterministic list of notifications, each sent by net-snmp
 
 with fixed explicit uptimes, so the receiver output is deterministic.
 
-usage: notifycheck.py [--quick|--all-users] [--receiver HOST:PORT] [--senders netsnmp,pysnmp] ACTION
+usage: notifycheck.py [--quick|--all-users] [--receiver ADDRESS] [--senders netsnmp,pysnmp] ACTION
   --quick       small subset (22 notifications instead of 86)
   --all-users   the full matrix, but the v3 traps/informs for every user of
                 config/users.tsv that net-snmp supports (43; no 3DES) - 198 notifications
+  --receiver    a net-snmp agent address (default 127.0.0.1:16165); over TCP
+                (tcp:127.0.0.1:16165) only net-snmp sends (the lab's pysnmp tools speak UDP only)
 ACTION:
   --expected   print the canonical blocks the receiver must print, in send order
   --send       send the matrix to the receiver; exit 1 if a send failed
@@ -65,6 +67,8 @@ TRAP_ENGINE = {"netsnmp": "0x8000000001020304", "pysnmp": "0x8000000001020305"}
 # show up as a duplicate notification at the receiver)
 INFORM_OPTS = ["-r", "0", "-t", "5"]
 SENDERS = ["netsnmp", "pysnmp"]
+# net-snmp's transport prefixes of an agent address; pysnmp_notify.py sends over UDP only
+DOMAINS = ("udp", "udp6", "udpv6", "udpipv6", "tcp", "tcp6", "tcpv6", "tcpipv6")
 
 E = (1, 3, 6, 1, 4, 1, 8072, 9999)          # netSnmpPlaypen
 N = E + (3,)                                # notification OIDs: N.0.<k>
@@ -326,15 +330,33 @@ def send_all(M, receiver):
     return failed == 0
 
 
+def blocks(lines):
+    """canonical lines -> one tuple of lines per NOTIFICATION ... END block"""
+    out, cur = [], []
+    for line in lines:
+        cur.append(line)
+        if line == "END":
+            out.append(tuple(cur))
+            cur = []
+    return out
+
+
+def transport_domain(receiver):
+    """the transport prefix of a net-snmp agent address (udp, tcp6, ...), "" for none"""
+    prefix = receiver.split(":", 1)[0].lower()
+    return prefix if prefix in DOMAINS else ""
+
+
 def selftest(M, receiver):
     """net-snmp snmptrapd as a stand-in for our receiver"""
     work = tempfile.mkdtemp(prefix="notifycheck-standin-")
     log = os.path.join(work, "snmptrapd.log")
     conf = os.path.join(CONFIG, "snmptrapd-standin.conf")
-    if receiver != "127.0.0.1:16165":
-        # same configuration on another address
+    listen = receiver if transport_domain(receiver) else "udp:" + receiver
+    if listen != "udp:127.0.0.1:16165":
+        # same configuration on another address or transport
         text = open(conf).read().replace("snmpTrapdAddr udp:127.0.0.1:16165",
-                                         "snmpTrapdAddr udp:%s" % receiver)
+                                         "snmpTrapdAddr %s" % listen)
         conf = os.path.join(work, "snmptrapd.conf")
         with open(conf, "w") as f:
             f.write(text)
@@ -353,7 +375,7 @@ def selftest(M, receiver):
             sys.stderr.write("stand-in snmptrapd did not start:\n%s\n"
                              % (open(log).read() if os.path.exists(log) else ""))
             return False
-        sys.stderr.write("stand-in snmptrapd (net-snmp) listening on udp:%s\n" % receiver)
+        sys.stderr.write("stand-in snmptrapd (net-snmp) listening on %s\n" % listen)
         sent_ok = send_all(M, receiver)
         want = len(M)
         for _ in range(40):  # traps are asynchronous: wait until all arrived (max 10 s)
@@ -372,7 +394,11 @@ def selftest(M, receiver):
         raw = f.read().splitlines()
     got, conv_ok = t2c.convert(raw, t2c.load_levels(os.path.join(CONFIG, "users.tsv")))
     exp = expected_lines(M)
-    same = got == exp
+    if transport_domain(receiver).startswith("tcp"):
+        # one connection per notification: the receiver may take them in any order
+        same = sorted(blocks(got)) == sorted(blocks(exp))
+    else:
+        same = got == exp
     sys.stdout.write("".join(line + "\n" for line in got))
     sys.stderr.write("stand-in snmptrapd log: %d lines, %d notifications\n"
                      % (len(raw), sum(1 for line in got if line.startswith("NOTIFICATION "))))
@@ -417,6 +443,9 @@ def main(argv):
             sys.stderr.write("unknown argument %s\n" % a)
             return 2
         i += 1
+    if transport_domain(receiver).startswith("tcp") and "pysnmp" in senders and action != "--expected":
+        sys.stderr.write("pysnmp_notify.py sends over UDP only: use --senders netsnmp with a tcp: receiver\n")
+        return 2
     M = build_matrix(quick, senders, all_users)
     if action == "--expected":
         sys.stdout.write("".join(line + "\n" for line in expected_lines(M)))

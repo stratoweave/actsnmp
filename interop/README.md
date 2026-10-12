@@ -10,8 +10,9 @@ A Docker lab that tests actsnmp against independent SNMP implementations:
 
 Both agents serve the same generated dataset, so every walk of it has one
 expected answer. All containers use host networking and listen on loopback
-only. The MIB compiler has its own corpus and oracle setup in
-[`mibs/`](mibs/README.md).
+only. net-snmp's agent and trap receiver also listen on TCP (RFC 3430);
+snmpsim and the lab's pysnmp tools speak UDP only. The MIB compiler has its
+own corpus and oracle setup in [`mibs/`](mibs/README.md).
 
 ## Quick start
 
@@ -19,6 +20,7 @@ only. The MIB compiler has its own corpus and oracle setup in
 interop/build.sh          # build the image actsnmp-interop:1
 interop/up.sh             # start snmpd, snmpsim, snmptrapd and the tools container
 interop/nsnmp.sh snmpget -v2c -c public 127.0.0.1:16161 1.3.6.1.2.1.1.1.0
+interop/nsnmp.sh snmpget -v2c -c public tcp:127.0.0.1:16161 1.3.6.1.2.1.1.1.0
 interop/pysnmp.sh get -v2c -c public 127.0.0.1:16162 1.3.6.1.2.1.1.1.0
 interop/selftest.sh       # verify the lab itself (about 4 min, --quick about 2)
 interop/down.sh           # remove the containers, keep the image
@@ -37,17 +39,19 @@ initial values and engineBoots restarts at 1.
 
 | Service | Container | Address | SNMPv3 engine ID |
 |---|---|---|---|
-| net-snmp agent | `actsnmp-snmpd` | udp/tcp `127.0.0.1:16161`, udp6 `[::1]:16161` | `0x80001f8880616374736e6d7064` ("actsnmpd") |
+| net-snmp agent | `actsnmp-snmpd` | udp/tcp `127.0.0.1:16161`, udp6/tcp6 `[::1]:16161` | `0x80001f8880616374736e6d7064` ("actsnmpd") |
 | snmpsim agent | `actsnmp-snmpsim` | udp `127.0.0.1:16162`, udp6 `[::1]:16162` | `0x80004fb805616374736e6d7073696d` ("actsnmpsim") |
-| actsnmp agent (under test) | host | udp `127.0.0.1:16163`, `[::1]:16163` | `0x80001f8880616374736e6d7061` ("actsnmpa") |
-| net-snmp trap receiver | `actsnmp-snmptrapd` | udp `127.0.0.1:16164`, udp6 `[::1]:16164` | `0x80001f8880616374736e6d7074` ("actsnmpt") |
-| actsnmp receiver (under test) | host | udp `127.0.0.1:16165` | `0x80001f8880616374736e6d7072` ("actsnmpr") |
+| actsnmp agent (under test) | host | udp `127.0.0.1:16163`, `[::1]:16163`; tcp with `--tcp` | `0x80001f8880616374736e6d7061` ("actsnmpa") |
+| net-snmp trap receiver | `actsnmp-snmptrapd` | udp/tcp `127.0.0.1:16164`, udp6/tcp6 `[::1]:16164` | `0x80001f8880616374736e6d7074` ("actsnmpt") |
+| actsnmp receiver (under test) | host | udp `127.0.0.1:16165`; tcp with `--tcp` | `0x80001f8880616374736e6d7072` ("actsnmpr") |
 | actsnmp agent serving an snmpd MIB snapshot | host | udp `127.0.0.1:16167` | |
-| closed port for timeout tests | | udp `127.0.0.1:16169` | |
+| closed port for timeout and refusal tests | | udp/tcp `127.0.0.1:16169`, `[::1]:16169` | |
 | tools | `actsnmp-tools` | | idle container for `docker exec` |
 
 16163 and 16165 and the two engine IDs are the defaults of `actsnmp agent`
-and `actsnmp trapd`; nothing in the lab listens on them.
+and `actsnmp trapd`; nothing in the lab listens on them. With `--tcp` they
+listen on the same address and port over TCP instead of UDP, so the checks
+run a UDP and a TCP instance side by side.
 
 SNMPv3 trap senders are authoritative and use fixed engine IDs:
 `0x8000000001020304` for net-snmp `snmptrap -e` and for actsnmp,
@@ -183,11 +187,11 @@ interop/run-interop.sh --phases cli,agent     # some phases, with an existing bu
 | Phase | What runs |
 |---|---|
 | `build` | `acton build`, then `up.sh` |
-| `library` | `src/test_interop.act`: the library against the lab over real UDP |
+| `library` | `src/test_interop.act`: the library against the lab over real UDP and TCP |
 | `cli` | `clicheck.sh`: the actsnmp CLI side by side with net-snmp's tools |
-| `agent` | `actsnmp agent` on 16163 (IPv4 and IPv6), checked with `agentcheck.sh` |
-| `notify` | `actsnmp trapd --canon` on 16165, fed by `notifycheck.sh` |
-| `trapd` | `trapdcheck.sh cli`: actsnmp sends, the lab snmptrapd receives |
+| `agent` | `actsnmp agent` on 16163 (IPv4 and IPv6), checked with `agentcheck.sh`; then `actsnmp agent --tcp`, checked with net-snmp's tools over TCP |
+| `notify` | `actsnmp trapd --canon` on 16165, fed by `notifycheck.sh`; then `actsnmp trapd --canon --tcp`, fed by net-snmp over TCP (`notifycheck.sh --tcp`) |
+| `trapd` | `trapdcheck.sh cli`: actsnmp sends, the lab snmptrapd receives; over UDP, then over TCP |
 
 Each check can also be run on its own with the lab up:
 
@@ -195,9 +199,10 @@ Each check can also be run on its own with the lab up:
 acton test --tag interop --no-cache --min-iter 1 --max-iter 1 --max-time 120000 --jobs 1 --module test_interop
 interop/clicheck.sh [--quick] [--section dataset,set] [--filter REGEX] [-v]
 interop/agentcheck.sh [--quick] 'acton=127.0.0.1:16163,udp6:[::1]:16163'
-interop/notifycheck.sh [--quick|--all-users] --log FILE      # FILE: output of actsnmp trapd --canon
+interop/agentcheck.sh [--quick] 'acton-tcp=tcp:127.0.0.1:16163,tcp6:[::1]:16163'   # actsnmp agent --tcp
+interop/notifycheck.sh [--tcp] [--quick|--all-users] --log FILE  # FILE: output of actsnmp trapd --canon [--tcp]
 interop/trapdcheck.sh start; ...; interop/trapdcheck.sh check EXPECTED
-interop/trapdcheck.sh cli [--quick|--all-users] out/bin/actsnmp
+interop/trapdcheck.sh cli [--tcp] [--quick|--all-users] out/bin/actsnmp
 ```
 
 The tests in `test_interop` skip themselves when the lab does not answer.
@@ -226,6 +231,38 @@ other direction: it restarts the lab snmptrapd, and `log` or `check` print
 or compare what it received. Restart it before each run, since it remembers
 boots and time per sender engine.
 
+### SNMP over TCP
+
+snmpd and snmptrapd listen on `tcp:127.0.0.1` and `tcp6:[::1]` next to UDP,
+and net-snmp's tools take the same `tcp:` and `tcp6:` addresses as actsnmp.
+The lab's pysnmp tools speak UDP only and snmpsim does not listen on TCP, so
+every TCP check uses net-snmp alone:
+
+* `test_interop`: Clients over `tcp_transport()` against snmpd (GET, GETNEXT,
+  GETBULK, walks, SNMPv3 discovery on the connection, IPv6, a refused
+  connection), notifications over TCP to snmptrapd, and net-snmp's half of
+  the notification matrix to a NotificationReceiver over
+  `tcp_server_transport()`.
+* `clicheck.sh --section tcp`: the CLI and net-snmp's tools with `tcp:` and
+  `tcp6:` addresses: requests, walks and SETs against snmpd, Reports and
+  timeouts on a live connection, refused connections, and notifications to
+  snmptrapd.
+* `agentcheck.sh` with `tcp:`/`tcp6:` addresses runs its checks with net-snmp
+  alone (pysnmp's are left out).
+* `notifycheck.sh --tcp` sends net-snmp's half of the matrix (99 of the 198
+  notifications with `--all-users`) to `tcp:127.0.0.1:16165`. The expected
+  blocks go to a temporary file. snmptrap and snmpinform use one connection
+  per notification and the receiver may take the connections in any order,
+  so the blocks are compared in any order.
+* `trapdcheck.sh cli --tcp` sends with the CLI to `tcp:127.0.0.1:16164`. A
+  trap over TCP gets no answer, so `actsnmp trap` waits for its connection
+  and exits 0.3 s after it came up and carried the trap.
+
+When the connection is refused, net-snmp's request tools print `snmpget:
+Unknown host (tcp:127.0.0.1:16169) (Connection refused)` at once, as
+actsnmp does. snmptrap and snmpinform print only `snmptrap: `; actsnmp gives
+the reason there too (a documented difference in clicheck).
+
 ## Helper commands
 
 | Command | Purpose |
@@ -247,6 +284,7 @@ interop/pysnmp.sh bulkwalk -v3 -l authPriv -u u_sha256_aes -a SHA-256 -A authpas
 
 Packet capture:
 `docker run --rm --network host --cap-add NET_RAW --cap-add NET_ADMIN -u root actsnmp-interop:1 tcpdump -i lo -nn -X udp port 16163`
+(`tcp port 16163` for an agent started with `--tcp`)
 
 ## Adding cases
 

@@ -1,13 +1,20 @@
-"""Loopback tests: Client, Agent and NotificationReceiver over real UDP on 127.0.0.1 and ::1
+"""Loopback tests: Client, Agent and NotificationReceiver over real UDP and TCP
 
-The servers listen on ephemeral ports. The GET to a closed port relies on
-Linux sending ICMP port unreachable on loopback.
+The UDP servers listen on ephemeral ports of 127.0.0.1 and ::1. The GET to
+a closed port relies on Linux sending ICMP port unreachable on loopback. A
+TCP listening socket cannot be closed or bound to port 0, so every TCP test
+listens on a port of its own range from TCP_PORTS on (testutil.ListenTcp).
+The CLI tests run actsnmp's client commands, agent and trapd over TCP as
+its main actor does, and HostLookup against the hosts file (localhost).
 """
 
 import logging
 import net
 import testing
+import time
 
+import actsnmp
+import cliopts
 import errors
 import fmt
 import notify
@@ -19,15 +26,33 @@ from notify import Notification
 from oid import Oid
 from receiver import NotificationReceiver, ReceiverConfig
 from security import Community, Security, Usm
-from transport import ServerTransport, udp_server_transport
+from transport import ServerTransport, tcp_transport, udp_server_transport
 from values import Integer, OctetString, VarBind
-from testutil import h, outcome, report_env
+from testutil import ListenTcp, h, outcome, pseudo_random, report_env
 
 SYS_DESCR = Oid([1, 3, 6, 1, 2, 1, 1, 1, 0])
 DESCR = b"actsnmp loopback agent"
 AGENT_ENGINE = "80001f88806c6f6f706261636b"
 RECEIVER_ENGINE = "80001f8880616374736e6d7072"
 OPTS = Options(timeout=1.0, retries=2)
+
+# The TCP tests' ports: test k listens on the first free one of the TCP_RANGE ports from
+# TCP_PORTS + k * TCP_RANGE, and nothing listens on TCP_CLOSED_PORT
+TCP_PORTS = 26500
+TCP_RANGE = 40
+TCP_CLOSED_PORT = 26499
+
+# Seconds a TCP test waits after its last answer to see that nothing more arrives (no retry, no
+# duplicate)
+QUIET = 0.1
+
+proc def _skip_env(t: testing.EnvT, reason: str) -> None:
+    # t.skip() reports the skip, then raises AbortTest to end the test body;
+    # in a callback that exception has nowhere to go
+    try:
+        t.skip(reason)
+    except testing.AbortTest:
+        pass
 
 def sha_aes() -> Usm:
     return Usm.from_passwords("u_sha_aes", usm.AUTH_SHA1, "authpass123", usm.PRIV_AES128, "privpass123")
@@ -189,3 +214,652 @@ actor _test_icmp_unreachable(t: testing.EnvT):
         c.get(done, [SYS_DESCR])
 
     udp_server_transport(net.UDPListenCap(ucap), "127.0.0.1", 0, on_ready, t.log_handler)
+
+
+# TCP ##############################################################################################
+
+def _tcp_ports(k: int) -> int:
+    # The first port of TCP test k's range
+    return TCP_PORTS + k * TCP_RANGE
+
+proc def _tcp_client(t: testing.EnvT, port: int, sec: Security, opts: Options=OPTS, stall_timeout: float=1.0) -> Client:
+    # A Client of 127.0.0.1 port over tcp_transport()
+    tcap = net.TCPCap(net.NetCap(t.env.cap))
+    tr = tcp_transport(net.TCPConnectCap(tcap), "127.0.0.1", port, stall_timeout=stall_timeout)
+    return Client(None, "127.0.0.1", sec, t.log_handler, port=port, opts=opts, transport=tr)
+
+def _users(sec: Security) -> list[Usm]:
+    if isinstance(sec, Usm):
+        return [sec]
+    return []
+
+def _enterprise(arcs: list[int]) -> Oid:
+    return Oid([1, 3, 6, 1, 4, 1, 8072, 9999] + arcs)
+
+
+actor _TcpAgent(t: testing.EnvT, first_port: int, view: MibView, users: list[Usm], on_listening: action(int) -> None,
+                max_connections: int=256, idle_timeout: float=300.0, delay: float=0.0):
+    """An Agent over tcp_server_transport() on 127.0.0.1 that records the source of every request
+
+    on_listening(port) once it listens; a listen error fails the test.
+    Every answer goes out delay seconds late.
+    """
+    var agent: ?Agent = None
+    var seen: list[(str, int)] = []
+    var server: ?ServerTransport = None
+
+    def sources() -> list[(str, int)]:
+        return seen
+
+    def close() -> None:
+        a = agent
+        if a is not None:
+            a.close()
+
+    def _send_late(data: bytes, dst_address: str, dst_port: int) -> None:
+        s = server
+        if s is not None:
+            s.send_to(data, dst_address, dst_port)
+
+    def on_ready(st: ServerTransport, error: ?str) -> None:
+        if error is not None:
+            t.failure(AssertionError("listen: " + error))
+            return
+        server = st
+        def set_receiver(on_data: action(bytes, str, int) -> None) -> None:
+            def recorded(data: bytes, src_address: str, src_port: int) -> None:
+                seen.append((src_address, src_port))
+                on_data(data, src_address, src_port)
+            st.set_receiver(recorded)
+        def send_to(data: bytes, dst_address: str, dst_port: int) -> None:
+            if delay > 0.0:
+                after delay: _send_late(data, dst_address, dst_port)
+            else:
+                st.send_to(data, dst_address, dst_port)
+        recording = ServerTransport(send_to, set_receiver, st.close, st.local_port)
+        agent = Agent(recording, view, AgentConfig({"public": False}, users, h(AGENT_ENGINE)), t.log_handler)
+        on_listening(st.local_port())
+
+    listener = ListenTcp(net.TCPListenCap(net.TCPCap(net.NetCap(t.env.cap))), "127.0.0.1", first_port, TCP_RANGE,
+                         on_ready, t.log_handler, max_connections, idle_timeout)
+
+
+actor _TcpGet(t: testing.EnvT, k: int, sec: Security):
+    """A GET of sysDescr.0 over TCP: discovery (SNMPv3) and the request go over the one connection"""
+    t.timeout(15.0)
+    var server: ?_TcpAgent = None
+
+    def conclude(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        c.close()
+        a = server
+        seen: list[(str, int)] = []
+        if a is not None:
+            seen = a.sources()
+            a.close()
+        def check() -> None:
+            if e is not None:
+                raise AssertionError("GET over TCP failed: " + str(e))
+            if r is not None:
+                testing.assertEqual(r.varbinds, [VarBind(SYS_DESCR, OctetString(DESCR))])
+            testing.assertEqual(seen, [("", 1) for _ in range(2 if isinstance(sec, Usm) else 1)])
+        report_env(t, outcome(check))
+
+    def done(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        after now QUIET: conclude(c, r, e)
+
+    def listening(port: int) -> None:
+        _tcp_client(t, port, sec).get(done, [SYS_DESCR])
+
+    server = _TcpAgent(t, _tcp_ports(k), view(), _users(sec), listening)
+
+actor _test_tcp_v2c_get(t: testing.EnvT):
+    """SNMPv2c GET over TCP on 127.0.0.1"""
+    a = _TcpGet(t, 0, Community("public"))
+
+actor _test_tcp_v3_auth_priv_get(t: testing.EnvT):
+    """SNMPv3 authPriv (SHA/AES) GET with discovery over TCP on 127.0.0.1"""
+    a = _TcpGet(t, 1, sha_aes())
+
+
+actor _test_tcp_walk(t: testing.EnvT):
+    """An SNMPv2c walk (GETBULK) over TCP: every request on the one connection"""
+    t.timeout(15.0)
+    rows = [VarBind(_enterprise([1, 1, i, 0]), Integer(i)) for i in range(1, 61)]
+    var server: ?_TcpAgent = None
+
+    def conclude(c: Client, vbs: list[VarBind], e: ?errors.SnmpError) -> None:
+        stats = c.stats()
+        c.close()
+        a = server
+        seen: list[(str, int)] = []
+        if a is not None:
+            seen = a.sources()
+            a.close()
+        def check() -> None:
+            if e is not None:
+                raise AssertionError("walk over TCP failed: " + str(e))
+            testing.assertEqual(vbs, rows)
+            testing.assertEqual(len(seen), stats.responses)
+            testing.assertTrue(len(seen) >= 2, "%d requests" % len(seen))
+            testing.assertEqual(stats.retries, 0)
+            for s in seen:
+                testing.assertEqual(s, ("", 1))
+        report_env(t, outcome(check))
+
+    def walked(c: Client, vbs: list[VarBind], e: ?errors.SnmpError) -> None:
+        after now QUIET: conclude(c, vbs, e)
+
+    def listening(port: int) -> None:
+        _tcp_client(t, port, Community("public")).walk(walked, _enterprise([]))
+
+    server = _TcpAgent(t, _tcp_ports(2), MibView(rows + [VarBind(SYS_DESCR, OctetString(DESCR))]), [], listening)
+
+
+actor _test_tcp_large_response(t: testing.EnvT):
+    """A response of about 61000 octets over TCP arrives in several reads and is put together again"""
+    t.timeout(15.0)
+    big = [VarBind(_enterprise([2, i, 0]), OctetString(pseudo_random(2400, i))) for i in range(1, 26)]
+    var server: ?_TcpAgent = None
+
+    def conclude(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        c.close()
+        a = server
+        seen: list[(str, int)] = []
+        if a is not None:
+            seen = a.sources()
+            a.close()
+        def check() -> None:
+            if e is not None:
+                raise AssertionError("GET over TCP failed: " + str(e))
+            if r is not None:
+                testing.assertTrue(r.varbinds == big, "the values differ")
+            testing.assertEqual(seen, [("", 1)])
+        report_env(t, outcome(check))
+
+    def got(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        after now QUIET: conclude(c, r, e)
+
+    def listening(port: int) -> None:
+        _tcp_client(t, port, Community("public")).get(got, [vb.oid for vb in big])
+
+    server = _TcpAgent(t, _tcp_ports(3), MibView(big), [], listening)
+
+
+actor _test_tcp_server_idle_timeout_reconnects(t: testing.EnvT):
+    """The agent closes an idle connection; the Client's next request goes out on a new one without a retry"""
+    t.timeout(15.0)
+    var server: ?_TcpAgent = None
+    var client: ?Client = None
+
+    def second(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        stats = c.stats()
+        c.close()
+        a = server
+        seen: list[(str, int)] = []
+        if a is not None:
+            seen = a.sources()
+            a.close()
+        def check() -> None:
+            if e is not None:
+                raise AssertionError("second GET failed: " + str(e))
+            testing.assertEqual(seen, [("", 1), ("", 2)])
+            testing.assertEqual([stats.responses, stats.retries], [2, 0])
+        report_env(t, outcome(check))
+
+    def ask_again() -> None:
+        c = client
+        if c is not None:
+            c.get(second, [SYS_DESCR])
+
+    def first(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        if e is not None:
+            c.close()
+            t.failure(AssertionError("first GET failed: " + str(e)))
+            return
+        after now 0.4: ask_again()
+
+    def listening(port: int) -> None:
+        c = _tcp_client(t, port, Community("public"))
+        client = c
+        c.get(first, [SYS_DESCR])
+
+    server = _TcpAgent(t, _tcp_ports(4), view(), [], listening, idle_timeout=0.15)
+
+
+actor _test_tcp_refused(t: testing.EnvT):
+    """A GET to a closed TCP port times out with the refused connection as the hint"""
+    t.timeout(15.0)
+
+    def done(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        stats = c.stats()
+        c.close()
+        def check() -> None:
+            if isinstance(e, errors.TimeoutError):
+                testing.assertEqual(e.hint, "send error: TCP connection to 127.0.0.1:%d failed: connection refused"
+                                    % TCP_CLOSED_PORT)
+                testing.assertEqual(stats.unreachable, 0)
+            else:
+                raise AssertionError("expected a TimeoutError, got " + (str(e) if e is not None else "a response"))
+        report_env(t, outcome(check))
+
+    c = _tcp_client(t, TCP_CLOSED_PORT, Community("public"), Options(timeout=0.3, retries=1))
+    c.get(done, [SYS_DESCR])
+
+
+actor _test_tcp_max_connections(t: testing.EnvT):
+    """Beyond max_connections the agent closes the session without traffic longest and serves the new connection"""
+    t.timeout(15.0)
+    var server: ?_TcpAgent = None
+    var first: ?Client = None
+    var second: ?Client = None
+    var steps: list[str] = []
+
+    def finish(error: ?Exception) -> None:
+        for x in [first, second]:
+            if x is not None:
+                x.close()
+        a = server
+        if a is not None:
+            a.close()
+        report_env(t, error)
+
+    def answered_again(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        steps.append("first answered again" if e is None else "first again: " + str(e))
+        a = server
+        seen = a.sources() if a is not None else []
+        def check() -> None:
+            testing.assertEqual(steps, ["first answered", "second answered", "first answered again"])
+            # the second Client's connection took the place of the first's, and the first's new one
+            # that of the second's
+            testing.assertEqual(seen, [("", 1), ("", 2), ("", 3)])
+        finish(outcome(check))
+
+    def answered_second(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        steps.append("second answered" if e is None else "second: " + str(e))
+        f = first
+        if f is not None:
+            f.get(answered_again, [SYS_DESCR])
+
+    def answered(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        steps.append("first answered" if e is None else "first: " + str(e))
+        s = second
+        if s is not None:
+            s.get(answered_second, [SYS_DESCR])
+
+    def listening(port: int) -> None:
+        first = _tcp_client(t, port, Community("public"))
+        second = _tcp_client(t, port, Community("public"))
+        f = first
+        if f is not None:
+            f.get(answered, [SYS_DESCR])
+
+    server = _TcpAgent(t, _tcp_ports(5), view(), [], listening, max_connections=1)
+
+
+actor _test_tcp_notifications(t: testing.EnvT):
+    """An SNMPv2c trap, an SNMPv2c inform and an SNMPv3 authPriv inform to the NotificationReceiver over TCP"""
+    t.timeout(15.0)
+    trap_oid = notify.TRAP_LINK_UP
+    payload = [VarBind(Oid([1, 3, 6, 1, 4, 1, 8072, 9999, 1, 1, 1, 0]), Integer(5))]
+    var rcv: ?NotificationReceiver = None
+    var listener: ?ListenTcp = None
+    var blocks: list[str] = []
+    var sources: list[str] = []
+    var addresses: list[str] = []
+    var acks: list[str] = []
+    var clients: list[Client] = []
+    var finished = False
+
+    def conclude() -> None:
+        for c in clients:
+            c.close()
+        r = rcv
+        if r is not None:
+            r.close()
+        line = ".1.3.6.1.4.1.8072.9999.1.1.1.0 = INTEGER: 5\nEND"
+        want = sorted(['NOTIFICATION v2c TRAP2 community="public" uptime=100 trapoid=.1.3.6.1.6.3.1.1.5.4\n' + line,
+                       'NOTIFICATION v2c INFORM community="public" uptime=200 trapoid=.1.3.6.1.6.3.1.1.5.4\n' + line,
+                       'NOTIFICATION v3 INFORM user="u_sha_aes" level=authPriv context="" uptime=300 '
+                       + 'trapoid=.1.3.6.1.6.3.1.1.5.4\n' + line])
+        got = sorted(blocks)
+        def check() -> None:
+            testing.assertEqual(sorted(acks), ["v2c", "v3"])
+            testing.assertEqual(got, want)
+            testing.assertEqual(addresses, ["", "", ""])
+            # the two Clients' connections, in either order; the v2c trap and inform share one
+            testing.assertEqual(sorted(list(set(sources))), ["session-1", "session-2"])
+        report_env(t, outcome(check))
+
+    proc def _maybe_done() -> None:
+        if finished or len(blocks) < 3 or len(acks) < 2:
+            return
+        finished = True
+        after now QUIET: conclude()
+
+    def on_notification(r: NotificationReceiver, n: Notification) -> None:
+        blocks.append(fmt.canon_notification(n))
+        sources.append(n.source())
+        addresses.append(n.source_address)
+        _maybe_done()
+
+    def trap_sent(c: Client, e: ?errors.SnmpError) -> None:
+        if e is not None:
+            t.failure(AssertionError("trap: " + str(e)))
+
+    def acked_v2c(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        if e is not None:
+            t.failure(AssertionError("v2c inform: " + str(e)))
+            return
+        acks.append("v2c")
+        _maybe_done()
+
+    def acked_v3(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        if e is not None:
+            t.failure(AssertionError("v3 inform: " + str(e)))
+            return
+        acks.append("v3")
+        _maybe_done()
+
+    def on_ready(st: ServerTransport, error: ?str) -> None:
+        if error is not None:
+            t.failure(AssertionError("listen failed: " + error))
+            return
+        cfg = ReceiverConfig(["public"], [sha_aes()], [], h(RECEIVER_ENGINE), 1)
+        rcv = NotificationReceiver(st, cfg, on_notification, t.log_handler)
+        port = st.local_port()
+        c2 = _tcp_client(t, port, Community("public"))
+        c3 = _tcp_client(t, port, sha_aes())
+        clients.append(c2)
+        clients.append(c3)
+        c2.trap(trap_sent, trap_oid, payload, 100)
+        c2.inform(acked_v2c, trap_oid, payload, 200)
+        c3.inform(acked_v3, trap_oid, payload, 300)
+
+    listener = ListenTcp(net.TCPListenCap(net.TCPCap(net.NetCap(t.env.cap))), "127.0.0.1", _tcp_ports(6), TCP_RANGE,
+                         on_ready, t.log_handler)
+
+
+# The CLI over TCP #################################################################################
+
+class _Step(object):
+    """A client command line (without "actsnmp"), what it must write and its exit code, within seconds"""
+    args: list[str]
+    out: str
+    err: str
+    code: int
+    seconds: float
+
+    def __init__(self, args: list[str], out: str, err: str, code: int, seconds: float):
+        self.args = args
+        self.out = out
+        self.err = err
+        self.code = code
+        self.seconds = seconds
+
+actor _CliRun(report: action(str, str, int, float) -> None):
+    """The out, err and done callbacks of one command; report(out, err, code, seconds taken) once"""
+    _started = _now()
+    var _out: list[str] = []
+    var _err: list[str] = []
+    var _done = False
+
+    def out(s: str) -> None:
+        _out.append(s)
+
+    def err(s: str) -> None:
+        _err.append(s)
+
+    def done(code: int) -> None:
+        if not _done:
+            _done = True
+            report("".join(_out), "".join(_err), code, _now() - _started)
+
+def _now() -> float:
+    # Monotonic time in seconds
+    return float(time.monotonic_ns()) / 1000000000.0
+
+proc def _cli(t: testing.EnvT, args: list[str], run: _CliRun) -> None:
+    # A client command over TCP, as `actsnmp` runs it once the agent's host is an IP address
+    o = cliopts.parse(["actsnmp"] + args)
+    cap = net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap)))
+    actsnmp.tcp_command(cap, o, actsnmp.security_of(o), run.out, run.err, run.done)
+
+actor _CliScript(t: testing.EnvT, steps: list[_Step], report: action(list[str]) -> None):
+    """Runs steps one after the other; report(mismatches) at the end, empty when all passed"""
+    var _i = 0
+    var _failures: list[str] = []
+
+    def _step_done(out: str, err: str, code: int, seconds: float) -> None:
+        s = steps[_i]
+        if (out, err, code) != (s.out, s.err, s.code) or seconds > s.seconds:
+            _failures.append("actsnmp " + " ".join(s.args) + "\n  expected exit %d, out %r, err %r within %g s"
+                             % (s.code, s.out, s.err, s.seconds) + "\n  got      exit %d, out %r, err %r after %f s"
+                             % (code, out, err, seconds))
+        _i += 1
+        _next()
+
+    proc def _next() -> None:
+        if _i >= len(steps):
+            report(_failures)
+        else:
+            _cli(t, steps[_i].args, _CliRun(_step_done))
+
+    _next()
+
+def _sha_aes_args() -> list[str]:
+    return ["-v3", "-l", "authPriv", "-u", "u_sha_aes", "-a", "SHA", "-A", "authpass123", "-x", "AES", "-X",
+            "privpass123"]
+
+actor _test_tcp_cli(t: testing.EnvT):
+    """get (SNMPv2c, SNMPv3 with discovery) and walk over TCP; a refused connection ends get and trap at once"""
+    t.timeout(30.0)
+    var server: ?_TcpAgent = None
+    var script: ?_CliScript = None
+    line = ".1.3.6.1.2.1.1.1.0 = STRING: \"actsnmp loopback agent\"\n"
+
+    def conclude(failures: list[str]) -> None:
+        a = server
+        if a is not None:
+            a.close()
+        if len(failures) == 0:
+            t.success()
+        else:
+            t.failure(AssertionError("%d step(s) failed:\n" % len(failures) + "\n".join(failures)))
+
+    def finished(failures: list[str]) -> None:
+        after now QUIET: conclude(failures)
+
+    def listening(port: int) -> None:
+        peer = "tcp:127.0.0.1:%d" % port
+        closed = "tcp:127.0.0.1:%d" % TCP_CLOSED_PORT
+        closed6 = "tcp6:[::1]:%d" % TCP_CLOSED_PORT
+        steps = [
+            _Step(["get", "-v2c", "-c", "public", peer, "1.3.6.1.2.1.1.1.0"], line, "", 0, 5.0),
+            _Step(["get"] + _sha_aes_args() + [peer, "1.3.6.1.2.1.1.1.0"], line, "", 0, 5.0),
+            _Step(["walk", "-v2c", "-c", "public", peer, "1.3.6.1.2.1.1.1"], line, "", 0, 5.0),
+            # -t 5 with the default -r 5: a timeout would take 30 s; net-snmp's error comes at once
+            _Step(["get", "-v2c", "-c", "public", "-t", "5", closed, "1.3.6.1.2.1.1.1.0"], "",
+                  "snmpget: Unknown host (" + closed + ") (Connection refused)\n", 1, 2.0),
+            _Step(["walk", "-v2c", "-c", "public", "-t", "5", closed6, "1.3.6.1.2.1.1"], "",
+                  "snmpwalk: Unknown host (" + closed6 + ") (Connection refused)\n", 1, 2.0),
+            _Step(["trap", "-v2c", "-c", "public", "-t", "5", closed, "1", "1.3.6.1.6.3.1.1.5.1"], "",
+                  "snmptrap: Unknown host (" + closed + ") (Connection refused)\n", 1, 2.0),
+            _Step(["inform"] + _sha_aes_args() + ["-t", "5", closed, "1", "1.3.6.1.6.3.1.1.5.1"], "",
+                  "snmpinform: Unknown host (" + closed + ") (Connection refused)\n", 1, 2.0),
+        ]
+        script = _CliScript(t, steps, finished)
+
+    server = _TcpAgent(t, _tcp_ports(7), view(), [sha_aes()], listening)
+
+
+actor _test_tcp_cli_slow_agent(t: testing.EnvT):
+    """An answer later than -t still counts over TCP: the first retry goes out on the same connection
+
+    The agent answers 1.5 s after each request: after the retry (-t 1),
+    and before the request ends after two tries of 1 s each.
+    """
+    t.timeout(15.0)
+    var server: ?_TcpAgent = None
+    var run: ?_CliRun = None
+
+    def conclude(out: str, err: str, code: int, seconds: float) -> None:
+        a = server
+        seen: list[(str, int)] = []
+        if a is not None:
+            seen = a.sources()
+            a.close()
+        def check() -> None:
+            testing.assertEqual((out, err, code), (".1.3.6.1.2.1.1.1.0 = STRING: \"actsnmp loopback agent\"\n", "", 0))
+            # the request and its first retry, both on the first connection
+            testing.assertEqual(seen, [("", 1), ("", 1)])
+        report_env(t, outcome(check))
+
+    def got(out: str, err: str, code: int, seconds: float) -> None:
+        after now QUIET: conclude(out, err, code, seconds)
+
+    def listening(port: int) -> None:
+        r = _CliRun(got)
+        run = r
+        _cli(t, ["get", "-v2c", "-c", "public", "-t", "1", "-r", "1", "tcp:127.0.0.1:%d" % port, "1.3.6.1.2.1.1.1.0"],
+             r)
+
+    server = _TcpAgent(t, _tcp_ports(10), view(), [], listening, delay=1.5)
+
+
+actor _ServeTcp(t: testing.EnvT, command: str, first_port: int, on_listening: action(int, str) -> None,
+                printed: action(str) -> None):
+    """agent or trapd with --tcp as `actsnmp` runs them, on the first free port of the TCP_RANGE ports from first_port
+
+    on_listening(port, startup line) once it listens; trapd (--canon) prints to printed.
+    """
+    ucap = net.UDPListenCap(net.UDPCap(net.NetCap(t.env.cap)))
+    tcap = net.TCPListenCap(net.TCPCap(net.NetCap(t.env.cap)))
+    var _port = first_port
+    var _line = ""
+    var _agent: ?actsnmp.AgentServer = None
+    var _trapd: ?actsnmp.TrapdServer = None
+
+    def err(s: str) -> None:
+        _line = s
+        if " serving on " in s or " listening on " in s:
+            on_listening(_port, s)
+
+    def done(code: int) -> None:
+        if "address already in use" in _line and _port < first_port + TCP_RANGE - 1:
+            _port += 1
+            _start()
+        else:
+            t.failure(AssertionError(command + " exited with %d: " % code + _line))
+
+    proc def _start() -> None:
+        o = cliopts.parse(["actsnmp", command, "--tcp", "--canon", "--port", str(_port)])
+        if command == "agent":
+            _agent = actsnmp.AgentServer(ucap, tcap, o, view(), AgentConfig({"public": False}, [], h(AGENT_ENGINE)),
+                                         err, done)
+        else:
+            _trapd = actsnmp.TrapdServer(ucap, tcap, o, ReceiverConfig(["public"], [], [], h(RECEIVER_ENGINE), 1),
+                                         printed, err, done)
+
+    _start()
+
+actor _test_tcp_cli_servers(t: testing.EnvT):
+    """agent --tcp and trapd --tcp as `actsnmp` runs them, with get and trap over TCP to them
+
+    The trap ends TRAP_LINGER after its connection came up, long before
+    its -t 5.
+    """
+    t.timeout(30.0)
+    var agent: ?_ServeTcp = None
+    var trapd: ?_ServeTcp = None
+    var lines: dict[str, str] = {}
+    var ports: dict[str, int] = {}
+    var results: dict[str, (str, str, int)] = {}
+    var trap_seconds = 0.0
+    var blocks = ""
+    var concluded = False
+
+    proc def _maybe_done() -> None:
+        if concluded or len(results) < 2 or blocks == "":
+            return
+        concluded = True
+        def check() -> None:
+            testing.assertEqual(lines["agent"], "actsnmp agent: serving on tcp:127.0.0.1:%d (engine ID 0x" % ports["agent"]
+                                + AGENT_ENGINE + ")\n")
+            testing.assertEqual(lines["trapd"], "actsnmp trapd: listening on tcp:127.0.0.1:%d (engine ID 0x"
+                                % ports["trapd"] + RECEIVER_ENGINE + ")\n")
+            testing.assertEqual(results["get"], (".1.3.6.1.2.1.1.1.0 = STRING: \"actsnmp loopback agent\"\n", "", 0))
+            testing.assertEqual(results["trap"], ("", "", 0))
+            testing.assertTrue(trap_seconds < 2.0, "the trap took %f s" % trap_seconds)
+            testing.assertEqual(blocks, "NOTIFICATION v2c TRAP2 community=\"public\" uptime=42 "
+                                + "trapoid=.1.3.6.1.6.3.1.1.5.1\nEND\n")
+        report_env(t, outcome(check))
+
+    def got(out: str, err: str, code: int, seconds: float) -> None:
+        results["get"] = (out, err, code)
+        _maybe_done()
+
+    def trapped(out: str, err: str, code: int, seconds: float) -> None:
+        results["trap"] = (out, err, code)
+        trap_seconds = seconds
+        _maybe_done()
+
+    def printed(text: str) -> None:
+        blocks += text
+        _maybe_done()
+
+    def listening(name: str, port: int, line: str) -> None:
+        lines[name] = line
+        ports[name] = port
+        if len(ports) == 2:
+            _cli(t, ["get", "-v2c", "-c", "public", "tcp:127.0.0.1:%d" % ports["agent"], "1.3.6.1.2.1.1.1.0"],
+                 _CliRun(got))
+            _cli(t, ["trap", "-v2c", "-c", "public", "-t", "5", "tcp:127.0.0.1:%d" % ports["trapd"], "42",
+                     "1.3.6.1.6.3.1.1.5.1"], _CliRun(trapped))
+
+    def agent_listening(port: int, line: str) -> None:
+        listening("agent", port, line)
+
+    def trapd_listening(port: int, line: str) -> None:
+        listening("trapd", port, line)
+
+    agent = _ServeTcp(t, "agent", _tcp_ports(8), agent_listening, printed)
+    trapd = _ServeTcp(t, "trapd", _tcp_ports(9), trapd_listening, printed)
+
+
+actor _test_host_lookup(t: testing.EnvT):
+    """HostLookup: AAAA only for udp6: and tcp6: (localhost is ::1, an IPv4 address does not resolve), else IPv4 first"""
+    t.timeout(15.0)
+    dcap = net.DNSCap(net.NetCap(t.env.cap))
+    var found: dict[str, str] = {}
+    var lookups: list[actsnmp.HostLookup] = []
+
+    proc def _found(name: str, address: str) -> None:
+        found[name] = address
+        if len(found) == 4:
+            if found["localhost v6"] == "":
+                _skip_env(t, "the hosts file gives localhost no IPv6 address")
+                return
+            def check() -> None:
+                testing.assertEqual(found["localhost v6"], "::1")
+                testing.assertEqual(found["localhost"], "127.0.0.1")
+                testing.assertEqual(found["127.0.0.1 v6"], "")
+                # no IPv4 address: the IPv6 one
+                testing.assertEqual(found["::1"], "::1")
+            report_env(t, outcome(check))
+
+    def v6(address: str) -> None:
+        _found("localhost v6", address)
+
+    def any_family(address: str) -> None:
+        _found("localhost", address)
+
+    def v4_as_v6(address: str) -> None:
+        _found("127.0.0.1 v6", address)
+
+    def v6_only_name(address: str) -> None:
+        _found("::1", address)
+
+    lookups.append(actsnmp.HostLookup(dcap, "localhost", True, v6))
+    lookups.append(actsnmp.HostLookup(dcap, "localhost", False, any_family))
+    lookups.append(actsnmp.HostLookup(dcap, "127.0.0.1", True, v4_as_v6))
+    lookups.append(actsnmp.HostLookup(dcap, "::1", False, v6_only_name))

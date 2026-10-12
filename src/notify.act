@@ -51,7 +51,10 @@ class Notification(object):
 
     version is message.SNMP_V1, SNMP_V2C or SNMP_V3 and pdu_type is
     pdu.TRAP_V1, TRAP_V2 or INFORM. source_address and source_port are the
-    sender of the datagram. community is set for SNMPv1/v2c; user,
+    sender of the message. A notification that arrived over TCP
+    (transport.tcp_server_transport()) has source_address "" and the
+    number of its TCP session as source_port; source() gives the sender as
+    text either way. community is set for SNMPv1/v2c; user,
     security_level, engine_id (msgAuthoritativeEngineID), context_engine_id
     and context_name for SNMPv3. security_level holds the message's
     FLAG_AUTH|FLAG_PRIV bits, so compare it with the usm.LEVEL_* constants:
@@ -131,6 +134,14 @@ class Notification(object):
             return t.varbinds
         return self.varbinds
 
+    def source(self) -> str:
+        """Return the sender as ADDRESS:PORT ([ADDRESS]:PORT for IPv6), or as session-N for TCP session N"""
+        if self.source_address == "":
+            return "session-%d" % self.source_port
+        if ":" in self.source_address:
+            return "[" + self.source_address + "]:%d" % self.source_port
+        return self.source_address + ":%d" % self.source_port
+
     def __repr__(self) -> str:
         if self.version == message.SNMP_V3:
             sec = ("user=" + repr(self.user) + ", security_level=" + usm.level_text(self.security_level) + ", engine_id="
@@ -139,7 +150,7 @@ class Notification(object):
         else:
             sec = "community=<%d octets>" % len(self.community)
         head = ("Notification(version=%d, " % self.version + pdu.pdu_type_name(self.pdu_type) + ", source="
-                + self.source_address + ":%d, " % self.source_port + sec
+                + self.source() + ", " + sec
                 + ", request_id=%d, uptime=%d, trap_oid=" % (self.request_id, self.uptime) + str(self.trap_oid)
                 + ", varbinds=[" + ", ".join([_repr_varbind(vb) for vb in self.varbinds]) + "]")
         if self.problem != "":

@@ -11,8 +11,8 @@ options, so command lines written for snmpget, snmpwalk, snmptrap and the
 others work unchanged. Options with a value may be glued or separate
 (`-v2c`, `-v 2c`), flags may be grouped, and options and arguments may be
 mixed as with GNU getopt. A word like "-5" is an argument, so a negative
-INTEGER needs no `--`. AGENT is [udp:|udp6:]HOST[:PORT], with IPv6
-literals in brackets when a port follows.
+INTEGER needs no `--`. AGENT is [udp:|udp6:|tcp:|tcp6:]HOST[:PORT], with
+IPv6 literals in brackets when a port follows.
 
 MIB mode is on with -m or -M, when MIBS or MIBDIRS is set, or when an OID
 argument names a module (MOD::name). OIDs are then read as snmp_parse_oid
@@ -23,7 +23,8 @@ as read_objid reads them.
 set, trap and inform take OID TYPE VALUE triples with snmpset's type
 letters (see parse_value); actsnmp adds q for a raw Opaque. translate,
 mib2yang, mibmeta and miblint have their own options (_scan_mib_command),
-and agent and trapd take a few long options for the lab setup.
+and agent and trapd take a few long options for the lab setup, --tcp
+among them to listen on TCP instead of UDP.
 
 Errors carry net-snmp's message and are checked in net-snmp's order. Where
 net-snmp would truncate or wrap a value that does not fit its type,
@@ -134,13 +135,14 @@ class CliOptions(object):
     """The parsed command line of one actsnmp command
 
     Most attributes hold one option each. peer is the agent argument as
-    given, for messages; address, port and transport_domain are parsed from
-    it. engine_id (-e) is the peer's engine ID, except for an SNMPv3 trap
-    where it is our own. uptime -1 means the sender's uptime. warnings are
-    lines to print on stderr before the command runs. session_error is the
-    error net-snmp reports when it opens an SNMPv3 session (no user, or no
-    pass phrase for the level); the command then only runs the engine
-    discovery before printing it.
+    given, for messages; address, port and transport_domain ("udp", "udp6",
+    "tcp" or "tcp6") are parsed from it. engine_id (-e) is the peer's
+    engine ID, except for an SNMPv3 trap where it is our own. uptime -1
+    means the sender's uptime. warnings are lines to print on stderr before
+    the command runs. session_error is the error net-snmp reports when it
+    opens an SNMPv3 session (no user, or no pass phrase for the level); the
+    command then only runs the engine discovery before printing it.
+    listen_tcp is agent's and trapd's --tcp.
     """
     command: str
     peer: str
@@ -192,6 +194,7 @@ class CliOptions(object):
     server_engine_id: bytes
     listen_port: int
     bind_address: str
+    listen_tcp: bool
     help: bool
     show_version: bool
     warnings: list[str]
@@ -267,6 +270,7 @@ class CliOptions(object):
         self.server_engine_id = bytes.from_hex(TRAPD_ENGINE_ID if command == "trapd" else AGENT_ENGINE_ID)
         self.listen_port = TRAPD_PORT if command == "trapd" else AGENT_PORT
         self.bind_address = DEFAULT_BIND
+        self.listen_tcp = False
         self.help = False
         self.show_version = False
         self.warnings = []
@@ -294,6 +298,10 @@ class CliOptions(object):
     def is_server(self) -> bool:
         """True for agent and trapd, which listen instead of talking to a peer"""
         return self.command == "agent" or self.command == "trapd"
+
+    def is_tcp(self) -> bool:
+        """True when the agent address names TCP (tcp:, tcp6:)"""
+        return self.transport_domain == "tcp" or self.transport_domain == "tcp6"
 
     def oid_words(self) -> list[str]:
         """The arguments net-snmp reads as OIDs (oid_words_of), which load the modules they name"""
@@ -1083,9 +1091,19 @@ def _port(text: str, spec: str) -> int:
         raise CliError("Invalid port in agent address: " + spec)
     return p
 
-def parse_agent(spec: str, default_port: int) -> (domain: str, host: str, port: int):
-    """Split an agent specification [udp:|udp6:]HOST[:PORT]
+# The transport prefixes of agent addresses, with net-snmp's aliases, and their domains
+_DOMAINS: list[(str, str)] = [("udp:", "udp"), ("udp6:", "udp6"), ("udpv6:", "udp6"), ("udpipv6:", "udp6"),
+                              ("tcp:", "tcp"), ("tcp6:", "tcp6"), ("tcpv6:", "tcp6"), ("tcpipv6:", "tcp6")]
 
+# net-snmp's other transport prefixes, which actsnmp refuses
+_UNSUPPORTED: list[str] = ["unix:", "ipx:", "aal5pvc:", "dtlsudp:", "dtls:", "tls:", "tlstcp:", "ssh:", "callback:",
+                           "alias:"]
+
+def parse_agent(spec: str, default_port: int) -> (domain: str, host: str, port: int):
+    """Split an agent specification [udp:|udp6:|tcp:|tcp6:]HOST[:PORT]
+
+    The prefix is case-insensitive, and net-snmp's aliases udpv6:,
+    udpipv6:, tcpv6: and tcpipv6: work too; without one the domain is udp.
     An IPv6 literal needs brackets when a port follows ([::1]:161); a HOST
     with two or more colons and no brackets has no port. Raises CliError
     for other transports, an empty host or a port outside 1..65535.
@@ -1093,18 +1111,14 @@ def parse_agent(spec: str, default_port: int) -> (domain: str, host: str, port: 
     s = spec
     domain = "udp"
     low = spec.lower()
-    for prefix in ["udp6:", "udpv6:", "udpipv6:"]:
+    for d in _DOMAINS:
+        if low.startswith(d.0):
+            domain = d.1
+            s = spec[len(d.0):]
+            break
+    for prefix in _UNSUPPORTED:
         if low.startswith(prefix):
-            domain = "udp6"
-            s = spec[len(prefix):]
-    if domain == "udp":
-        if low.startswith("udp:"):
-            s = spec[4:]
-        else:
-            for prefix in ["tcp:", "tcp6:", "tcpv6:", "tcpipv6:", "unix:", "ipx:", "aal5pvc:", "dtlsudp:", "tls:",
-                           "tlstcp:", "ssh:", "callback:", "alias:"]:
-                if low.startswith(prefix):
-                    raise CliError("Unsupported transport in agent address: " + spec + " (only udp and udp6)")
+            raise CliError("Unsupported transport in agent address: " + spec + " (only udp, udp6, tcp and tcp6)")
     host = s
     port = default_port
     if s.startswith("["):
@@ -1609,6 +1623,8 @@ def _apply_long(o: CliOptions, name: str, value: str) -> None:
         if value == "":
             raise CliError("Invalid address after --bind", True)
         o.bind_address = value
+    elif o.is_server() and name == "tcp":
+        o.listen_tcp = True
     elif o.is_server():
         raise CliError("unrecognized option '--" + name + "'", True)
     else:
@@ -1866,6 +1882,8 @@ def _finish(o: CliOptions) -> None:
     if o.is_server():
         if len(pos) > 0:
             raise CliError("Unexpected argument: " + pos[0], True)
+        if o.listen_tcp and o.listen_port == 0:
+            raise CliError("--port 0 is not supported with --tcp (the port picked for it cannot be learned)", True)
         if o.command == "agent" and o.engine_id is not None:
             o.server_engine_id = o.engine_id!
         if o.command == "trapd" and o.engine_id is not None:
@@ -1965,8 +1983,9 @@ _SYNOPSIS: dict[str, str] = {
     "trap": ("trap [OPTIONS] AGENT UPTIME TRAPOID [OID TYPE VALUE]...\n"
              + "       actsnmp trap -v1 [OPTIONS] AGENT ENTERPRISE AGENT-ADDR GENERIC SPECIFIC UPTIME [OID TYPE VALUE]..."),
     "inform": "inform [OPTIONS] AGENT UPTIME TRAPOID [OID TYPE VALUE]...",
-    "agent": "agent [--snmprec FILE] [--write-rules TSV] [--users TSV] [--engine-id HEX] [--port N] [--bind ADDR] [-c COMM]... [-w COMM]...",
-    "trapd": "trapd [--port N] [--bind ADDR] [-c COMM]... [--users TSV] [--engine-id HEX] [--canon] [-O FLAGS]",
+    "agent": ("agent [--snmprec FILE] [--write-rules TSV] [--users TSV] [--engine-id HEX] [--port N] [--bind ADDR] [--tcp] "
+              + "[-c COMM]... [-w COMM]..."),
+    "trapd": "trapd [--port N] [--bind ADDR] [--tcp] [-c COMM]... [--users TSV] [--engine-id HEX] [--canon] [-O FLAGS]",
     "translate": "translate [-m MODULES] [-M DIRS] [-O FLAGS] [-I FLAGS] [-Td] [-Tp] [-TB] [-w WIDTH] OID...",
     "mib2yang": ("mib2yang [-M DIRS] [-o OUTDIR] [--meta] [--consistent-status] [--ignore-display-hint MOD::TC] "
                  + "[-l LEVEL] MODULE|FILE..."),
@@ -1978,6 +1997,8 @@ _MIB_TEXT = """  -m MODULES            modules to load, ':'-separated (ALL: ever
                         net-snmp's default list; a name with a '/' is a file; default: MIBS, else none)
   -M DIRS               MIB search path, ':'-separated (+DIR appends, -DIR puts first; default: MIBDIRS,
                         else $HOME/.snmp/mibs:/usr/share/snmp/mibs:/usr/share/snmp/mibs/iana:/usr/share/snmp/mibs/ietf)"""
+
+_TCP_TEXT = "  --tcp                 listen on TCP (RFC 3430) instead of UDP; not with --port 0\n"
 
 def usage(command: str) -> str:
     """Return the usage text of a command ("" or an unknown name: of the whole CLI), without the final newline"""
@@ -2018,11 +2039,13 @@ def usage(command: str) -> str:
                 + "  --users TSV           default " + LAB_USERS + " (skipped when absent)\n"
                 + "  --engine-id HEX       default 0x" + AGENT_ENGINE_ID + "\n"
                 + "  --port N, --bind ADDR default " + DEFAULT_BIND + ":%d\n" % AGENT_PORT
+                + _TCP_TEXT
                 + "  -c COMM / -w COMM     read-only / read-write community (default: public, private rw)")
     if command == "trapd":
         return ("USAGE: actsnmp " + _SYNOPSIS["trapd"] + "\n\n"
                 + "  Prints every trap and inform received until SIGTERM or SIGINT.\n"
                 + "  --port N, --bind ADDR default " + DEFAULT_BIND + ":%d\n" % TRAPD_PORT
+                + _TCP_TEXT
                 + "  -c COMM               accepted community (repeatable; default public; * = any)\n"
                 + "  --users TSV           SNMPv3 users (default " + LAB_USERS + " when present)\n"
                 + "  --engine-id HEX       default 0x" + TRAPD_ENGINE_ID + "\n"
@@ -2031,7 +2054,7 @@ def usage(command: str) -> str:
     if syn is not None:
         cx = _C_TEXT.get(command)
         c = cx if cx is not None else ""
-        agent = ("\n\n  AGENT                 [udp:|udp6:]HOST[:PORT] (default port %d)\n"
+        agent = ("\n\n  AGENT                 [udp:|udp6:|tcp:|tcp6:]HOST[:PORT] (default port %d)\n"
                  % (TRAP_PORT if command == "trap" or command == "inform" else SNMP_PORT))
         types = ""
         if command == "set" or command == "trap" or command == "inform":

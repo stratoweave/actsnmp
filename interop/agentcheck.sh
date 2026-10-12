@@ -5,11 +5,14 @@
 #   interop/agentcheck.sh acton=127.0.0.1:16163
 #   interop/agentcheck.sh --quick --users u_noauth,u_sha_aes acton=127.0.0.1:16163,udp6:[::1]:16163
 #   interop/agentcheck.sh --skip v1,negative acton=127.0.0.1:16163
+#   interop/agentcheck.sh acton-tcp=tcp:127.0.0.1:16163,tcp6:[::1]:16163     # actsnmp agent --tcp
 #
 # The agent must serve dataset/actsnmp_dataset.py below 1.3.6.1.4.1.8072.9999.1
 # (writable objects reset to their initial values), communities public/private
-# and the lab SNMPv3 users (see README.md). Writes a Markdown report to stdout
-# and exits 0 when all mandatory checks pass. Only the tools container is needed.
+# and the lab SNMPv3 users (see README.md). An agent over TCP is checked with
+# net-snmp's tools alone (the lab's pysnmp tools speak UDP only). Writes a Markdown report
+# to stdout and exits 0 when all mandatory checks pass. Only the tools container
+# is needed.
 set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 

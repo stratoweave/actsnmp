@@ -20,9 +20,23 @@ response, so large walks are not buffered. With -Cc, where net-snmp would
 loop forever, a repeated OID ends the walk with an error. table fetches
 the columns with Client.get_table and prints the rows in index order.
 
+An agent address with tcp: or tcp6: carries the command over TCP (RFC
+3430, transport.tcp_transport()). net-snmp's tools connect when they open
+the session, so a connection that fails before the agent has answered
+anything ends the command at once with net-snmp's error, "snmpget:
+Unknown host (tcp:HOST:PORT) (Connection refused)" (TcpWatch). A trap gets
+no answer, so over TCP the command waits for its connection: it exits with
+0 shortly after the connection came up and carried the trap, or with
+net-snmp's error and code 1 if the connection failed within -t seconds.
+Host names of udp6: and tcp6: addresses resolve to IPv6 addresses only
+and those of tcp: addresses to IPv4 addresses, as in net-snmp; a tcp:
+name without an IPv4 address resolves to IPv6. A name that does not
+resolve is net-snmp's "Unknown host" (resolves_name(), HostLookup).
+
 agent serves an snmprec file (the lab dataset by default) until SIGTERM or
 SIGINT. trapd prints each notification it receives, canonically with
---canon or otherwise in net-snmp style. The MIB commands are in mibcli.
+--canon or otherwise in net-snmp style. Both listen on UDP, or with --tcp
+on TCP. The MIB commands are in mibcli.
 
 The commands are actors that take the parsed options, a Client and output
 callbacks, so test_cli can run them in-process over transport.MemNet.
@@ -49,13 +63,17 @@ from notify import Notification
 from oid import Oid
 from receiver import NotificationReceiver, ReceiverConfig
 from security import Community, Security, Usm
-from transport import ServerTransport, Transport, udp_server_transport
+from transport import ServerTransport, Transport, tcp_server_transport, tcp_transport, udp_server_transport
 from values import ObjectIdentifier, VarBind, is_exception
 
 VERSION = "0.1.0-dev"
 
-# Seconds a trap command waits after handing its datagram to the transport before it exits
+# Seconds a trap command waits after handing its datagram to the transport before it exits; over
+# TCP, after its connection came up and the trap was written
 TRAP_LINGER = 0.3
+
+# Longest wait for a TCP connection to come up, in seconds: about as long as Linux retries a SYN
+TCP_CONNECT_MAX = 120.0
 
 # How the Client's TimeoutError.hint starts when the SNMPv3 engine discovery timed out
 DISCOVERY_HINT = "SNMPv3 engine discovery"
@@ -171,12 +189,21 @@ def failure_text(o: CliOptions, e: errors.SnmpError, period: bool) -> str:
             return tool_name(o) + ": Timeout" + stale + "\n"
         return "Timeout: No Response from " + o.peer + ("." if period else "") + "\n"
     if isinstance(e, errors.TransportError) and "DNS lookup" in e.error_message:
-        return tool_name(o) + ": Unknown host (" + o.peer + ")\n"
+        return unknown_host_text(o, "")
     if isinstance(e, errors.ReportError):
         t = _REPORT_TEXTS.get(e.name)
         if t is not None:
             return tool_name(o) + ": " + t + stale + "\n"
     return tool_name(o) + ": " + e.error_message + stale + "\n"
+
+def unknown_host_text(o: CliOptions, reason: str) -> str:
+    """net-snmp's error when it cannot open the session to the agent, with the final newline
+
+    "snmpget: Unknown host (tcp:HOST:PORT) (Connection refused)"; an empty
+    reason, for a host name that does not resolve, leaves the second
+    parenthesis out.
+    """
+    return tool_name(o) + ": Unknown host (" + o.peer + ")" + (" (" + reason + ")" if reason != "" else "") + "\n"
 
 def session_error_text(o: CliOptions) -> str:
     """CliOptions.session_error as net-snmp prints it when it opens the session, with the final newline"""
@@ -221,8 +248,9 @@ def notification_text(o: CliOptions, n: Notification) -> str:
     """What trapd prints for one notification, with the final newline
 
     With --canon this is fmt.canon_notification(n). Otherwise the header
-    gets `from=ADDRESS:PORT` after the PDU type and the varbinds are printed
-    in net-snmp style. An SNMPv1 trap shows its original varbinds, without
+    gets `from=ADDRESS:PORT` (`[ADDRESS]:PORT` for IPv6, `session-N` for
+    TCP session N, see Notification.source()) after the PDU type and the
+    varbinds are printed in net-snmp style. An SNMPv1 trap shows its original varbinds, without
     the snmpTrapCommunity.0 that RFC 3584 translation adds.
     """
     block = fmt.canon_notification(n)
@@ -230,7 +258,7 @@ def notification_text(o: CliOptions, n: Notification) -> str:
         return block + "\n"
     first = block.split("\n")[0]
     words = first.split(" ")
-    head = " ".join(words[:3]) + " from=" + n.source_address + ":%d" % n.source_port
+    head = " ".join(words[:3]) + " from=" + n.source()
     if len(words) > 3:
         head += " " + " ".join(words[3:])
     v1 = n.v1
@@ -286,6 +314,187 @@ def table_options(o: CliOptions) -> Options:
     return request_options(o).with_(check_increasing=not o.dont_check, split_too_big=True)
 
 
+# TCP and host names #################################################################################
+
+# strerror() texts that net-snmp prints where the network's texts for the same errors differ
+_STRERROR: dict[str, str] = {"host is unreachable": "No route to host",
+                             "address not available": "Cannot assign requested address"}
+
+def connect_failure(error: str) -> str:
+    """The reason in net-snmp's words when a transport error says that a TCP connection failed, else ""
+
+    tcp_transport() reports "TCP connection to ADDRESS:PORT failed: REASON"
+    with REASON in lower case as the network gives it (refused, unreachable,
+    or "no connection within N s"). net-snmp prints strerror()'s text, and
+    "Connection timed out" when the connection does not come up. An error
+    on a connection that was up ("TCP connection to ... lost: REASON") is
+    not a failed connection.
+    """
+    if not error.startswith("TCP connection to "):
+        return ""
+    i = error.find(" failed: ")
+    if i < 0:
+        return ""
+    reason = error[i + len(" failed: "):]
+    if reason.startswith("no connection within "):
+        return "Connection timed out"
+    t = _STRERROR.get(reason)
+    if t is not None:
+        return t
+    return reason[:1].upper() + reason[1:]
+
+def tcp_connect_timeout(o: CliOptions) -> float:
+    """Seconds the TCP connection to the agent has to come up, at most TCP_CONNECT_MAX
+
+    A trap waits -t seconds for it. Other commands give it longer than all
+    tries of a request together (-t times (-r + 1)), so that an agent that
+    never accepts the connection times out like one that does not answer
+    over UDP: "Timeout: No Response from AGENT".
+    """
+    wait = o.timeout if o.command == "trap" and not o.inform else o.timeout * float(o.retries + 2)
+    return wait if wait < TCP_CONNECT_MAX else TCP_CONNECT_MAX
+
+proc def tcp_client_transport(cap: net.TCPConnectCap, o: CliOptions, on_connect: action() -> None) -> Transport:
+    """tcp_transport() to the agent of a tcp: or tcp6: address, after resolves_name()
+
+    stall_timeout is twice -t: the first retry of a request goes out on the
+    same connection, so an answer that comes later than -t still counts, as
+    over UDP; a later retry goes out on a new connection, in case the peer
+    reset the old one (see tcp_transport()). on_connect is called each time
+    a connection has come up.
+    """
+    return tcp_transport(cap, o.address, o.port, connect_timeout=tcp_connect_timeout(o),
+                         stall_timeout=2.0 * o.timeout, on_connect=on_connect)
+
+proc def tcp_command(cap: net.TCPConnectCap, o: CliOptions, sec: Security, out: action(str) -> None,
+                     err: action(str) -> None, done: action(int) -> None) -> Command:
+    """The Command of a client command over TCP, with a TcpWatch on its transport
+
+    The Client sends over tcp_client_transport(). The TcpWatch ends the
+    Command when the connection fails before the agent has answered
+    (Command.connection_failed()) and tells it when the connection is up
+    (Command.connected()), which ends a trap.
+    """
+    w = TcpWatch()
+    tr = w.watch(tcp_client_transport(cap, o, w.connected))
+    cmd = Command(o, new_client(None, o, sec, tr), out, err, done)
+    w.on_failure(cmd.connection_failed)
+    w.on_connect(cmd.connected)
+    return cmd
+
+def resolves_name(o: CliOptions) -> bool:
+    """Whether the agent's host is looked up (HostLookup) before the command sets up its transport
+
+    The command then uses the address found. As in net-snmp, udp6: and tcp6:
+    hosts must resolve to IPv6 addresses (an IPv4 address gives "Unknown
+    host") and tcp: names to IPv4 addresses. A tcp: name that does not
+    resolve is "Unknown host"; tcp_transport() takes IP addresses only.
+    udp: names are left to the UDP socket, which reports a name that does
+    not resolve.
+    """
+    d = o.transport_domain
+    if d == "udp6" or d == "tcp6":
+        return not net.is_ipv6(o.address)
+    if d == "tcp":
+        return not (net.is_ipv4(o.address) or net.is_ipv6(o.address))
+    return False
+
+
+actor HostLookup(cap: net.DNSCap, name: str, ipv6_only: bool, on_done: action(str) -> None):
+    """Resolves the host name of an agent; on_done(address) once, with "" when the name does not resolve
+
+    ipv6_only asks for AAAA records only. Otherwise the first IPv4 address
+    is the answer, and the first IPv6 address only for a name without one.
+    """
+    def _none(host: str, error: str) -> None:
+        on_done("")
+
+    def _first(addresses: list[str]) -> None:
+        on_done(addresses[0] if len(addresses) > 0 else "")
+
+    def _no_ipv4(host: str, error: str) -> None:
+        net.lookup_aaaa(cap, name, _first, _none)
+
+    def _first_ipv4(addresses: list[str]) -> None:
+        if len(addresses) > 0:
+            on_done(addresses[0])
+        else:
+            _no_ipv4(name, "no IPv4 address")
+
+    if ipv6_only:
+        net.lookup_aaaa(cap, name, _first, _none)
+    else:
+        net.lookup_a(cap, name, _first_ipv4, _no_ipv4)
+
+
+actor TcpWatch():
+    """Passes the messages and errors of a TCP transport on to its owner and watches its connection
+
+    watch(tr) starts watching tr and returns the transport to give the
+    owner (the Client), watched(tr, w). When tr reports that its connection
+    failed (connect_failure()) before any message has arrived, the action
+    given to on_failure() gets the reason, once. connected() is the
+    on_connect of tr (tcp_transport()); the action given to on_connect() is
+    called once, when the first connection has come up. Both actions are
+    called also when they are registered after the event.
+    """
+    var _on_data: ?action(bytes, str, int) -> None = None
+    var _on_error: ?action(str, bool) -> None = None
+    var _on_failure: ?action(str) -> None = None
+    var _on_up: ?action() -> None = None
+    var _answered = False
+    var _failure = ""
+    var _up = False
+
+    def watch(tr: Transport) -> Transport:
+        tr.set_receiver(_data, _error)
+        return watched(tr, self)
+
+    def set_receiver(on_data: action(bytes, str, int) -> None, on_error: action(str, bool) -> None) -> None:
+        _on_data = on_data
+        _on_error = on_error
+
+    def on_failure(report: action(str) -> None) -> None:
+        _on_failure = report
+        if _failure != "":
+            report(_failure)
+
+    def on_connect(report: action() -> None) -> None:
+        _on_up = report
+        if _up:
+            report()
+
+    def connected() -> None:
+        if not _up:
+            _up = True
+            report = _on_up
+            if report is not None:
+                report()
+
+    def _data(data: bytes, src_address: str, src_port: int) -> None:
+        _answered = True
+        on_data = _on_data
+        if on_data is not None:
+            on_data(data, src_address, src_port)
+
+    def _error(text: str, fatal: bool) -> None:
+        if not _answered and _failure == "":
+            _failure = connect_failure(text)
+            report = _on_failure
+            if report is not None and _failure != "":
+                report(_failure)
+        on_error = _on_error
+        if on_error is not None:
+            on_error(text, fatal)
+
+
+def watched(tr: Transport, w: TcpWatch) -> Transport:
+    """tr with its messages and errors passing through w (see TcpWatch)"""
+    def _set_receiver(on_data: action(bytes, str, int) -> None, on_error: action(str, bool) -> None) -> None:
+        w.set_receiver(on_data, on_error)
+    return Transport(tr.send, _set_receiver, tr.close, source_checked=tr.source_checked)
+
+
 # The client commands ################################################################################
 
 actor Command(o: CliOptions, c: Client, out: action(str) -> None, err: action(str) -> None,
@@ -294,7 +503,9 @@ actor Command(o: CliOptions, c: Client, out: action(str) -> None, err: action(st
 
     out and err receive stdout and stderr text as whole lines, in output
     order. done is called once with the exit code. The caller owns c and
-    closes it.
+    closes it. Over TCP the caller calls connection_failed() when the
+    connection fails before the agent has answered, and connected() when
+    it is up (tcp_command() does).
     """
     _opts = request_options(o)
     _tool = tool_name(o)
@@ -304,6 +515,8 @@ actor Command(o: CliOptions, c: Client, out: action(str) -> None, err: action(st
     var _oids: list[Oid] = o.oids
     var _exit = 0
     var _finished = False
+    var _trap_handed = False
+    var _connection_up = False
     var _name: Oid = o.oids[0] if len(o.oids) > 0 else Oid([])
     var _count = 0
     var _seen: set[bytes] = set()
@@ -493,11 +706,22 @@ actor Command(o: CliOptions, c: Client, out: action(str) -> None, err: action(st
 
     # trap and inform ---------------------------------------------------------------------------------
 
+    def _trap_written() -> None:
+        # Over TCP: the connection came up and carried the trap, or did not fail within its connect timeout
+        _finish(0)
+
     def _on_trap(cl: Client, e: ?errors.SnmpError) -> None:
         if e is not None:
             _fail(e, False)
             return
-        _finish(0)
+        if o.is_tcp():
+            # the trap is written once the connection is up (connected()); connection_failed() ends the
+            # command if the connection fails, and without either the connect timeout does
+            _trap_handed = True
+            wait = TRAP_LINGER if _connection_up else tcp_connect_timeout(o) + TRAP_LINGER
+            after wait: _trap_written()
+        else:
+            _finish(0)
 
     def _on_inform(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         # snmpinform does not look at the error-status of the acknowledgement
@@ -511,6 +735,27 @@ actor Command(o: CliOptions, c: Client, out: action(str) -> None, err: action(st
                 _finish(0)
             return
         _finish(0)
+
+    # TCP ---------------------------------------------------------------------------------------------
+
+    def connection_failed(reason: str) -> None:
+        """Ends the command as net-snmp's tools end when they cannot open a TCP session
+
+        The connection to the agent failed (reason in net-snmp's words, see
+        connect_failure()) before the agent answered anything: exit code 1
+        with "<tool>: Unknown host (AGENT) (REASON)". Does nothing once the
+        command has finished.
+        """
+        if not _finished:
+            err(unknown_host_text(o, reason))
+            _finish(1)
+
+    def connected() -> None:
+        """Notes that the connection to the agent is up and carries what was sent: a trap ends TRAP_LINGER later"""
+        if not _connection_up:
+            _connection_up = True
+            if _trap_handed:
+                after TRAP_LINGER: _trap_written()
 
     # dispatch ----------------------------------------------------------------------------------------
 
@@ -590,39 +835,60 @@ actor TrapPrinter(o: CliOptions, out: action(str) -> None):
         out(notification_text(o, n))
 
 
-actor AgentServer(cap: net.UDPListenCap, o: CliOptions, view: MibView, config: AgentConfig,
+def listen_text(o: CliOptions, port: int) -> str:
+    """Where agent and trapd listen, as their messages show it
+
+    ADDRESS:PORT, or with --tcp the agent address that a client command
+    takes: tcp:127.0.0.1:16163, tcp6:[::1]:16163.
+    """
+    if not o.listen_tcp:
+        return o.bind_address + ":%d" % port
+    if ":" in o.bind_address:
+        return "tcp6:[" + o.bind_address + "]:%d" % port
+    return "tcp:" + o.bind_address + ":%d" % port
+
+proc def listen(ucap: net.UDPListenCap, tcap: net.TCPListenCap, o: CliOptions,
+                on_ready: action(ServerTransport, ?str) -> None) -> None:
+    """udp_server_transport(), or tcp_server_transport() with --tcp, on o.bind_address and o.listen_port"""
+    if o.listen_tcp:
+        tcp_server_transport(tcap, o.bind_address, o.listen_port, on_ready)
+    else:
+        udp_server_transport(ucap, o.bind_address, o.listen_port, on_ready)
+
+
+actor AgentServer(ucap: net.UDPListenCap, tcap: net.TCPListenCap, o: CliOptions, view: MibView, config: AgentConfig,
                   err: action(str) -> None, done: action(int) -> None):
-    """Listens on o.bind_address and o.listen_port (UDP) and serves view with an Agent until the process ends"""
+    """Listens (see listen()) and serves view with an Agent until the process ends"""
     var _agent: ?Agent = None
 
     def _ready(t: ServerTransport, error: ?str) -> None:
         if error is not None:
-            err("actsnmp agent: cannot listen on " + o.bind_address + ":%d: " % o.listen_port + error + "\n")
+            err("actsnmp agent: cannot listen on " + listen_text(o, o.listen_port) + ": " + error + "\n")
             done(1)
             return
         _agent = Agent(t, view, config, None)
-        err("actsnmp agent: serving on " + o.bind_address + ":%d (engine ID 0x" % t.local_port()
+        err("actsnmp agent: serving on " + listen_text(o, t.local_port()) + " (engine ID 0x"
             + config.engine_id.hex() + ")\n")
 
-    udp_server_transport(cap, o.bind_address, o.listen_port, _ready)
+    listen(ucap, tcap, o, _ready)
 
 
-actor TrapdServer(cap: net.UDPListenCap, o: CliOptions, config: ReceiverConfig, out: action(str) -> None,
-                  err: action(str) -> None, done: action(int) -> None):
-    """Listens on o.bind_address and o.listen_port (UDP) and prints every notification until the process ends"""
+actor TrapdServer(ucap: net.UDPListenCap, tcap: net.TCPListenCap, o: CliOptions, config: ReceiverConfig,
+                  out: action(str) -> None, err: action(str) -> None, done: action(int) -> None):
+    """Listens (see listen()) and prints every notification until the process ends"""
     var _receiver: ?NotificationReceiver = None
     _printer = TrapPrinter(o, out)
 
     def _ready(t: ServerTransport, error: ?str) -> None:
         if error is not None:
-            err("actsnmp trapd: cannot listen on " + o.bind_address + ":%d: " % o.listen_port + error + "\n")
+            err("actsnmp trapd: cannot listen on " + listen_text(o, o.listen_port) + ": " + error + "\n")
             done(1)
             return
         _receiver = NotificationReceiver(t, config, _printer.on_notification, None)
-        err("actsnmp trapd: listening on " + o.bind_address + ":%d (engine ID 0x" % t.local_port()
+        err("actsnmp trapd: listening on " + listen_text(o, t.local_port()) + " (engine ID 0x"
             + config.engine_id.hex() + ")\n")
 
-    udp_server_transport(cap, o.bind_address, o.listen_port, _ready)
+    listen(ucap, tcap, o, _ready)
 
 
 # main ################################################################################################
@@ -661,7 +927,7 @@ proc def new_client(cap: ?net.UDPConnectCap, o: CliOptions, sec: Security, tr: ?
 
     -e is our own engine ID for an SNMPv3 trap and the peer's engine ID,
     which skips discovery, for every other command. tr replaces the UDP
-    socket in tests.
+    socket: the TCP transport of tcp_command(), or MemNet in tests.
     """
     engine: ?EngineInfo = None
     local_id: ?bytes = None
@@ -677,6 +943,7 @@ proc def new_client(cap: ?net.UDPConnectCap, o: CliOptions, sec: Security, tr: ?
 actor main(env):
     var _trap = False
     var _flush_out = False
+    var _lookup: ?HostLookup = None
 
     def write_out(s: str) -> None:
         print(s, end="", flush=_flush_out)
@@ -707,6 +974,12 @@ actor main(env):
             write_err(cliopts.usage(_command_of(env.argv)) + "\n")
         env.exit(1)
 
+    proc def _udp_listen_cap() -> net.UDPListenCap:
+        return net.UDPListenCap(net.UDPCap(net.NetCap(env.cap)))
+
+    proc def _tcp_listen_cap() -> net.TCPListenCap:
+        return net.TCPListenCap(net.TCPCap(net.NetCap(env.cap)))
+
     proc def _serve_agent(o: CliOptions) -> None:
         rec = _read(o.snmprec)
         rules = _read(o.write_rules)
@@ -725,8 +998,7 @@ actor main(env):
                     config = r.1
                     if view is not None:
                         if config is not None:
-                            lcap = net.UDPListenCap(net.UDPCap(net.NetCap(env.cap)))
-                            AgentServer(lcap, o, view, config, write_err, finish)
+                            AgentServer(_udp_listen_cap(), _tcp_listen_cap(), o, view, config, write_err, finish)
                             return
                     _usage_error("actsnmp agent: " + r.2, False)
 
@@ -739,8 +1011,7 @@ actor main(env):
         config = r.0
         if config is not None:
             _flush_out = True
-            lcap = net.UDPListenCap(net.UDPCap(net.NetCap(env.cap)))
-            TrapdServer(lcap, o, config, write_out, write_err, finish)
+            TrapdServer(_udp_listen_cap(), _tcp_listen_cap(), o, config, write_out, write_err, finish)
         else:
             _usage_error("actsnmp trapd: " + r.1, False)
 
@@ -762,11 +1033,33 @@ actor main(env):
         r = _load_security(o)
         sec = r.0
         if sec is not None:
+            _client(o, sec)
+        else:
+            _usage_error(tool_name(o) + ": " + r.1, False)
+
+    proc def _client(o: CliOptions, sec: Security) -> None:
+        # A client command, after looking up the agent's host where resolves_name() says so
+        if resolves_name(o):
+            def resolved(address: str) -> None:
+                if address == "":
+                    write_err(unknown_host_text(o, ""))
+                    env.exit(1)
+                    return
+                o.address = address
+                _run_client(o, sec)
+            _lookup = HostLookup(net.DNSCap(net.NetCap(env.cap)), o.address, o.transport_domain != "tcp", resolved)
+        else:
+            _run_client(o, sec)
+
+    proc def _run_client(o: CliOptions, sec: Security) -> None:
+        # A client command once its agent's host has been looked up where resolves_name() says so
+        if o.is_tcp():
+            tcp_command(net.TCPConnectCap(net.TCPCap(net.NetCap(env.cap))), o, sec, write_out, write_err, finish)
+        else:
+            # a trap command exits TRAP_LINGER after the datagram was handed over (Command waits over TCP)
             _trap = o.command == "trap" and not o.inform
             ccap = net.UDPConnectCap(net.UDPCap(net.NetCap(env.cap)))
             Command(o, new_client(ccap, o, sec), write_out, write_err, finish)
-        else:
-            _usage_error(tool_name(o) + ": " + r.1, False)
 
     proc def _mkdirs(path: str) -> None:
         # mkdir -p (errors show when the files are written)

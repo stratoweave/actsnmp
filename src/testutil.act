@@ -1,9 +1,13 @@
 """Helpers shared by the test modules; not part of the library API"""
 
 import file
+import logging
+import net
 import testing
 import ber
 import errors
+import transport
+from transport import ServerTransport
 
 def h(s: str) -> bytes:
     """Return the bytes written as hex in s; spaces, colons and line breaks are ignored (ber.from_hex)"""
@@ -107,3 +111,27 @@ proc def report_env(t: testing.EnvT, error: ?Exception) -> None:
         t.failure(error)
     else:
         t.success()
+
+
+actor ListenTcp(cap: net.TCPListenCap, address: str, first_port: int, count: int,
+                on_ready: action(ServerTransport, ?str) -> None, log_handler: ?logging.Handler,
+                max_connections: int=256, idle_timeout: float=300.0):
+    """transport.tcp_server_transport() on the first free port of first_port .. first_port + count - 1
+
+    A listening TCP socket stays bound until the process exits, and a test
+    can run several times in one process, so each run listens on the next
+    port of the test's own range; a port that anything else uses is skipped
+    as well. on_ready gets the last error when no port of the range is
+    free. Give every test its own range, apart from the other tests' and
+    from the ephemeral ports.
+    """
+    var _port = first_port
+
+    def _ready(s: ServerTransport, error: ?str) -> None:
+        if error is not None and "address already in use" in error and _port < first_port + count - 1:
+            _port += 1
+            transport.tcp_server_transport(cap, address, _port, _ready, log_handler, max_connections, idle_timeout)
+            return
+        on_ready(s, error)
+
+    transport.tcp_server_transport(cap, address, _port, _ready, log_handler, max_connections, idle_timeout)
