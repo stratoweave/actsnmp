@@ -453,14 +453,16 @@ actor Agent(transport: ServerTransport, view: MibView, config: AgentConfig, log_
     agent. log_handler gets debug messages for drops and Reports and trace
     messages per request.
 
-    reboot() simulates a restart of the SNMPv3 engine, and close() releases
-    the transport.
+    reboot() simulates a restart of the SNMPv3 engine. set_value() and
+    set_view() change the served variables without a restart. close()
+    releases the transport.
     """
     _log = logging.Logger(log_handler)
     _logging = log_handler is not None
     _communities: dict[bytes, bool] = _community_table(config.communities)
     _read_only: set[bytes] = _name_set(config.read_only_users)
     _salts = usm.SaltCounter()
+    var _view: MibView = view
     var _start: float = _now()
     var _engine: AuthoritativeEngine = _new_engine(config, config.engine_id, config.engine_boots, _start)
     var _faults: ?Faults = faults
@@ -474,7 +476,7 @@ actor Agent(transport: ServerTransport, view: MibView, config: AgentConfig, log_
 
     proc def _set_uptime(now: float) -> None:
         ticks = int((now - _start) * 100.0) & _UINT32_MASK
-        view.set_value(notify.SYS_UPTIME_0, values.TimeTicks(ticks))
+        _view.set_value(notify.SYS_UPTIME_0, values.TimeTicks(ticks))
 
     proc def _too_big_over() -> int:
         f = _faults
@@ -597,10 +599,10 @@ actor Agent(transport: ServerTransport, view: MibView, config: AgentConfig, log_
 
     proc def _successor(o: Oid, v1: bool) -> VarBind:
         # One GETNEXT step from o: SNMPv1 skips Counter64 objects; Faults.non_increasing_at applies
-        vb = view.get_next(o)
+        vb = _view.get_next(o)
         if v1:
             while isinstance(vb.value, values.Counter64):
-                vb = view.get_next(vb.oid)
+                vb = _view.get_next(vb.oid)
         f = _faults
         if f is not None:
             at = f.non_increasing_at
@@ -614,7 +616,7 @@ actor Agent(transport: ServerTransport, view: MibView, config: AgentConfig, log_
         out: list[VarBind] = []
         for i in range(len(vbs)):
             o = vbs[i].oid
-            v = view.get(o)
+            v = _view.get(o)
             if v1:
                 if _hidden_in_v1(v):
                     return _error(p, pdu.NO_SUCH_NAME, i + 1)
@@ -680,7 +682,7 @@ actor Agent(transport: ServerTransport, view: MibView, config: AgentConfig, log_
             for i in range(len(vbs)):
                 if isinstance(vbs[i].value, values.Counter64):
                     return _deliver(p, _error(p, pdu.BAD_VALUE, i + 1), v1, limit, encode)
-        status, index = view.check_set(vbs, config.write_rules)
+        status, index = _view.check_set(vbs, config.write_rules)
         if status != pdu.NO_ERROR:
             return _deliver(p, _error(p, v1_error_status(status) if v1 else status, index), v1, limit, encode)
         resp = Pdu(pdu.RESPONSE, p.request_id, pdu.NO_ERROR, 0, vbs)
@@ -688,7 +690,7 @@ actor Agent(transport: ServerTransport, view: MibView, config: AgentConfig, log_
         if d is not None:
             over = _too_big_over()
             if len(d) <= limit and (over <= 0 or len(d) <= over):
-                view.apply_set(vbs, config.write_rules)
+                _view.apply_set(vbs, config.write_rules)
                 return _Answer(resp, d)
             return _too_big(p, v1, limit, encode)
         # check_set() refuses values that cannot be encoded, so this is not expected
@@ -873,9 +875,27 @@ actor Agent(transport: ServerTransport, view: MibView, config: AgentConfig, log_
         now = _now()
         _engine = _new_engine(config, eid, b, now)
         _start = now
-        view.set_value(SNMP_ENGINE_ID_0, values.OctetString(eid))
+        _view.set_value(SNMP_ENGINE_ID_0, values.OctetString(eid))
         _set_uptime(now)
         _log.info("Agent rebooted", {"engine_id": eid.hex(), "boots": b})
+
+    def set_value(oid: Oid, value: Value) -> None:
+        """Set the value of oid, adding the variable if the view does not have it yet
+
+        No write rules apply. Later requests see the new value.
+        """
+        _view.set_value(oid, value)
+
+    def set_view(new_view: MibView) -> None:
+        """Serve new_view instead of the current view
+
+        The agent owns new_view from then on and writes snmpEngineID.0 and
+        sysUpTime.0 into it. The engine, the counters and the start time do
+        not change.
+        """
+        _view = new_view
+        _view.set_value(SNMP_ENGINE_ID_0, values.OctetString(_engine.engine_id))
+        _set_uptime(_now())
 
     def close() -> None:
         """Stop answering and close the transport (idempotent)"""
@@ -884,8 +904,8 @@ actor Agent(transport: ServerTransport, view: MibView, config: AgentConfig, log_
             transport.close()
             _log.info("Agent closed", None)
 
-    view.set_value(SNMP_ENGINE_ID_0, values.OctetString(config.engine_id))
+    _view.set_value(SNMP_ENGINE_ID_0, values.OctetString(config.engine_id))
     _set_uptime(_start)
     transport.set_receiver(_received)
     _log.info("Agent started", {"engine_id": config.engine_id.hex(), "boots": config.engine_boots,
-                                "variables": view.size(), "port": transport.local_port()})
+                                "variables": _view.size(), "port": transport.local_port()})

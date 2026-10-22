@@ -1007,6 +1007,27 @@ actor _test_reboot(t: testing.AsyncT):
               [h(DISCOVERY_REQUEST), v3_user("sha", get_pdu(12, g), 2, 1), v3_user("sha", get_pdu(13, g), 3, 2),
                v2c(get_pdu(14, [o(ENGINE_ID_OID)]))], 4, _check_reboot)
 
+def _check_set_value_and_view(replies: list[Reply], stats: dict[str, int]) -> None:
+    testing.assertEqual(len(replies), 1)
+    p = response_of(replies[0])
+    testing.assertEqual(p.varbinds[:4], [VarBind(eo("1.1.0"), Integer(99)), VarBind(eo("9.1.0"), Integer(9)),
+                                         VarBind(eo("1.2.0"), NoSuchObject()),
+                                         VarBind(o(ENGINE_ID_OID), OctetString(ENGINE_ID))])
+    uptime = p.varbinds[4]
+    testing.assertEqual(uptime.oid, o(SYS_UPTIME))
+    testing.assertTrue(isinstance(uptime.value, TimeTicks), "sysUpTime.0 in the new view")
+
+actor _test_set_value_and_view(t: testing.AsyncT):
+    """set_view() replaces the variables and set_value() changes or adds one; the agent's own variables stay"""
+    mn = MemNet()
+    ag = Agent(mn.server(AGENT_ADDR, AGENT_PORT), test_view(), config(), t.log_handler)
+    ag.set_view(MibView([VarBind(eo("1.1.0"), Integer(1))]))
+    ag.set_value(eo("1.1.0"), Integer(99))
+    ag.set_value(eo("9.1.0"), Integer(9))
+    _exchange(_async_report(t), ag, _client(mn),
+              [v2c(get_pdu(1, [eo("1.1.0"), eo("9.1.0"), eo("1.2.0"), o(ENGINE_ID_OID), o(SYS_UPTIME)]))], 1,
+              _check_set_value_and_view)
+
 def _check_new_engine(replies: list[Reply], stats: dict[str, int]) -> None:
     testing.assertEqual(len(replies), 4)
     check_report(replies[0], None, 1001, b"", usm.USM_STATS_UNKNOWN_ENGINE_IDS, 1, 5001, 9, OTHER_ENGINE_ID)
