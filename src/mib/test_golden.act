@@ -21,6 +21,7 @@ import mib.source
 import mib.yang
 
 GOLDEN_DIR = "interop/mibs/golden"
+GOLDEN_EXPECTED = GOLDEN_DIR + "/expected"
 
 # "MOD::name" -> why our OID differs from the oracle's (checked by hand)
 KNOWN: dict[str, str] = {}
@@ -77,7 +78,7 @@ proc def write_text(fc: file.FileCap, path: str, text: str) -> None:
     wf.close()
 
 
-proc def compare_module(fc: file.FileCap, ms: mib.model.MibSet, mod: str, st: GoldenStats, expected: str = GOLDEN_DIR + "/expected") -> None:
+proc def compare_module(fc: file.FileCap, ms: mib.model.MibSet, mod: str, st: GoldenStats, expected: str = GOLDEN_EXPECTED) -> None:
     nj = read_text(fc, expected + "/netsnmp/" + mod + ".jsonl")
     if nj is not None:
         for line in nj.split("\n"):
