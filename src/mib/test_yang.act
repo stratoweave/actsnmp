@@ -11,6 +11,7 @@ import mib.model
 import mib.resolver
 import mib.source
 import mib.yang
+import mib.yang_smiv2
 
 T_MIB = r"""T-MIB DEFINITIONS ::= BEGIN
 IMPORTS
@@ -229,6 +230,16 @@ def _test_identifiers() -> None:
     testing.assertEqual(mib.yang.typedef_identifier("string"), "_string")
     n = mib.yang.Namer()
     testing.assertEqual([n.take("a"), n.take("a"), n.take("a_2"), n.take("a")], ["a", "a_2", "a_2_2", "a_3"])
+
+
+def _test_smiv2_module() -> None:
+    """The bundled ietf-yang-smiv2 module defines what translated modules use from it."""
+    text = mib.yang_smiv2.TEXT
+    testing.assertTrue(text.startswith("module " + mib.yang.SMIV2 + " {{"))
+    for name in ["alias", "defval", "display-hint", "implied", "max-access", "oid"]:
+        testing.assertTrue("extension " + name + " {{" in text, name)
+    testing.assertTrue("identity object-identity {{" in text)
+    testing.assertTrue("typedef opaque {{" in text)
 
 
 def _test_prefixes() -> None:
