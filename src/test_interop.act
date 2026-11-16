@@ -19,7 +19,6 @@ instead of stopping at the first.
 
 import logging
 import net
-import process
 import testing
 import time
 
@@ -371,9 +370,9 @@ actor Slot(label: str, started: float, on_outcome: action(str, Outcome) -> None)
 
 
 actor Script(name: str, steps: list[Step], on_done: action(str, dict[str, Outcome]) -> None,
-             pcap: ?process.ProcessCap=None):
+             processes: ?EnvProcess=None):
     """Run steps strictly one after another (each when the previous one's callback came), then call
-    on_done(name, outcomes by label) once and close the steps' Clients; pcap runs the _SHELL steps"""
+    on_done(name, outcomes by label) once and close the steps' Clients; processes runs commands for _SHELL steps"""
     var got: dict[str, Outcome] = {}
     var at = 0
     var finished = False
@@ -399,7 +398,7 @@ actor Script(name: str, steps: list[Step], on_done: action(str, dict[str, Outcom
     proc def _start(s: Step) -> None:
         k = s.kind
         if k == _SHELL:
-            pc = pcap
+            pc = processes
             if pc is not None:
                 slot = Slot(s.label, _now(), _step_finished)
                 sh = Shell(pc, s.cmd, slot.exited, s.seconds)
@@ -487,25 +486,22 @@ def _decode(data: bytes) -> str:
     except Exception:
         return repr(data)
 
-proc def proc_cap(t: testing.EnvT) -> process.ProcessCap:
-    return process.ProcessCap(t.env.cap)
-
-actor Shell(pcap: process.ProcessCap, cmd: list[str], on_done: action(int, str, str) -> None, limit: float=120.0):
+actor Shell(processes: EnvProcess, cmd: list[str], on_done: action(int, str, str) -> None, limit: float=120.0):
     """Run cmd (paths relative to the project root) and call on_done(exit status, stdout, stderr) once;
     a process killed by a signal gives 128 + the signal, one that could not start -1"""
     var called = False
 
-    def _exited(pr: process.Process, code: int, sig: int, out: bytes, err: bytes) -> None:
+    def _exited(pr: Process, code: int, sig: int, out: bytes, err: bytes) -> None:
         if not called:
             called = True
             on_done(code if sig == 0 else 128 + sig, _decode(out), _decode(err))
 
-    def _failed(pr: process.Process, msg: str) -> None:
+    def _failed(pr: Process, msg: str) -> None:
         if not called:
             called = True
             on_done(-1, "", msg)
 
-    _p = process.RunProcess(pcap, cmd, _exited, _failed, None, None, limit)
+    _p = processes.run(cmd, _exited, _failed, timeout=limit)
 
 
 # Checks #############################################################################################
@@ -1269,7 +1265,7 @@ actor _test_snmpd_real_mib(t: testing.EnvT):
         report_env(t, outcome(run))
 
     def lab_up() -> None:
-        s = Script("real mib", steps, finished, proc_cap(t))
+        s = Script("real mib", steps, finished, t.env.process)
 
     gate = LabGate(t, lab_up)
 
@@ -1351,7 +1347,7 @@ actor _test_snmpd_full_mib(t: testing.EnvT):
         report_env(t, outcome(run))
 
     def lab_up() -> None:
-        s = Script("full mib", steps, finished, proc_cap(t))
+        s = Script("full mib", steps, finished, t.env.process)
 
     gate = LabGate(t, lab_up)
 
@@ -1476,7 +1472,7 @@ actor _test_snmpd_restart(t: testing.EnvT):
                  get_step("probe", probe, [b([1, 1, 0])]),
                  get_step("after restart", c, [b([1, 18, 0])]),
                  get_step("again", c, [b([1, 18, 0])]), info_step("info after", c)]
-        s = Script("restart", steps, finished, proc_cap(t))
+        s = Script("restart", steps, finished, t.env.process)
 
     def measured(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         c.close()
@@ -2145,10 +2141,10 @@ actor _ToSnmptrapd(t: testing.EnvT, steps: list[Step], want: list[str]):
             after now 1.0: last_poll_due()
 
     def poll() -> None:
-        sh = Shell(proc_cap(t), ["interop/trapdcheck.sh", "log"], polled, 60.0)
+        sh = Shell(t.env.process, ["interop/trapdcheck.sh", "log"], polled, 60.0)
 
     def last_poll_due() -> None:
-        sh = Shell(proc_cap(t), ["interop/trapdcheck.sh", "log"], last_polled, 60.0)
+        sh = Shell(t.env.process, ["interop/trapdcheck.sh", "log"], last_polled, 60.0)
 
     def all_sent(name: str, got: dict[str, Outcome]) -> None:
         sent = got
@@ -2162,7 +2158,7 @@ actor _ToSnmptrapd(t: testing.EnvT, steps: list[Step], want: list[str]):
 
     def lab_up() -> None:
         # a fresh snmptrapd: it keeps the boots and time of every trap sender engine
-        sh = Shell(proc_cap(t), ["interop/trapdcheck.sh", "start"], started, 90.0)
+        sh = Shell(t.env.process, ["interop/trapdcheck.sh", "start"], started, 90.0)
 
     gate = LabGate(t, lab_up)
 
@@ -2362,7 +2358,7 @@ actor _Matrix(t: testing.EnvT, flag: str, expected_file: str, address: str=LOCAL
         srv = st
         cfg = ReceiverConfig.from_users_tsv(users_text, h(RECEIVER_ENGINE), ["public"])
         rcv = NotificationReceiver(st, cfg, received, None)
-        sh = Shell(proc_cap(t), notifycheck("--send") + ["--receiver", receiver], sent, 280.0)
+        sh = Shell(t.env.process, notifycheck("--send") + ["--receiver", receiver], sent, 280.0)
 
     proc def listen() -> None:
         if tcp:
@@ -2380,7 +2376,7 @@ actor _Matrix(t: testing.EnvT, flag: str, expected_file: str, address: str=LOCAL
     def lab_up() -> None:
         if tcp:
             # the net-snmp half of the matrix, numbered as notifycheck.py sends it
-            sh = Shell(proc_cap(t), notifycheck("--expected"), got_expected, 60.0)
+            sh = Shell(t.env.process, notifycheck("--expected"), got_expected, 60.0)
         else:
             listen()
 
