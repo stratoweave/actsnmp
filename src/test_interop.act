@@ -442,7 +442,10 @@ actor Script(name: str, steps: list[Step], on_done: action(str, dict[str, Outcom
         elif k == _INFORM:
             c.inform(slot.completed, s.trap_oid, s.varbinds, s.uptime, s.opts)
 
-    _advance()
+    proc def __startup__():
+        _advance()
+
+    __startup__()
 
 
 actor Gather(want: int, on_done: action(dict[str, dict[str, Outcome]]) -> None):
@@ -477,7 +480,10 @@ actor LabGate(t: testing.EnvT, on_up: action() -> None):
         else:
             t.failure(AssertionError("lab probe failed: " + str(e)))
 
-    c.get(probed, [b([1, 1, 0])])
+    proc def __startup__():
+        c.get(probed, [b([1, 1, 0])])
+
+    __startup__()
 
 
 def _decode(data: bytes) -> str:
@@ -501,10 +507,13 @@ actor Shell(processes: EnvProcess, cmd: list[str], on_done: action(int, str, str
             called = True
             on_done(-1, "", msg)
 
-    _p = processes.run(cmd, _exited, _failed, timeout=limit)
+    proc def __startup__():
+        _p = processes.run(cmd, _exited, _failed, timeout=limit)
 
+    __startup__()
 
 # Checks #############################################################################################
+
 
 def clip(s: str) -> str:
     return s if len(s) <= 300 else s[:300] + "..."
@@ -626,50 +635,13 @@ def all_passed(failures: list[str]) -> None:
 actor _Communities(t: testing.EnvT, a: LabAgent):
     """GET of every scalar and of the system group, GETNEXT, GETBULK and missing objects with each of the
     agent's communities (SNMPv1 and SNMPv2c), an unknown community, IPv6, and snmpd's sysonly view"""
-    scal = expected(t, "canon/scalars.txt")
-    system = expected(t, "canon/" + a.name + "-system.txt")
     cap = udp_cap(t)
     one_pdu = OPTS.with_(max_oids_per_request=0)
     var steps: list[Step] = []
     var labels: list[(str, bool)] = [("v2c public", False), ("v2c private", False), ("v1 public", True),
                                      ("v1 private", True)]
-    if a.name == "snmpsim":
-        labels.append(("v2c empty", False))       # "" serves the public dataset (README, Credentials)
 
-    for lv in labels:
-        label = lv.0
-        words = label.split(" ")
-        community = words[1] if words[1] != "empty" else ""
-        sec = Community(community, message.SNMP_V1 if lv.1 else message.SNMP_V2C)
-        c = Client(cap, LOCAL4, sec, None, port=a.port, opts=one_pdu)
-        steps.append(get_step(label + " get scalars", c, [oid_of(x) for x in scal]))
-        steps.append(get_step(label + " get system", c, [oid_of(x) for x in system]))
-        steps.append(next_step(label + " getnext", c, [BASE, b([1, 19, 0]), b([10, 1, 1])]))
-        steps.append(bulk_step(label + " getbulk", c, [b([1]), b([10, 1, 2])], 1, 3))
-        steps.append(get_step(label + " missing", c, [b([99, 0]), b([1, 1, 0])]))
-        # the end of the MIB view: snmpsim serves nothing after snmpEngineID.0 (SNMPv1: noSuchName)
-        steps.append(walk_step(label + " engine group", c, SNMP_ENGINE))
-    bad = Client(cap, LOCAL4, Community("nosuchcommunity"), None, port=a.port, opts=Options(timeout=0.5, retries=1))
-    steps.append(get_step("unknown community", bad, [b([1, 1, 0])]))
-    v6 = Client(cap, LOCAL6, Community("public"), None, port=a.port, opts=one_pdu)
-    steps.append(get_step("ipv6 get scalars", v6, [oid_of(x) for x in scal]))
-    steps.append(walk_step("ipv6 walk", v6, b([1])))
-    v6v1 = Client(cap, LOCAL6, Community("public", message.SNMP_V1), None, port=a.port, opts=one_pdu)
-    steps.append(walk_step("ipv6 v1 walk", v6v1, b([2])))
-    # a host name: the agents listen on 127.0.0.1 and ::1, so either DNS answer works
-    named = Client(cap, "localhost", Community("public"), None, port=a.port, opts=one_pdu)
-    steps.append(get_step("localhost", named, [SYS_DESCR]))
-    # the agents echo the community (check_community) and accept 16-bit request-ids
-    strict = Client(cap, LOCAL4, Community("private"), None, port=a.port,
-                    opts=OPTS.with_(check_community=True, request_id_bits=16))
-    steps.append(get_step("check community", strict, [SYS_DESCR]))
-    if a.name == "snmpd":
-        so = Client(cap, LOCAL4, Community("sysonly"), None, port=a.port, opts=OPTS)
-        steps.append(get_step("sysonly get", so, [b([1, 1, 0]), SYS_DESCR]))
-        steps.append(walk_step("sysonly walk", so, MIB2))
-        steps.append(bulk_step("sysonly getbulk", so, [SYSTEM], 0, 100))
-
-    def finished(name: str, got: dict[str, Outcome]) -> None:
+    def finished(scal, system, name: str, got: dict[str, Outcome]) -> None:
         def run() -> None:
             failures: list[str] = []
             for lv in labels:
@@ -774,58 +746,88 @@ actor _Communities(t: testing.EnvT, a: LabAgent):
             all_passed(failures)
         report_env(t, outcome(run))
 
-    def lab_up() -> None:
-        s = Script(a.name, steps, finished)
+    def lab_up(scal, system) -> None:
+        s = Script(a.name, steps, (lambda name, got: finished(scal, system, name, got)))
 
-    gate = LabGate(t, lab_up)
+    proc def __startup__():
+        scal = expected(t, "canon/scalars.txt")
+        system = expected(t, "canon/" + a.name + "-system.txt")
+
+        if a.name == "snmpsim":
+            labels.append(("v2c empty", False))       # "" serves the public dataset (README, Credentials)
+
+        for lv in labels:
+            label = lv.0
+            words = label.split(" ")
+            community = words[1] if words[1] != "empty" else ""
+            sec = Community(community, message.SNMP_V1 if lv.1 else message.SNMP_V2C)
+            c = Client(cap, LOCAL4, sec, None, port=a.port, opts=one_pdu)
+            steps.append(get_step(label + " get scalars", c, [oid_of(x) for x in scal]))
+            steps.append(get_step(label + " get system", c, [oid_of(x) for x in system]))
+            steps.append(next_step(label + " getnext", c, [BASE, b([1, 19, 0]), b([10, 1, 1])]))
+            steps.append(bulk_step(label + " getbulk", c, [b([1]), b([10, 1, 2])], 1, 3))
+            steps.append(get_step(label + " missing", c, [b([99, 0]), b([1, 1, 0])]))
+            # the end of the MIB view: snmpsim serves nothing after snmpEngineID.0 (SNMPv1: noSuchName)
+            steps.append(walk_step(label + " engine group", c, SNMP_ENGINE))
+        bad = Client(cap, LOCAL4, Community("nosuchcommunity"), None, port=a.port, opts=Options(timeout=0.5, retries=1))
+        steps.append(get_step("unknown community", bad, [b([1, 1, 0])]))
+        v6 = Client(cap, LOCAL6, Community("public"), None, port=a.port, opts=one_pdu)
+        steps.append(get_step("ipv6 get scalars", v6, [oid_of(x) for x in scal]))
+        steps.append(walk_step("ipv6 walk", v6, b([1])))
+        v6v1 = Client(cap, LOCAL6, Community("public", message.SNMP_V1), None, port=a.port, opts=one_pdu)
+        steps.append(walk_step("ipv6 v1 walk", v6v1, b([2])))
+        # a host name: the agents listen on 127.0.0.1 and ::1, so either DNS answer works
+        named = Client(cap, "localhost", Community("public"), None, port=a.port, opts=one_pdu)
+        steps.append(get_step("localhost", named, [SYS_DESCR]))
+        # the agents echo the community (check_community) and accept 16-bit request-ids
+        strict = Client(cap, LOCAL4, Community("private"), None, port=a.port,
+                        opts=OPTS.with_(check_community=True, request_id_bits=16))
+        steps.append(get_step("check community", strict, [SYS_DESCR]))
+        if a.name == "snmpd":
+            so = Client(cap, LOCAL4, Community("sysonly"), None, port=a.port, opts=OPTS)
+            steps.append(get_step("sysonly get", so, [b([1, 1, 0]), SYS_DESCR]))
+            steps.append(walk_step("sysonly walk", so, MIB2))
+            steps.append(bulk_step("sysonly getbulk", so, [SYSTEM], 0, 100))
+
+        gate = LabGate(t, (lambda: lab_up(scal, system)))
+
+    __startup__()
+
 
 actor _test_snmpd_communities(t: testing.EnvT):
     """snmpd: SNMPv1/v2c public and private, unknown community, IPv6, the sysonly view"""
-    t.timeout(60.0)
-    t.require("interop")
-    r = _Communities(t, SNMPD)
+
+    proc def __startup__():
+        t.timeout(60.0)
+        t.require("interop")
+        r = _Communities(t, SNMPD)
+
+    __startup__()
+
 
 actor _test_snmpsim_communities(t: testing.EnvT):
     """snmpsim: SNMPv1/v2c public, private and the empty community, unknown community, IPv6"""
-    t.timeout(60.0)
-    t.require("interop")
-    r = _Communities(t, SNMPSIM)
 
+    proc def __startup__():
+        t.timeout(60.0)
+        t.require("interop")
+        r = _Communities(t, SNMPSIM)
+
+    __startup__()
 
 # SNMPv3: every lab user ############################################################################
+
 
 actor _V3Users(t: testing.EnvT, a: LabAgent):
     """Every user of users.tsv the agent has, each with its own Client: discovery from cold, a GET and a
     GETBULK walk of the scalars; with one user discover(), IPv6, and a Client seeded (EngineInfo) with a
     stale engine time (one notInTimeWindows resync) or a wrong engine ID (unknownEngineIDs, rediscovery)"""
-    scal = expected(t, "canon/scalars.txt")
-    users = [u for u in lab_users(t) if u.on(a)]
     cap = udp_cap(t)
     walk_opts = OPTS.with_(max_walk_varbinds=SCALARS)
     var scripts: list[(str, list[Step])] = []
-    for u in users:
-        c = Client(cap, LOCAL4, u.sec, None, port=a.port, opts=OPTS)
-        scripts.append((u.name, [get_step("get", c, [b([1, 18, 0]), b([2, 1, 0]), SYS_DESCR]),
-                                 walk_step("walk", c, BASE, walk_opts), info_step("info", c)]))
     shaaes = find_user(lab_users(t), "u_sha256_aes")
-    d = Client(cap, LOCAL4, shaaes, None, port=a.port, opts=OPTS)
-    scripts.append(("discover()", [discover_step("discover", d), get_step("get", d, [b([1, 18, 0])]),
-                                   info_step("info", d)]))
-    c6 = Client(cap, LOCAL6, shaaes, None, port=a.port, opts=OPTS)
-    scripts.append(("ipv6", [get_step("get", c6, [b([1, 18, 0]), b([2, 1, 0]), SYS_DESCR]),
-                             walk_step("walk", c6, BASE, walk_opts), info_step("info", c6)]))
-    stale = Client(cap, LOCAL4, shaaes, None, port=a.port, opts=OPTS,
-                   engine=EngineInfo(a.engine_id, a.boots, 1000000, _now()))
-    scripts.append(("stale time", [get_step("get", stale, [b([1, 18, 0])]), info_step("info", stale)]))
-    # snmpd answers unknownEngineIDs, snmpsim unknownUserNames naming its own engine (README,
-    # "Implementation differences"): either Report names another engine than the request went to and
-    # answers its msgID, so the Client rediscovers and resends; no request is lost
-    moved = Client(cap, LOCAL4, shaaes, None, port=a.port, opts=Options(timeout=1.0, retries=1),
-                   engine=EngineInfo(h("8000000001020399"), 1, 0, _now()))
-    scripts.append(("wrong engine ID", [get_step("get", moved, [b([1, 18, 0])]), get_step("get 2", moved, [b([1, 18, 0])]),
-                                        get_step("get 3", moved, [b([1, 18, 0])]), info_step("info", moved)]))
 
-    def gathered(results: dict[str, dict[str, Outcome]]) -> None:
+    def gathered(scal, results: dict[str, dict[str, Outcome]]) -> None:
         def run() -> None:
             failures: list[str] = []
             want_get = [".1.3.6.1.4.1.8072.9999.1.1.18.0 = INTEGER: 2147483647",
@@ -911,27 +913,65 @@ actor _V3Users(t: testing.EnvT, a: LabAgent):
             all_passed(failures)
         report_env(t, outcome(run))
 
-    def lab_up() -> None:
-        g = Gather(len(scripts), gathered)
+    def lab_up(scal) -> None:
+        g = Gather(len(scripts), (lambda results: gathered(scal, results)))
         for sn in scripts:
             s = Script(sn.0, sn.1, g.script_finished)
 
-    gate = LabGate(t, lab_up)
+    proc def __startup__():
+        scal = expected(t, "canon/scalars.txt")
+        users = [u for u in lab_users(t) if u.on(a)]
+
+        for u in users:
+            c = Client(cap, LOCAL4, u.sec, None, port=a.port, opts=OPTS)
+            scripts.append((u.name, [get_step("get", c, [b([1, 18, 0]), b([2, 1, 0]), SYS_DESCR]),
+                                     walk_step("walk", c, BASE, walk_opts), info_step("info", c)]))
+
+        d = Client(cap, LOCAL4, shaaes, None, port=a.port, opts=OPTS)
+        scripts.append(("discover()", [discover_step("discover", d), get_step("get", d, [b([1, 18, 0])]),
+                                       info_step("info", d)]))
+        c6 = Client(cap, LOCAL6, shaaes, None, port=a.port, opts=OPTS)
+        scripts.append(("ipv6", [get_step("get", c6, [b([1, 18, 0]), b([2, 1, 0]), SYS_DESCR]),
+                                 walk_step("walk", c6, BASE, walk_opts), info_step("info", c6)]))
+        stale = Client(cap, LOCAL4, shaaes, None, port=a.port, opts=OPTS,
+                       engine=EngineInfo(a.engine_id, a.boots, 1000000, _now()))
+        scripts.append(("stale time", [get_step("get", stale, [b([1, 18, 0])]), info_step("info", stale)]))
+        # snmpd answers unknownEngineIDs, snmpsim unknownUserNames naming its own engine (README,
+        # "Implementation differences"): either Report names another engine than the request went to and
+        # answers its msgID, so the Client rediscovers and resends; no request is lost
+        moved = Client(cap, LOCAL4, shaaes, None, port=a.port, opts=Options(timeout=1.0, retries=1),
+                       engine=EngineInfo(h("8000000001020399"), 1, 0, _now()))
+        scripts.append(("wrong engine ID", [get_step("get", moved, [b([1, 18, 0])]), get_step("get 2", moved, [b([1, 18, 0])]),
+                                            get_step("get 3", moved, [b([1, 18, 0])]), info_step("info", moved)]))
+
+        gate = LabGate(t, (lambda: lab_up(scal)))
+
+    __startup__()
+
 
 actor _test_snmpd_v3_users(t: testing.EnvT):
     """snmpd: every lab user (44) from cold: discovery, GET, GETBULK walk of B.1..B.9; discover(); IPv6"""
-    t.timeout(180.0)
-    t.require("interop")
-    r = _V3Users(t, SNMPD)
+
+    proc def __startup__():
+        t.timeout(180.0)
+        t.require("interop")
+        r = _V3Users(t, SNMPD)
+
+    __startup__()
+
 
 actor _test_snmpsim_v3_users(t: testing.EnvT):
     """snmpsim: every lab user (49, 3DES included) from cold: discovery, GET, GETBULK walk; discover(); IPv6"""
-    t.timeout(180.0)
-    t.require("interop")
-    r = _V3Users(t, SNMPSIM)
 
+    proc def __startup__():
+        t.timeout(180.0)
+        t.require("interop")
+        r = _V3Users(t, SNMPSIM)
+
+    __startup__()
 
 # SNMPv3: negative cases ############################################################################
+
 
 def v3(user: str, auth: int=usm.AUTH_NONE, auth_password: str="", priv: int=usm.PRIV_NONE,
        priv_password: str="", context: str="") -> Usm:
@@ -984,9 +1024,6 @@ actor _V3Negative(t: testing.EnvT, a: LabAgent):
     cases = negative_cases()
     neg = Options(timeout=1.5, retries=1)
     var scripts: list[(str, list[Step])] = []
-    for cs in cases:
-        c = Client(cap, LOCAL4, cs.1, None, port=a.port, opts=neg)
-        scripts.append((cs.0, [get_step("get", c, [b([1, 18, 0])]), info_step("info", c)]))
 
     def gathered(results: dict[str, dict[str, Outcome]]) -> None:
         def run() -> None:
@@ -1019,46 +1056,53 @@ actor _V3Negative(t: testing.EnvT, a: LabAgent):
 
     gate = LabGate(t, lab_up)
 
+    proc def __startup__():
+        for cs in cases:
+            c = Client(cap, LOCAL4, cs.1, None, port=a.port, opts=neg)
+            scripts.append((cs.0, [get_step("get", c, [b([1, 18, 0])]), info_step("info", c)]))
+
+    __startup__()
+
+
 actor _test_snmpd_v3_negative(t: testing.EnvT):
     """snmpd: wrong credentials give Reports, undecryptable requests and unknown contexts no answer, a level
     below the user's authorizationError"""
-    t.timeout(60.0)
-    t.require("interop")
-    r = _V3Negative(t, SNMPD)
+
+    proc def __startup__():
+        t.timeout(60.0)
+        t.require("interop")
+        r = _V3Negative(t, SNMPD)
+
+    __startup__()
+
 
 actor _test_snmpsim_v3_negative(t: testing.EnvT):
     """snmpsim: wrong credentials give Reports (decryptionErrors too), a level below the user's
     unsupportedSecLevels, an unknown context no answer"""
-    t.timeout(60.0)
-    t.require("interop")
-    r = _V3Negative(t, SNMPSIM)
 
+    proc def __startup__():
+        t.timeout(60.0)
+        t.require("interop")
+        r = _V3Negative(t, SNMPSIM)
+
+    __startup__()
 
 # Full walks of the dataset #########################################################################
+
 
 actor _Walks(t: testing.EnvT, a: LabAgent, users: list[str]):
     """The whole dataset B walked with SNMPv1 GETNEXT, SNMPv2c GETNEXT and GETBULK, walk_stream, IPv6 and
     SNMPv3 users, all at once; each compared with expected/canon/dataset.txt (SNMPv1: dataset-v1.txt)"""
-    full = expected(t, "canon/dataset.txt")
-    full_v1 = expected(t, "canon/dataset-v1.txt")
     lab = lab_users(t)
     cap = udp_cap(t)
     var scripts: list[(str, list[Step])] = []
     v1 = Client(cap, LOCAL4, Community("public", message.SNMP_V1), None, port=a.port, opts=OPTS)
-    scripts.append(("v1 getnext", [walk_step("walk", v1, BASE)]))
     v2 = Client(cap, LOCAL4, Community("public"), None, port=a.port, opts=OPTS)
-    scripts.append(("v2c getbulk", [walk_step("walk", v2, BASE)]))
     v2n = Client(cap, LOCAL4, Community("public"), None, port=a.port, opts=OPTS)
-    scripts.append(("v2c getnext", [walk_step("walk", v2n, BASE, OPTS.with_(use_bulk=False))]))
     v2s = Client(cap, LOCAL4, Community("private"), None, port=a.port, opts=OPTS)
-    scripts.append(("v2c walk_stream", [stream_step("walk", v2s, BASE, OPTS.with_(max_repetitions=50))]))
     v6 = Client(cap, LOCAL6, Community("public"), None, port=a.port, opts=OPTS)
-    scripts.append(("ipv6 v2c getbulk", [walk_step("walk", v6, BASE, OPTS.with_(max_repetitions=10))]))
-    for name in users:
-        c = Client(cap, LOCAL4, find_user(lab, name), None, port=a.port, opts=OPTS)
-        scripts.append((name, [walk_step("walk", c, BASE, OPTS.with_(max_repetitions=40))]))
 
-    def gathered(results: dict[str, dict[str, Outcome]]) -> None:
+    def gathered(full, full_v1, results: dict[str, dict[str, Outcome]]) -> None:
         def run() -> None:
             failures: list[str] = []
             for sn in scripts:
@@ -1074,38 +1118,61 @@ actor _Walks(t: testing.EnvT, a: LabAgent, users: list[str]):
             all_passed(failures)
         report_env(t, outcome(run))
 
-    def lab_up() -> None:
-        g = Gather(len(scripts), gathered)
+    def lab_up(full, full_v1) -> None:
+        g = Gather(len(scripts), (lambda results: gathered(full, full_v1, results)))
         for sn in scripts:
             s = Script(sn.0, sn.1, g.script_finished)
 
-    gate = LabGate(t, lab_up)
+    proc def __startup__():
+        full = expected(t, "canon/dataset.txt")
+        full_v1 = expected(t, "canon/dataset-v1.txt")
+
+        scripts.append(("v1 getnext", [walk_step("walk", v1, BASE)]))
+
+        scripts.append(("v2c getbulk", [walk_step("walk", v2, BASE)]))
+
+        scripts.append(("v2c getnext", [walk_step("walk", v2n, BASE, OPTS.with_(use_bulk=False))]))
+
+        scripts.append(("v2c walk_stream", [stream_step("walk", v2s, BASE, OPTS.with_(max_repetitions=50))]))
+
+        scripts.append(("ipv6 v2c getbulk", [walk_step("walk", v6, BASE, OPTS.with_(max_repetitions=10))]))
+        for name in users:
+            c = Client(cap, LOCAL4, find_user(lab, name), None, port=a.port, opts=OPTS)
+            scripts.append((name, [walk_step("walk", c, BASE, OPTS.with_(max_repetitions=40))]))
+
+        gate = LabGate(t, (lambda: lab_up(full, full_v1)))
+
+    __startup__()
+
 
 actor _test_snmpd_walks(t: testing.EnvT):
     """snmpd: the whole dataset by SNMPv1 GETNEXT (5731), SNMPv2c GETNEXT/GETBULK/walk_stream, IPv6 and
     SNMPv3 (6038 varbinds)"""
-    t.timeout(120.0)
-    t.require("interop")
-    r = _Walks(t, SNMPD, ["u_noauth", "u_sha256_aes", "u_md5_aes256", "u_sha512_aes256c"])
+
+    proc def __startup__():
+        t.timeout(120.0)
+        t.require("interop")
+        r = _Walks(t, SNMPD, ["u_noauth", "u_sha256_aes", "u_md5_aes256", "u_sha512_aes256c"])
+
+    __startup__()
+
 
 actor _test_snmpsim_walks(t: testing.EnvT):
     """snmpsim: the whole dataset by SNMPv1 GETNEXT, SNMPv2c GETNEXT/GETBULK/walk_stream, IPv6 and SNMPv3"""
-    t.timeout(120.0)
-    t.require("interop")
-    r = _Walks(t, SNMPSIM, ["u_noauth", "u_sha256_aes", "u_md5_aes192c", "u_sha_3des"])
 
+    proc def __startup__():
+        t.timeout(120.0)
+        t.require("interop")
+        r = _Walks(t, SNMPSIM, ["u_noauth", "u_sha256_aes", "u_md5_aes192c", "u_sha_3des"])
+
+    __startup__()
 
 # Tables and GETBULK caps ###########################################################################
+
 
 actor _Tables(t: testing.EnvT, a: LabAgent, user: str):
     """get_table of B.10 (sparse column 7), B.11 (string index) and B.12 (2000 rows), SNMPv1/v2c/v3, column
     groups in parallel; GETBULK responses capped by the agent, seen in the Response"""
-    full = expected(t, "canon/dataset.txt")
-    full_v1 = expected(t, "canon/dataset-v1.txt")
-    scal_oids = [oid_of(x) for x in expected(t, "canon/scalars.txt")]
-    table = expected(t, "canon/table.txt")
-    strtable = expected(t, "canon/strtable.txt")
-    bigtable = expected(t, "canon/bigtable.txt")
     cap = udp_cap(t)
     sec = find_user(lab_users(t), user)
     t10 = [b([10, 1, c]) for c in range(1, 8)]
@@ -1116,25 +1183,8 @@ actor _Tables(t: testing.EnvT, a: LabAgent, user: str):
     par = Client(cap, LOCAL4, Community("public"), None, port=a.port, opts=OPTS.with_(max_in_flight=3))
     c3 = Client(cap, LOCAL4, sec, None, port=a.port, opts=OPTS)
     var scripts: list[(str, list[Step])] = []
-    scripts.append(("v2c", [table_step("B.10", v2, t10), table_step("B.11", v2, t11), table_step("B.12", v2, t12),
-                            table_step("B.10 getnext", v2, t10, OPTS.with_(use_bulk=False)),
-                            bulk_step("cap", v2, [b([12, 1, 1])], 0, 200),
-                            bulk_step("cap non-repeater", v2, [b([1]), b([12, 1, 1])], 1, 200),
-                            bulk_step("cap two columns", v2, t12, 0, 200),
-                            walk_step("walk B.12 R=200", v2, b([12]), OPTS.with_(max_repetitions=200)),
-                            bulk_step("M=0", v2, [b([1])], 0, 0, Options(timeout=1.5, retries=0)),
-                            walk_step("walk R=0", v2, b([1]), OPTS.with_(max_repetitions=0)),
-                            # 70 OIDs: three GETNEXT PDUs (max_oids_per_request 32), merged in order
-                            next_step("getnext 70", v2, scal_oids)]))
-    scripts.append(("v1", [table_step("B.10", v1, t10), table_step("B.11", v1, t11),
-                           next_step("getnext 70", v1, scal_oids)]))
-    scripts.append(("parallel", [table_step("B.10", par, t10, OPTS.with_(max_oids_per_request=2)),
-                                 table_step("B.12", par, t12, OPTS.with_(max_oids_per_request=1,
-                                                                         max_repetitions=40))]))
-    scripts.append(("v3", [table_step("B.12", c3, t12), table_step("B.11", c3, t11),
-                           bulk_step("cap", c3, [b([12, 1, 1])], 0, 200)]))
 
-    def gathered(results: dict[str, dict[str, Outcome]]) -> None:
+    def gathered(bigtable, full, full_v1, scal_oids, strtable, table, results: dict[str, dict[str, Outcome]]) -> None:
         def run() -> None:
             failures: list[str] = []
             n = a.bulk_cap
@@ -1186,27 +1236,65 @@ actor _Tables(t: testing.EnvT, a: LabAgent, user: str):
             all_passed(failures)
         report_env(t, outcome(run))
 
-    def lab_up() -> None:
-        g = Gather(len(scripts), gathered)
+    def lab_up(bigtable, full, full_v1, scal_oids, strtable, table) -> None:
+        g = Gather(len(scripts), (lambda results: gathered(bigtable, full, full_v1, scal_oids, strtable, table, results)))
         for sn in scripts:
             s = Script(sn.0, sn.1, g.script_finished)
 
-    gate = LabGate(t, lab_up)
+    proc def __startup__():
+        full = expected(t, "canon/dataset.txt")
+        full_v1 = expected(t, "canon/dataset-v1.txt")
+        scal_oids = [oid_of(x) for x in expected(t, "canon/scalars.txt")]
+        table = expected(t, "canon/table.txt")
+        strtable = expected(t, "canon/strtable.txt")
+        bigtable = expected(t, "canon/bigtable.txt")
+
+        scripts.append(("v2c", [table_step("B.10", v2, t10), table_step("B.11", v2, t11), table_step("B.12", v2, t12),
+                                table_step("B.10 getnext", v2, t10, OPTS.with_(use_bulk=False)),
+                                bulk_step("cap", v2, [b([12, 1, 1])], 0, 200),
+                                bulk_step("cap non-repeater", v2, [b([1]), b([12, 1, 1])], 1, 200),
+                                bulk_step("cap two columns", v2, t12, 0, 200),
+                                walk_step("walk B.12 R=200", v2, b([12]), OPTS.with_(max_repetitions=200)),
+                                bulk_step("M=0", v2, [b([1])], 0, 0, Options(timeout=1.5, retries=0)),
+                                walk_step("walk R=0", v2, b([1]), OPTS.with_(max_repetitions=0)),
+                                # 70 OIDs: three GETNEXT PDUs (max_oids_per_request 32), merged in order
+                                next_step("getnext 70", v2, scal_oids)]))
+        scripts.append(("v1", [table_step("B.10", v1, t10), table_step("B.11", v1, t11),
+                               next_step("getnext 70", v1, scal_oids)]))
+        scripts.append(("parallel", [table_step("B.10", par, t10, OPTS.with_(max_oids_per_request=2)),
+                                     table_step("B.12", par, t12, OPTS.with_(max_oids_per_request=1,
+                                                                             max_repetitions=40))]))
+        scripts.append(("v3", [table_step("B.12", c3, t12), table_step("B.11", c3, t11),
+                               bulk_step("cap", c3, [b([12, 1, 1])], 0, 200)]))
+
+        gate = LabGate(t, (lambda: lab_up(bigtable, full, full_v1, scal_oids, strtable, table)))
+
+    __startup__()
+
 
 actor _test_snmpd_tables(t: testing.EnvT):
     """snmpd: tables with get_table (SNMPv1/v2c/v3, parallel column groups), GETBULK capped at 100 varbinds"""
-    t.timeout(120.0)
-    t.require("interop")
-    r = _Tables(t, SNMPD, "u_sha_aes192")
+
+    proc def __startup__():
+        t.timeout(120.0)
+        t.require("interop")
+        r = _Tables(t, SNMPD, "u_sha_aes192")
+
+    __startup__()
+
 
 actor _test_snmpsim_tables(t: testing.EnvT):
     """snmpsim: tables with get_table (SNMPv1/v2c/v3, parallel column groups), GETBULK capped at 64 varbinds"""
-    t.timeout(120.0)
-    t.require("interop")
-    r = _Tables(t, SNMPSIM, "u_md5_3des")
 
+    proc def __startup__():
+        t.timeout(120.0)
+        t.require("interop")
+        r = _Tables(t, SNMPSIM, "u_md5_3des")
+
+    __startup__()
 
 # snmpd's own tables ###############################################################################
+
 
 USM_USER_TABLE = Oid([1, 3, 6, 1, 6, 3, 15, 1, 2])
 VACM_MIB_OBJECTS = Oid([1, 3, 6, 1, 6, 3, 16, 1])
@@ -1223,21 +1311,9 @@ actor _test_snmpd_real_mib(t: testing.EnvT):
     MIB: string and engine-ID indexes, binary strings, OID and RowStatus values), walked by the Client
     (SNMPv1 GETNEXT, SNMPv2c GETNEXT and GETBULK, SNMPv3) and fetched with get_table, equal net-snmp's
     own snmpbulkwalk of them (converted by netsnmp2canon.py)"""
-    t.timeout(120.0)
-    t.require("interop")
     cap = udp_cap(t)
-    v2 = Client(cap, LOCAL4, Community("public"), None, port=SNMPD.port, opts=OPTS)
-    v1 = Client(cap, LOCAL4, Community("public", message.SNMP_V1), None, port=SNMPD.port, opts=OPTS)
-    c3 = Client(cap, LOCAL4, find_user(lab_users(t), "u_sha512_aes256c"), None, port=SNMPD.port, opts=OPTS)
-    usm_columns = [USM_USER_ENTRY.child([c]) for c in range(3, 14)]
-    vacm_columns = [VACM_GROUP_ENTRY.child([c]) for c in range(3, 6)]
     var steps: list[Step] = []
     subtrees = [("usmUserTable", USM_USER_TABLE), ("vacmMIBObjects", VACM_MIB_OBJECTS)]
-    for st in subtrees:
-        steps += [shell_step(st.0 + " net-snmp", netsnmp_walk(st.1), 60.0),
-                  walk_step(st.0 + " v2c", v2, st.1), walk_step(st.0 + " v2c getnext", v2, st.1, OPTS.with_(use_bulk=False)),
-                  walk_step(st.0 + " v1", v1, st.1), walk_step(st.0 + " v3", c3, st.1, OPTS.with_(max_repetitions=60))]
-    steps += [table_step("usmUserEntry", v2, usm_columns), table_step("vacmSecurityToGroupEntry", c3, vacm_columns)]
 
     def finished(name: str, got: dict[str, Outcome]) -> None:
         def run() -> None:
@@ -1267,7 +1343,25 @@ actor _test_snmpd_real_mib(t: testing.EnvT):
     def lab_up() -> None:
         s = Script("real mib", steps, finished, t.env.process)
 
-    gate = LabGate(t, lab_up)
+    proc def __startup__():
+        t.timeout(120.0)
+        t.require("interop")
+
+        v2 = Client(cap, LOCAL4, Community("public"), None, port=SNMPD.port, opts=OPTS)
+        v1 = Client(cap, LOCAL4, Community("public", message.SNMP_V1), None, port=SNMPD.port, opts=OPTS)
+        c3 = Client(cap, LOCAL4, find_user(lab_users(t), "u_sha512_aes256c"), None, port=SNMPD.port, opts=OPTS)
+        usm_columns = [USM_USER_ENTRY.child([c]) for c in range(3, 14)]
+        vacm_columns = [VACM_GROUP_ENTRY.child([c]) for c in range(3, 6)]
+
+        for st in subtrees:
+            steps += [shell_step(st.0 + " net-snmp", netsnmp_walk(st.1), 60.0),
+                      walk_step(st.0 + " v2c", v2, st.1), walk_step(st.0 + " v2c getnext", v2, st.1, OPTS.with_(use_bulk=False)),
+                      walk_step(st.0 + " v1", v1, st.1), walk_step(st.0 + " v3", c3, st.1, OPTS.with_(max_repetitions=60))]
+        steps += [table_step("usmUserEntry", v2, usm_columns), table_step("vacmSecurityToGroupEntry", c3, vacm_columns)]
+
+        gate = LabGate(t, lab_up)
+
+    __startup__()
 
 
 def type_of(line: str) -> str:
@@ -1299,18 +1393,8 @@ actor _test_snmpd_full_mib(t: testing.EnvT):
     included), walked by the Client with SNMPv2c and SNMPv3 GETBULK from 1.3, compared with net-snmp's own
     snmpbulkwalk of .1: the same types for every OID both walks saw, the same values in the stable
     subtrees, and (the tables of a live host change) at least 95 % of net-snmp's OIDs"""
-    t.timeout(120.0)
-    t.require("interop")
     cap = udp_cap(t)
-    v2 = Client(cap, LOCAL4, Community("public"), None, port=SNMPD.port, opts=OPTS)
-    c3 = Client(cap, LOCAL4, find_user(lab_users(t), "u_sha_aes"), None, port=SNMPD.port, opts=OPTS)
-    everything = Oid([1, 3])
-    var steps: list[Step] = [
-        shell_step("net-snmp", ["sh", "-c", "interop/nsnmp.sh snmpbulkwalk -v2c -c public -On -Oe -Ox "
-                                + "--hexOutputLength=0 -Cr50 127.0.0.1:%d .1 | python3 interop/tools/netsnmp2canon.py"
-                                % SNMPD.port], 60.0),
-        walk_step("v2c", v2, everything, OPTS.with_(max_repetitions=50)),
-        walk_step("v3", c3, everything, OPTS.with_(max_repetitions=50))]
+    var steps: list[Step] = []
 
     def finished(name: str, got: dict[str, Outcome]) -> None:
         def run() -> None:
@@ -1349,10 +1433,26 @@ actor _test_snmpd_full_mib(t: testing.EnvT):
     def lab_up() -> None:
         s = Script("full mib", steps, finished, t.env.process)
 
-    gate = LabGate(t, lab_up)
+    proc def __startup__():
+        t.timeout(120.0)
+        t.require("interop")
 
+        v2 = Client(cap, LOCAL4, Community("public"), None, port=SNMPD.port, opts=OPTS)
+        c3 = Client(cap, LOCAL4, find_user(lab_users(t), "u_sha_aes"), None, port=SNMPD.port, opts=OPTS)
+        everything = Oid([1, 3])
+        steps = [
+            shell_step("net-snmp", ["sh", "-c", "interop/nsnmp.sh snmpbulkwalk -v2c -c public -On -Oe -Ox "
+                                    + "--hexOutputLength=0 -Cr50 127.0.0.1:%d .1 | python3 interop/tools/netsnmp2canon.py"
+                                    % SNMPD.port], 60.0),
+            walk_step("v2c", v2, everything, OPTS.with_(max_repetitions=50)),
+            walk_step("v3", c3, everything, OPTS.with_(max_repetitions=50))]
+
+        gate = LabGate(t, lab_up)
+
+    __startup__()
 
 # Large responses ##################################################################################
+
 
 actor _Large(t: testing.EnvT, a: LabAgent):
     """GETs of B.2.13.0 (4000 octets) repeated: 15 times (about 60 KB) fit into one datagram; 20 times
@@ -1401,23 +1501,34 @@ actor _Large(t: testing.EnvT, a: LabAgent):
 
     gate = LabGate(t, lab_up)
 
+
 actor _test_snmpd_large(t: testing.EnvT):
     """snmpd: 60 KB responses; 80 KB dropped in SNMPv1/v2c, tooBig in SNMPv3 (the Client splits the GET)"""
-    t.timeout(60.0)
-    t.require("interop")
-    r = _Large(t, SNMPD)
+
+    proc def __startup__():
+        t.timeout(60.0)
+        t.require("interop")
+        r = _Large(t, SNMPD)
+
+    __startup__()
+
 
 actor _test_snmpsim_large(t: testing.EnvT):
     """snmpsim: 60 KB responses; 80 KB dropped in every version"""
-    t.timeout(60.0)
-    t.require("interop")
-    r = _Large(t, SNMPSIM)
 
+    proc def __startup__():
+        t.timeout(60.0)
+        t.require("interop")
+        r = _Large(t, SNMPSIM)
+
+    __startup__()
 
 # An agent restart under a long-lived Client #########################################################
 
 # snmpd's engine time must be above this when the Client learns it, so that after the restart (time
 # from 0 again) its messages are more than 150 s off
+
+
 RESTART_MIN_UPTIME = 165
 
 actor _test_snmpd_restart(t: testing.EnvT):
@@ -1427,8 +1538,6 @@ actor _test_snmpd_restart(t: testing.EnvT):
     answers with an authenticated notInTimeWindows Report (RFC 3414 3.2
     step 7b). The Client resynchronises from it and resends.
     """
-    t.timeout(300.0)
-    t.require("interop")
     cap = udp_cap(t)
     u = find_user(lab_users(t), "u_sha_aes")
 
@@ -1493,10 +1602,16 @@ actor _test_snmpd_restart(t: testing.EnvT):
         m = Client(cap, LOCAL4, Community("public"), None, port=SNMPD.port, opts=OPTS)
         m.get(measured, [SNMP_ENGINE_TIME])
 
-    gate = LabGate(t, lab_up)
+    proc def __startup__():
+        t.timeout(300.0)
+        t.require("interop")
 
+        gate = LabGate(t, lab_up)
+
+    __startup__()
 
 # SET ##############################################################################################
+
 
 def w(n: int) -> Oid:
     """The writable object B.20.n.0"""
@@ -1546,7 +1661,6 @@ def set_errors() -> list[(str, str, list[VarBind], str, str)]:
 actor _Set(t: testing.EnvT, a: LabAgent):
     """SET every writable type, every error case, non-atomic B.20 and (snmpd) atomic system objects, then
     restore the initial values; all strictly in order"""
-    initial = expected(t, "canon/writable-initial.txt")
     users = lab_users(t)
     cap = udp_cap(t)
     snmpd = a.name == "snmpd"
@@ -1557,38 +1671,10 @@ actor _Set(t: testing.EnvT, a: LabAgent):
     rw3 = Client(cap, LOCAL4, find_user(users, "u_sha_aes"), None, port=a.port, opts=noretry)
     var clients: dict[str, Client] = {"v2c": priv, "public": pub, "v1": v1}
     var steps: list[Step] = [walk_step("before", pub, b([20]))]
-    for sc in set_cases():
-        steps.append(set_step("set " + sc.0, priv, [sc.1]))
-        steps.append(get_step("get " + sc.0, pub, [sc.1.oid]))
-    steps.append(set_step("set v1", v1, [VarBind(w(5), Gauge32(7))]))
-    steps.append(get_step("get v1", pub, [w(5)]))
     v3vbs = [VarBind(w(1), Integer(1234)), VarBind(w(2), OctetString(b"py\"set"))]
-    steps.append(set_step("set v3", rw3, v3vbs))
-    steps.append(get_step("get v3", pub, [w(1), w(2)]))
-    for se in set_errors():
-        steps.append(set_step("error " + se.0, clients[se.1], se.2))
-    steps.append(get_step("get after second varbind wrongValue", pub, [w(1)]))
-    steps.append(set_step("error Integer32 overflow", priv, [VarBind(w(1), Integer(2147483648))]))
-    if snmpd:
-        ro3 = Client(cap, LOCAL4, find_user(users, "u_ro_sha_aes"), None, port=a.port, opts=noretry)
-        steps.append(set_step("error read-only user", ro3, [VarBind(w(1), Integer(1))]))
-        steps.append(set_step("error atomic", priv, [VarBind(SYS_CONTACT, OctetString(b"CHANGED")),
-                                                     VarBind(w(7), Integer(1))]))
-        steps.append(get_step("get after atomic", pub, [SYS_CONTACT]))
-        steps.append(set_step("set system", priv, [VarBind(SYS_CONTACT, OctetString(b"new-contact")),
-                                                   VarBind(SYS_NAME, OctetString(b"new-name")),
-                                                   VarBind(SYS_LOCATION, OctetString(b"new-location"))]))
-        steps.append(get_step("get system", pub, [SYS_CONTACT, SYS_NAME, SYS_LOCATION]))
     var restore = initial_writable()
-    if snmpd:
-        restore += [VarBind(SYS_CONTACT, OctetString(b"actsnmp-contact")),
-                    VarBind(SYS_NAME, OctetString(b"actsnmp-snmpd")), VarBind(SYS_LOCATION, OctetString(b"actsnmp-lab"))]
-    steps.append(set_step("restore", priv, restore, OPTS))
-    steps.append(walk_step("after", pub, b([20]), OPTS))
-    if snmpd:
-        steps.append(get_step("system after", pub, [SYS_CONTACT, SYS_NAME, SYS_LOCATION], OPTS))
 
-    def finished(name: str, got: dict[str, Outcome]) -> None:
+    def finished(initial, name: str, got: dict[str, Outcome]) -> None:
         def run() -> None:
             failures: list[str] = []
 
@@ -1678,27 +1764,74 @@ actor _Set(t: testing.EnvT, a: LabAgent):
             all_passed(failures)
         report_env(t, outcome(run))
 
-    def lab_up() -> None:
-        s = Script(a.name, steps, finished)
+    def lab_up(initial) -> None:
+        s = Script(a.name, steps, (lambda name, got: finished(initial, name, got)))
 
-    gate = LabGate(t, lab_up)
+    proc def __startup__():
+        initial = expected(t, "canon/writable-initial.txt")
+
+        for sc in set_cases():
+            steps.append(set_step("set " + sc.0, priv, [sc.1]))
+            steps.append(get_step("get " + sc.0, pub, [sc.1.oid]))
+        steps.append(set_step("set v1", v1, [VarBind(w(5), Gauge32(7))]))
+        steps.append(get_step("get v1", pub, [w(5)]))
+
+        steps.append(set_step("set v3", rw3, v3vbs))
+        steps.append(get_step("get v3", pub, [w(1), w(2)]))
+        for se in set_errors():
+            steps.append(set_step("error " + se.0, clients[se.1], se.2))
+        steps.append(get_step("get after second varbind wrongValue", pub, [w(1)]))
+        steps.append(set_step("error Integer32 overflow", priv, [VarBind(w(1), Integer(2147483648))]))
+        if snmpd:
+            ro3 = Client(cap, LOCAL4, find_user(users, "u_ro_sha_aes"), None, port=a.port, opts=noretry)
+            steps.append(set_step("error read-only user", ro3, [VarBind(w(1), Integer(1))]))
+            steps.append(set_step("error atomic", priv, [VarBind(SYS_CONTACT, OctetString(b"CHANGED")),
+                                                         VarBind(w(7), Integer(1))]))
+            steps.append(get_step("get after atomic", pub, [SYS_CONTACT]))
+            steps.append(set_step("set system", priv, [VarBind(SYS_CONTACT, OctetString(b"new-contact")),
+                                                       VarBind(SYS_NAME, OctetString(b"new-name")),
+                                                       VarBind(SYS_LOCATION, OctetString(b"new-location"))]))
+            steps.append(get_step("get system", pub, [SYS_CONTACT, SYS_NAME, SYS_LOCATION]))
+
+        if snmpd:
+            restore += [VarBind(SYS_CONTACT, OctetString(b"actsnmp-contact")),
+                        VarBind(SYS_NAME, OctetString(b"actsnmp-snmpd")), VarBind(SYS_LOCATION, OctetString(b"actsnmp-lab"))]
+        steps.append(set_step("restore", priv, restore, OPTS))
+        steps.append(walk_step("after", pub, b([20]), OPTS))
+        if snmpd:
+            steps.append(get_step("system after", pub, [SYS_CONTACT, SYS_NAME, SYS_LOCATION], OPTS))
+
+        gate = LabGate(t, (lambda: lab_up(initial)))
+
+    __startup__()
+
 
 actor _test_snmpd_set(t: testing.EnvT):
     """snmpd: SET of every writable type (v1/v2c/v3), every error status, atomicity, restore"""
-    t.timeout(120.0)
-    t.require("interop")
-    r = _Set(t, SNMPD)
+
+    proc def __startup__():
+        t.timeout(120.0)
+        t.require("interop")
+        r = _Set(t, SNMPD)
+
+    __startup__()
+
 
 actor _test_snmpsim_set(t: testing.EnvT):
     """snmpsim: SET of every writable type (v1/v2c/v3), its error behaviour (noSuchInstance quirk), restore"""
-    t.timeout(120.0)
-    t.require("interop")
-    r = _Set(t, SNMPSIM)
 
+    proc def __startup__():
+        t.timeout(120.0)
+        t.require("interop")
+        r = _Set(t, SNMPSIM)
+
+    __startup__()
 
 # snmpsim's pathological dataset ####################################################################
 
 # P.3.i.0: (status, error-index) of the error variation (tooBig names no varbind)
+
+
 ERROR_CASES: list[(int, int)] = [(pdu.GEN_ERR, 1), (pdu.TOO_BIG, 0), (pdu.NO_ACCESS, 1), (pdu.AUTHORIZATION_ERROR, 1),
                                  (pdu.RESOURCE_UNAVAILABLE, 1), (pdu.NO_SUCH_NAME, 1)]
 # The same in SNMPv1, as snmpsim (pysnmp) maps them: noAccess and authorizationError become noSuchName
@@ -1710,53 +1843,10 @@ V1_ERROR_CASES: list[(int, int)] = [(pdu.GEN_ERR, 1), (pdu.TOO_BIG, 0), (0, 0), 
 actor _test_snmpsim_pathological(t: testing.EnvT):
     """snmpsim, community and v3 context "pathological": NULL, huge values, a response too large for UDP
     (timeout; adaptive GETBULK in a walk), exceptions as data, every error-status, non-increasing OIDs"""
-    t.timeout(120.0)
-    t.require("interop")
     a = SNMPSIM
     cap = udp_cap(t)
-    quick = Options(timeout=2.0, retries=0)
-    v2 = Client(cap, LOCAL4, Community("pathological"), None, port=a.port, opts=OPTS)
-    v1 = Client(cap, LOCAL4, Community("pathological", message.SNMP_V1), None, port=a.port, opts=OPTS)
-    adaptive = Client(cap, LOCAL4, Community("pathological"), None, port=a.port, opts=OPTS)
-    nb = Client(cap, LOCAL4, Community("pathological"), None, port=a.port, opts=OPTS)
     u3 = with_context(find_user(lab_users(t), "u_sha_aes"), "pathological")
-    v3c = Client(cap, LOCAL4, u3, None, port=a.port, opts=OPTS)
-    v3a = Client(cap, LOCAL4, u3, None, port=a.port, opts=OPTS)
-    getnext = OPTS.with_(use_bulk=False)
-    var steps: list[Step] = [
-        get_step("values", v2, [p([1, 1, 0]), p([1, 2, 0]), p([1, 5, 0])]),
-        get_step("10000", v2, [p([1, 3, 0])]),
-        get_step("60000", v2, [p([1, 6, 0])]),
-        get_step("65535", v2, [p([1, 4, 0])], quick),
-        bulk_step("getbulk too big", v2, [p([1])], 0, 10, quick),
-        walk_step("walk P.1 adaptive", adaptive, p([1]), Options(timeout=1.0, retries=3, max_repetitions=10)),
-        walk_step("walk P.1 after", adaptive, p([1]), Options(timeout=1.0, retries=0, max_repetitions=10)),
-        info_step("adaptive stats", adaptive),
-        walk_step("walk P.1 getnext", v2, p([1]), Options(timeout=1.0, retries=1, use_bulk=False)),
-        walk_step("v1 walk P.1", v1, p([1]), Options(timeout=1.0, retries=1)),
-        get_step("exceptions", v2, [p([2, 1, 0]), p([2, 2, 0]), p([2, 3, 0]), p([2, 4, 0])]),
-        next_step("getnext P.2", v2, [p([2])]),
-        # at most 4 repetitions: a GETBULK that reaches P.3 gets the error variation's genErr
-        walk_step("walk P.2", v2, p([2]), OPTS.with_(max_repetitions=4)),
-        walk_step("walk P.2 getnext", v2, p([2]), getnext),
-        walk_step("walk P.3", v2, p([3])),
-        get_step("v1 noSuchName", v1, [p([3, 3, 0]), p([1, 1, 0])]),
-        walk_step("walk P.5 getnext", v2, p([5]), getnext),
-        walk_step("walk P.5 getbulk", v2, p([5])),
-        walk_step("walk P.5.3", v2, p([5, 3]), getnext),
-        walk_step("walk P.5 loop guard", nb, p([5]), getnext.with_(check_increasing=False)),
-        walk_step("walk P.5.3 loop guard", nb, p([5, 3]), OPTS.with_(check_increasing=False)),
-        walk_step("v1 walk P.5", v1, p([5])),
-        get_step("v3 values", v3c, [p([1, 1, 0]), p([1, 2, 0])]),
-        get_step("v3 60000", v3c, [p([1, 6, 0])]),
-        get_step("v3 genErr", v3c, [p([3, 1, 0])]),
-        walk_step("v3 walk P.5", v3c, p([5])),
-        get_step("v3 65535", v3c, [p([1, 4, 0])], quick),
-        # SNMPv3: each halving re-encodes the ScopedPDU
-        walk_step("v3 walk P.1 adaptive", v3a, p([1]), Options(timeout=1.0, retries=3, max_repetitions=10))]
-    for i in range(1, 7):
-        steps.append(get_step("error %d" % i, v2, [p([3, i, 0])]))
-        steps.append(get_step("v1 error %d" % i, v1, [p([3, i, 0])]))
+    var steps: list[Step] = []
 
     def finished(name: str, got: dict[str, Outcome]) -> None:
         def run() -> None:
@@ -1876,27 +1966,65 @@ actor _test_snmpsim_pathological(t: testing.EnvT):
     def lab_up() -> None:
         s = Script("pathological", steps, finished)
 
-    gate = LabGate(t, lab_up)
+    proc def __startup__():
+        t.timeout(120.0)
+        t.require("interop")
+
+        quick = Options(timeout=2.0, retries=0)
+        v2 = Client(cap, LOCAL4, Community("pathological"), None, port=a.port, opts=OPTS)
+        v1 = Client(cap, LOCAL4, Community("pathological", message.SNMP_V1), None, port=a.port, opts=OPTS)
+        adaptive = Client(cap, LOCAL4, Community("pathological"), None, port=a.port, opts=OPTS)
+        nb = Client(cap, LOCAL4, Community("pathological"), None, port=a.port, opts=OPTS)
+
+        v3c = Client(cap, LOCAL4, u3, None, port=a.port, opts=OPTS)
+        v3a = Client(cap, LOCAL4, u3, None, port=a.port, opts=OPTS)
+        getnext = OPTS.with_(use_bulk=False)
+        steps = [
+            get_step("values", v2, [p([1, 1, 0]), p([1, 2, 0]), p([1, 5, 0])]),
+            get_step("10000", v2, [p([1, 3, 0])]),
+            get_step("60000", v2, [p([1, 6, 0])]),
+            get_step("65535", v2, [p([1, 4, 0])], quick),
+            bulk_step("getbulk too big", v2, [p([1])], 0, 10, quick),
+            walk_step("walk P.1 adaptive", adaptive, p([1]), Options(timeout=1.0, retries=3, max_repetitions=10)),
+            walk_step("walk P.1 after", adaptive, p([1]), Options(timeout=1.0, retries=0, max_repetitions=10)),
+            info_step("adaptive stats", adaptive),
+            walk_step("walk P.1 getnext", v2, p([1]), Options(timeout=1.0, retries=1, use_bulk=False)),
+            walk_step("v1 walk P.1", v1, p([1]), Options(timeout=1.0, retries=1)),
+            get_step("exceptions", v2, [p([2, 1, 0]), p([2, 2, 0]), p([2, 3, 0]), p([2, 4, 0])]),
+            next_step("getnext P.2", v2, [p([2])]),
+            # at most 4 repetitions: a GETBULK that reaches P.3 gets the error variation's genErr
+            walk_step("walk P.2", v2, p([2]), OPTS.with_(max_repetitions=4)),
+            walk_step("walk P.2 getnext", v2, p([2]), getnext),
+            walk_step("walk P.3", v2, p([3])),
+            get_step("v1 noSuchName", v1, [p([3, 3, 0]), p([1, 1, 0])]),
+            walk_step("walk P.5 getnext", v2, p([5]), getnext),
+            walk_step("walk P.5 getbulk", v2, p([5])),
+            walk_step("walk P.5.3", v2, p([5, 3]), getnext),
+            walk_step("walk P.5 loop guard", nb, p([5]), getnext.with_(check_increasing=False)),
+            walk_step("walk P.5.3 loop guard", nb, p([5, 3]), OPTS.with_(check_increasing=False)),
+            walk_step("v1 walk P.5", v1, p([5])),
+            get_step("v3 values", v3c, [p([1, 1, 0]), p([1, 2, 0])]),
+            get_step("v3 60000", v3c, [p([1, 6, 0])]),
+            get_step("v3 genErr", v3c, [p([3, 1, 0])]),
+            walk_step("v3 walk P.5", v3c, p([5])),
+            get_step("v3 65535", v3c, [p([1, 4, 0])], quick),
+            # SNMPv3: each halving re-encodes the ScopedPDU
+            walk_step("v3 walk P.1 adaptive", v3a, p([1]), Options(timeout=1.0, retries=3, max_repetitions=10))]
+        for i in range(1, 7):
+            steps.append(get_step("error %d" % i, v2, [p([3, i, 0])]))
+            steps.append(get_step("v1 error %d" % i, v1, [p([3, i, 0])]))
+
+        gate = LabGate(t, lab_up)
+
+    __startup__()
+
 
 actor _test_snmpsim_slow(t: testing.EnvT):
     """snmpsim's delay variation (P.4: answers after 1 s / 5 s, blocking snmpsim): a long enough timeout,
     a timeout, and a late answer to the first attempt accepted after two retries"""
-    t.timeout(90.0)
-    t.require("interop")
     a = SNMPSIM
     cap = udp_cap(t)
-    c = Client(cap, LOCAL4, Community("pathological"), None, port=a.port, opts=OPTS)
-    var steps: list[Step] = [
-        get_step("1 s", c, [p([4, 1, 0])], Options(timeout=3.0, retries=0)),
-        get_step("5 s timeout", c, [p([4, 2, 0])], Options(timeout=2.0, retries=0)),
-        # snmpsim is busy until the 5 s answer has gone out
-        get_step("blocked", c, [p([1, 1, 0])], Options(timeout=10.0, retries=0)),
-        # attempts at 0, 2 and 4 s; the answer to the first comes at 5 s, within the third attempt's
-        # timeout: a late answer to an earlier attempt completes the request (RFC 3416 4.1)
-        get_step("5 s late answer", c, [p([4, 2, 0])], Options(timeout=2.0, retries=2)),
-        # snmpsim still answers the two retransmissions, 5 s each
-        get_step("blocked again", c, [p([1, 1, 0])], Options(timeout=15.0, retries=0)),
-        info_step("stats", c)]
+    var steps: list[Step] = []
 
     def finished(name: str, got: dict[str, Outcome]) -> None:
         def run() -> None:
@@ -1924,10 +2052,29 @@ actor _test_snmpsim_slow(t: testing.EnvT):
     def lab_up() -> None:
         s = Script("slow", steps, finished)
 
-    gate = LabGate(t, lab_up)
+    proc def __startup__():
+        t.timeout(90.0)
+        t.require("interop")
 
+        c = Client(cap, LOCAL4, Community("pathological"), None, port=a.port, opts=OPTS)
+        steps = [
+            get_step("1 s", c, [p([4, 1, 0])], Options(timeout=3.0, retries=0)),
+            get_step("5 s timeout", c, [p([4, 2, 0])], Options(timeout=2.0, retries=0)),
+            # snmpsim is busy until the 5 s answer has gone out
+            get_step("blocked", c, [p([1, 1, 0])], Options(timeout=10.0, retries=0)),
+            # attempts at 0, 2 and 4 s; the answer to the first comes at 5 s, within the third attempt's
+            # timeout: a late answer to an earlier attempt completes the request (RFC 3416 4.1)
+            get_step("5 s late answer", c, [p([4, 2, 0])], Options(timeout=2.0, retries=2)),
+            # snmpsim still answers the two retransmissions, 5 s each
+            get_step("blocked again", c, [p([1, 1, 0])], Options(timeout=15.0, retries=0)),
+            info_step("stats", c)]
+
+        gate = LabGate(t, lab_up)
+
+    __startup__()
 
 # SNMP over TCP (RFC 3430) #########################################################################
+
 
 proc def tcp_cap(t: testing.EnvT) -> net.TCPConnectCap:
     return net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap)))
@@ -1942,37 +2089,9 @@ actor _test_snmpd_tcp(t: testing.EnvT):
     """snmpd over TCP: GET of the scalars with SNMPv1, SNMPv2c and SNMPv3 authPriv (discovery on the
     connection), GETNEXT, GETBULK, bulk walks of the dataset with SNMPv2c and SNMPv3, GETNEXT walks and IPv6,
     without a retry; a refused connection is a TimeoutError whose hint is the refusal"""
-    t.timeout(120.0)
-    t.require("interop")
-    full = expected(t, "canon/dataset.txt")
-    full_v1 = expected(t, "canon/dataset-v1.txt")
-    scal = expected(t, "canon/scalars.txt")
-    scal_oids = [oid_of(x) for x in scal]
     lab = lab_users(t)
-    one_pdu = OPTS.with_(max_oids_per_request=0)
-    v2 = tcp_client(t, LOCAL4, SNMPD.port, Community("public"), one_pdu)
-    v1 = tcp_client(t, LOCAL4, SNMPD.port, Community("public", message.SNMP_V1), one_pdu)
-    v3c = tcp_client(t, LOCAL4, SNMPD.port, find_user(lab, "u_sha256_aes"), one_pdu)
-    v6 = tcp_client(t, LOCAL6, SNMPD.port, Community("public"), one_pdu)
-    v6v3 = tcp_client(t, LOCAL6, SNMPD.port, find_user(lab, "u_sha512_aes256c"), one_pdu)
-    closed = tcp_client(t, LOCAL4, CLOSED_PORT, Community("public"), Options(timeout=0.5, retries=1))
-    steps = [get_step("v2c get scalars", v2, scal_oids),
-             next_step("v2c getnext", v2, [BASE, b([1, 19, 0]), b([10, 1, 1])]),
-             bulk_step("v2c getbulk", v2, [b([1]), b([10, 1, 2])], 1, 3),
-             walk_step("v2c bulk walk", v2, BASE),
-             walk_step("v2c getnext walk", v2, b([10]), one_pdu.with_(use_bulk=False)),
-             info_step("v2c stats", v2),
-             get_step("v1 get scalars", v1, scal_oids),
-             walk_step("v1 walk", v1, b([11])),
-             info_step("v1 stats", v1),
-             get_step("v3 get scalars", v3c, scal_oids),
-             walk_step("v3 bulk walk", v3c, BASE),
-             info_step("v3 stats", v3c),
-             walk_step("ipv6 bulk walk", v6, b([12])),
-             get_step("ipv6 v3 get scalars", v6v3, scal_oids),
-             get_step("refused", closed, [b([1, 1, 0])])]
 
-    def finished(name: str, got: dict[str, Outcome]) -> None:
+    def finished(full, full_v1, scal, name: str, got: dict[str, Outcome]) -> None:
         def run() -> None:
             failures: list[str] = []
 
@@ -2029,15 +2148,49 @@ actor _test_snmpd_tcp(t: testing.EnvT):
             all_passed(failures)
         report_env(t, outcome(run))
 
-    def lab_up() -> None:
-        s = Script("tcp", steps, finished)
+    def lab_up(full, full_v1, scal, steps) -> None:
+        s = Script("tcp", steps, (lambda name, got: finished(full, full_v1, scal, name, got)))
 
-    gate = LabGate(t, lab_up)
+    proc def __startup__():
+        t.timeout(120.0)
+        t.require("interop")
+        full = expected(t, "canon/dataset.txt")
+        full_v1 = expected(t, "canon/dataset-v1.txt")
+        scal = expected(t, "canon/scalars.txt")
+        scal_oids = [oid_of(x) for x in scal]
 
+        one_pdu = OPTS.with_(max_oids_per_request=0)
+        v2 = tcp_client(t, LOCAL4, SNMPD.port, Community("public"), one_pdu)
+        v1 = tcp_client(t, LOCAL4, SNMPD.port, Community("public", message.SNMP_V1), one_pdu)
+        v3c = tcp_client(t, LOCAL4, SNMPD.port, find_user(lab, "u_sha256_aes"), one_pdu)
+        v6 = tcp_client(t, LOCAL6, SNMPD.port, Community("public"), one_pdu)
+        v6v3 = tcp_client(t, LOCAL6, SNMPD.port, find_user(lab, "u_sha512_aes256c"), one_pdu)
+        closed = tcp_client(t, LOCAL4, CLOSED_PORT, Community("public"), Options(timeout=0.5, retries=1))
+        steps = [get_step("v2c get scalars", v2, scal_oids),
+                 next_step("v2c getnext", v2, [BASE, b([1, 19, 0]), b([10, 1, 1])]),
+                 bulk_step("v2c getbulk", v2, [b([1]), b([10, 1, 2])], 1, 3),
+                 walk_step("v2c bulk walk", v2, BASE),
+                 walk_step("v2c getnext walk", v2, b([10]), one_pdu.with_(use_bulk=False)),
+                 info_step("v2c stats", v2),
+                 get_step("v1 get scalars", v1, scal_oids),
+                 walk_step("v1 walk", v1, b([11])),
+                 info_step("v1 stats", v1),
+                 get_step("v3 get scalars", v3c, scal_oids),
+                 walk_step("v3 bulk walk", v3c, BASE),
+                 info_step("v3 stats", v3c),
+                 walk_step("ipv6 bulk walk", v6, b([12])),
+                 get_step("ipv6 v3 get scalars", v6v3, scal_oids),
+                 get_step("refused", closed, [b([1, 1, 0])])]
+
+        gate = LabGate(t, (lambda: lab_up(full, full_v1, scal, steps)))
+
+    __startup__()
 
 # Notifications: our sender to the lab's snmptrapd #################################################
 
 # The payload of the notification matrix (interop/tools/notifycheck.py FULL): every dataset type
+
+
 FULL_PAYLOAD: list[list[int]] = [[1, 18, 0], [1, 19, 0], [1, 7, 0], [2, 1, 0], [2, 2, 0], [2, 3, 0], [2, 4, 0],
                                  [2, 5, 0], [2, 6, 0], [2, 16, 0], [3, 1, 0], [3, 3, 0], [3, 4, 0], [3, 7, 0],
                                  [4, 1, 0], [4, 4, 0], [5, 4, 0], [5, 5, 0], [6, 4, 0], [7, 3, 0], [7, 4, 0],
@@ -2162,72 +2315,82 @@ actor _ToSnmptrapd(t: testing.EnvT, steps: list[Step], want: list[str]):
 
     gate = LabGate(t, lab_up)
 
+
 actor _test_trap_to_snmptrapd(t: testing.EnvT):
     """Client.trap_v1/trap/inform to the lab's snmptrapd: SNMPv1 (every generic-trap), SNMPv2c traps and
     informs (IPv6 too), SNMPv3 traps (sender engine 0x8000000001020304) and informs (discovery) for every
     user snmptrapd has; what it logged (trapdcheck.sh log) equals the fmt.canon_notification blocks of what
     was sent; traps with a wrong community, password or level are dropped"""
-    t.timeout(180.0)
-    t.require("interop")
-    view = mibview.load_snmprec(read_text(t, "interop/dataset/actsnmp.snmprec"))
     users = [u for u in lab_users(t) if u.snmpd and not u.read_only]
     cap = udp_cap(t)
-    # informs are acknowledged; a retransmission would be logged twice
-    inform_opts = Options(timeout=5.0, retries=0)
-    full = payload(view, FULL_PAYLOAD)
-    full_v1 = payload(view, FULL_PAYLOAD, True)
     var steps: list[Step] = []
     var want: list[str] = []
 
-    c1 = Client(cap, LOCAL4, Community("public", message.SNMP_V1), None, port=SNMPTRAPD_PORT, opts=inform_opts)
-    steps.append(trap_v1_step("v1 example", c1, ENTERPRISE, b"\xc0\x00\x02\x01", 6, 42, payload(view, [[1, 1, 0]]),
-                              12345))
-    want.append(v1_block(ENTERPRISE, b"\xc0\x00\x02\x01", 6, 42, 12345, payload(view, [[1, 1, 0]])))
     generic: list[(int, bytes, int, list[list[int]])] = [
         (0, b"\xc0\x00\x02\x01", 0, []), (1, b"\x7f\x00\x00\x01", 1, [[2, 1, 0]]),
         (2, b"\x0a\x00\x00\x01", 100, [[10, 1, 1, 7], [10, 1, 2, 7]]),
         (3, b"\xff\xff\xff\xff", 8640000, [[10, 1, 1, 7], [10, 1, 2, 7], [10, 1, 5, 7]]),
         (4, b"\x00\x00\x00\x00", 2147483648, [[4, 3, 0]]), (5, b"\xc0\x00\x02\xfe", 4294967295, [[4, 2, 0], [5, 1, 0]])]
-    for g in generic:
-        vbs = payload(view, g.3)
-        steps.append(trap_v1_step("v1 generic %d" % g.0, c1, NOTIF, g.1, g.0, 0, vbs, g.2))
-        want.append(v1_block(NOTIF, g.1, g.0, 0, g.2, vbs))
-    steps.append(trap_v1_step("v1 specific max", c1, NOTIF, b"\xc6\x33\x64\x07", 6, 2147483647, payload(view, [[2, 1, 0]]),
-                              4294967295))
-    want.append(v1_block(NOTIF, b"\xc6\x33\x64\x07", 6, 2147483647, 4294967295, payload(view, [[2, 1, 0]])))
-    steps.append(trap_v1_step("v1 full", c1, NOTIF, b"\xcb\x00\x71\x09", 6, 100, full_v1, 123456789))
-    want.append(v1_block(NOTIF, b"\xcb\x00\x71\x09", 6, 100, 123456789, full_v1))
 
-    c2 = Client(cap, LOCAL4, Community("public"), None, port=SNMPTRAPD_PORT, opts=inform_opts)
-    steps.append(trap_step("v2c coldStart", c2, notify.TRAP_COLD_START, [], 0))
-    want.append(v2c_block(pdu.TRAP_V2, 0, notify.TRAP_COLD_START, []))
-    steps.append(trap_step("v2c full", c2, NOTIF.child([0, 101]), full, 4294967295))
-    want.append(v2c_block(pdu.TRAP_V2, 4294967295, NOTIF.child([0, 101]), full))
-    steps.append(inform_step("v2c inform full", c2, NOTIF.child([0, 102]), full, 123))
-    want.append(v2c_block(pdu.INFORM, 123, NOTIF.child([0, 102]), full))
-    steps.append(inform_step("v2c inform empty", c2, NOTIF.child([0, 103]), [], 1))
-    want.append(v2c_block(pdu.INFORM, 1, NOTIF.child([0, 103]), []))
-    c6 = Client(cap, LOCAL6, Community("public"), None, port=SNMPTRAPD_PORT, opts=inform_opts)
-    steps.append(trap_step("ipv6 trap", c6, NOTIF.child([0, 104]), payload(view, [[1, 1, 0]]), 104))
-    want.append(v2c_block(pdu.TRAP_V2, 104, NOTIF.child([0, 104]), payload(view, [[1, 1, 0]])))
-    steps.append(inform_step("ipv6 inform", c6, NOTIF.child([0, 105]), payload(view, [[2, 1, 0]]), 105))
-    want.append(v2c_block(pdu.INFORM, 105, NOTIF.child([0, 105]), payload(view, [[2, 1, 0]])))
-    # dropped silently by snmptrapd: another community, a wrong password, a level below the user's
-    bad = Client(cap, LOCAL4, Community("secret"), None, port=SNMPTRAPD_PORT)
-    steps.append(trap_step("bad community", bad, NOTIF.child([0, 106]), [], 106))
     sender = h(TRAP_ENGINE)
-    wrong = Client(cap, LOCAL4, v3("u_sha", usm.AUTH_SHA1, WRONGPASS), None, port=SNMPTRAPD_PORT, local_engine_id=sender)
-    steps.append(trap_step("wrong password", wrong, NOTIF.child([0, 107]), [], 107))
-    low = Client(cap, LOCAL4, v3("u_sha_aes", usm.AUTH_SHA1, AUTHPASS), None, port=SNMPTRAPD_PORT, local_engine_id=sender)
-    steps.append(trap_step("level too low", low, NOTIF.child([0, 108]), [], 108))
-    for i in range(len(users)):
-        u = users[i]
-        c = Client(cap, LOCAL4, u.sec, None, port=SNMPTRAPD_PORT, opts=inform_opts, local_engine_id=sender)
-        steps.append(trap_step(u.name + " trap", c, NOTIF.child([0, 200 + i]), full, 3000000 + i))
-        want.append(v3_block(u.sec, pdu.TRAP_V2, 3000000 + i, NOTIF.child([0, 200 + i]), full))
-        steps.append(inform_step(u.name + " inform", c, NOTIF.child([0, 300 + i]), full, 3001000 + i))
-        want.append(v3_block(u.sec, pdu.INFORM, 3001000 + i, NOTIF.child([0, 300 + i]), full))
-    n = _ToSnmptrapd(t, steps, want)
+
+    proc def __startup__():
+        t.timeout(180.0)
+        t.require("interop")
+        view = mibview.load_snmprec(read_text(t, "interop/dataset/actsnmp.snmprec"))
+
+        # informs are acknowledged; a retransmission would be logged twice
+        inform_opts = Options(timeout=5.0, retries=0)
+        full = payload(view, FULL_PAYLOAD)
+        full_v1 = payload(view, FULL_PAYLOAD, True)
+
+        c1 = Client(cap, LOCAL4, Community("public", message.SNMP_V1), None, port=SNMPTRAPD_PORT, opts=inform_opts)
+        steps.append(trap_v1_step("v1 example", c1, ENTERPRISE, b"\xc0\x00\x02\x01", 6, 42, payload(view, [[1, 1, 0]]),
+                                  12345))
+        want.append(v1_block(ENTERPRISE, b"\xc0\x00\x02\x01", 6, 42, 12345, payload(view, [[1, 1, 0]])))
+
+        for g in generic:
+            vbs = payload(view, g.3)
+            steps.append(trap_v1_step("v1 generic %d" % g.0, c1, NOTIF, g.1, g.0, 0, vbs, g.2))
+            want.append(v1_block(NOTIF, g.1, g.0, 0, g.2, vbs))
+        steps.append(trap_v1_step("v1 specific max", c1, NOTIF, b"\xc6\x33\x64\x07", 6, 2147483647, payload(view, [[2, 1, 0]]),
+                                  4294967295))
+        want.append(v1_block(NOTIF, b"\xc6\x33\x64\x07", 6, 2147483647, 4294967295, payload(view, [[2, 1, 0]])))
+        steps.append(trap_v1_step("v1 full", c1, NOTIF, b"\xcb\x00\x71\x09", 6, 100, full_v1, 123456789))
+        want.append(v1_block(NOTIF, b"\xcb\x00\x71\x09", 6, 100, 123456789, full_v1))
+
+        c2 = Client(cap, LOCAL4, Community("public"), None, port=SNMPTRAPD_PORT, opts=inform_opts)
+        steps.append(trap_step("v2c coldStart", c2, notify.TRAP_COLD_START, [], 0))
+        want.append(v2c_block(pdu.TRAP_V2, 0, notify.TRAP_COLD_START, []))
+        steps.append(trap_step("v2c full", c2, NOTIF.child([0, 101]), full, 4294967295))
+        want.append(v2c_block(pdu.TRAP_V2, 4294967295, NOTIF.child([0, 101]), full))
+        steps.append(inform_step("v2c inform full", c2, NOTIF.child([0, 102]), full, 123))
+        want.append(v2c_block(pdu.INFORM, 123, NOTIF.child([0, 102]), full))
+        steps.append(inform_step("v2c inform empty", c2, NOTIF.child([0, 103]), [], 1))
+        want.append(v2c_block(pdu.INFORM, 1, NOTIF.child([0, 103]), []))
+        c6 = Client(cap, LOCAL6, Community("public"), None, port=SNMPTRAPD_PORT, opts=inform_opts)
+        steps.append(trap_step("ipv6 trap", c6, NOTIF.child([0, 104]), payload(view, [[1, 1, 0]]), 104))
+        want.append(v2c_block(pdu.TRAP_V2, 104, NOTIF.child([0, 104]), payload(view, [[1, 1, 0]])))
+        steps.append(inform_step("ipv6 inform", c6, NOTIF.child([0, 105]), payload(view, [[2, 1, 0]]), 105))
+        want.append(v2c_block(pdu.INFORM, 105, NOTIF.child([0, 105]), payload(view, [[2, 1, 0]])))
+        # dropped silently by snmptrapd: another community, a wrong password, a level below the user's
+        bad = Client(cap, LOCAL4, Community("secret"), None, port=SNMPTRAPD_PORT)
+        steps.append(trap_step("bad community", bad, NOTIF.child([0, 106]), [], 106))
+
+        wrong = Client(cap, LOCAL4, v3("u_sha", usm.AUTH_SHA1, WRONGPASS), None, port=SNMPTRAPD_PORT, local_engine_id=sender)
+        steps.append(trap_step("wrong password", wrong, NOTIF.child([0, 107]), [], 107))
+        low = Client(cap, LOCAL4, v3("u_sha_aes", usm.AUTH_SHA1, AUTHPASS), None, port=SNMPTRAPD_PORT, local_engine_id=sender)
+        steps.append(trap_step("level too low", low, NOTIF.child([0, 108]), [], 108))
+        for i in range(len(users)):
+            u = users[i]
+            c = Client(cap, LOCAL4, u.sec, None, port=SNMPTRAPD_PORT, opts=inform_opts, local_engine_id=sender)
+            steps.append(trap_step(u.name + " trap", c, NOTIF.child([0, 200 + i]), full, 3000000 + i))
+            want.append(v3_block(u.sec, pdu.TRAP_V2, 3000000 + i, NOTIF.child([0, 200 + i]), full))
+            steps.append(inform_step(u.name + " inform", c, NOTIF.child([0, 300 + i]), full, 3001000 + i))
+            want.append(v3_block(u.sec, pdu.INFORM, 3001000 + i, NOTIF.child([0, 300 + i]), full))
+        n = _ToSnmptrapd(t, steps, want)
+
+    __startup__()
 
 
 actor _test_tcp_trap_to_snmptrapd(t: testing.EnvT):
@@ -2235,49 +2398,56 @@ actor _test_tcp_trap_to_snmptrapd(t: testing.EnvT):
     (IPv6 too), SNMPv3 traps (sender engine 0x8000000001020304) and informs (discovery on the connection)
     for users of every security level and key extension; snmptrapd logs exactly what was sent and drops
     the trap with a wrong community"""
-    t.timeout(120.0)
-    t.require("interop")
-    view = mibview.load_snmprec(read_text(t, "interop/dataset/actsnmp.snmprec"))
     lab = lab_users(t)
-    # informs are acknowledged; a retransmission would be logged twice
-    inform_opts = Options(timeout=5.0, retries=0)
-    full = payload(view, FULL_PAYLOAD)
-    full_v1 = payload(view, FULL_PAYLOAD, True)
     sender = h(TRAP_ENGINE)
     var steps: list[Step] = []
     var want: list[str] = []
 
-    c1 = tcp_client(t, LOCAL4, SNMPTRAPD_PORT, Community("public", message.SNMP_V1), inform_opts)
-    steps.append(trap_v1_step("v1 example", c1, ENTERPRISE, b"\xc0\x00\x02\x01", 6, 42, payload(view, [[1, 1, 0]]),
-                              12345))
-    want.append(v1_block(ENTERPRISE, b"\xc0\x00\x02\x01", 6, 42, 12345, payload(view, [[1, 1, 0]])))
-    steps.append(trap_v1_step("v1 full", c1, NOTIF, b"\xcb\x00\x71\x09", 6, 100, full_v1, 123456789))
-    want.append(v1_block(NOTIF, b"\xcb\x00\x71\x09", 6, 100, 123456789, full_v1))
-    c2 = tcp_client(t, LOCAL4, SNMPTRAPD_PORT, Community("public"), inform_opts)
-    steps.append(trap_step("v2c full", c2, NOTIF.child([0, 101]), full, 4294967295))
-    want.append(v2c_block(pdu.TRAP_V2, 4294967295, NOTIF.child([0, 101]), full))
-    steps.append(inform_step("v2c inform full", c2, NOTIF.child([0, 102]), full, 123))
-    want.append(v2c_block(pdu.INFORM, 123, NOTIF.child([0, 102]), full))
-    c6 = tcp_client(t, LOCAL6, SNMPTRAPD_PORT, Community("public"), inform_opts)
-    steps.append(trap_step("ipv6 trap", c6, NOTIF.child([0, 104]), payload(view, [[1, 1, 0]]), 104))
-    want.append(v2c_block(pdu.TRAP_V2, 104, NOTIF.child([0, 104]), payload(view, [[1, 1, 0]])))
-    steps.append(inform_step("ipv6 inform", c6, NOTIF.child([0, 105]), payload(view, [[2, 1, 0]]), 105))
-    want.append(v2c_block(pdu.INFORM, 105, NOTIF.child([0, 105]), payload(view, [[2, 1, 0]])))
-    # dropped silently by snmptrapd
-    bad = tcp_client(t, LOCAL4, SNMPTRAPD_PORT, Community("secret"))
-    steps.append(trap_step("bad community", bad, NOTIF.child([0, 106]), [], 106))
     names = ["u_noauth", "u_sha", "u_sha_aes", "u_md5_aes192", "u_md5_aes256c", "u_sha512_aes256c"]
-    for i in range(len(names)):
-        u = find_user(lab, names[i])
-        c = tcp_client(t, LOCAL4, SNMPTRAPD_PORT, u, inform_opts, sender)
-        steps.append(trap_step(names[i] + " trap", c, NOTIF.child([0, 200 + i]), full, 3000000 + i))
-        want.append(v3_block(u, pdu.TRAP_V2, 3000000 + i, NOTIF.child([0, 200 + i]), full))
-        steps.append(inform_step(names[i] + " inform", c, NOTIF.child([0, 300 + i]), full, 3001000 + i))
-        want.append(v3_block(u, pdu.INFORM, 3001000 + i, NOTIF.child([0, 300 + i]), full))
-    n = _ToSnmptrapd(t, steps, want)
 
+    proc def __startup__():
+        t.timeout(120.0)
+        t.require("interop")
+        view = mibview.load_snmprec(read_text(t, "interop/dataset/actsnmp.snmprec"))
+
+        # informs are acknowledged; a retransmission would be logged twice
+        inform_opts = Options(timeout=5.0, retries=0)
+        full = payload(view, FULL_PAYLOAD)
+        full_v1 = payload(view, FULL_PAYLOAD, True)
+
+        c1 = tcp_client(t, LOCAL4, SNMPTRAPD_PORT, Community("public", message.SNMP_V1), inform_opts)
+        steps.append(trap_v1_step("v1 example", c1, ENTERPRISE, b"\xc0\x00\x02\x01", 6, 42, payload(view, [[1, 1, 0]]),
+                                  12345))
+        want.append(v1_block(ENTERPRISE, b"\xc0\x00\x02\x01", 6, 42, 12345, payload(view, [[1, 1, 0]])))
+        steps.append(trap_v1_step("v1 full", c1, NOTIF, b"\xcb\x00\x71\x09", 6, 100, full_v1, 123456789))
+        want.append(v1_block(NOTIF, b"\xcb\x00\x71\x09", 6, 100, 123456789, full_v1))
+        c2 = tcp_client(t, LOCAL4, SNMPTRAPD_PORT, Community("public"), inform_opts)
+        steps.append(trap_step("v2c full", c2, NOTIF.child([0, 101]), full, 4294967295))
+        want.append(v2c_block(pdu.TRAP_V2, 4294967295, NOTIF.child([0, 101]), full))
+        steps.append(inform_step("v2c inform full", c2, NOTIF.child([0, 102]), full, 123))
+        want.append(v2c_block(pdu.INFORM, 123, NOTIF.child([0, 102]), full))
+        c6 = tcp_client(t, LOCAL6, SNMPTRAPD_PORT, Community("public"), inform_opts)
+        steps.append(trap_step("ipv6 trap", c6, NOTIF.child([0, 104]), payload(view, [[1, 1, 0]]), 104))
+        want.append(v2c_block(pdu.TRAP_V2, 104, NOTIF.child([0, 104]), payload(view, [[1, 1, 0]])))
+        steps.append(inform_step("ipv6 inform", c6, NOTIF.child([0, 105]), payload(view, [[2, 1, 0]]), 105))
+        want.append(v2c_block(pdu.INFORM, 105, NOTIF.child([0, 105]), payload(view, [[2, 1, 0]])))
+        # dropped silently by snmptrapd
+        bad = tcp_client(t, LOCAL4, SNMPTRAPD_PORT, Community("secret"))
+        steps.append(trap_step("bad community", bad, NOTIF.child([0, 106]), [], 106))
+
+        for i in range(len(names)):
+            u = find_user(lab, names[i])
+            c = tcp_client(t, LOCAL4, SNMPTRAPD_PORT, u, inform_opts, sender)
+            steps.append(trap_step(names[i] + " trap", c, NOTIF.child([0, 200 + i]), full, 3000000 + i))
+            want.append(v3_block(u, pdu.TRAP_V2, 3000000 + i, NOTIF.child([0, 200 + i]), full))
+            steps.append(inform_step(names[i] + " inform", c, NOTIF.child([0, 300 + i]), full, 3001000 + i))
+            want.append(v3_block(u, pdu.INFORM, 3001000 + i, NOTIF.child([0, 300 + i]), full))
+        n = _ToSnmptrapd(t, steps, want)
+
+    __startup__()
 
 # Notifications: the lab's senders to our NotificationReceiver ######################################
+
 
 def receiver_spec(address: str, tcp: bool) -> str:
     """The receiver argument of notifycheck.py (net-snmp syntax) for address and our receiver port"""
@@ -2295,12 +2465,9 @@ actor _Matrix(t: testing.EnvT, flag: str, expected_file: str, address: str=LOCAL
     (expected_file is not used), in any order: each notification comes on a connection of its own.
     """
     receiver = receiver_spec(address, tcp)
-    users_text = read_text(t, "interop/config/users.tsv")
     ucap = net.UDPCap(net.NetCap(t.env.cap))
     tcap = net.TCPCap(net.NetCap(t.env.cap))
     var want: list[str] = []
-    if not tcp:
-        want = blocks_of(read_text(t, "interop/expected/notify/" + expected_file))
     var blocks: list[str] = []
     var rcv: ?NotificationReceiver = None
     var srv: ?ServerTransport = None
@@ -2351,7 +2518,7 @@ actor _Matrix(t: testing.EnvT, flag: str, expected_file: str, address: str=LOCAL
             cmd += ["--senders", "netsnmp"]
         return cmd
 
-    def listening(st: ServerTransport, error: ?str) -> None:
+    def listening(users_text, st: ServerTransport, error: ?str) -> None:
         if error is not None:
             t.failure(AssertionError("our receiver cannot listen on " + receiver + ": " + error))
             return
@@ -2360,67 +2527,105 @@ actor _Matrix(t: testing.EnvT, flag: str, expected_file: str, address: str=LOCAL
         rcv = NotificationReceiver(st, cfg, received, None)
         sh = Shell(t.env.process, notifycheck("--send") + ["--receiver", receiver], sent, 280.0)
 
-    proc def listen() -> None:
+    proc def listen(users_text) -> None:
         if tcp:
-            tcp_server_transport(net.TCPListenCap(tcap), address, RECEIVER_PORT, listening, None)
+            tcp_server_transport(net.TCPListenCap(tcap), address, RECEIVER_PORT, (lambda st, error: listening(users_text, st, error)), None)
         else:
-            udp_server_transport(net.UDPListenCap(ucap), address, RECEIVER_PORT, listening, None)
+            udp_server_transport(net.UDPListenCap(ucap), address, RECEIVER_PORT, (lambda st, error: listening(users_text, st, error)), None)
 
-    def got_expected(code: int, out: str, err: str) -> None:
+    def got_expected(users_text, code: int, out: str, err: str) -> None:
         if code != 0:
             t.failure(AssertionError("notifycheck.py --expected exited with %d: " % code + clip(err)))
             return
         want = blocks_of(out)
-        listen()
+        listen(users_text)
 
-    def lab_up() -> None:
+    def lab_up(users_text) -> None:
         if tcp:
             # the net-snmp half of the matrix, numbered as notifycheck.py sends it
-            sh = Shell(t.env.process, notifycheck("--expected"), got_expected, 60.0)
+            sh = Shell(t.env.process, notifycheck("--expected"), (lambda code, out, err: got_expected(users_text, code, out, err)), 60.0)
         else:
-            listen()
+            listen(users_text)
 
-    gate = LabGate(t, lab_up)
+    proc def __startup__():
+        users_text = read_text(t, "interop/config/users.tsv")
+
+        if not tcp:
+            want = blocks_of(read_text(t, "interop/expected/notify/" + expected_file))
+
+        gate = LabGate(t, (lambda: lab_up(users_text)))
+
+    __startup__()
+
 
 actor _test_receiver_matrix_quick(t: testing.EnvT):
     """The --quick notification matrix (22) from net-snmp and pysnmp to our NotificationReceiver over UDP"""
-    t.timeout(120.0)
-    t.require("interop")
-    r = _Matrix(t, "--quick", "matrix-quick.txt")
+
+    proc def __startup__():
+        t.timeout(120.0)
+        t.require("interop")
+        r = _Matrix(t, "--quick", "matrix-quick.txt")
+
+    __startup__()
+
 
 actor _test_receiver_matrix_full(t: testing.EnvT):
     """The full notification matrix (86) from net-snmp and pysnmp to our NotificationReceiver over UDP"""
-    t.timeout(180.0)
-    t.require("interop")
-    r = _Matrix(t, "", "matrix.txt")
+
+    proc def __startup__():
+        t.timeout(180.0)
+        t.require("interop")
+        r = _Matrix(t, "", "matrix.txt")
+
+    __startup__()
+
 
 actor _test_receiver_matrix_all_users(t: testing.EnvT):
     """The notification matrix with every SNMPv3 user (198) to our NotificationReceiver over UDP"""
-    t.timeout(300.0)
-    t.require("interop")
-    r = _Matrix(t, "--all-users", "matrix-all.txt")
+
+    proc def __startup__():
+        t.timeout(300.0)
+        t.require("interop")
+        r = _Matrix(t, "--all-users", "matrix-all.txt")
+
+    __startup__()
+
 
 actor _test_receiver_matrix_quick_ipv6(t: testing.EnvT):
     """The --quick notification matrix (22) to our NotificationReceiver over IPv6 ([::1]:16165)"""
-    t.timeout(120.0)
-    t.require("interop")
-    r = _Matrix(t, "--quick", "matrix-quick.txt", LOCAL6)
+
+    proc def __startup__():
+        t.timeout(120.0)
+        t.require("interop")
+        r = _Matrix(t, "--quick", "matrix-quick.txt", LOCAL6)
+
+    __startup__()
+
 
 actor _test_receiver_matrix_full_tcp(t: testing.EnvT):
     """The full notification matrix of net-snmp's senders (43) to our NotificationReceiver over TCP"""
-    t.timeout(180.0)
-    t.require("interop")
-    r = _Matrix(t, "", "", tcp=True)
+
+    proc def __startup__():
+        t.timeout(180.0)
+        t.require("interop")
+        r = _Matrix(t, "", "", tcp=True)
+
+    __startup__()
+
 
 actor _test_receiver_matrix_quick_tcp6(t: testing.EnvT):
     """The --quick notification matrix of net-snmp's senders (11) to our NotificationReceiver over TCP and IPv6
     (tcp6:[::1]:16165)"""
-    t.timeout(120.0)
-    t.require("interop")
-    r = _Matrix(t, "--quick", "", LOCAL6, tcp=True)
 
+    proc def __startup__():
+        t.timeout(120.0)
+        t.require("interop")
+        r = _Matrix(t, "--quick", "", LOCAL6, tcp=True)
+
+    __startup__()
 
 # The shared-socket Dispatcher ######################################################################
+
 
 proc def via(d: Dispatcher, a: LabAgent, address: str, sec: Security, opts: Options) -> Client:
     """A Client of agent a at address whose transport the Dispatcher d attached"""
@@ -2430,19 +2635,13 @@ actor _test_dispatcher(t: testing.EnvT):
     """20 Clients of both agents through ONE Dispatcher socket on "::", all at once: SNMPv1 and SNMPv2c
     (two communities, GETNEXT and GETBULK, IPv4 and IPv6) and six SNMPv3 users per agent (snmpsim: also a
     context) walk the dataset and GET the scalars; each compared with expected/canon, nothing unroutable"""
-    t.timeout(120.0)
-    t.require("interop")
-    full = expected(t, "canon/dataset.txt")
-    full_v1 = expected(t, "canon/dataset-v1.txt")
-    scal = expected(t, "canon/scalars.txt")
     lab = lab_users(t)
-    lcap = net.UDPListenCap(net.UDPCap(net.NetCap(t.env.cap)))
     v3_users = {"snmpd": ["u_noauth", "u_md5", "u_sha256_aes", "u_md5_aes256", "u_sha512_aes256c", "u_sha_des"],
                 "snmpsim": ["u_noauth", "u_sha", "u_sha256_aes", "u_md5_aes192c", "u_sha_3des", "u_sha224_aes256"]}
     var disp: ?Dispatcher = None
     var scripts: list[(str, list[Step])] = []
 
-    def gathered(results: dict[str, dict[str, Outcome]]) -> None:
+    def gathered(full, full_v1, scal, results: dict[str, dict[str, Outcome]]) -> None:
         d = disp
         s = d.stats() if d is not None else None
         if s is not None:
@@ -2471,7 +2670,7 @@ actor _test_dispatcher(t: testing.EnvT):
             d.close()
         report_env(t, outcome(run))
 
-    def disp_listening(d: Dispatcher, error: ?str) -> None:
+    def disp_listening(full, full_v1, scal, d: Dispatcher, error: ?str) -> None:
         if error is not None:
             t.failure(AssertionError("dispatcher: " + error))
             return
@@ -2496,11 +2695,22 @@ actor _test_dispatcher(t: testing.EnvT):
             else:
                 cx = via(d, a, LOCAL4, with_context(find_user(lab, "u_sha_aes"), "private"), o)
                 scripts.append(("snmpsim u_sha_aes context private", [walk_step("walk", cx, BASE)]))
-        g = Gather(len(scripts), gathered)
+        g = Gather(len(scripts), (lambda results: gathered(full, full_v1, scal, results)))
         for sn in scripts:
             sc = Script(sn.0, sn.1, g.script_finished)
 
-    def lab_up() -> None:
-        dispatcher.udp_dispatcher(lcap, "::", 0, disp_listening, None)
+    def lab_up(full, full_v1, lcap, scal) -> None:
+        dispatcher.udp_dispatcher(lcap, "::", 0, (lambda d, error: disp_listening(full, full_v1, scal, d, error)), None)
 
-    gate = LabGate(t, lab_up)
+    proc def __startup__():
+        t.timeout(120.0)
+        t.require("interop")
+        full = expected(t, "canon/dataset.txt")
+        full_v1 = expected(t, "canon/dataset-v1.txt")
+        scal = expected(t, "canon/scalars.txt")
+
+        lcap = net.UDPListenCap(net.UDPCap(net.NetCap(t.env.cap)))
+
+        gate = LabGate(t, (lambda: lab_up(full, full_v1, lcap, scal)))
+
+    __startup__()

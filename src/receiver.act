@@ -803,6 +803,9 @@ actor NotificationReceiver(transport: ServerTransport, config: ReceiverConfig,
             transport.close()
             _log.info("notification receiver closed", None)
 
-    transport.set_receiver(_received)
-    _log.info("notification receiver started", {"engine_id": config.engine_id.hex(), "users": len(config.users),
-                                                "communities": len(config.communities)})
+    proc def __startup__():
+        transport.set_receiver(_received)
+        _log.info("notification receiver started", {"engine_id": config.engine_id.hex(), "users": len(config.users),
+                                                    "communities": len(config.communities)})
+
+    __startup__()

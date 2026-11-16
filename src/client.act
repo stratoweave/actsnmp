@@ -2696,18 +2696,21 @@ actor Client(cap: ?net.UDPConnectCap,
 
     # Start #########################################################################################
 
-    _transport = _make_transport(cap, address, port, transport)
-    if _usm is not None:
-        seed = engine
-        if seed is not None:
-            n = len(seed.engine_id)
-            if n >= usm.MIN_ENGINE_ID_LEN and n <= usm.MAX_ENGINE_ID_LEN:
-                _engine_id = seed.engine_id
-                _times[seed.engine_id] = EngineTime(seed.engine_id, seed.boots, seed.time, 0, seed.learned_at)
-            else:
-                _log.warning("seeded engine ID ignored: not 5 to 32 octets", {"octets": n})
-    tr0 = _transport
-    if tr0 is not None:
-        _attach(tr0)
-    else:
-        _fatal = "no transport: neither cap nor transport was given"
+    proc def __startup__():
+        _transport = _make_transport(cap, address, port, transport)
+        if _usm is not None:
+            seed = engine
+            if seed is not None:
+                n = len(seed.engine_id)
+                if n >= usm.MIN_ENGINE_ID_LEN and n <= usm.MAX_ENGINE_ID_LEN:
+                    _engine_id = seed.engine_id
+                    _times[seed.engine_id] = EngineTime(seed.engine_id, seed.boots, seed.time, 0, seed.learned_at)
+                else:
+                    _log.warning("seeded engine ID ignored: not 5 to 32 octets", {"octets": n})
+        tr0 = _transport
+        if tr0 is not None:
+            _attach(tr0)
+        else:
+            _fatal = "no transport: neither cap nor transport was given"
+
+    __startup__()

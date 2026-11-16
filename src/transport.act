@@ -465,10 +465,13 @@ actor _UdpClient(cap: net.UDPConnectCap, address: str, port: int):
             c.close()
             _fail(_tidy(error))
 
-    if port > 0 and port <= 65535:
-        _conn = net.UDPConnection(cap, address, port, _connected, _received, _net_failed)
-    else:
-        _fail("port %d is outside 1..65535" % port)
+    proc def __startup__():
+        if port > 0 and port <= 65535:
+            _conn = net.UDPConnection(cap, address, port, _connected, _received, _net_failed)
+        else:
+            _fail("port %d is outside 1..65535" % port)
+
+    __startup__()
 
 
 def udp_server_transport(cap: net.UDPListenCap, address: str, port: int,
@@ -552,13 +555,16 @@ actor _UdpServer(cap: net.UDPListenCap, address: str, port: int,
         if not _closed:
             _log.warning("UDP error", {"local": _peer_text(address, port), "error": error})
 
-    if port >= 0 and port <= 65535:
-        _listener = net.UDPListener(cap, address, port, _listening, _received, _net_failed)
-    else:
-        _report_ready(0, "UDP listen on " + _peer_text(address, port) + " failed: port outside 0..65535")
+    proc def __startup__():
+        if port >= 0 and port <= 65535:
+            _listener = net.UDPListener(cap, address, port, _listening, _received, _net_failed)
+        else:
+            _report_ready(0, "UDP listen on " + _peer_text(address, port) + " failed: port outside 0..65535")
 
+    __startup__()
 
 # Stream framing ###################################################################################
+
 
 def message_length(header: bytes) -> int:
     """Return the total length of the SNMP message that header starts
@@ -1016,10 +1022,13 @@ actor _TcpClient(cap: net.TCPConnectCap, address: str, port: int, connect_timeou
         _inbox.clear()
         _drop()
 
-    if port <= 0 or port > 65535:
-        _failure = "TCP setup for " + _peer + " failed: port %d is outside 1..65535" % port
-    elif not (net.is_ipv4(address) or net.is_ipv6(address)):
-        _failure = "TCP setup for " + _peer + " failed: not an IPv4 or IPv6 address"
+    proc def __startup__():
+        if port <= 0 or port > 65535:
+            _failure = "TCP setup for " + _peer + " failed: port %d is outside 1..65535" % port
+        elif not (net.is_ipv4(address) or net.is_ipv6(address)):
+            _failure = "TCP setup for " + _peer + " failed: not an IPv4 or IPv6 address"
+
+    __startup__()
 
 
 def tcp_server_transport(cap: net.TCPListenCap, address: str, port: int,
@@ -1218,16 +1227,19 @@ actor _TcpServer(cap: net.TCPListenCap, address: str, port: int,
         if idle_timeout > 0.0:
             after now idle_timeout: _idle_expired(sid)
 
-    if port == 0:
-        _report_ready(0, "TCP listen on " + _local + " failed: port 0 is not supported: the port picked for it "
-                      + "cannot be learned")
-    elif port < 0 or port > 65535:
-        _report_ready(0, "TCP listen on " + _local + " failed: port outside 1..65535")
-    else:
-        _listener = net.TCPListener(cap, address, port, _listening, _accepted)
+    proc def __startup__():
+        if port == 0:
+            _report_ready(0, "TCP listen on " + _local + " failed: port 0 is not supported: the port picked for it "
+                          + "cannot be learned")
+        elif port < 0 or port > 65535:
+            _report_ready(0, "TCP listen on " + _local + " failed: port outside 1..65535")
+        else:
+            _listener = net.TCPListener(cap, address, port, _listening, _accepted)
 
+    __startup__()
 
 # In-memory network ################################################################################
+
 
 class NetFaults(object):
     """Packet-level faults that a MemNet applies to the datagrams it carries

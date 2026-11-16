@@ -1038,40 +1038,47 @@ def _test_fuzz_never_raises(t: testing.SyncT) -> None:
 # --- files, golden set, corpus, performance --------------------------------------------------
 
 actor _test_parse_file(t: testing.EnvT):
-    t.timeout(30.0)
     fc = file.FileCap(t.env.cap)
-    r = mib.parser.parse_file(fc, GOLDEN_DIR + "/IF-MIB")
-    testing.assertEqual(len(r.modules), 1)
-    testing.assertEqual(r.modules[0].name, "IF-MIB")
-    testing.assertEqual(r.modules[0].sha256, "a41d2d0414bd6e1b3249257d0d035ea11554624c525b830f6910195b72b0c297")
-    testing.assertEqual(r.modules[0].file, GOLDEN_DIR + "/IF-MIB")
-    testing.assertEqual(len(r.modules[0].defs), 99)
-    testing.assertEqual(codes(r), "")
-    r2 = mib.parser.parse_file(fc, "/nonexistent/NO-MIB")
-    testing.assertEqual(len(r2.modules), 0)
-    testing.assertEqual(codes(r2), "L2 source.unreadable")
     # through the content index, including a built-in base module
     mp = mib.source.MibPath([GOLDEN_DIR])
-    mib.source.index_path(mp, fc, mib.diag.Diagnostics(""))
-    e = mp.find("BRIDGE-MIB")
-    if e is not None:
-        r3 = mib.parser.parse_entry(fc, e)
-        testing.assertEqual(r3.module("BRIDGE-MIB")?.sha256, e.sha256)
-    else:
-        testing.error("BRIDGE-MIB not indexed")
-    b = mp.find("SNMPv2-TC")
-    if b is not None:
-        r4 = mib.parser.parse_entry(fc, b)
-        testing.assertEqual(r4.module("SNMPv2-TC")?.file, "<builtin>/SNMPv2-TC")
-        testing.assertEqual(codes(r4), "")
-    t.success()
 
+    proc def __startup__():
+        t.timeout(30.0)
+
+        r = mib.parser.parse_file(fc, GOLDEN_DIR + "/IF-MIB")
+        testing.assertEqual(len(r.modules), 1)
+        testing.assertEqual(r.modules[0].name, "IF-MIB")
+        testing.assertEqual(r.modules[0].sha256, "a41d2d0414bd6e1b3249257d0d035ea11554624c525b830f6910195b72b0c297")
+        testing.assertEqual(r.modules[0].file, GOLDEN_DIR + "/IF-MIB")
+        testing.assertEqual(len(r.modules[0].defs), 99)
+        testing.assertEqual(codes(r), "")
+        r2 = mib.parser.parse_file(fc, "/nonexistent/NO-MIB")
+        testing.assertEqual(len(r2.modules), 0)
+        testing.assertEqual(codes(r2), "L2 source.unreadable")
+
+        mib.source.index_path(mp, fc, mib.diag.Diagnostics(""))
+        e = mp.find("BRIDGE-MIB")
+        if e is not None:
+            r3 = mib.parser.parse_entry(fc, e)
+            testing.assertEqual(r3.module("BRIDGE-MIB")?.sha256, e.sha256)
+        else:
+            testing.error("BRIDGE-MIB not indexed")
+        b = mp.find("SNMPv2-TC")
+        if b is not None:
+            r4 = mib.parser.parse_entry(fc, b)
+            testing.assertEqual(r4.module("SNMPv2-TC")?.file, "<builtin>/SNMPv2-TC")
+            testing.assertEqual(codes(r4), "")
+        t.success()
+
+    __startup__()
 
 # Level-1/2 diagnostics expected on the golden set, only where smilint also reports level-1/2
 # problems (interop/mibs/golden/expected/smilint). GMPLS-TC-MIB has draft page footers inside
 # an enumeration and the date 200224060900Z twice (smilint reports date-month at the same
 # lines), SNMPv2-PDU is an ASN.1 protocol module rather than SMI, and TCPIPX-MIB lacks commas
 # in two SEQUENCEs.
+
+
 GOLDEN_ERRORS: dict[str, str] = {
     "GMPLS-TC-MIB": "lex.page-header, lex.page-header, parse.date-invalid, parse.date-invalid",
     "SNMPv2-PDU": "parse.non-smi-assignment, parse.range-symbolic, parse.range-symbolic, parse.range-symbolic",
@@ -1081,67 +1088,79 @@ GOLDEN_ERRORS: dict[str, str] = {
 
 actor _test_golden_set(t: testing.EnvT):
     """Every golden module parses; level-1/2 diagnostics only where smilint reports errors too."""
-    t.timeout(120.0)
     fc = file.FileCap(t.env.cap)
     fs = file.FS(fc)
-    files = sorted(fs.listdir(GOLDEN_DIR))
-    testing.assertTrue(len(files) >= 43)
-    nmods = 0
-    ndefs = 0
-    for nm in files:
-        r = mib.parser.parse_file(fc, GOLDEN_DIR + "/" + nm)
-        testing.assertEqual([m.name for m in r.modules], [nm], nm)
-        m = r.modules[0]
-        testing.assertTrue(m.has_end, nm)
-        nmods += 1
-        ndefs += len(m.defs)
-        errs = ", ".join([d.code for d in r.diags if d.level <= 2])
-        testing.assertEqual(errs, GOLDEN_ERRORS.get_def(nm, ""), nm)
-        for d in r.diags:
-            testing.assertTrue(d.level > 0, "internal diagnostic in " + nm + ": " + str(d))
-            testing.assertEqual(d.module, nm, str(d))
-    testing.assertEqual(nmods, len(files))
-    if len(files) == 43:
-        testing.assertEqual(ndefs, 3344)
-    t.success()
+
+    proc def __startup__():
+        t.timeout(120.0)
+
+        files = sorted(fs.listdir(GOLDEN_DIR))
+        testing.assertTrue(len(files) >= 43)
+        nmods = 0
+        ndefs = 0
+        for nm in files:
+            r = mib.parser.parse_file(fc, GOLDEN_DIR + "/" + nm)
+            testing.assertEqual([m.name for m in r.modules], [nm], nm)
+            m = r.modules[0]
+            testing.assertTrue(m.has_end, nm)
+            nmods += 1
+            ndefs += len(m.defs)
+            errs = ", ".join([d.code for d in r.diags if d.level <= 2])
+            testing.assertEqual(errs, GOLDEN_ERRORS.get_def(nm, ""), nm)
+            for d in r.diags:
+                testing.assertTrue(d.level > 0, "internal diagnostic in " + nm + ": " + str(d))
+                testing.assertEqual(d.module, nm, str(d))
+        testing.assertEqual(nmods, len(files))
+        if len(files) == 43:
+            testing.assertEqual(ndefs, 3344)
+        t.success()
+
+    __startup__()
 
 
 actor _test_corpus_sweep(t: testing.EnvT):
     """Parse every module of the corpus (13,976 files; run with --tag mibcorpus, preferably
     --fast). Gate: no internal diagnostics and syntax errors in at most 1% of the modules."""
-    t.require("mibcorpus")
-    t.timeout(1800.0)
-    fc = file.FileCap(t.env.cap)
-    fs = file.FS(fc)
-    files = sorted(fs.listdir(CORPUS_DIR))
     nbytes = 0
-    nmods = 0
-    ndefs = 0
-    nsyntax = 0
-    bad_files = 0
-    by_level = [0, 0, 0, 0, 0, 0, 0]
     t0 = time.monotonic_ns()
-    for nm in files:
-        r = mib.parser.parse_file(fc, CORPUS_DIR + "/" + nm, False, 6, False)
-        nmods += len(r.modules)
-        for m in r.modules:
-            ndefs += len(m.defs)
-        has_syntax = False
-        for d in r.diags:
-            by_level[d.level] += 1
-            if d.code == "parse.syntax":
-                nsyntax += 1
-                has_syntax = True
-        if has_syntax:
-            bad_files += 1
     t1 = time.monotonic_ns()
-    print("corpus: files=" + str(len(files)) + " modules=" + str(nmods) + " defs=" + str(ndefs) +
-          " syntax-errors=" + str(nsyntax) + " in " + str(bad_files) + " files; levels " + str(by_level) +
-          "; " + str((t1 - t0) // 1000000) + " ms", err=True)
-    testing.assertEqual(by_level[0], 0)
-    testing.assertTrue(len(files) > 13000)
-    testing.assertTrue(bad_files * 100 <= len(files))
-    t.success()
+
+    proc def __startup__():
+        t.require("mibcorpus")
+        t.timeout(1800.0)
+        fc = file.FileCap(t.env.cap)
+        fs = file.FS(fc)
+        files = sorted(fs.listdir(CORPUS_DIR))
+
+        nmods = 0
+        ndefs = 0
+        nsyntax = 0
+        bad_files = 0
+        by_level = [0, 0, 0, 0, 0, 0, 0]
+
+        for nm in files:
+            r = mib.parser.parse_file(fc, CORPUS_DIR + "/" + nm, False, 6, False)
+            nmods += len(r.modules)
+            for m in r.modules:
+                ndefs += len(m.defs)
+            has_syntax = False
+            for d in r.diags:
+                by_level[d.level] += 1
+                if d.code == "parse.syntax":
+                    nsyntax += 1
+                    has_syntax = True
+            if has_syntax:
+                bad_files += 1
+
+        print("corpus: files=" + str(len(files)) + " modules=" + str(nmods) + " defs=" + str(ndefs) +
+              " syntax-errors=" + str(nsyntax) + " in " + str(bad_files) + " files; levels " + str(by_level) +
+              "; " + str((t1 - t0) // 1000000) + " ms", err=True)
+        testing.assertEqual(by_level[0], 0)
+        testing.assertTrue(len(files) > 13000)
+        testing.assertTrue(bad_files * 100 <= len(files))
+        t.success()
+
+    __startup__()
 
 
 def synthetic_mib(nobj: int) -> bytes:

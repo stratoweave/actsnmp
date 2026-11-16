@@ -421,10 +421,13 @@ actor HostLookup(cap: net.DNSCap, name: str, ipv6_only: bool, on_done: action(st
         else:
             _ipv4_failed(name, "no IPv4 address")
 
-    if ipv6_only:
-        net.lookup_aaaa(cap, name, _ipv6_resolved, _ipv6_failed)
-    else:
-        net.lookup_a(cap, name, _ipv4_resolved, _ipv4_failed)
+    proc def __startup__():
+        if ipv6_only:
+            net.lookup_aaaa(cap, name, _ipv6_resolved, _ipv6_failed)
+        else:
+            net.lookup_a(cap, name, _ipv4_resolved, _ipv4_failed)
+
+    __startup__()
 
 
 actor TcpWatch():
@@ -824,10 +827,13 @@ actor Command(o: CliOptions, c: Client, out: action(str) -> None, err: action(st
             err("actsnmp: " + cmd + " is not a client command\n")
             _finish(1)
 
-    _run()
+    proc def __startup__():
+        _run()
 
+    __startup__()
 
 # trapd and agent #####################################################################################
+
 
 actor TrapPrinter(o: CliOptions, out: action(str) -> None):
     """Writes notification_text of every notification a NotificationReceiver delivers"""
@@ -870,7 +876,10 @@ actor AgentServer(ucap: net.UDPListenCap, tcap: net.TCPListenCap, o: CliOptions,
         err("actsnmp agent: serving on " + listen_text(o, t.local_port()) + " (engine ID 0x"
             + config.engine_id.hex() + ")\n")
 
-    listen(ucap, tcap, o, _listening)
+    proc def __startup__():
+        listen(ucap, tcap, o, _listening)
+
+    __startup__()
 
 
 actor TrapdServer(ucap: net.UDPListenCap, tcap: net.TCPListenCap, o: CliOptions, config: ReceiverConfig,
@@ -888,10 +897,13 @@ actor TrapdServer(ucap: net.UDPListenCap, tcap: net.TCPListenCap, o: CliOptions,
         err("actsnmp trapd: listening on " + listen_text(o, t.local_port()) + " (engine ID 0x"
             + config.engine_id.hex() + ")\n")
 
-    listen(ucap, tcap, o, _listening)
+    proc def __startup__():
+        listen(ucap, tcap, o, _listening)
 
+    __startup__()
 
 # main ################################################################################################
+
 
 def _parse(argv: list[str]) -> (?CliOptions, str, bool):
     # The options, or the error text and whether the usage text follows it
@@ -1171,4 +1183,7 @@ actor main(env):
             return
         _start(opts)
 
-    _main()
+    proc def __startup__():
+        _main()
+
+    __startup__()
