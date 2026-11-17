@@ -2143,17 +2143,17 @@ actor _test_udp_fleet_dispatcher(t: testing.EnvT):
 actor _test_udp_fleet_connected(t: testing.EnvT):
     """The same fleet with a connected UDP socket per Client, for comparison: one file descriptor per Client
     (skipped when the open-files limit is too low for it)"""
-    limit = max_open_files(t)
-    else:
-        f = _Fleet(t, False, FLEET_CLIENTS, FLEET_AGENTS, FLEET_GETS, FLEET_WINDOW)
 
     proc def __startup__():
+        limit = max_open_files(t)
         t.timeout(120.0)
         if limit >= 0 and limit < FLEET_CLIENTS + 1000:
             try:
                 t.skip("the open-files limit %d is too low for %d connected sockets" % (limit, FLEET_CLIENTS))
             except testing.AbortTest:
                 pass
+        else:
+            f = _Fleet(t, False, FLEET_CLIENTS, FLEET_AGENTS, FLEET_GETS, FLEET_WINDOW)
 
     __startup__()
 

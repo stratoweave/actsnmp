@@ -825,7 +825,6 @@ actor _V3Users(t: testing.EnvT, a: LabAgent):
     cap = udp_cap(t)
     walk_opts = OPTS.with_(max_walk_varbinds=SCALARS)
     var scripts: list[(str, list[Step])] = []
-    shaaes = find_user(lab_users(t), "u_sha256_aes")
 
     def gathered(scal, results: dict[str, dict[str, Outcome]]) -> None:
         def run() -> None:
@@ -919,6 +918,8 @@ actor _V3Users(t: testing.EnvT, a: LabAgent):
             s = Script(sn.0, sn.1, g.script_finished)
 
     proc def __startup__():
+        shaaes = find_user(lab_users(t), "u_sha256_aes")
+
         scal = expected(t, "canon/scalars.txt")
         users = [u for u in lab_users(t) if u.on(a)]
 
@@ -1093,7 +1094,6 @@ actor _test_snmpsim_v3_negative(t: testing.EnvT):
 actor _Walks(t: testing.EnvT, a: LabAgent, users: list[str]):
     """The whole dataset B walked with SNMPv1 GETNEXT, SNMPv2c GETNEXT and GETBULK, walk_stream, IPv6 and
     SNMPv3 users, all at once; each compared with expected/canon/dataset.txt (SNMPv1: dataset-v1.txt)"""
-    lab = lab_users(t)
     cap = udp_cap(t)
     var scripts: list[(str, list[Step])] = []
     v1 = Client(cap, LOCAL4, Community("public", message.SNMP_V1), None, port=a.port, opts=OPTS)
@@ -1124,6 +1124,8 @@ actor _Walks(t: testing.EnvT, a: LabAgent, users: list[str]):
             s = Script(sn.0, sn.1, g.script_finished)
 
     proc def __startup__():
+        lab = lab_users(t)
+
         full = expected(t, "canon/dataset.txt")
         full_v1 = expected(t, "canon/dataset-v1.txt")
 
@@ -1845,7 +1847,6 @@ actor _test_snmpsim_pathological(t: testing.EnvT):
     (timeout; adaptive GETBULK in a walk), exceptions as data, every error-status, non-increasing OIDs"""
     a = SNMPSIM
     cap = udp_cap(t)
-    u3 = with_context(find_user(lab_users(t), "u_sha_aes"), "pathological")
     var steps: list[Step] = []
 
     def finished(name: str, got: dict[str, Outcome]) -> None:
@@ -1967,6 +1968,8 @@ actor _test_snmpsim_pathological(t: testing.EnvT):
         s = Script("pathological", steps, finished)
 
     proc def __startup__():
+        u3 = with_context(find_user(lab_users(t), "u_sha_aes"), "pathological")
+
         t.timeout(120.0)
         t.require("interop")
 
@@ -2089,7 +2092,6 @@ actor _test_snmpd_tcp(t: testing.EnvT):
     """snmpd over TCP: GET of the scalars with SNMPv1, SNMPv2c and SNMPv3 authPriv (discovery on the
     connection), GETNEXT, GETBULK, bulk walks of the dataset with SNMPv2c and SNMPv3, GETNEXT walks and IPv6,
     without a retry; a refused connection is a TimeoutError whose hint is the refusal"""
-    lab = lab_users(t)
 
     def finished(full, full_v1, scal, name: str, got: dict[str, Outcome]) -> None:
         def run() -> None:
@@ -2152,6 +2154,8 @@ actor _test_snmpd_tcp(t: testing.EnvT):
         s = Script("tcp", steps, (lambda name, got: finished(full, full_v1, scal, name, got)))
 
     proc def __startup__():
+        lab = lab_users(t)
+
         t.timeout(120.0)
         t.require("interop")
         full = expected(t, "canon/dataset.txt")
@@ -2321,7 +2325,6 @@ actor _test_trap_to_snmptrapd(t: testing.EnvT):
     informs (IPv6 too), SNMPv3 traps (sender engine 0x8000000001020304) and informs (discovery) for every
     user snmptrapd has; what it logged (trapdcheck.sh log) equals the fmt.canon_notification blocks of what
     was sent; traps with a wrong community, password or level are dropped"""
-    users = [u for u in lab_users(t) if u.snmpd and not u.read_only]
     cap = udp_cap(t)
     var steps: list[Step] = []
     var want: list[str] = []
@@ -2335,6 +2338,8 @@ actor _test_trap_to_snmptrapd(t: testing.EnvT):
     sender = h(TRAP_ENGINE)
 
     proc def __startup__():
+        users = [u for u in lab_users(t) if u.snmpd and not u.read_only]
+
         t.timeout(180.0)
         t.require("interop")
         view = mibview.load_snmprec(read_text(t, "interop/dataset/actsnmp.snmprec"))
@@ -2398,7 +2403,6 @@ actor _test_tcp_trap_to_snmptrapd(t: testing.EnvT):
     (IPv6 too), SNMPv3 traps (sender engine 0x8000000001020304) and informs (discovery on the connection)
     for users of every security level and key extension; snmptrapd logs exactly what was sent and drops
     the trap with a wrong community"""
-    lab = lab_users(t)
     sender = h(TRAP_ENGINE)
     var steps: list[Step] = []
     var want: list[str] = []
@@ -2406,6 +2410,8 @@ actor _test_tcp_trap_to_snmptrapd(t: testing.EnvT):
     names = ["u_noauth", "u_sha", "u_sha_aes", "u_md5_aes192", "u_md5_aes256c", "u_sha512_aes256c"]
 
     proc def __startup__():
+        lab = lab_users(t)
+
         t.timeout(120.0)
         t.require("interop")
         view = mibview.load_snmprec(read_text(t, "interop/dataset/actsnmp.snmprec"))
