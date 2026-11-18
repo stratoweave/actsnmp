@@ -1131,7 +1131,7 @@ actor main(env):
     proc def _load_mibs(o: CliOptions, env_mibs: ?str, env_dirs: ?str) -> mibcli.Loaded:
         # The MIBs of a command line: -M/MIBDIRS (snmptranslate: the last -M), -m/MIBS and the modules OID
         # arguments name; mib2yang, mibmeta and miblint load their arguments (modules or files)
-        home = env.getenv("HOME")
+        home = env.vars.getenv("HOME")
         fcap = file.FileCap(env.cap)
         translate = o.command == "translate"
         path = mibcli.search_path(o.mib_dirs_opts, env_dirs, home, translate)
@@ -1140,8 +1140,8 @@ actor main(env):
         return mibcli.load(fcap, path, mibcli.module_list(o.mib_modules_opt, env_mibs), mibcli.modules_named(o.oid_words()))
 
     proc def _main() -> None:
-        env_mibs = env.getenv("MIBS")
-        env_dirs = env.getenv("MIBDIRS")
+        env_mibs = env.vars.getenv("MIBS")
+        env_dirs = env.vars.getenv("MIBDIRS")
         o: ?CliOptions = None
         try:
             o = cliopts.scan(env.argv, env_mibs, env_dirs)

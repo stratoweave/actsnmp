@@ -1446,7 +1446,7 @@ actor _test_yang_golden(t: testing.EnvT):
     t.timeout(600.0)
     fc = file.FileCap(t.env.cap)
     out = ""
-    eo = t.env.getenv("MIBYANG_OUT")
+    eo = t.env.vars.getenv("MIBYANG_OUT")
     if eo is not None:
         out = eo
     # the reference SNMPv2-TC text differs from the built-in copy in blank lines
@@ -1480,11 +1480,11 @@ actor _test_yang_golden_vendor(t: testing.EnvT):
     t.timeout(600.0)
     fc = file.FileCap(t.env.cap)
     vdir = VENDOR_DIR
-    ev = t.env.getenv("MIBGOLDEN_VENDOR")
+    ev = t.env.vars.getenv("MIBGOLDEN_VENDOR")
     if ev is not None and ev != "":
         vdir = ev
     out = CACHE_YANG + "/golden-all"
-    eo = t.env.getenv("MIBYANG_OUT")
+    eo = t.env.vars.getenv("MIBYANG_OUT")
     if eo is not None and eo != "":
         out = eo
     mkdirs(fc, out)
@@ -1561,20 +1561,20 @@ actor _test_yang_corpus(t: testing.EnvT):
     t.timeout(1800.0)
     fc = file.FileCap(t.env.cap)
     cdir = "interop/mibs/corpus/flat"
-    ed = t.env.getenv("MIBCORPUS_DIR")
+    ed = t.env.vars.getenv("MIBCORPUS_DIR")
     if ed is not None and ed != "":
         cdir = ed
     out = CACHE_YANG + "/corpus"
-    eo = t.env.getenv("MIBYANG_OUT")
+    eo = t.env.vars.getenv("MIBYANG_OUT")
     if eo is not None and eo != "":
         out = eo
     mkdirs(fc, out)
     meta = False
-    em = t.env.getenv("MIBYANG_META")
+    em = t.env.vars.getenv("MIBYANG_META")
     if em is not None and em.strip() == "1":
         meta = True
     spec = ""
-    ec = t.env.getenv("MIBCORPUS_CHUNK")
+    ec = t.env.vars.getenv("MIBCORPUS_CHUNK")
     if ec is not None:
         spec = ec.strip()
     mp = mib.source.MibPath([cdir], True, False)
@@ -1584,11 +1584,11 @@ actor _test_yang_corpus(t: testing.EnvT):
     lo, hi = corpus_chunk(spec, len(allnames))
     names = allnames[lo:hi]
     sfx = "" if spec == "" else "." + spec.replace("/", "of")
-    eon = t.env.getenv("MIBCORPUS_ONLY")
+    eon = t.env.vars.getenv("MIBCORPUS_ONLY")
     if eon is not None and eon.strip() != "":
         names = [x.strip() for x in eon.split(",") if x.strip() != ""]
         sfx = ".only"
-    el = t.env.getenv("MIBCORPUS_LIST")
+    el = t.env.vars.getenv("MIBCORPUS_LIST")
     if el is not None and el.strip() != "":
         rf = file.ReadFile(file.ReadFileCap(fc), el.strip())
         names = [x.strip() for x in rf.read().decode().split("\n") if x.strip() != "" and not x.startswith("#")]
@@ -1597,7 +1597,7 @@ actor _test_yang_corpus(t: testing.EnvT):
     ms = mib.resolver.resolve_path(fc, mp, names)
     opts = mib.yang.Options()
     opts.prefix_names = allnames
-    ecs = t.env.getenv("MIBYANG_CONSISTENT_STATUS")
+    ecs = t.env.vars.getenv("MIBYANG_CONSISTENT_STATUS")
     if ecs is not None and ecs.strip() == "1":
         opts.consistent_status = True
     tr = mib.yang.Translator(ms, opts)
