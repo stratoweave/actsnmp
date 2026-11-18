@@ -83,16 +83,9 @@ def make_config() -> AgentConfig:
 
 def table_lines(cols: list[int], rows: list[int], row_major: bool) -> str:
     """Output lines of the test table, in column order (a walk) or row order (table)"""
-    out: list[str] = []
     if row_major:
-        for i in rows:
-            for c in cols:
-                out.append(EP + ".10.1.%d.%d = INTEGER: %d\n" % (c, i, c * 100 + i))
-    else:
-        for c in cols:
-            for i in rows:
-                out.append(EP + ".10.1.%d.%d = INTEGER: %d\n" % (c, i, c * 100 + i))
-    return "".join(out)
+        return "".join([EP + ".10.1.%d.%d = INTEGER: %d\n" % (c, i, c * 100 + i) for i in rows for c in cols])
+    return "".join([EP + ".10.1.%d.%d = INTEGER: %d\n" % (c, i, c * 100 + i) for c in cols for i in rows])
 
 
 # The harness #######################################################################################

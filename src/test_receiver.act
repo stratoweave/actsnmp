@@ -323,6 +323,8 @@ actor Bench(network: MemNet, peer: ServerTransport, receiver_transport: ServerTr
         _receiver.close()
 
     proc def __startup__():
+        # Wait until the receiver startup has queued its callback registration.
+        await async _receiver.stats()
         peer.set_receiver(_peer_received)
 
     __startup__()
@@ -713,7 +715,7 @@ def lab_users(auth_name: str) -> list[Usm]:
         users.append(keyed("u_" + auth_name + "_" + pname))
     return users
 
-def v3_traps_round(auth_name: str, with_noauth: bool) -> (list[Usm], list[bytes], list[Notification]):
+pure def v3_traps_round(auth_name: str, with_noauth: bool) -> (list[Usm], list[bytes], list[Notification]):
     """Every user of lab_users(auth_name) (and u_noauth) sends a trap from sender A and from sender B
 
     Returns the users, the datagrams and the notifications they must give.
@@ -926,7 +928,7 @@ actor _test_v3_trap_refusals(t: testing.AsyncT):
     __startup__()
 
 
-def time_window_steps(sha: Usm, sha_aes: Usm, noauth: Usm) -> list[(bytes, bool)]:
+pure def time_window_steps(sha: Usm, sha_aes: Usm, noauth: Usm) -> list[(bytes, bool)]:
     """SNMPv3 traps and whether the receiver accepts them; trap k has request-id k"""
     ka = sha.localized(sender_a())
     kpa = sha_aes.localized(sender_a())

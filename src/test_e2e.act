@@ -141,11 +141,7 @@ def agent_config(users: list[Usm]) -> AgentConfig:
 
 def lab_users(auth: str) -> list[Usm]:
     """The users of USERS whose net-snmp authentication column is auth; MD5 also gets u_noauth, SHA u_ro_sha_aes"""
-    rows: list[str] = []
-    for r in USERS:
-        a = r.split("\t")[2]
-        if a == auth or (auth == "MD5" and a == "-"):
-            rows.append(r)
+    rows = [r for r in USERS if r.split("\t")[2] == auth or (auth == "MD5" and r.split("\t")[2] == "-")]
     return security.load_users_tsv("\n".join(rows)).users
 
 def table(c: int, i: int) -> VarBind:

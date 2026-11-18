@@ -1472,6 +1472,9 @@ actor _test_transport_failures(t: testing.AsyncT):
         note(name_of(e))
 
     proc def __startup__():
+        # Let startup queue the failure callback before issuing requests.
+        await async c.stats()
+        await async none.stats()
         c.get(got, _oids(1))
         c.trap(trap_sent, TRAP_OID, [])
         none.get(got, _oids(1))
@@ -3201,7 +3204,8 @@ actor _test_rv_trap_v3_after_restart(t: testing.AsyncT):
 
         mn.send(usm.protect(hdr, message.encode_scoped(ScopedPdu(eid, b"", old)), keys, u64(0)), MANAGER, 40000,
                 "10.0.0.9", 162)
-        c = Client(None, "10.0.0.9", u, t.log_handler, port=162, transport=mn.client(MANAGER, 40001, "10.0.0.9", 162),
+        c_transport = mn.client(MANAGER, 40001, "10.0.0.9", 162)
+        c = Client(None, "10.0.0.9", u, t.log_handler, port=162, transport=c_transport,
                    local_engine_id=eid, local_engine_boots=2)
 
         after now 0.1: trap_due(c, rcv)
@@ -3402,9 +3406,11 @@ actor _test_rv_trap_boots_validated(t: testing.AsyncT):
     proc def __startup__():
         srv = mn.server("10.0.0.9", 162)
 
-        bad = Client(None, "10.0.0.9", u, None, port=162, transport=mn.client(MANAGER, 40001, "10.0.0.9", 162),
+        bad_transport = mn.client(MANAGER, 40001, "10.0.0.9", 162)
+        bad = Client(None, "10.0.0.9", u, None, port=162, transport=bad_transport,
                      local_engine_id=eid, local_engine_boots=0)
-        good = Client(None, "10.0.0.9", u, None, port=162, transport=mn.client(MANAGER, 40002, "10.0.0.9", 162),
+        good_transport = mn.client(MANAGER, 40002, "10.0.0.9", 162)
+        good = Client(None, "10.0.0.9", u, None, port=162, transport=good_transport,
                       local_engine_id=eid, local_engine_boots=77)
 
         srv.set_receiver(received)

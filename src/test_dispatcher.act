@@ -330,13 +330,9 @@ def table_vbs(tb: Table) -> list[VarBind]:
 
 def full_view() -> list[VarBind]:
     """make_view() below 1.3.6.1.4.1.8072.9999.1, in OID order"""
-    out = [VarBind(e([1, 1, 0]), Integer(42)), VarBind(e([2, 1, 0]), OctetString(b"hello"))]
-    for c in range(1, 4):
-        for i in range(1, 6):
-            out.append(table(c, i))
-    for i in range(1, 65):
-        out.append(VarBind(e([20, i, 0]), Integer(i)))
-    return out
+    return ([VarBind(e([1, 1, 0]), Integer(42)), VarBind(e([2, 1, 0]), OctetString(b"hello"))]
+            + [table(c, i) for c in range(1, 4) for i in range(1, 6)]
+            + [VarBind(e([20, i, 0]), Integer(i)) for i in range(1, 65)])
 
 def got_of(label: str, d: dict[str, Got]) -> Got:
     g = d.get(label)

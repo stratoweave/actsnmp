@@ -195,7 +195,7 @@ def pattern(n: int) -> bytes:
     reps = n // len(alphabet) + 1
     return (alphabet * reps)[:n]
 
-proc def udp_cap(t: testing.EnvT) -> net.UDPConnectCap:
+pure def udp_cap(t: testing.EnvT) -> net.UDPConnectCap:
     return net.UDPConnectCap(net.UDPCap(net.NetCap(t.env.cap)))
 
 def _now() -> float:
@@ -1172,11 +1172,15 @@ actor _test_snmpsim_walks(t: testing.EnvT):
 # Tables and GETBULK caps ###########################################################################
 
 
-actor _Tables(t: testing.EnvT, a: LabAgent, user: str):
+proc def _tables(t: testing.EnvT, a: LabAgent, user: str):
+    return _Tables(t, a, user, lab_users(t))
+
+
+actor _Tables(t: testing.EnvT, a: LabAgent, user: str, users_from_file: list[LabUser]):
     """get_table of B.10 (sparse column 7), B.11 (string index) and B.12 (2000 rows), SNMPv1/v2c/v3, column
     groups in parallel; GETBULK responses capped by the agent, seen in the Response"""
     cap = udp_cap(t)
-    sec = find_user(lab_users(t), user)
+    sec = find_user(users_from_file, user)
     t10 = [b([10, 1, c]) for c in range(1, 8)]
     t11 = [b([11, 1, c]) for c in range(1, 4)]
     t12 = [b([12, 1, c]) for c in range(1, 3)]
@@ -1280,7 +1284,7 @@ actor _test_snmpd_tables(t: testing.EnvT):
     proc def __startup__():
         t.timeout(120.0)
         t.require("interop")
-        r = _Tables(t, SNMPD, "u_sha_aes192")
+        r = _tables(t, SNMPD, "u_sha_aes192")
 
     __startup__()
 
@@ -1291,7 +1295,7 @@ actor _test_snmpsim_tables(t: testing.EnvT):
     proc def __startup__():
         t.timeout(120.0)
         t.require("interop")
-        r = _Tables(t, SNMPSIM, "u_md5_3des")
+        r = _tables(t, SNMPSIM, "u_md5_3des")
 
     __startup__()
 
@@ -1456,7 +1460,11 @@ actor _test_snmpd_full_mib(t: testing.EnvT):
 # Large responses ##################################################################################
 
 
-actor _Large(t: testing.EnvT, a: LabAgent):
+proc def _large(t: testing.EnvT, a: LabAgent):
+    return _Large(t, a, lab_users(t))
+
+
+actor _Large(t: testing.EnvT, a: LabAgent, users_from_file: list[LabUser]):
     """GETs of B.2.13.0 (4000 octets) repeated: 15 times (about 60 KB) fit into one datagram; 20 times
     (80 KB) do not: SNMPv1/v2c answers are dropped (timeout), snmpd answers SNMPv3 with tooBig and the
     Client splits the GET, snmpsim drops it (README, "Oversized responses")"""
@@ -1466,7 +1474,7 @@ actor _Large(t: testing.EnvT, a: LabAgent):
     too_big = [b([2, 13, 0]) for _ in range(20)]
     v2 = Client(cap, LOCAL4, Community("public"), None, port=a.port, opts=quick)
     v1 = Client(cap, LOCAL4, Community("public", message.SNMP_V1), None, port=a.port, opts=quick)
-    c3 = Client(cap, LOCAL4, find_user(lab_users(t), "u_sha_aes"), None, port=a.port, opts=OPTS)
+    c3 = Client(cap, LOCAL4, find_user(users_from_file, "u_sha_aes"), None, port=a.port, opts=OPTS)
     var steps: list[Step] = [get_step("v2c 60 KB", v2, fits), get_step("v2c 80 KB", v2, too_big),
                              get_step("v1 80 KB", v1, too_big), get_step("v3 60 KB", c3, fits),
                              get_step("v3 80 KB", c3, too_big, quick), info_step("v3 info", c3)]
@@ -1510,7 +1518,7 @@ actor _test_snmpd_large(t: testing.EnvT):
     proc def __startup__():
         t.timeout(60.0)
         t.require("interop")
-        r = _Large(t, SNMPD)
+        r = _large(t, SNMPD)
 
     __startup__()
 
@@ -1521,7 +1529,7 @@ actor _test_snmpsim_large(t: testing.EnvT):
     proc def __startup__():
         t.timeout(60.0)
         t.require("interop")
-        r = _Large(t, SNMPSIM)
+        r = _large(t, SNMPSIM)
 
     __startup__()
 
@@ -1533,7 +1541,12 @@ actor _test_snmpsim_large(t: testing.EnvT):
 
 RESTART_MIN_UPTIME = 165
 
-actor _test_snmpd_restart(t: testing.EnvT):
+proc def _test_snmpd_restart(t: testing.EnvT):
+    t.require("interop")
+    _SnmpdRestart(t, lab_users(t))
+
+
+actor _SnmpdRestart(t: testing.EnvT, users_from_file: list[LabUser]):
     """An snmpd restart under a long-lived SNMPv3 Client loses no request
 
     After a docker restart snmpd is back at boots 1 and time 0, so it
@@ -1541,7 +1554,7 @@ actor _test_snmpd_restart(t: testing.EnvT):
     step 7b). The Client resynchronises from it and resends.
     """
     cap = udp_cap(t)
-    u = find_user(lab_users(t), "u_sha_aes")
+    u = find_user(users_from_file, "u_sha_aes")
 
     def finished(name: str, got: dict[str, Outcome]) -> None:
         def run() -> None:
@@ -1660,10 +1673,14 @@ def set_errors() -> list[(str, str, list[VarBind], str, str)]:
             ("second varbind wrongValue", "v2c", [VarBind(w(1), Integer(7)), VarBind(w(8), Integer(101))],
              "status:10:2", "status:10:2")]
 
-actor _Set(t: testing.EnvT, a: LabAgent):
+proc def _set(t: testing.EnvT, a: LabAgent):
+    return _Set(t, a, lab_users(t))
+
+
+actor _Set(t: testing.EnvT, a: LabAgent, users_from_file: list[LabUser]):
     """SET every writable type, every error case, non-atomic B.20 and (snmpd) atomic system objects, then
     restore the initial values; all strictly in order"""
-    users = lab_users(t)
+    users = users_from_file
     cap = udp_cap(t)
     snmpd = a.name == "snmpd"
     noretry = Options(timeout=3.0, retries=0)
@@ -1814,7 +1831,7 @@ actor _test_snmpd_set(t: testing.EnvT):
     proc def __startup__():
         t.timeout(120.0)
         t.require("interop")
-        r = _Set(t, SNMPD)
+        r = _set(t, SNMPD)
 
     __startup__()
 
@@ -1825,7 +1842,7 @@ actor _test_snmpsim_set(t: testing.EnvT):
     proc def __startup__():
         t.timeout(120.0)
         t.require("interop")
-        r = _Set(t, SNMPSIM)
+        r = _set(t, SNMPSIM)
 
     __startup__()
 
@@ -2637,11 +2654,16 @@ proc def via(d: Dispatcher, a: LabAgent, address: str, sec: Security, opts: Opti
     """A Client of agent a at address whose transport the Dispatcher d attached"""
     return Client(None, address, sec, None, port=a.port, opts=opts, transport=d.attach(address, a.port))
 
-actor _test_dispatcher(t: testing.EnvT):
+proc def _test_dispatcher(t: testing.EnvT):
+    t.require("interop")
+    _LabDispatcher(t, lab_users(t))
+
+
+actor _LabDispatcher(t: testing.EnvT, users_from_file: list[LabUser]):
     """20 Clients of both agents through ONE Dispatcher socket on "::", all at once: SNMPv1 and SNMPv2c
     (two communities, GETNEXT and GETBULK, IPv4 and IPv6) and six SNMPv3 users per agent (snmpsim: also a
     context) walk the dataset and GET the scalars; each compared with expected/canon, nothing unroutable"""
-    lab = lab_users(t)
+    lab = users_from_file
     v3_users = {"snmpd": ["u_noauth", "u_md5", "u_sha256_aes", "u_md5_aes256", "u_sha512_aes256c", "u_sha_des"],
                 "snmpsim": ["u_noauth", "u_sha", "u_sha256_aes", "u_md5_aes192c", "u_sha_3des", "u_sha224_aes256"]}
     var disp: ?Dispatcher = None

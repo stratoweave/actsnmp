@@ -85,6 +85,7 @@ def _test_ip_octets() -> None:
     testing.assertEqual(ip_octets("fe80::"), bytes([0xfe, 0x80] + [0] * 14))
     testing.assertEqual(ip_octets("1:2:3:4:5:6:7:8"), bytes([0, 1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0, 7, 0, 8]))
     testing.assertEqual(ip_octets("::2:3:4:5:6:7:8"), bytes([0, 0, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0, 7, 0, 8]))
+    testing.assertNone(ip_octets("1:" * 4096 + "1"))
     for bad in ["", "agent.example", "192.0.2", "192.0.2.256", "192.0.2.1.5", "1:2:3:4:5:6:7", "1:2:3:4:5:6:7:8:9",
                 "1::2::3", "12345::1", "g::1", "1:2:3:4:5:6:7::8", "::192.0.2", ":1", "1:", "192.0.2.-1"]:
         testing.assertNone(ip_octets(bad), bad)

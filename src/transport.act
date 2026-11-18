@@ -110,34 +110,33 @@ def _ipv4_octets(text: str) -> ?bytes:
     parts = text.split(".")
     if len(parts) != 4:
         return None
-    out: list[int] = []
     for p in parts:
         if len(p) < 1 or len(p) > 3 or not (p.isascii() and p.isdecimal()):
             return None
         v = int(p)
         if v > 255:
             return None
-        out.append(v)
-    return bytes(out)
+    return bytes([int(p) for p in parts])
 
 def _ipv6_groups(text: str, last: bool) -> ?list[int]:
     # The 16-bit groups of a colon-separated run; an IPv4 tail (last run only) gives two groups
     out: list[int] = []
     parts = text.split(":")
+    if len(parts) > 8:
+        return None
     for i in range(len(parts)):
         p = parts[i]
         if last and i == len(parts) - 1 and "." in p:
             v4 = _ipv4_octets(p)
             if v4 is not None:
-                out.append(v4[0] * 256 + v4[1])
-                out.append(v4[2] * 256 + v4[3])
+                out = out + [v4[0] * 256 + v4[1], v4[2] * 256 + v4[3]]
             else:
                 return None
         else:
             v = _hex_group(p)
             if v < 0:
                 return None
-            out.append(v)
+            out = out + [v]
     return out
 
 def _ipv6_octets(text: str) -> ?bytes:
@@ -168,11 +167,7 @@ def _ipv6_octets(text: str) -> ?bytes:
         head = head + [0 for _ in range(8 - len(head) - len(tail))] + tail
     elif len(head) != 8:
         return None
-    out: list[int] = []
-    for g in head:
-        out.append(g >> 8)
-        out.append(g & 0xff)
-    return bytes(out)
+    return bytes([octet for g in head for octet in [g >> 8, g & 0xff]])
 
 def ip_octets(address: str) -> ?bytes:
     """Return the octets of an IP address in text form, None if it is not one
@@ -1280,23 +1275,15 @@ class NetFaults(object):
     def __init__(self, drop_first_n: int=0, drop_every_nth: int=0, duplicate: bool=False, delay: float=0.0,
                  reorder: bool=False, corrupt_byte: int=-1, spoof_source: bool=False,
                  to_address: str="", to_port: int=0):
-        if drop_first_n < 0 or drop_every_nth < 0:
-            raise ValueError("NetFaults drop counts must not be negative")
-        if corrupt_byte < -1:
-            raise ValueError("NetFaults corrupt_byte must be -1 (off) or an offset")
-        if not (delay >= 0.0 and delay <= 3600.0):
-            raise ValueError("NetFaults delay must be 0.0 to 3600.0 seconds")
-        if to_port < 0 or to_port > 65535:
-            raise ValueError("NetFaults to_port must be 0 (any) to 65535")
-        self.drop_first_n = drop_first_n
+        self.drop_first_n = drop_first_n if drop_first_n >= 0 and drop_every_nth >= 0 else raise ValueError("NetFaults drop counts must not be negative")
+        self.corrupt_byte = corrupt_byte if corrupt_byte >= -1 else raise ValueError("NetFaults corrupt_byte must be -1 (off) or an offset")
+        self.delay = delay if delay >= 0.0 and delay <= 3600.0 else raise ValueError("NetFaults delay must be 0.0 to 3600.0 seconds")
+        self.to_port = to_port if to_port >= 0 and to_port <= 65535 else raise ValueError("NetFaults to_port must be 0 (any) to 65535")
         self.drop_every_nth = drop_every_nth
         self.duplicate = duplicate
-        self.delay = delay
         self.reorder = reorder
-        self.corrupt_byte = corrupt_byte
         self.spoof_source = spoof_source
         self.to_address = to_address
-        self.to_port = to_port
 
     def matches(self, address: str, port: int) -> bool:
         """Return True if the faults apply to datagrams for address and port"""

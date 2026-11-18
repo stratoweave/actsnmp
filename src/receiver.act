@@ -247,7 +247,7 @@ class ReceiverConfig(object):
     dedup_window: float
     trap_users: list[TrapUser]
 
-    def __init__(self, communities: list[str], users: list[Usm], trap_engines: list[bytes], engine_id: bytes,
+    pure def __init__(self, communities: list[str], users: list[Usm], trap_engines: list[bytes], engine_id: bytes,
                  engine_boots: int, dedup_window: float=0.0, trap_users: list[TrapUser]=[]):
         _check_config(trap_engines, engine_id, engine_boots, dedup_window)
         _check_users(users, trap_users)
@@ -317,25 +317,15 @@ class _TrapUsm(object):
     derived: int
 
     def __init__(self, users: list[Usm], engines: list[bytes], trap_users: list[TrapUser]=[]):
-        self.users = {}
-        for u in users:
-            self.users[u.user.encode()] = u
-        self.engine_users = {}
-        for tu in trap_users:
-            self.engine_users[(tu.engine_id, tu.usm.user.encode())] = tu.usm
-        self.engines = {}
-        for e in engines:
-            self.engines[e] = True
-        if len(engines) > 0:
-            for tu in trap_users:
-                self.engines[tu.engine_id] = True
+        self.users = {u.user.encode(): u for u in users}
+        self.engine_users = {(tu.engine_id, tu.usm.user.encode()): tu.usm for tu in trap_users}
+        self.engines = {e: True for e in engines + ([tu.engine_id for tu in trap_users] if len(engines) > 0 else [])}
         self.keys = {}
         self.keys_used = {}
         self.times = {}
         self.times_used = {}
-        pinned = len(self.users) * len(self.engines) + len(self.engine_users)
-        self.key_limit = MAX_TRAP_SENDERS if pinned < MAX_TRAP_SENDERS else pinned
-        self.time_limit = MAX_TRAP_TIME_RECORDS if pinned < MAX_TRAP_TIME_RECORDS else pinned
+        self.key_limit = max([MAX_TRAP_SENDERS, len(self.users) * len(self.engines) + len(self.engine_users)])
+        self.time_limit = max([MAX_TRAP_TIME_RECORDS, len(self.users) * len(self.engines) + len(self.engine_users)])
         self.tick = 0
         self.derived = 0
 
