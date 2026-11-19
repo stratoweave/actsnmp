@@ -67,7 +67,7 @@ converter(s, opts): it parses the hint and the label maps a single time.
 """
 
 import errors
-import math
+import std.math
 import values
 import mib.hint
 import mib.meta
@@ -524,12 +524,12 @@ def _ieee_value(c: bytes, start: int, n: int, exp_bits: int) -> float:
     f = bits & ((1 << frac_bits) - 1)
     x = 0.0
     if e == exp_max:
-        inf = math.ldexp(1.0, 1024)
+        inf = std.math.ldexp(1.0, 1024)
         x = inf if f == 0 else inf - inf
     elif e == 0:
-        x = math.ldexp(float(f), 1 - bias - frac_bits)
+        x = std.math.ldexp(float(f), 1 - bias - frac_bits)
     else:
-        x = math.ldexp(float(f | (1 << frac_bits)), e - bias - frac_bits)
+        x = std.math.ldexp(float(f | (1 << frac_bits)), e - bias - frac_bits)
     return -x if negative else x
 
 
@@ -567,11 +567,11 @@ def _ieee_bits(x: float, exp_bits: int, frac_bits: int) -> int:
     q = 0
     if be <= 0:
         # subnormal: a / 2^(1 - bias - frac_bits)
-        q = _round_even(math.ldexp(a, bias - 1 + frac_bits))
+        q = _round_even(std.math.ldexp(a, bias - 1 + frac_bits))
         if q >= (1 << frac_bits):
             return (sign << (exp_bits + frac_bits)) | (1 << frac_bits)
         return (sign << (exp_bits + frac_bits)) | q
-    q = _round_even(math.ldexp(m - 1.0, frac_bits))
+    q = _round_even(std.math.ldexp(m - 1.0, frac_bits))
     if q >= (1 << frac_bits):
         q = 0
         be += 1

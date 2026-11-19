@@ -31,7 +31,7 @@ net-snmp would truncate or wrap a value that does not fit its type,
 actsnmp refuses it.
 """
 
-import math
+import std.math
 import fmt
 import message
 import mibcli
@@ -490,7 +490,7 @@ def c_float(s: str) -> CFloat:
                     k += 1
                 e += esign * x
                 j = k
-        return CFloat(j, neg, 0, math.ldexp(m, e) if m != 0.0 else 0.0)
+        return CFloat(j, neg, 0, std.math.ldexp(m, e) if m != 0.0 else 0.0)
     j = i
     digits = 0
     while j < n and _is_digit(s[j]):
@@ -717,9 +717,9 @@ def _float_bits(neg: bool, kind: int, magnitude: float, exp_bits: int, frac_bits
     biased = e + bias
     if biased <= 0:
         # subnormal (or rounds up into the smallest normal number, which the bits express as well)
-        bits = _round_even(math.ldexp(m, e - 1 + bias + frac_bits))
+        bits = _round_even(std.math.ldexp(m, e - 1 + bias + frac_bits))
     else:
-        bits = (biased << frac_bits) + _round_even(math.ldexp(m - 1.0, frac_bits))
+        bits = (biased << frac_bits) + _round_even(std.math.ldexp(m - 1.0, frac_bits))
     if bits >= (exp_all << frac_bits):
         return sign | (exp_all << frac_bits)
     return sign | bits

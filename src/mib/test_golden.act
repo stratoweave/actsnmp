@@ -10,7 +10,7 @@ Known oracle differences are listed in `KNOWN` (name -> reason) and skipped.
 """
 
 import file
-import json
+import std.json
 import testing
 import time
 import mib.diag
@@ -84,12 +84,12 @@ proc def compare_module(fc: file.FileCap, ms: mib.model.MibSet, mod: str, st: Go
         for line in nj.split("\n"):
             if line.strip() == "":
                 continue
-            d = json.decode(line)
+            d = std.json.decode(line)
             if jstr(d, "module") == mod:
                 st.check(ms, "netsnmp", mod, jstr(d, "name"), jstr(d, "oid"))
     pj = read_text(fc, expected + "/pysmi/" + mod + ".json")
     if pj is not None:
-        top = json.decode(pj)
+        top = std.json.decode(pj)
         for k, v in top.items():
             if isinstance(v, dict):
                 ent: dict[str, ?value] = v
