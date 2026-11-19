@@ -415,67 +415,67 @@ actor _test_walk_not_increasing(t: testing.AsyncT):
 actor _test_walk_disorder_scripted(t: testing.AsyncT):
     """A scripted agent: decreasing but new OIDs fail a checked walk and pass an unchecked one; a loop ends either
     way; noSuchObject answered to a GETNEXT ends a walk; SNMPv1 noSuchName with error-index 0 ends one too"""
-    mn = MemNet()
-    root = Oid([1, 3, 6, 1, 4, 1, 99])
-    # GETNEXT successors: R -> R.1 -> R.3 -> R.2 (decreasing, new) -> R.4 -> out of the subtree;
-    # the loop: L -> L.1 -> L.2 -> L.1 again
-    loop = Oid([1, 3, 6, 1, 4, 1, 98])
-    # nso.1 is answered as noSuchObject (an agent bug to tolerate); after nsn.1 an SNMPv1 request gets
-    # noSuchName with error-index 0
-    nso = Oid([1, 3, 6, 1, 4, 1, 97])
-    nsn = Oid([1, 3, 6, 1, 4, 1, 96])
-    var nexts: dict[Oid, Oid] = {root: root.child([1]), root.child([1]): root.child([3]),
-                                 root.child([3]): root.child([2]), root.child([2]): root.child([4]),
-                                 root.child([4]): SYS_DESCR.child([5]),
-                                 loop: loop.child([1]), loop.child([1]): loop.child([2]), loop.child([2]): loop.child([1]),
-                                 nso: nso.child([1]), nsn: nsn.child([1])}
-    var results: dict[str, Got] = {}
-
-    def check() -> None:
-        r = results
-        testing.assertEqual([vb.oid for vb in r["checked"].vbs], [root.child([1]), root.child([3])], "checked: partial")
-        testing.assertEqual(not_increasing(r["checked"], "checked"), (root.child([3]).arcs, root.child([2]).arcs))
-        testing.assertEqual([vb.oid for vb in ok(r["unchecked"], "unchecked")],
-                            [root.child([1]), root.child([3]), root.child([2]), root.child([4])], "unchecked: all four")
-        testing.assertEqual([vb.oid for vb in r["loop"].vbs], [loop.child([1]), loop.child([2])], "loop: partial")
-        testing.assertEqual(not_increasing(r["loop"], "loop"), (loop.child([2]).arcs, loop.child([1]).arcs))
-        testing.assertEqual(ok(r["noSuchObject"], "noSuchObject"), [], "noSuchObject ends the walk, the GET too")
-        testing.assertEqual(ok(r["v1 noSuchName"], "v1 noSuchName"), [VarBind(nsn.child([1]), Integer(8))],
-                            "noSuchName that names no varbind ends an SNMPv1 walk")
-
-    def got(label: str, g: Got) -> None:
-        results[label] = g
-        if len(results) == 5:
-            after now QUIET: report(t, outcome(check))
-
-    def received(server: transport.ServerTransport, data: bytes, address: str, port: int) -> None:
-        c, m = message.decode(data)
-        if c is not None:
-            p = c.pdu
-            if p is not None:
-                v1 = (c.version == message.SNMP_V1)
-                out: list[VarBind] = []
-                status = 0
-                index = 0
-                for vb in p.varbinds:
-                    n = nexts.get(vb.oid)
-                    if p.pdu_type == pdu.GET:
-                        out.append(VarBind(vb.oid, NoSuchObject()))
-                        if v1:
-                            status = pdu.NO_SUCH_NAME
-                            index = 1
-                    elif v1 and vb.oid == nsn.child([1]):
-                        status = pdu.NO_SUCH_NAME
-                    elif n is not None:
-                        out.append(VarBind(n, NoSuchObject() if n == nso.child([1]) else Integer(len(n.arcs))))
-                    else:
-                        out.append(VarBind(vb.oid, EndOfMibView()))
-                vbs = p.varbinds if status != 0 else out
-                resp = Pdu(pdu.RESPONSE, p.request_id, status, index, vbs)
-                server.send_to(message.encode_community(message.CommunityMessage(c.version, c.community, resp)),
-                               address, port)
-
     proc def __startup__():
+        mn = MemNet()
+        root = Oid([1, 3, 6, 1, 4, 1, 99])
+        # GETNEXT successors: R -> R.1 -> R.3 -> R.2 (decreasing, new) -> R.4 -> out of the subtree;
+        # the loop: L -> L.1 -> L.2 -> L.1 again
+        loop = Oid([1, 3, 6, 1, 4, 1, 98])
+        # nso.1 is answered as noSuchObject (an agent bug to tolerate); after nsn.1 an SNMPv1 request gets
+        # noSuchName with error-index 0
+        nso = Oid([1, 3, 6, 1, 4, 1, 97])
+        nsn = Oid([1, 3, 6, 1, 4, 1, 96])
+        nexts: dict[Oid, Oid] = {root: root.child([1]), root.child([1]): root.child([3]),
+                                     root.child([3]): root.child([2]), root.child([2]): root.child([4]),
+                                     root.child([4]): SYS_DESCR.child([5]),
+                                     loop: loop.child([1]), loop.child([1]): loop.child([2]), loop.child([2]): loop.child([1]),
+                                     nso: nso.child([1]), nsn: nsn.child([1])}
+        results: dict[str, Got] = {}
+
+        def check() -> None:
+            r = results
+            testing.assertEqual([vb.oid for vb in r["checked"].vbs], [root.child([1]), root.child([3])], "checked: partial")
+            testing.assertEqual(not_increasing(r["checked"], "checked"), (root.child([3]).arcs, root.child([2]).arcs))
+            testing.assertEqual([vb.oid for vb in ok(r["unchecked"], "unchecked")],
+                                [root.child([1]), root.child([3]), root.child([2]), root.child([4])], "unchecked: all four")
+            testing.assertEqual([vb.oid for vb in r["loop"].vbs], [loop.child([1]), loop.child([2])], "loop: partial")
+            testing.assertEqual(not_increasing(r["loop"], "loop"), (loop.child([2]).arcs, loop.child([1]).arcs))
+            testing.assertEqual(ok(r["noSuchObject"], "noSuchObject"), [], "noSuchObject ends the walk, the GET too")
+            testing.assertEqual(ok(r["v1 noSuchName"], "v1 noSuchName"), [VarBind(nsn.child([1]), Integer(8))],
+                                "noSuchName that names no varbind ends an SNMPv1 walk")
+
+        def got(label: str, g: Got) -> None:
+            results[label] = g
+            if len(results) == 5:
+                after now QUIET: report(t, outcome(check))
+
+        def received(server: transport.ServerTransport, data: bytes, address: str, port: int) -> None:
+            c, m = message.decode(data)
+            if c is not None:
+                p = c.pdu
+                if p is not None:
+                    v1 = (c.version == message.SNMP_V1)
+                    out: list[VarBind] = []
+                    status = 0
+                    index = 0
+                    for vb in p.varbinds:
+                        n = nexts.get(vb.oid)
+                        if p.pdu_type == pdu.GET:
+                            out.append(VarBind(vb.oid, NoSuchObject()))
+                            if v1:
+                                status = pdu.NO_SUCH_NAME
+                                index = 1
+                        elif v1 and vb.oid == nsn.child([1]):
+                            status = pdu.NO_SUCH_NAME
+                        elif n is not None:
+                            out.append(VarBind(n, NoSuchObject() if n == nso.child([1]) else Integer(len(n.arcs))))
+                        else:
+                            out.append(VarBind(vb.oid, EndOfMibView()))
+                    vbs = p.varbinds if status != 0 else out
+                    resp = Pdu(pdu.RESPONSE, p.request_id, status, index, vbs)
+                    server.send_to(message.encode_community(message.CommunityMessage(c.version, c.community, resp)),
+                                   address, port)
+
         t.timeout(30.0)
 
         server = mn.server(AGENT, 161)
@@ -638,28 +638,28 @@ actor _test_walk_adaptive_timeout(t: testing.AsyncT):
 actor _test_walk_adaptive_timeout_v3(t: testing.AsyncT):
     """adaptive_bulk on a timeout with SNMPv3 (noAuthNoPriv, so the requests can be read): the retry's ScopedPDU
     is encoded again with half the max-repetitions"""
-    mn = MemNet()
-    noauth = Usm.from_passwords("u_noauth")
-    want = [VarBind(b([5, n, 0]), big(n)) for n in range(1, 61)]
-    var walks: list[Got] = []
-
-    def check(c: Client) -> None:
-        testing.assertEqual(len(walks), 1, "one callback")
-        testing.assertEqual(ok(walks[0], "v3 walk"), want)
-        r = bulk_reps(requests_sent([d.data for d in mn.history() if d.src_port == 40001]))
-        testing.assertEqual(r[:3], [25, 12, 12], "the retry is halved: " + str(r))
-        testing.assertEqual(c.stats().retries, 1)
-
-    def walked(c: Client, cl: Client, vbs: list[VarBind], e: ?errors.SnmpError) -> None:
-        walks.append(Got(vbs, None, len(vbs), [], e))
-        after now QUIET: report(t, outcome((lambda: check(c))))
-
-    def discovered(c: Client, cl: Client, info: ?EngineInfo, e: ?errors.SnmpError) -> None:
-        # the next datagram to the Client, the answer to the walk's first GETBULK, is lost
-        mn.set_faults(NetFaults(drop_first_n=1, to_address=MANAGER, to_port=40001))
-        c.walk((lambda cl, vbs, e: walked(c, cl, vbs, e)), b([5]))
-
     proc def __startup__():
+        mn = MemNet()
+        noauth = Usm.from_passwords("u_noauth")
+        want = [VarBind(b([5, n, 0]), big(n)) for n in range(1, 61)]
+        walks: list[Got] = []
+
+        def check(c: Client) -> None:
+            testing.assertEqual(len(walks), 1, "one callback")
+            testing.assertEqual(ok(walks[0], "v3 walk"), want)
+            r = bulk_reps(requests_sent([d.data for d in mn.history() if d.src_port == 40001]))
+            testing.assertEqual(r[:3], [25, 12, 12], "the retry is halved: " + str(r))
+            testing.assertEqual(c.stats().retries, 1)
+
+        def walked(c: Client, cl: Client, vbs: list[VarBind], e: ?errors.SnmpError) -> None:
+            walks.append(Got(vbs, None, len(vbs), [], e))
+            after now QUIET: report(t, outcome((lambda: check(c))))
+
+        def discovered(c: Client, cl: Client, info: ?EngineInfo, e: ?errors.SnmpError) -> None:
+            # the next datagram to the Client, the answer to the walk's first GETBULK, is lost
+            mn.set_faults(NetFaults(drop_first_n=1, to_address=MANAGER, to_port=40001))
+            c.walk((lambda cl, vbs, e: walked(c, cl, vbs, e)), b([5]))
+
         t.timeout(30.0)
 
         agent = Agent(mn.server(AGENT, 161), small_view(), AgentConfig({}, [noauth]), None)
@@ -686,29 +686,29 @@ def regrow_sequence(top: int, low: int, length: int) -> list[int]:
 actor _test_walk_adaptive_regrow(t: testing.AsyncT):
     """The learned max-repetitions grows back: tooBig teaches 12, then the agent answers everything; after
     BULK_REGROW_AFTER clean responses at 12 the walks use 24, after as many at 24 the Options' 25, which stays"""
-    mn = MemNet()
-    extra = [VarBind(b([6, k, 0]), Integer(k)) for k in range(1, 401)]
-    var results: dict[str, Got] = {}
-
-    def check() -> None:
-        testing.assertEqual(client_mod.BULK_REGROW_AFTER, 8, "the counts below assume 8")
-        testing.assertEqual(ok(results["learn"], "learn"), [VarBind(b([5, n, 0]), big(n)) for n in range(1, 61)])
-        testing.assertEqual(ok(results["regrow"], "regrow"), extra)
-        r = bulk_reps(requests_sent([d.data for d in mn.history() if d.src_port == 40001]))
-        # learn: 25 (tooBig) 12, then five clean at 12 (B.5.13 .. B.5.60 and the end); regrow: three more
-        # clean at 12 (eight), eight at 24, then 25 for the rest of the 400 integers
-        testing.assertEqual(r, [25, 12] + [12 for _ in range(8)] + [24 for _ in range(8)] + [25 for _ in range(7)],
-                            "max-repetitions sent: " + str(r))
-
-    def got(agent: Agent, c: Client, label: str, g: Got) -> None:
-        results[label] = g
-        if label == "learn":
-            agent.set_faults(None)
-            c.walk(Sink("regrow", (lambda label, g: got(agent, c, label, g))).walked, b([6]))
-        else:
-            after now QUIET: report(t, outcome(check))
-
     proc def __startup__():
+        mn = MemNet()
+        extra = [VarBind(b([6, k, 0]), Integer(k)) for k in range(1, 401)]
+        results: dict[str, Got] = {}
+
+        def check() -> None:
+            testing.assertEqual(client_mod.BULK_REGROW_AFTER, 8, "the counts below assume 8")
+            testing.assertEqual(ok(results["learn"], "learn"), [VarBind(b([5, n, 0]), big(n)) for n in range(1, 61)])
+            testing.assertEqual(ok(results["regrow"], "regrow"), extra)
+            r = bulk_reps(requests_sent([d.data for d in mn.history() if d.src_port == 40001]))
+            # learn: 25 (tooBig) 12, then five clean at 12 (B.5.13 .. B.5.60 and the end); regrow: three more
+            # clean at 12 (eight), eight at 24, then 25 for the rest of the 400 integers
+            testing.assertEqual(r, [25, 12] + [12 for _ in range(8)] + [24 for _ in range(8)] + [25 for _ in range(7)],
+                                "max-repetitions sent: " + str(r))
+
+        def got(agent: Agent, c: Client, label: str, g: Got) -> None:
+            results[label] = g
+            if label == "learn":
+                agent.set_faults(None)
+                c.walk(Sink("regrow", (lambda label, g: got(agent, c, label, g))).walked, b([6]))
+            else:
+                after now QUIET: report(t, outcome(check))
+
         t.timeout(30.0)
 
         agent = Agent(mn.server(AGENT, 161), MibView(small_view().varbinds() + extra), config(), None,
@@ -724,26 +724,26 @@ actor _test_walk_adaptive_regrow_backoff(t: testing.AsyncT):
     """An agent that answers tooBig above 2 rows, walked with max_repetitions 4: each doubling to 4 fails and
     is answered at 2, and the next one waits twice as long: 8, 16, ... clean responses, at most
     BULK_REGROW_AFTER_MAX (one failed try per 256 requests: bounded oscillation)"""
-    mn = MemNet()
-    extra = [VarBind(b([7, k, 0]), big(k)) for k in range(1, 1601)]
-    var walks: list[Got] = []
-
-    def check() -> None:
-        testing.assertEqual(client_mod.BULK_REGROW_AFTER_MAX, 256, "the counts below assume 256")
-        testing.assertEqual(len(walks), 1, "one callback")
-        testing.assertEqual(ok(walks[0], "walk"), extra)
-        r = bulk_reps(requests_sent([d.data for d in mn.history() if d.src_port == 40001]))
-        # 2 + (8 + 2) + (16 + 2) + ... + (256 + 2) + (256 + 2) = 776 GETBULKs: two gaps of 256 in a row
-        n = 776
-        testing.assertTrue(len(r) > n + 20, "%d GETBULKs" % len(r))
-        testing.assertEqual(r[:n], regrow_sequence(4, 2, n), "max-repetitions sent")
-        testing.assertEqual(r[n:], [2 for _ in range(len(r) - n)], "after the last doubling")
-
-    def walked(cl: Client, vbs: list[VarBind], e: ?errors.SnmpError) -> None:
-        walks.append(Got(vbs, None, len(vbs), [], e))
-        after now QUIET: report(t, outcome(check))
-
     proc def __startup__():
+        mn = MemNet()
+        extra = [VarBind(b([7, k, 0]), big(k)) for k in range(1, 1601)]
+        walks: list[Got] = []
+
+        def check() -> None:
+            testing.assertEqual(client_mod.BULK_REGROW_AFTER_MAX, 256, "the counts below assume 256")
+            testing.assertEqual(len(walks), 1, "one callback")
+            testing.assertEqual(ok(walks[0], "walk"), extra)
+            r = bulk_reps(requests_sent([d.data for d in mn.history() if d.src_port == 40001]))
+            # 2 + (8 + 2) + (16 + 2) + ... + (256 + 2) + (256 + 2) = 776 GETBULKs: two gaps of 256 in a row
+            n = 776
+            testing.assertTrue(len(r) > n + 20, "%d GETBULKs" % len(r))
+            testing.assertEqual(r[:n], regrow_sequence(4, 2, n), "max-repetitions sent")
+            testing.assertEqual(r[n:], [2 for _ in range(len(r) - n)], "after the last doubling")
+
+        def walked(cl: Client, vbs: list[VarBind], e: ?errors.SnmpError) -> None:
+            walks.append(Got(vbs, None, len(vbs), [], e))
+            after now QUIET: report(t, outcome(check))
+
         t.timeout(60.0)
 
         agent = Agent(mn.server(AGENT, 161), MibView(small_view().varbinds() + extra), config(), None,
@@ -1060,22 +1060,22 @@ actor _test_tables(t: testing.AsyncT):
 actor _test_table_cancel_sends_once(t: testing.AsyncT):
     """A table with three column groups and max_in_flight 1, cancelled while its first request is out: the
     queued groups are cancelled without ever being sent"""
-    mn = MemNet(NetFaults(delay=0.3, to_address=MANAGER))
-    var got: list[Got] = []
-
-    def check(c: Client) -> None:
-        testing.assertEqual(len(got), 1, "one callback")
-        e = got[0].e
-        testing.assertTrue(e is not None and is_cancelled(e), describe(got[0]))
-        sent = requests_sent([d.data for d in mn.history() if d.src_port == 40001])
-        testing.assertEqual(len(sent), 1, "requests on the wire: %d" % len(sent))
-        s = c.stats()
-        testing.assertEqual((s.queued, s.in_flight), (0, 0), str(s))
-
-    def got_table(cl: Client, tb: ?Table, e: ?errors.SnmpError) -> None:
-        got.append(Got([], tb, 0, [], e))
-
     proc def __startup__():
+        mn = MemNet(NetFaults(delay=0.3, to_address=MANAGER))
+        got: list[Got] = []
+
+        def check(c: Client) -> None:
+            testing.assertEqual(len(got), 1, "one callback")
+            e = got[0].e
+            testing.assertTrue(e is not None and is_cancelled(e), describe(got[0]))
+            sent = requests_sent([d.data for d in mn.history() if d.src_port == 40001])
+            testing.assertEqual(len(sent), 1, "requests on the wire: %d" % len(sent))
+            s = c.stats()
+            testing.assertEqual((s.queued, s.in_flight), (0, 0), str(s))
+
+        def got_table(cl: Client, tb: ?Table, e: ?errors.SnmpError) -> None:
+            got.append(Got([], tb, 0, [], e))
+
         t.timeout(30.0)
 
         agent = Agent(mn.server(AGENT, 161), small_view(), config(), None)
@@ -1090,21 +1090,21 @@ actor _test_table_cancel_sends_once(t: testing.AsyncT):
 
 actor _test_table_timeout_sends_once(t: testing.AsyncT):
     """No agent: the table's first column group times out and ends the table; the queued groups are not sent"""
-    mn = MemNet()
-    var got: list[Got] = []
-
-    def check() -> None:
-        testing.assertEqual(len(got), 1, "one callback")
-        e = got[0].e
-        testing.assertTrue(isinstance(e, errors.TimeoutError), describe(got[0]))
-        sent = requests_sent([d.data for d in mn.history() if d.src_port == 40001])
-        testing.assertEqual(len(sent), 1, "requests on the wire: %d" % len(sent))
-
-    def got_table(cl: Client, tb: ?Table, e: ?errors.SnmpError) -> None:
-        got.append(Got([], tb, 0, [], e))
-        after now 0.3: report(t, outcome(check))
-
     proc def __startup__():
+        mn = MemNet()
+        got: list[Got] = []
+
+        def check() -> None:
+            testing.assertEqual(len(got), 1, "one callback")
+            e = got[0].e
+            testing.assertTrue(isinstance(e, errors.TimeoutError), describe(got[0]))
+            sent = requests_sent([d.data for d in mn.history() if d.src_port == 40001])
+            testing.assertEqual(len(sent), 1, "requests on the wire: %d" % len(sent))
+
+        def got_table(cl: Client, tb: ?Table, e: ?errors.SnmpError) -> None:
+            got.append(Got([], tb, 0, [], e))
+            after now 0.3: report(t, outcome(check))
+
         t.timeout(30.0)
 
         c = client(mn, v2c(), 40001, Options(timeout=0.1, retries=0, max_oids_per_request=1, max_in_flight=1))
@@ -1126,25 +1126,25 @@ actor _test_walk_adaptive_slow_agent(t: testing.AsyncT):
     """A slow but lossless agent (every answer 300 ms late, timeout 200 ms): each walk's GETBULK times out
     once and its retry is halved, but the late answer to the full-size attempt arrives first and is taken.
     It proves the agent handles 25 rows, so later walks keep starting at 25 (no collapse to 1)"""
-    mn = MemNet(NetFaults(delay=0.3, to_address=MANAGER))
-    var rows: list[int] = []
-
-    def check() -> None:
-        testing.assertEqual(rows, [20, 20, 20, 20, 20, 20], "rows per walk")
-        r = bulk_reps(requests_sent([d.data for d in mn.history() if d.src_port == 40001]))
-        testing.assertEqual(r, [25, 12, 25, 12, 25, 12, 25, 12, 25, 12, 25, 12], "max-repetitions sent: " + str(r))
-
-    def walked(c: Client, cl: Client, vbs: list[VarBind], e: ?errors.SnmpError) -> None:
-        if e is not None:
-            t.failure(AssertionError("walk %d: %s" % (len(rows) + 1, str(e))))
-            return
-        rows.append(len(vbs))
-        if len(rows) < 6:
-            c.walk((lambda cl, vbs, e: walked(c, cl, vbs, e)), b([8, 1, len(rows) + 1]))
-        else:
-            after now QUIET: report(t, outcome(check))
-
     proc def __startup__():
+        mn = MemNet(NetFaults(delay=0.3, to_address=MANAGER))
+        rows: list[int] = []
+
+        def check() -> None:
+            testing.assertEqual(rows, [20, 20, 20, 20, 20, 20], "rows per walk")
+            r = bulk_reps(requests_sent([d.data for d in mn.history() if d.src_port == 40001]))
+            testing.assertEqual(r, [25, 12, 25, 12, 25, 12, 25, 12, 25, 12, 25, 12], "max-repetitions sent: " + str(r))
+
+        def walked(c: Client, cl: Client, vbs: list[VarBind], e: ?errors.SnmpError) -> None:
+            if e is not None:
+                t.failure(AssertionError("walk %d: %s" % (len(rows) + 1, str(e))))
+                return
+            rows.append(len(vbs))
+            if len(rows) < 6:
+                c.walk((lambda cl, vbs, e: walked(c, cl, vbs, e)), b([8, 1, len(rows) + 1]))
+            else:
+                after now QUIET: report(t, outcome(check))
+
         t.timeout(60.0)
 
         agent = Agent(mn.server(AGENT, 161), slow_view(), config(), None)
@@ -1272,15 +1272,15 @@ def check_lab(results: dict[str, Got], calls: int, want: int, expected: str, lab
 
 actor _test_lab_walks_v2c(t: testing.EnvT):
     """SNMPv2c walks of the lab dataset, GETNEXT, GETBULK and walk_stream, equal expected/canon/dataset.txt"""
-    mn = MemNet()
-
-    def gathered(expected: str, r: dict[str, Got], calls: int) -> None:
-        def check() -> None:
-            check_lab(r, calls, 3, expected, ["getnext", "bulk", "stream"])
-            testing.assertEqual(r["stream"].count, 6038)
-        report_env(t, outcome(check))
-
     proc def __startup__():
+        mn = MemNet()
+
+        def gathered(expected: str, r: dict[str, Got], calls: int) -> None:
+            def check() -> None:
+                check_lab(r, calls, 3, expected, ["getnext", "bulk", "stream"])
+                testing.assertEqual(r["stream"].count, 6038)
+            report_env(t, outcome(check))
+
         t.timeout(120.0)
         snmprec = read_text(t, SNMPREC)
         expected = read_text(t, CANON_DATASET)
@@ -1299,14 +1299,14 @@ actor _test_lab_walks_v2c(t: testing.EnvT):
 
 actor _test_lab_walks_v1(t: testing.EnvT):
     """SNMPv1 walk of the lab dataset (GETNEXT, Counter64 skipped) equals expected/canon/dataset-v1.txt"""
-    mn = MemNet()
-
-    def gathered(expected: str, r: dict[str, Got], calls: int) -> None:
-        def check() -> None:
-            check_lab(r, calls, 1, expected, ["v1"])
-        report_env(t, outcome(check))
-
     proc def __startup__():
+        mn = MemNet()
+
+        def gathered(expected: str, r: dict[str, Got], calls: int) -> None:
+            def check() -> None:
+                check_lab(r, calls, 1, expected, ["v1"])
+            report_env(t, outcome(check))
+
         t.timeout(120.0)
         snmprec = read_text(t, SNMPREC)
         expected = read_text(t, CANON_DATASET_V1)
@@ -1321,14 +1321,14 @@ actor _test_lab_walks_v1(t: testing.EnvT):
 
 actor _test_lab_walks_v3(t: testing.EnvT):
     """SNMPv3 (authPriv, SHA/AES) walks of the lab dataset, GETNEXT and GETBULK, equal expected/canon/dataset.txt"""
-    mn = MemNet()
-
-    def gathered(expected: str, r: dict[str, Got], calls: int) -> None:
-        def check() -> None:
-            check_lab(r, calls, 2, expected, ["getnext", "bulk"])
-        report_env(t, outcome(check))
-
     proc def __startup__():
+        mn = MemNet()
+
+        def gathered(expected: str, r: dict[str, Got], calls: int) -> None:
+            def check() -> None:
+                check_lab(r, calls, 2, expected, ["getnext", "bulk"])
+            report_env(t, outcome(check))
+
         t.timeout(120.0)
         snmprec = read_text(t, SNMPREC)
         expected = read_text(t, CANON_DATASET)
@@ -1348,30 +1348,30 @@ def lab_columns(table: int, n: int) -> list[Oid]:
 
 actor _test_lab_tables(t: testing.EnvT):
     """get_table of the lab tables (B.10 with sparse column 7, B.11 string-indexed, B.12 2000 rows) equals the expected files"""
-    mn = MemNet()
-    mn2 = MemNet()
-
-    def verify(bigtable: str, strtable: str, table: str, v1_table: str, r: dict[str, Got], calls: int) -> None:
-        testing.assertEqual(calls, 7, "callbacks (exactly once per table)")
-        for label in ["table", "table getnext", "table cut mid-row", "table in groups"]:
-            tb = table_of(r[label], label)
-            assert_same_lines(canon(table_varbinds(tb)), table, label)
-            testing.assertEqual(len(tb.rows), 300, label + ": rows")
-        tb = table_of(r["table"], "table")
-        testing.assertEqual(len(tb.rows[2].values), 7, "row 3 has column 7")
-        testing.assertEqual(len(tb.rows[3].values), 6, "row 4 has not")
-        assert_same_lines(canon(table_varbinds(table_of(r["strtable"], "strtable"))), strtable, "strtable")
-        st = table_of(r["strtable"], "strtable")
-        testing.assertEqual(st.rows[0].index, [1, 120], "the string index \"x\" sorts first")
-        assert_same_lines(canon(table_varbinds(table_of(r["bigtable"], "bigtable"))), bigtable, "bigtable")
-        assert_same_lines(canon(table_varbinds(table_of(r["v1 table"], "v1 table"))), v1_table, "v1 table")
-
-    def gathered(bigtable: str, strtable: str, table: str, v1_table: str, r: dict[str, Got], calls: int) -> None:
-        def check() -> None:
-            verify(bigtable, strtable, table, v1_table, r, calls)
-        report_env(t, outcome(check))
-
     proc def __startup__():
+        mn = MemNet()
+        mn2 = MemNet()
+
+        def verify(bigtable: str, strtable: str, table: str, v1_table: str, r: dict[str, Got], calls: int) -> None:
+            testing.assertEqual(calls, 7, "callbacks (exactly once per table)")
+            for label in ["table", "table getnext", "table cut mid-row", "table in groups"]:
+                tb = table_of(r[label], label)
+                assert_same_lines(canon(table_varbinds(tb)), table, label)
+                testing.assertEqual(len(tb.rows), 300, label + ": rows")
+            tb = table_of(r["table"], "table")
+            testing.assertEqual(len(tb.rows[2].values), 7, "row 3 has column 7")
+            testing.assertEqual(len(tb.rows[3].values), 6, "row 4 has not")
+            assert_same_lines(canon(table_varbinds(table_of(r["strtable"], "strtable"))), strtable, "strtable")
+            st = table_of(r["strtable"], "strtable")
+            testing.assertEqual(st.rows[0].index, [1, 120], "the string index \"x\" sorts first")
+            assert_same_lines(canon(table_varbinds(table_of(r["bigtable"], "bigtable"))), bigtable, "bigtable")
+            assert_same_lines(canon(table_varbinds(table_of(r["v1 table"], "v1 table"))), v1_table, "v1 table")
+
+        def gathered(bigtable: str, strtable: str, table: str, v1_table: str, r: dict[str, Got], calls: int) -> None:
+            def check() -> None:
+                verify(bigtable, strtable, table, v1_table, r, calls)
+            report_env(t, outcome(check))
+
         t.timeout(120.0)
         snmprec = read_text(t, SNMPREC)
         table = read_text(t, CANON_TABLE)

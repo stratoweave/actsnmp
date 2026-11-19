@@ -396,35 +396,34 @@ actor Tally(want: int, on_done: action(dict[str, Got]) -> None):
 
 actor _test_routing(t: testing.AsyncT):
     """Clients of two agents over one socket get their own answers; a datagram from an unknown source is unroutable"""
-    mn = MemNet()
-    a1 = Agent(mn.server(AGENT, 161), make_view(b"agent one"), agent_config([]), None)
-    a2 = Agent(mn.server(AGENT2, 161), make_view(b"agent two"), agent_config([]), None)
-    d = mem_dispatcher(mn, t.log_handler)
-    c1 = client_via(d, AGENT, Community("public"))
-    c2 = client_via(d, AGENT2, Community("public"))
-
-    def tallied(got: dict[str, Got]) -> None:
-        s = d.stats()
-        s1 = c1.stats()
-        s2 = c2.stats()
-        def check() -> None:
-            testing.assertEqual(vbs_of(got_of("c1 get", got), "c1 get"), [VarBind(SYS_DESCR, OctetString(b"agent one"))])
-            testing.assertEqual(vbs_of(got_of("c2 get", got), "c2 get"), [VarBind(SYS_DESCR, OctetString(b"agent two"))])
-            testing.assertEqual(vbs_of(got_of("c1 next", got), "c1 next"), [VarBind(e([2, 1, 0]), OctetString(b"hello"))])
-            testing.assertEqual(vbs_of(got_of("c2 bulk", got), "c2 bulk"), [table(1, 1), table(1, 2)])
-            testing.assertEqual((s.endpoints, s.peers, s.sent, s.received, s.routed, s.unroutable, s.collisions),
-                                (2, 2, 4, 5, 4, 1, 0), str(s))
-            testing.assertEqual(s.records, 4, "one record per request: " + str(s))
-            testing.assertEqual((s1.responses, s1.drops_unknown_id, s1.drops_source), (2, 0, 0), str(s1))
-            testing.assertEqual((s2.responses, s2.drops_unknown_id, s2.drops_source), (2, 0, 0), str(s2))
-        c1.close()
-        c2.close()
-        report(t, outcome(check))
-
-    tally = Tally(4, tallied)
-    # injected before the requests, so the Dispatcher has seen it when the last answer comes
-
     proc def __startup__():
+        mn = MemNet()
+        a1 = Agent(mn.server(AGENT, 161), make_view(b"agent one"), agent_config([]), None)
+        a2 = Agent(mn.server(AGENT2, 161), make_view(b"agent two"), agent_config([]), None)
+        d = mem_dispatcher(mn, t.log_handler)
+        c1 = client_via(d, AGENT, Community("public"))
+        c2 = client_via(d, AGENT2, Community("public"))
+        tally = Tally(4, tallied)
+        # injected before the requests, so the Dispatcher has seen it when the last answer comes
+
+        def tallied(got: dict[str, Got]) -> None:
+            s = d.stats()
+            s1 = c1.stats()
+            s2 = c2.stats()
+            def check() -> None:
+                testing.assertEqual(vbs_of(got_of("c1 get", got), "c1 get"), [VarBind(SYS_DESCR, OctetString(b"agent one"))])
+                testing.assertEqual(vbs_of(got_of("c2 get", got), "c2 get"), [VarBind(SYS_DESCR, OctetString(b"agent two"))])
+                testing.assertEqual(vbs_of(got_of("c1 next", got), "c1 next"), [VarBind(e([2, 1, 0]), OctetString(b"hello"))])
+                testing.assertEqual(vbs_of(got_of("c2 bulk", got), "c2 bulk"), [table(1, 1), table(1, 2)])
+                testing.assertEqual((s.endpoints, s.peers, s.sent, s.received, s.routed, s.unroutable, s.collisions),
+                                    (2, 2, 4, 5, 4, 1, 0), str(s))
+                testing.assertEqual(s.records, 4, "one record per request: " + str(s))
+                testing.assertEqual((s1.responses, s1.drops_unknown_id, s1.drops_source), (2, 0, 0), str(s1))
+                testing.assertEqual((s2.responses, s2.drops_unknown_id, s2.drops_source), (2, 0, 0), str(s2))
+            c1.close()
+            c2.close()
+            report(t, outcome(check))
+
         t.timeout(20.0)
         mn.send(_community(message.SNMP_V2C, pdu.RESPONSE, 7), "10.0.0.99", 161, MANAGER, MPORT)
         c1.get(tally.completed("c1 get"), [SYS_DESCR])
@@ -437,34 +436,33 @@ actor _test_routing(t: testing.AsyncT):
 
 actor _test_shared_peer_communities(t: testing.AsyncT):
     """Two SNMPv2c communities of one agent, 8 requests in flight each: every answer reaches the Client that asked"""
-    mn = MemNet()
-    a = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), None)
-    d = mem_dispatcher(mn, t.log_handler)
-    o8 = OPTS.with_(max_in_flight=8)
-    pub = client_via(d, AGENT, Community("public"), o8)
-    priv = client_via(d, AGENT, Community("private"), o8)
-
-    def tallied(got: dict[str, Got]) -> None:
-        s = d.stats()
-        sp = pub.stats()
-        sq = priv.stats()
-        def check() -> None:
-            for i in range(1, 21):
-                testing.assertEqual(vbs_of(got_of("pub %d" % i, got), "pub get"), [VarBind(e([20, i, 0]), Integer(i))])
-                j = 20 + i
-                testing.assertEqual(vbs_of(got_of("priv %d" % j, got), "priv set"),
-                                    [VarBind(e([20, j, 0]), Integer(1000 + j))])
-            testing.assertEqual(status_of(got_of("pub set", got), "SET with public"), (pdu.NO_ACCESS, 1))
-            testing.assertEqual((sp.responses, sp.drops_unknown_id, sp.drops_auth, sp.id_collisions), (21, 0, 0, 0), str(sp))
-            testing.assertEqual((sq.responses, sq.drops_unknown_id, sq.drops_auth, sq.id_collisions), (20, 0, 0, 0), str(sq))
-            testing.assertEqual((s.endpoints, s.peers, s.routed, s.unroutable), (2, 1, 41, 0), str(s))
-        pub.close()
-        priv.close()
-        report(t, outcome(check))
-
-    tally = Tally(41, tallied)
-
     proc def __startup__():
+        mn = MemNet()
+        a = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), None)
+        d = mem_dispatcher(mn, t.log_handler)
+        o8 = OPTS.with_(max_in_flight=8)
+        pub = client_via(d, AGENT, Community("public"), o8)
+        priv = client_via(d, AGENT, Community("private"), o8)
+        tally = Tally(41, tallied)
+
+        def tallied(got: dict[str, Got]) -> None:
+            s = d.stats()
+            sp = pub.stats()
+            sq = priv.stats()
+            def check() -> None:
+                for i in range(1, 21):
+                    testing.assertEqual(vbs_of(got_of("pub %d" % i, got), "pub get"), [VarBind(e([20, i, 0]), Integer(i))])
+                    j = 20 + i
+                    testing.assertEqual(vbs_of(got_of("priv %d" % j, got), "priv set"),
+                                        [VarBind(e([20, j, 0]), Integer(1000 + j))])
+                testing.assertEqual(status_of(got_of("pub set", got), "SET with public"), (pdu.NO_ACCESS, 1))
+                testing.assertEqual((sp.responses, sp.drops_unknown_id, sp.drops_auth, sp.id_collisions), (21, 0, 0, 0), str(sp))
+                testing.assertEqual((sq.responses, sq.drops_unknown_id, sq.drops_auth, sq.id_collisions), (20, 0, 0, 0), str(sq))
+                testing.assertEqual((s.endpoints, s.peers, s.routed, s.unroutable), (2, 1, 41, 0), str(s))
+            pub.close()
+            priv.close()
+            report(t, outcome(check))
+
         t.timeout(30.0)
         for i in range(1, 21):
             pub.get(tally.completed("pub %d" % i), [e([20, i, 0])])
@@ -477,41 +475,40 @@ actor _test_shared_peer_communities(t: testing.AsyncT):
 
 actor _test_shared_peer_v3_users(t: testing.AsyncT):
     """Four SNMPv3 users and an SNMPv2c community of one agent, from cold (concurrent discovery), over one socket"""
-    users = [noauth(), md5(), sha_aes(), sha256_des()]
-    mn = MemNet()
-    a = Agent(mn.server(AGENT, 161), make_view(), agent_config(users), None)
-    d = mem_dispatcher(mn, t.log_handler)
-    var clients: list[Client] = []
-    v2 = client_via(d, AGENT, Community("public"), OPTS.with_(max_in_flight=4))
-
-    def tallied(got: dict[str, Got]) -> None:
-        s = d.stats()
-        infos = [c.engine_info() for c in clients]
-        stats = [c.stats() for c in clients]
-        def check() -> None:
-            for k in range(len(users)):
-                name = users[k].user
-                n = k + 1
-                testing.assertEqual(vbs_of(got_of(name + " get", got), name), [VarBind(SYS_DESCR, OctetString(b"dispatcher test agent"))])
-                testing.assertEqual(vbs_of(got_of(name + " bulk", got), name), [table(1, 1), table(1, 2), table(1, 3)])
-                testing.assertEqual(vbs_of(got_of(name + " next", got), name), [VarBind(e([20, n + 1, 0]), Integer(n + 1))])
-                info = infos[k]
-                if info is not None:
-                    testing.assertEqual(info.engine_id, h(ENGINE), name + " engine")
-                else:
-                    raise AssertionError(name + ": no engine info after discovery")
-                st = stats[k]
-                testing.assertEqual((st.drops_unknown_id, st.drops_auth, st.timeouts), (0, 0, 0), name + " " + str(st))
-            testing.assertEqual(vbs_of(got_of("v2c get", got), "v2c"), [VarBind(SYS_DESCR, OctetString(b"dispatcher test agent"))])
-            testing.assertEqual((s.endpoints, s.peers, s.unroutable), (5, 1, 0), str(s))
-        for c in clients:
-            c.close()
-        v2.close()
-        report(t, outcome(check))
-
-    tally = Tally(3 * len(users) + 1, tallied)
-
     proc def __startup__():
+        users = [noauth(), md5(), sha_aes(), sha256_des()]
+        mn = MemNet()
+        a = Agent(mn.server(AGENT, 161), make_view(), agent_config(users), None)
+        d = mem_dispatcher(mn, t.log_handler)
+        clients: list[Client] = []
+        v2 = client_via(d, AGENT, Community("public"), OPTS.with_(max_in_flight=4))
+        tally = Tally(3 * len(users) + 1, tallied)
+
+        def tallied(got: dict[str, Got]) -> None:
+            s = d.stats()
+            infos = [c.engine_info() for c in clients]
+            stats = [c.stats() for c in clients]
+            def check() -> None:
+                for k in range(len(users)):
+                    name = users[k].user
+                    n = k + 1
+                    testing.assertEqual(vbs_of(got_of(name + " get", got), name), [VarBind(SYS_DESCR, OctetString(b"dispatcher test agent"))])
+                    testing.assertEqual(vbs_of(got_of(name + " bulk", got), name), [table(1, 1), table(1, 2), table(1, 3)])
+                    testing.assertEqual(vbs_of(got_of(name + " next", got), name), [VarBind(e([20, n + 1, 0]), Integer(n + 1))])
+                    info = infos[k]
+                    if info is not None:
+                        testing.assertEqual(info.engine_id, h(ENGINE), name + " engine")
+                    else:
+                        raise AssertionError(name + ": no engine info after discovery")
+                    st = stats[k]
+                    testing.assertEqual((st.drops_unknown_id, st.drops_auth, st.timeouts), (0, 0, 0), name + " " + str(st))
+                testing.assertEqual(vbs_of(got_of("v2c get", got), "v2c"), [VarBind(SYS_DESCR, OctetString(b"dispatcher test agent"))])
+                testing.assertEqual((s.endpoints, s.peers, s.unroutable), (5, 1, 0), str(s))
+            for c in clients:
+                c.close()
+            v2.close()
+            report(t, outcome(check))
+
         t.timeout(60.0)
         for u in users:
             clients.append(client_via(d, AGENT, u, OPTS.with_(max_in_flight=4)))
@@ -524,7 +521,7 @@ actor _test_shared_peer_v3_users(t: testing.AsyncT):
         v2.get(tally.completed("v2c get"), [SYS_DESCR])
 
 
-    # Id collisions #####################################################################################
+            # Id collisions #####################################################################################
 
     __startup__()
 
@@ -676,50 +673,48 @@ def refusing(r: _Refuser) -> Transport:
 actor _test_client_redraws(t: testing.AsyncT):
     """The Client sends a refused attempt again at once with a fresh id: no retry, no extra attempt (SNMPv2c GET,
     SNMPv3 discovery and GET, SNMPv2c inform)"""
-    mn = MemNet()
-    a = Agent(mn.server(AGENT, 161), make_view(), agent_config([sha_aes()]), None)
-
-    def ignored(r: NotificationReceiver, n: Notification) -> None:
-        pass
-
-    rcv = NotificationReceiver(mn.server(RECEIVER, 162), ReceiverConfig(["public"], [], [], h(RECEIVER_ENGINE), 1),
-                               ignored, None)
-    r2 = _Refuser(mn.client(MANAGER, 40001, AGENT, 161), [True, True])
-    r3 = _Refuser(mn.client(MANAGER, 40002, AGENT, 161), [True, False, True])
-    ri = _Refuser(mn.client(MANAGER, 40003, RECEIVER, 162), [True])
-    c2 = Client(None, AGENT, Community("public"), t.log_handler, opts=OPTS, transport=refusing(r2))
-    c3 = Client(None, AGENT, sha_aes(), t.log_handler, opts=OPTS, transport=refusing(r3))
-    ci = Client(None, RECEIVER, Community("public"), t.log_handler, port=162, opts=OPTS, transport=refusing(ri))
-
-    def tallied(got: dict[str, Got]) -> None:
-        s2 = c2.stats()
-        s3 = c3.stats()
-        si = ci.stats()
-        f2 = r2.refused()
-        f3 = r3.refused()
-        fi = ri.refused()
-        def check() -> None:
-            g = ok(got_of("v2c", got), "v2c")
-            testing.assertEqual(g.varbinds, [VarBind(SYS_DESCR, OctetString(b"dispatcher test agent"))])
-            testing.assertEqual(g.attempts, 1, "a refused attempt is not an attempt")
-            testing.assertTrue(g.request_id not in f2, "the answered id is a fresh one")
-            testing.assertEqual((s2.retries, s2.id_collisions, s2.responses), (0, 2, 1), str(s2))
-            g3 = ok(got_of("v3", got), "v3")
-            testing.assertEqual(g3.varbinds, [VarBind(SYS_DESCR, OctetString(b"dispatcher test agent"))])
-            testing.assertEqual((s3.retries, s3.id_collisions, s3.timeouts), (0, 2, 0), "probe and GET refused once: " + str(s3))
-            testing.assertEqual(g3.attempts, 1)
-            gi = ok(got_of("inform", got), "inform")
-            testing.assertEqual(gi.attempts, 1)
-            testing.assertEqual((si.retries, si.id_collisions), (0, 1), str(si))
-            testing.assertEqual((len(f2), len(f3), len(fi)), (2, 2, 1))
-        c2.close()
-        c3.close()
-        ci.close()
-        report(t, outcome(check))
-
-    tally = Tally(3, tallied)
-
     proc def __startup__():
+        mn = MemNet()
+        a = Agent(mn.server(AGENT, 161), make_view(), agent_config([sha_aes()]), None)
+        rcv = NotificationReceiver(mn.server(RECEIVER, 162), ReceiverConfig(["public"], [], [], h(RECEIVER_ENGINE), 1),
+                                   ignored, None)
+        r2 = _Refuser(mn.client(MANAGER, 40001, AGENT, 161), [True, True])
+        r3 = _Refuser(mn.client(MANAGER, 40002, AGENT, 161), [True, False, True])
+        ri = _Refuser(mn.client(MANAGER, 40003, RECEIVER, 162), [True])
+        c2 = Client(None, AGENT, Community("public"), t.log_handler, opts=OPTS, transport=refusing(r2))
+        c3 = Client(None, AGENT, sha_aes(), t.log_handler, opts=OPTS, transport=refusing(r3))
+        ci = Client(None, RECEIVER, Community("public"), t.log_handler, port=162, opts=OPTS, transport=refusing(ri))
+        tally = Tally(3, tallied)
+
+        def ignored(r: NotificationReceiver, n: Notification) -> None:
+            pass
+
+        def tallied(got: dict[str, Got]) -> None:
+            s2 = c2.stats()
+            s3 = c3.stats()
+            si = ci.stats()
+            f2 = r2.refused()
+            f3 = r3.refused()
+            fi = ri.refused()
+            def check() -> None:
+                g = ok(got_of("v2c", got), "v2c")
+                testing.assertEqual(g.varbinds, [VarBind(SYS_DESCR, OctetString(b"dispatcher test agent"))])
+                testing.assertEqual(g.attempts, 1, "a refused attempt is not an attempt")
+                testing.assertTrue(g.request_id not in f2, "the answered id is a fresh one")
+                testing.assertEqual((s2.retries, s2.id_collisions, s2.responses), (0, 2, 1), str(s2))
+                g3 = ok(got_of("v3", got), "v3")
+                testing.assertEqual(g3.varbinds, [VarBind(SYS_DESCR, OctetString(b"dispatcher test agent"))])
+                testing.assertEqual((s3.retries, s3.id_collisions, s3.timeouts), (0, 2, 0), "probe and GET refused once: " + str(s3))
+                testing.assertEqual(g3.attempts, 1)
+                gi = ok(got_of("inform", got), "inform")
+                testing.assertEqual(gi.attempts, 1)
+                testing.assertEqual((si.retries, si.id_collisions), (0, 1), str(si))
+                testing.assertEqual((len(f2), len(f3), len(fi)), (2, 2, 1))
+            c2.close()
+            c3.close()
+            ci.close()
+            report(t, outcome(check))
+
         t.timeout(30.0)
         c2.get(tally.completed("v2c"), [SYS_DESCR])
         c3.get(tally.completed("v3"), [SYS_DESCR])
@@ -731,33 +726,32 @@ actor _test_client_redraws(t: testing.AsyncT):
 actor _test_collisions_16bit(t: testing.AsyncT):
     """With request_id_bits=16 and 30720 of the 32767 ids of the peer recorded by another transport, every
     GET of a Client redraws until a free id (Stats.id_collisions, DispatcherStats.collisions) and succeeds"""
-    mn = MemNet()
-    a = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), None)
-    d = mem_dispatcher(mn, t.log_handler, max_ids=40000)
-    raw = d.attach(AGENT, 161)
-    rr = Recorder()
-    c = client_via(d, AGENT, Community("public"), Options(timeout=5.0, retries=0, request_id_bits=16))
-
-    def tallied(got: dict[str, Got]) -> None:
-        s = d.stats()
-        sc = c.stats()
-        def check() -> None:
-            for i in range(1, 11):
-                g = ok(got_of("get %d" % i, got), "get %d" % i)
-                testing.assertEqual(g.varbinds, [VarBind(e([20, i, 0]), Integer(i))])
-                testing.assertEqual(g.request_id % 16, 0, "a free id")
-                testing.assertEqual(g.attempts, 1)
-            testing.assertTrue(sc.id_collisions >= 1, "collisions: " + str(sc))
-            testing.assertEqual((sc.retries, sc.timeouts, sc.responses), (0, 0, 10), str(sc))
-            testing.assertEqual(s.collisions, sc.id_collisions, "every collision redrawn: " + str(s))
-            testing.assertEqual(s.unroutable, 0, str(s))
-        c.close()
-        raw.close()
-        report(t, outcome(check))
-
-    tally = Tally(10, tallied)
-
     proc def __startup__():
+        mn = MemNet()
+        a = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), None)
+        d = mem_dispatcher(mn, t.log_handler, max_ids=40000)
+        raw = d.attach(AGENT, 161)
+        rr = Recorder()
+        c = client_via(d, AGENT, Community("public"), Options(timeout=5.0, retries=0, request_id_bits=16))
+        tally = Tally(10, tallied)
+
+        def tallied(got: dict[str, Got]) -> None:
+            s = d.stats()
+            sc = c.stats()
+            def check() -> None:
+                for i in range(1, 11):
+                    g = ok(got_of("get %d" % i, got), "get %d" % i)
+                    testing.assertEqual(g.varbinds, [VarBind(e([20, i, 0]), Integer(i))])
+                    testing.assertEqual(g.request_id % 16, 0, "a free id")
+                    testing.assertEqual(g.attempts, 1)
+                testing.assertTrue(sc.id_collisions >= 1, "collisions: " + str(sc))
+                testing.assertEqual((sc.retries, sc.timeouts, sc.responses), (0, 0, 10), str(sc))
+                testing.assertEqual(s.collisions, sc.id_collisions, "every collision redrawn: " + str(s))
+                testing.assertEqual(s.unroutable, 0, str(s))
+            c.close()
+            raw.close()
+            report(t, outcome(check))
+
         t.timeout(120.0)
         raw.set_receiver(rr.received, rr.failed)
         # a community the agent drops silently: the ids stay recorded, nothing answers them
@@ -769,7 +763,7 @@ actor _test_collisions_16bit(t: testing.AsyncT):
             c.get(tally.completed("get %d" % i), [e([20, i, 0])])
 
 
-    # Late answers, multi-homed agents ##################################################################
+            # Late answers, multi-homed agents ##################################################################
 
     __startup__()
 
@@ -888,27 +882,28 @@ actor _test_multihomed_loose(t: testing.AsyncT):
 
 actor _test_loose_ambiguous(t: testing.AsyncT):
     """strict_source=False: an answer from an unknown source whose id two peers' requests have is dropped"""
-    mn = MemNet()
-    d = mem_dispatcher(mn, t.log_handler, strict_source=False)
-    t1 = d.attach(AGENT, 161)
-    t2 = d.attach(AGENT2, 161)
-    r1 = Recorder()
-    r2 = Recorder()
-    def settled() -> None:
-        s = d.stats()
-        k1 = r1.keys_seen()
-        k2 = r2.keys_seen()
-        def check() -> None:
-            testing.assertEqual(k1, [], "no answer for t1")
-            testing.assertEqual(k2, [v2key(78)], "the unique id routed to t2")
-            testing.assertEqual((s.ambiguous, s.routed_by_id, s.unroutable, s.collisions), (1, 1, 2, 0), str(s))
-        t1.close()
-        t2.close()
-        report(t, outcome(check))
-
-    # answers from a source nobody attached: id 77 (two peers), 78 (one), 79 (none)
-
     proc def __startup__():
+        mn = MemNet()
+        d = mem_dispatcher(mn, t.log_handler, strict_source=False)
+        t1 = d.attach(AGENT, 161)
+        t2 = d.attach(AGENT2, 161)
+        r1 = Recorder()
+        r2 = Recorder()
+
+        def settled() -> None:
+            s = d.stats()
+            k1 = r1.keys_seen()
+            k2 = r2.keys_seen()
+            def check() -> None:
+                testing.assertEqual(k1, [], "no answer for t1")
+                testing.assertEqual(k2, [v2key(78)], "the unique id routed to t2")
+                testing.assertEqual((s.ambiguous, s.routed_by_id, s.unroutable, s.collisions), (1, 1, 2, 0), str(s))
+            t1.close()
+            t2.close()
+            report(t, outcome(check))
+
+        # answers from a source nobody attached: id 77 (two peers), 78 (one), 79 (none)
+
         t.timeout(20.0)
         t1.set_receiver(r1.received, r1.failed)
         t2.set_receiver(r2.received, r2.failed)
@@ -922,7 +917,7 @@ actor _test_loose_ambiguous(t: testing.AsyncT):
         after QUIET: settled()
 
 
-    # Address forms #####################################################################################
+            # Address forms #####################################################################################
 
     __startup__()
 
@@ -949,32 +944,31 @@ actor _Echo(mn: MemNet, bind: str, reply_from: str):
 
 actor _test_address_forms(t: testing.AsyncT):
     """IPv4-mapped and IPv6 addresses in any text form, attached and as answer sources, route to their Client"""
-    mn = MemNet()
-    a4 = Agent(mn.server(AGENT, 161), make_view(b"v4"), agent_config([]), None)
-    a6 = Agent(mn.server("2001:db8::1", 161), make_view(b"v6"), agent_config([]), None)
-    m4 = _Echo(mn, "10.0.0.3", "::ffff:10.0.0.3")
-    m6 = _Echo(mn, "2001:db8::3", "2001:0DB8:0:0::0:3")
-    d = mem_dispatcher(mn, t.log_handler)
-    cmap = client_via(d, "::FFFF:10.0.0.1", Community("public"))
-    c6 = client_via(d, "2001:DB8:0:0:0:0:0:1", Community("public"))
-    ce4 = client_via(d, "10.0.0.3", Community("public"))
-    ce6 = client_via(d, "2001:db8::3", Community("public"))
-
-    def tallied(got: dict[str, Got]) -> None:
-        s = d.stats()
-        def check() -> None:
-            testing.assertEqual(vbs_of(got_of("mapped", got), "mapped"), [VarBind(SYS_DESCR, OctetString(b"v4"))])
-            testing.assertEqual(vbs_of(got_of("v6", got), "v6"), [VarBind(SYS_DESCR, OctetString(b"v6"))])
-            testing.assertEqual(vbs_of(got_of("echo4", got), "echo4"), [VarBind(SYS_DESCR, OctetString(b"echo"))])
-            testing.assertEqual(vbs_of(got_of("echo6", got), "echo6"), [VarBind(SYS_DESCR, OctetString(b"echo"))])
-            testing.assertEqual((s.peers, s.routed, s.unroutable), (4, 4, 0), str(s))
-        for c in [cmap, c6, ce4, ce6]:
-            c.close()
-        report(t, outcome(check))
-
-    tally = Tally(4, tallied)
-
     proc def __startup__():
+        mn = MemNet()
+        a4 = Agent(mn.server(AGENT, 161), make_view(b"v4"), agent_config([]), None)
+        a6 = Agent(mn.server("2001:db8::1", 161), make_view(b"v6"), agent_config([]), None)
+        m4 = _Echo(mn, "10.0.0.3", "::ffff:10.0.0.3")
+        m6 = _Echo(mn, "2001:db8::3", "2001:0DB8:0:0::0:3")
+        d = mem_dispatcher(mn, t.log_handler)
+        cmap = client_via(d, "::FFFF:10.0.0.1", Community("public"))
+        c6 = client_via(d, "2001:DB8:0:0:0:0:0:1", Community("public"))
+        ce4 = client_via(d, "10.0.0.3", Community("public"))
+        ce6 = client_via(d, "2001:db8::3", Community("public"))
+        tally = Tally(4, tallied)
+
+        def tallied(got: dict[str, Got]) -> None:
+            s = d.stats()
+            def check() -> None:
+                testing.assertEqual(vbs_of(got_of("mapped", got), "mapped"), [VarBind(SYS_DESCR, OctetString(b"v4"))])
+                testing.assertEqual(vbs_of(got_of("v6", got), "v6"), [VarBind(SYS_DESCR, OctetString(b"v6"))])
+                testing.assertEqual(vbs_of(got_of("echo4", got), "echo4"), [VarBind(SYS_DESCR, OctetString(b"echo"))])
+                testing.assertEqual(vbs_of(got_of("echo6", got), "echo6"), [VarBind(SYS_DESCR, OctetString(b"echo"))])
+                testing.assertEqual((s.peers, s.routed, s.unroutable), (4, 4, 0), str(s))
+            for c in [cmap, c6, ce4, ce6]:
+                c.close()
+            report(t, outcome(check))
+
         t.timeout(20.0)
         cmap.get(tally.completed("mapped"), [SYS_DESCR])
         c6.get(tally.completed("v6"), [SYS_DESCR])
@@ -982,7 +976,7 @@ actor _test_address_forms(t: testing.AsyncT):
         ce6.get(tally.completed("echo6"), [SYS_DESCR])
 
 
-    # Attach, detach, close #############################################################################
+            # Attach, detach, close #############################################################################
 
     __startup__()
 
@@ -1198,39 +1192,38 @@ actor _test_client_flows(t: testing.AsyncT):
 actor _test_faults(t: testing.AsyncT):
     """Lost, duplicated, reordered and spoofed answers on the shared socket: three Clients of one agent
     (two communities, an SNMPv3 user) walk it with retries and each gets exactly its walk"""
-    mn = MemNet(NetFaults(drop_every_nth=5, duplicate=True, reorder=True, spoof_source=True, to_address=MANAGER))
-    a = Agent(mn.server(AGENT, 161), make_view(), agent_config([sha_aes()]), None)
-    d = mem_dispatcher(mn, t.log_handler)
-    o = Options(timeout=0.3, retries=5, max_repetitions=6)
-    clients = [client_via(d, AGENT, Community("public"), o), client_via(d, AGENT, Community("private"), o),
-               client_via(d, AGENT, sha_aes(), o)]
-    labels = ["public", "private", "u_sha_aes"]
-    full = full_view()
-
-    def tallied(got: dict[str, Got]) -> None:
-        s = d.stats()
-        ns = mn.stats()
-        cs = [c.stats() for c in clients]
-        def check() -> None:
-            for k in range(len(labels)):
-                testing.assertEqual(walk_result(got_of(labels[k], got), labels[k]), full)
-                testing.assertEqual((cs[k].drops_source, cs[k].drops_auth), (0, 0), labels[k] + ": " + str(cs[k]))
-            testing.assertTrue(ns.dropped > 0 and ns.duplicated > 0 and ns.reordered > 0, str(ns))
-            testing.assertTrue(s.unroutable >= ns.spoofed, "the forged copies (source port 162): " + str(s) + str(ns))
-            testing.assertEqual(s.late, 0, str(s))
-        for c in clients:
-            c.close()
-        report(t, outcome(check))
-
-    tally = Tally(3, tallied)
-
     proc def __startup__():
+        mn = MemNet(NetFaults(drop_every_nth=5, duplicate=True, reorder=True, spoof_source=True, to_address=MANAGER))
+        a = Agent(mn.server(AGENT, 161), make_view(), agent_config([sha_aes()]), None)
+        d = mem_dispatcher(mn, t.log_handler)
+        o = Options(timeout=0.3, retries=5, max_repetitions=6)
+        clients = [client_via(d, AGENT, Community("public"), o), client_via(d, AGENT, Community("private"), o),
+                   client_via(d, AGENT, sha_aes(), o)]
+        labels = ["public", "private", "u_sha_aes"]
+        full = full_view()
+        tally = Tally(3, tallied)
+
+        def tallied(got: dict[str, Got]) -> None:
+            s = d.stats()
+            ns = mn.stats()
+            cs = [c.stats() for c in clients]
+            def check() -> None:
+                for k in range(len(labels)):
+                    testing.assertEqual(walk_result(got_of(labels[k], got), labels[k]), full)
+                    testing.assertEqual((cs[k].drops_source, cs[k].drops_auth), (0, 0), labels[k] + ": " + str(cs[k]))
+                testing.assertTrue(ns.dropped > 0 and ns.duplicated > 0 and ns.reordered > 0, str(ns))
+                testing.assertTrue(s.unroutable >= ns.spoofed, "the forged copies (source port 162): " + str(s) + str(ns))
+                testing.assertEqual(s.late, 0, str(s))
+            for c in clients:
+                c.close()
+            report(t, outcome(check))
+
         t.timeout(60.0)
         for k in range(len(labels)):
             clients[k].walk(tally.walked(labels[k]), Oid([1, 3, 6, 1, 4, 1, 8072, 9999, 1]))
 
 
-    # Record bounds and lifetime, redraws, spoofers, zones ##############################################
+            # Record bounds and lifetime, redraws, spoofers, zones ##############################################
 
     __startup__()
 
@@ -1457,27 +1450,27 @@ actor _test_redraws_bounded(t: testing.AsyncT):
 actor _test_redraw_keeps_attempt_timer(t: testing.AsyncT):
     """A refused attempt is not an attempt: a GET to a silent agent, refused twice, with one retry, times out
     after its two attempt timeouts with TimeoutError.attempts 2 (a redraw neither counts nor restarts the timer)"""
-    mn = MemNet()
-    a = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), None)
-    rf = _Refuser(mn.client(MANAGER, 40001, AGENT, 161), [True, True])
-    c = Client(None, AGENT, Community("nobody"), t.log_handler, opts=Options(timeout=0.5, retries=1),
-               transport=refusing(rf))
-    var started = _ms()
-
-    def got(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
-        elapsed = _ms() - started
-        sc = cl.stats()
-        cl.close()
-        def check() -> None:
-            if isinstance(err, errors.TimeoutError):
-                testing.assertEqual(err.attempts, 2, str(err))
-            else:
-                raise AssertionError("expected a TimeoutError, got " + describe(Got(r=r, e=err)))
-            testing.assertTrue(elapsed >= 950.0 and elapsed < 1450.0, "timed out after %d ms" % int(elapsed))
-            testing.assertEqual((sc.id_collisions, sc.retries, sc.timeouts), (2, 1, 1), str(sc))
-        report(t, outcome(check))
-
     proc def __startup__():
+        mn = MemNet()
+        a = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), None)
+        rf = _Refuser(mn.client(MANAGER, 40001, AGENT, 161), [True, True])
+        c = Client(None, AGENT, Community("nobody"), t.log_handler, opts=Options(timeout=0.5, retries=1),
+                   transport=refusing(rf))
+        started = _ms()
+
+        def got(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+            elapsed = _ms() - started
+            sc = cl.stats()
+            cl.close()
+            def check() -> None:
+                if isinstance(err, errors.TimeoutError):
+                    testing.assertEqual(err.attempts, 2, str(err))
+                else:
+                    raise AssertionError("expected a TimeoutError, got " + describe(Got(r=r, e=err)))
+                testing.assertTrue(elapsed >= 950.0 and elapsed < 1450.0, "timed out after %d ms" % int(elapsed))
+                testing.assertEqual((sc.id_collisions, sc.retries, sc.timeouts), (2, 1, 1), str(sc))
+            report(t, outcome(check))
+
         t.timeout(20.0)
         c.get(got, [SYS_DESCR])
 
@@ -1535,13 +1528,14 @@ actor _test_loose_spoofer(t: testing.AsyncT):
 actor _test_attach_refuses_zones(t: testing.AsyncT):
     """attach() refuses an IPv6 address with a zone: the UDP socket cannot send to one, so every
     request would be dropped with only a log warning"""
-    mn = MemNet()
-    d = mem_dispatcher(mn, t.log_handler)
-    var outcomes: list[str] = []
-    def check() -> None:
-        testing.assertEqual(outcomes, ["refused", "refused", "refused"])
-
     proc def __startup__():
+        mn = MemNet()
+        d = mem_dispatcher(mn, t.log_handler)
+        outcomes: list[str] = []
+
+        def check() -> None:
+            testing.assertEqual(outcomes, ["refused", "refused", "refused"])
+
         t.timeout(10.0)
         for spec in ["fe80::1%eth0", "::1%lo", "fe80::1%1"]:
             try:
@@ -1559,12 +1553,13 @@ actor _test_attach_family(t: testing.AsyncT):
     """A Dispatcher that knows its local address refuses peers of the other address family: IPv6 when bound
     to an IPv4 address, IPv4 (also IPv4-mapped) when bound to an IPv6 one; "::" and an unknown address
     refuse neither"""
-    mn = MemNet()
-    var outcomes: list[str] = []
-    def check() -> None:
-        testing.assertEqual(outcomes, ["10.0.0.100 ++-", "0.0.0.0 ++-", "2001:db8::100 --+", ":: +++", " +++"])
-
     proc def __startup__():
+        mn = MemNet()
+        outcomes: list[str] = []
+
+        def check() -> None:
+            testing.assertEqual(outcomes, ["10.0.0.100 ++-", "0.0.0.0 ++-", "2001:db8::100 --+", ":: +++", " +++"])
+
         t.timeout(10.0)
         for local in ["10.0.0.100", "0.0.0.0", "2001:db8::100", "::", ""]:
             d = Dispatcher(mn.server(local if local != "" else "mem", 0), None, local_address=local)
@@ -1587,36 +1582,35 @@ actor _test_attach_family(t: testing.AsyncT):
 actor _test_full_hint(t: testing.AsyncT):
     """max_ids=1 on a shared peer, answers after 1 s: a second GET is not sent while the first waits; it times
     out with the refusal as its hint (DispatcherStats.refused)"""
-    mn = MemNet(NetFaults(delay=1.0, to_address=MANAGER))
-    a = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), None)
-    d = mem_dispatcher(mn, t.log_handler, max_ids=1)
-    ca = client_via(d, AGENT, Community("public"), Options(timeout=0.5, retries=0, max_in_flight=2))
-    other = d.attach(AGENT, 161)
-
-    def tallied(got: dict[str, Got]) -> None:
-        s = d.stats()
-        sa = ca.stats()
-        ca.close()
-        other.close()
-        def check() -> None:
-            expect_timeout(got_of("first", got), "first")
-            g = got_of("second", got)
-            err = g.e
-            if isinstance(err, errors.TimeoutError):
-                testing.assertEqual(err.attempts, 1, str(err))
-                h = err.hint
-                if h is not None:
-                    testing.assertTrue(dispatcher.FULL in h, h)
-                else:
-                    raise AssertionError("no hint: " + str(err))
-            else:
-                raise AssertionError("expected a TimeoutError, got " + describe(g))
-            testing.assertEqual((s.sent, s.refused), (1, 1), str(s))
-        report(t, outcome(check))
-
-    tally = Tally(2, tallied)
-
     proc def __startup__():
+        mn = MemNet(NetFaults(delay=1.0, to_address=MANAGER))
+        a = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), None)
+        d = mem_dispatcher(mn, t.log_handler, max_ids=1)
+        ca = client_via(d, AGENT, Community("public"), Options(timeout=0.5, retries=0, max_in_flight=2))
+        other = d.attach(AGENT, 161)
+        tally = Tally(2, tallied)
+
+        def tallied(got: dict[str, Got]) -> None:
+            s = d.stats()
+            sa = ca.stats()
+            ca.close()
+            other.close()
+            def check() -> None:
+                expect_timeout(got_of("first", got), "first")
+                g = got_of("second", got)
+                err = g.e
+                if isinstance(err, errors.TimeoutError):
+                    testing.assertEqual(err.attempts, 1, str(err))
+                    h = err.hint
+                    if h is not None:
+                        testing.assertTrue(dispatcher.FULL in h, h)
+                    else:
+                        raise AssertionError("no hint: " + str(err))
+                else:
+                    raise AssertionError("expected a TimeoutError, got " + describe(g))
+                testing.assertEqual((s.sent, s.refused), (1, 1), str(s))
+            report(t, outcome(check))
+
         t.timeout(20.0)
         ca.get(tally.completed("first"), [e([20, 1, 0])])
         ca.get(tally.completed("second"), [e([20, 2, 0])])
@@ -1685,30 +1679,29 @@ actor _test_room_from_shorter_holds(t: testing.AsyncT):
     """max_ids=2 on a shared peer, answers after 1 s: a GET with a long budget, then one with a 0.05 s budget
     that times out; a third GET takes the timed-out one's record, behind the older one still waited for, and
     is sent (no refusal)"""
-    mn = MemNet(NetFaults(delay=1.0, to_address=MANAGER))
-    a = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), None)
-    d = mem_dispatcher(mn, t.log_handler, max_ids=2)
-    long = Options(timeout=3.0, retries=0, max_in_flight=4)
-    ca = client_via(d, AGENT, Community("public"), long)
-    other = d.attach(AGENT, 161)
-
-    def tallied(got: dict[str, Got]) -> None:
-        s = d.stats()
-        ca.close()
-        other.close()
-        def check() -> None:
-            testing.assertEqual(vbs_of(got_of("long", got), "long"), [VarBind(e([20, 1, 0]), Integer(1))])
-            expect_timeout(got_of("short", got), "short")
-            testing.assertEqual(vbs_of(got_of("third", got), "third"), [VarBind(e([20, 3, 0]), Integer(3))])
-            testing.assertEqual((s.sent, s.refused), (3, 0), str(s))
-        report(t, outcome(check))
-
-    tally = Tally(3, tallied)
-
-    def third_due() -> None:
-        ca.get(tally.completed("third"), [e([20, 3, 0])])
-
     proc def __startup__():
+        mn = MemNet(NetFaults(delay=1.0, to_address=MANAGER))
+        a = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), None)
+        d = mem_dispatcher(mn, t.log_handler, max_ids=2)
+        long = Options(timeout=3.0, retries=0, max_in_flight=4)
+        ca = client_via(d, AGENT, Community("public"), long)
+        other = d.attach(AGENT, 161)
+        tally = Tally(3, tallied)
+
+        def tallied(got: dict[str, Got]) -> None:
+            s = d.stats()
+            ca.close()
+            other.close()
+            def check() -> None:
+                testing.assertEqual(vbs_of(got_of("long", got), "long"), [VarBind(e([20, 1, 0]), Integer(1))])
+                expect_timeout(got_of("short", got), "short")
+                testing.assertEqual(vbs_of(got_of("third", got), "third"), [VarBind(e([20, 3, 0]), Integer(3))])
+                testing.assertEqual((s.sent, s.refused), (3, 0), str(s))
+            report(t, outcome(check))
+
+        def third_due() -> None:
+            ca.get(tally.completed("third"), [e([20, 3, 0])])
+
         t.timeout(20.0)
         ca.get(tally.completed("long"), [e([20, 1, 0])])
         ca.get(tally.completed("short"), [e([20, 2, 0])], Options(timeout=0.05, retries=0))
@@ -1721,38 +1714,37 @@ actor _test_strict_per_attach(t: testing.AsyncT):
     """attach(..., strict) overrides the Dispatcher's strict_source: on a strict Dispatcher, a loose attach
     hears its multi-homed agent; on a loose one, a strict attach is not reached by answers from other
     sources, even with the right community and id (only the loose transports' requests are candidates)"""
-    mn = MemNet()
-    a = Agent(mn.server(OTHER, 161), make_view(), agent_config([]), None)
-    relay = _Relay(mn, AGENT, OTHER)
-    ds = Dispatcher(mn.server(MANAGER, MPORT), t.log_handler)
-    dl = Dispatcher(mn.server(MANAGER, MPORT + 1), t.log_handler, False)
-    o = Options(timeout=0.3, retries=1)
-    loose_on_strict = Client(None, AGENT, Community("public"), None, opts=o, transport=ds.attach(AGENT, 161, False))
-    strict_on_loose = Client(None, AGENT, Community("public"), None, opts=o, transport=dl.attach(AGENT, 161, True))
-
-    def tallied(got: dict[str, Got]) -> None:
-        s1 = ds.stats()
-        s2 = dl.stats()
-        loose_on_strict.close()
-        strict_on_loose.close()
-        def check() -> None:
-            testing.assertEqual(vbs_of(got_of("loose on strict", got), "loose on strict"),
-                                [VarBind(SYS_DESCR, OctetString(b"dispatcher test agent"))])
-            expect_timeout(got_of("strict on loose", got), "strict on loose")
-            testing.assertEqual((s1.routed_by_id, s1.unroutable), (1, 0), str(s1))
-            testing.assertEqual((s2.routed, s2.routed_by_id), (0, 0), str(s2))
-            testing.assertTrue(s2.unroutable >= 2, str(s2))
-        report(t, outcome(check))
-
-    tally = Tally(2, tallied)
-
     proc def __startup__():
+        mn = MemNet()
+        a = Agent(mn.server(OTHER, 161), make_view(), agent_config([]), None)
+        relay = _Relay(mn, AGENT, OTHER)
+        ds = Dispatcher(mn.server(MANAGER, MPORT), t.log_handler)
+        dl = Dispatcher(mn.server(MANAGER, MPORT + 1), t.log_handler, False)
+        o = Options(timeout=0.3, retries=1)
+        loose_on_strict = Client(None, AGENT, Community("public"), None, opts=o, transport=ds.attach(AGENT, 161, False))
+        strict_on_loose = Client(None, AGENT, Community("public"), None, opts=o, transport=dl.attach(AGENT, 161, True))
+        tally = Tally(2, tallied)
+
+        def tallied(got: dict[str, Got]) -> None:
+            s1 = ds.stats()
+            s2 = dl.stats()
+            loose_on_strict.close()
+            strict_on_loose.close()
+            def check() -> None:
+                testing.assertEqual(vbs_of(got_of("loose on strict", got), "loose on strict"),
+                                    [VarBind(SYS_DESCR, OctetString(b"dispatcher test agent"))])
+                expect_timeout(got_of("strict on loose", got), "strict on loose")
+                testing.assertEqual((s1.routed_by_id, s1.unroutable), (1, 0), str(s1))
+                testing.assertEqual((s2.routed, s2.routed_by_id), (0, 0), str(s2))
+                testing.assertTrue(s2.unroutable >= 2, str(s2))
+            report(t, outcome(check))
+
         t.timeout(30.0)
         loose_on_strict.get(tally.completed("loose on strict"), [SYS_DESCR])
         strict_on_loose.get(tally.completed("strict on loose"), [SYS_DESCR])
 
 
-    # Real UDP (env tests) ##############################################################################
+            # Real UDP (env tests) ##############################################################################
 
     __startup__()
 
@@ -1916,21 +1908,21 @@ actor _test_udp_source_address(t: testing.EnvT):
 
 actor _test_udp_listen_failure(t: testing.EnvT):
     """udp_dispatcher on an address that is not ours reports the error; its Dispatcher's transports fail at once"""
-    def got(c: Client, r: ?Response, err: ?errors.SnmpError) -> None:
-        c.close()
-        def check() -> None:
-            if not isinstance(err, errors.TransportError):
-                raise AssertionError("expected a TransportError, got " + describe(Got(r=r, e=err)))
-        report_env(t, outcome(check))
-
-    def disp_listening(d: Dispatcher, error: ?str) -> None:
-        if error is None:
-            t.failure(AssertionError("listening on 192.0.2.1 should fail"))
-            return
-        c = client_via(d, "127.0.0.1", Community("public"), Options(timeout=1.0, retries=0))
-        c.get(got, [SYS_DESCR])
-
     proc def __startup__():
+        def got(c: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+            c.close()
+            def check() -> None:
+                if not isinstance(err, errors.TransportError):
+                    raise AssertionError("expected a TransportError, got " + describe(Got(r=r, e=err)))
+            report_env(t, outcome(check))
+
+        def disp_listening(d: Dispatcher, error: ?str) -> None:
+            if error is None:
+                t.failure(AssertionError("listening on 192.0.2.1 should fail"))
+                return
+            c = client_via(d, "127.0.0.1", Community("public"), Options(timeout=1.0, retries=0))
+            c.get(got, [SYS_DESCR])
+
         t.timeout(30.0)
 
         dispatcher.udp_dispatcher(listen_cap(t), "192.0.2.1", 0, disp_listening, None)
@@ -1941,42 +1933,42 @@ actor _test_udp_listen_failure(t: testing.EnvT):
 actor _test_udp_family_refused(t: testing.EnvT):
     """attach() refuses a peer of an address family the socket cannot reach: IPv6 on a Dispatcher bound to
     0.0.0.0, IPv4 on one bound to ::1 (every send would fail with only a log warning)"""
-    var results: list[str] = []
-
-    proc def _try(d: Dispatcher, address: str) -> str:
-        try:
-            tr = d.attach(address, 161)
-            tr.close()
-            return address + " accepted"
-        except ValueError:
-            return address + " refused"
-
-    def v6_listening(d: Dispatcher, error: ?str) -> None:
-        if error is not None:
-            t.failure(AssertionError("dispatcher on ::1: " + error))
-            return
-        results.append("::1: " + _try(d, "::1") + ", " + _try(d, "127.0.0.1"))
-        d.close()
-        r = results.copy()
-        def check() -> None:
-            testing.assertEqual(r, ["0.0.0.0: ::1 refused, 127.0.0.1 accepted",
-                                    "::1: ::1 accepted, 127.0.0.1 refused"])
-        report_env(t, outcome(check))
-
-    def v4_listening(d: Dispatcher, error: ?str) -> None:
-        if error is not None:
-            t.failure(AssertionError("dispatcher on 0.0.0.0: " + error))
-            return
-        results.append("0.0.0.0: " + _try(d, "::1") + ", " + _try(d, "127.0.0.1"))
-        d.close()
-        dispatcher.udp_dispatcher(listen_cap(t), "::1", 0, v6_listening, t.log_handler)
-
     proc def __startup__():
+        results: list[str] = []
+
+        proc def _try(d: Dispatcher, address: str) -> str:
+            try:
+                tr = d.attach(address, 161)
+                tr.close()
+                return address + " accepted"
+            except ValueError:
+                return address + " refused"
+
+        def v6_listening(d: Dispatcher, error: ?str) -> None:
+            if error is not None:
+                t.failure(AssertionError("dispatcher on ::1: " + error))
+                return
+            results.append("::1: " + _try(d, "::1") + ", " + _try(d, "127.0.0.1"))
+            d.close()
+            r = results.copy()
+            def check() -> None:
+                testing.assertEqual(r, ["0.0.0.0: ::1 refused, 127.0.0.1 accepted",
+                                        "::1: ::1 accepted, 127.0.0.1 refused"])
+            report_env(t, outcome(check))
+
+        def v4_listening(d: Dispatcher, error: ?str) -> None:
+            if error is not None:
+                t.failure(AssertionError("dispatcher on 0.0.0.0: " + error))
+                return
+            results.append("0.0.0.0: " + _try(d, "::1") + ", " + _try(d, "127.0.0.1"))
+            d.close()
+            dispatcher.udp_dispatcher(listen_cap(t), "::1", 0, v6_listening, t.log_handler)
+
         t.timeout(30.0)
         dispatcher.udp_dispatcher(listen_cap(t), "0.0.0.0", 0, v4_listening, t.log_handler)
 
 
-    # The fleet: thousands of Clients, one socket
+            # The fleet: thousands of Clients, one socket
 
     __startup__()
 

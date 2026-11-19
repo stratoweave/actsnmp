@@ -545,17 +545,17 @@ def _sha_aes() -> Usm:
 
 actor _test_fault_drop_first_n(t: testing.AsyncT):
     """drop_first_n: the lost answer is retried; the SET was applied once and its retry meets the same value"""
-    def check(outs: list[Outcome], c: Client) -> None:
-        r = ok(outs[0], "get")
-        testing.assertEqual((r.varbinds, r.attempts), ([VarBind(SYS_DESCR, OctetString(DESCR))], 2))
-        testing.assertEqual(vbs_of(outs[1], "get"), [VarBind(e([1, 1, 0]), Integer(42))])
-        testing.assertEqual(c.stats().retries, 1)
-
-    run = _FaultRun(t, Faults(drop_first_n=1), None, Community("public"), Options(timeout=0.2, retries=2), check)
-    c = run.client()
-    completed = run.completed()
-
     proc def __startup__():
+        run = _FaultRun(t, Faults(drop_first_n=1), None, Community("public"), Options(timeout=0.2, retries=2), check)
+        c = run.client()
+        completed = run.completed()
+
+        def check(outs: list[Outcome], c: Client) -> None:
+            r = ok(outs[0], "get")
+            testing.assertEqual((r.varbinds, r.attempts), ([VarBind(SYS_DESCR, OctetString(DESCR))], 2))
+            testing.assertEqual(vbs_of(outs[1], "get"), [VarBind(e([1, 1, 0]), Integer(42))])
+            testing.assertEqual(c.stats().retries, 1)
+
         t.timeout(30.0)
 
         c.get(completed, [SYS_DESCR])
@@ -567,17 +567,17 @@ actor _test_fault_drop_first_n(t: testing.AsyncT):
 
 actor _test_fault_wrong_request_id(t: testing.AsyncT):
     """wrong_request_id: the copy with another request-id is dropped, the genuine Response taken"""
-    def check(outs: list[Outcome], c: Client) -> None:
-        testing.assertEqual(vbs_of(outs[0], "get"), [VarBind(SYS_DESCR, OctetString(DESCR))])
-        testing.assertEqual(vbs_of(outs[1], "get_next"), [VarBind(e([2, 1, 0]), OctetString(b"hello"))])
-        s = c.stats()
-        testing.assertEqual((s.drops_unknown_id, s.responses), (2, 2), str(s))
-
-    run = _FaultRun(t, Faults(wrong_request_id=True), None, Community("public"), OPTS, check)
-    c = run.client()
-    completed = run.completed()
-
     proc def __startup__():
+        run = _FaultRun(t, Faults(wrong_request_id=True), None, Community("public"), OPTS, check)
+        c = run.client()
+        completed = run.completed()
+
+        def check(outs: list[Outcome], c: Client) -> None:
+            testing.assertEqual(vbs_of(outs[0], "get"), [VarBind(SYS_DESCR, OctetString(DESCR))])
+            testing.assertEqual(vbs_of(outs[1], "get_next"), [VarBind(e([2, 1, 0]), OctetString(b"hello"))])
+            s = c.stats()
+            testing.assertEqual((s.drops_unknown_id, s.responses), (2, 2), str(s))
+
         t.timeout(30.0)
 
         c.get(completed, [SYS_DESCR])
@@ -589,18 +589,18 @@ actor _test_fault_wrong_request_id(t: testing.AsyncT):
 
 actor _test_net_duplicate(t: testing.AsyncT):
     """Every answer duplicated by the network: each callback exactly once, the copies dropped"""
-    def check(outs: list[Outcome], c: Client) -> None:
-        testing.assertEqual(len(outs), 3, "exactly one callback per request")
-        for o in outs:
-            testing.assertEqual(vbs_of(o, "get"), [VarBind(SYS_DESCR, OctetString(DESCR))])
-        s = c.stats()
-        testing.assertEqual((s.responses, s.drops_unknown_id), (3, 3), str(s))
-
-    run = _FaultRun(t, None, NetFaults(duplicate=True, to_address=MANAGER), Community("public"), OPTS, check)
-    c = run.client()
-    completed = run.completed()
-
     proc def __startup__():
+        run = _FaultRun(t, None, NetFaults(duplicate=True, to_address=MANAGER), Community("public"), OPTS, check)
+        c = run.client()
+        completed = run.completed()
+
+        def check(outs: list[Outcome], c: Client) -> None:
+            testing.assertEqual(len(outs), 3, "exactly one callback per request")
+            for o in outs:
+                testing.assertEqual(vbs_of(o, "get"), [VarBind(SYS_DESCR, OctetString(DESCR))])
+            s = c.stats()
+            testing.assertEqual((s.responses, s.drops_unknown_id), (3, 3), str(s))
+
         t.timeout(30.0)
 
         for _ in range(3):
@@ -612,18 +612,18 @@ actor _test_net_duplicate(t: testing.AsyncT):
 
 actor _test_net_late(t: testing.AsyncT):
     """Answers delayed beyond the timeout: the late answer to the first attempt completes the request"""
-    def check(outs: list[Outcome], c: Client) -> None:
-        r = ok(outs[0], "get")
-        testing.assertEqual((r.varbinds, r.attempts), ([VarBind(SYS_DESCR, OctetString(DESCR))], 2))
-        testing.assertTrue(r.rtt >= 0.25, "the rtt of the first attempt: %f" % r.rtt)
-        s = c.stats()
-        testing.assertEqual((s.responses, s.retries, s.timeouts), (1, 1, 0), str(s))
-
-    run = _FaultRun(t, None, NetFaults(delay=0.3, to_address=MANAGER), Community("public"),
-                    Options(timeout=0.2, retries=2), check)
-    c = run.client()
-
     proc def __startup__():
+        run = _FaultRun(t, None, NetFaults(delay=0.3, to_address=MANAGER), Community("public"),
+                        Options(timeout=0.2, retries=2), check)
+        c = run.client()
+
+        def check(outs: list[Outcome], c: Client) -> None:
+            r = ok(outs[0], "get")
+            testing.assertEqual((r.varbinds, r.attempts), ([VarBind(SYS_DESCR, OctetString(DESCR))], 2))
+            testing.assertTrue(r.rtt >= 0.25, "the rtt of the first attempt: %f" % r.rtt)
+            s = c.stats()
+            testing.assertEqual((s.responses, s.retries, s.timeouts), (1, 1, 0), str(s))
+
         t.timeout(30.0)
 
         c.get(run.completed(), [SYS_DESCR])
@@ -634,17 +634,17 @@ actor _test_net_late(t: testing.AsyncT):
 
 actor _test_fault_not_in_time_window_once(t: testing.AsyncT):
     """SNMPv3: a forced authenticated notInTimeWindows Report makes the Client resynchronise and resend once"""
-    def check(outs: list[Outcome], c: Client) -> None:
-        testing.assertEqual(vbs_of(outs[0], "get"), [VarBind(SYS_DESCR, OctetString(DESCR))])
-        testing.assertEqual(vbs_of(outs[1], "get"), [VarBind(e([1, 1, 0]), Integer(42))])
-        s = c.stats()
-        testing.assertEqual((s.reports, s.timeouts), (2, 0), "discovery and notInTimeWindows: " + str(s))
-
-    run = _FaultRun(t, Faults(report_not_in_time_window_once=True), None, _sha_aes(), OPTS, check)
-    c = run.client()
-    completed = run.completed()
-
     proc def __startup__():
+        run = _FaultRun(t, Faults(report_not_in_time_window_once=True), None, _sha_aes(), OPTS, check)
+        c = run.client()
+        completed = run.completed()
+
+        def check(outs: list[Outcome], c: Client) -> None:
+            testing.assertEqual(vbs_of(outs[0], "get"), [VarBind(SYS_DESCR, OctetString(DESCR))])
+            testing.assertEqual(vbs_of(outs[1], "get"), [VarBind(e([1, 1, 0]), Integer(42))])
+            s = c.stats()
+            testing.assertEqual((s.reports, s.timeouts), (2, 0), "discovery and notInTimeWindows: " + str(s))
+
         t.timeout(30.0)
 
         c.get(completed, [SYS_DESCR])
@@ -656,20 +656,19 @@ actor _test_fault_not_in_time_window_once(t: testing.AsyncT):
 
 actor _test_fault_too_big(t: testing.AsyncT):
     """too_big_over: a GET is split until each part fits, a GETBULK halves max-repetitions, a SET reports tooBig"""
-    oids = [e([9, i, 0]) for i in range(1, 9)]
-
-    def check(outs: list[Outcome], c: Client) -> None:
-        testing.assertEqual(vbs_of(outs[0], "split get"), [VarBind(e([9, i, 0]), big(i)) for i in range(1, 9)])
-        vbs = vbs_of(outs[1], "halved get_bulk")
-        testing.assertTrue(len(vbs) >= 1 and len(vbs) <= 4, "repetitions halved: %d varbinds" % len(vbs))
-        testing.assertEqual(vbs, [VarBind(e([9, i, 0]), big(i)) for i in range(2, 2 + len(vbs))])
-        testing.assertEqual(status_of(outs[2], "set"), (pdu.TOO_BIG, 0))
-
-    run = _FaultRun(t, Faults(too_big_over=300), None, Community("private"), OPTS, check)
-    c = run.client()
-    completed = run.completed()
-
     proc def __startup__():
+        oids = [e([9, i, 0]) for i in range(1, 9)]
+        run = _FaultRun(t, Faults(too_big_over=300), None, Community("private"), OPTS, check)
+        c = run.client()
+        completed = run.completed()
+
+        def check(outs: list[Outcome], c: Client) -> None:
+            testing.assertEqual(vbs_of(outs[0], "split get"), [VarBind(e([9, i, 0]), big(i)) for i in range(1, 9)])
+            vbs = vbs_of(outs[1], "halved get_bulk")
+            testing.assertTrue(len(vbs) >= 1 and len(vbs) <= 4, "repetitions halved: %d varbinds" % len(vbs))
+            testing.assertEqual(vbs, [VarBind(e([9, i, 0]), big(i)) for i in range(2, 2 + len(vbs))])
+            testing.assertEqual(status_of(outs[2], "set"), (pdu.TOO_BIG, 0))
+
         t.timeout(30.0)
         c.get(completed, oids)
         c.get_bulk(completed, [e([9, 1, 0])], 0, 8)
@@ -681,13 +680,13 @@ actor _test_fault_too_big(t: testing.AsyncT):
 
 actor _test_fault_truncate_bulk(t: testing.AsyncT):
     """truncate_bulk: the Client returns the shortened GETBULK answer as it is"""
-    def check(outs: list[Outcome], c: Client) -> None:
-        testing.assertEqual(vbs_of(outs[0], "get_bulk"), [table(1, 1), table(2, 1)])
-
-    run = _FaultRun(t, Faults(truncate_bulk=2), None, Community("public"), OPTS, check)
-    c = run.client()
-
     proc def __startup__():
+        run = _FaultRun(t, Faults(truncate_bulk=2), None, Community("public"), OPTS, check)
+        c = run.client()
+
+        def check(outs: list[Outcome], c: Client) -> None:
+            testing.assertEqual(vbs_of(outs[0], "get_bulk"), [table(1, 1), table(2, 1)])
+
         t.timeout(30.0)
 
         c.get_bulk(run.completed(), [e([10, 1, 1]), e([10, 1, 2])], 0, 5)
@@ -698,20 +697,20 @@ actor _test_fault_truncate_bulk(t: testing.AsyncT):
 
 actor _test_fault_error_at(t: testing.AsyncT):
     """error_at: the injected error-status reaches the caller with its index, OID and transient flag"""
-    def check(outs: list[Outcome], c: Client) -> None:
-        testing.assertEqual(status_of(outs[0], "get"), (pdu.RESOURCE_UNAVAILABLE, 2))
-        err = outs[0].e
-        if isinstance(err, errors.ErrorStatusError):
-            testing.assertEqual(err.oid, e([5, 1, 0]).arcs)
-            testing.assertTrue(err.transient, "resourceUnavailable is transient")
-        testing.assertEqual(vbs_of(outs[1], "another OID"), [VarBind(e([6, 1, 0]), Gauge32(8))])
-
-    run = _FaultRun(t, Faults(error_at=e([5, 1, 0]), error_status=pdu.RESOURCE_UNAVAILABLE), None,
-                    Community("public"), OPTS, check)
-    c = run.client()
-    completed = run.completed()
-
     proc def __startup__():
+        run = _FaultRun(t, Faults(error_at=e([5, 1, 0]), error_status=pdu.RESOURCE_UNAVAILABLE), None,
+                        Community("public"), OPTS, check)
+        c = run.client()
+        completed = run.completed()
+
+        def check(outs: list[Outcome], c: Client) -> None:
+            testing.assertEqual(status_of(outs[0], "get"), (pdu.RESOURCE_UNAVAILABLE, 2))
+            err = outs[0].e
+            if isinstance(err, errors.ErrorStatusError):
+                testing.assertEqual(err.oid, e([5, 1, 0]).arcs)
+                testing.assertTrue(err.transient, "resourceUnavailable is transient")
+            testing.assertEqual(vbs_of(outs[1], "another OID"), [VarBind(e([6, 1, 0]), Gauge32(8))])
+
         t.timeout(30.0)
 
         c.get(completed, [e([1, 1, 0]), e([5, 1, 0])])
@@ -723,35 +722,35 @@ actor _test_fault_error_at(t: testing.AsyncT):
 
 actor _test_fault_wrong_source_version_community(t: testing.AsyncT):
     """Answers from another port, in the wrong version or (checked) with the wrong community time out with a hint"""
-    mn = MemNet()
-    other = mn.server(AGENT, 1161)
-    a1 = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), None,
-               Faults(respond_from_other_port=True, other_port=other))
-    a2 = Agent(mn.server(AGENT, 162), make_view(), agent_config([]), None, Faults(wrong_version=True))
-    a3 = Agent(mn.server(AGENT, 163), make_view(), agent_config([]), None, Faults(wrong_community=True))
-    quick = Options(timeout=0.2, retries=0)
-    c1 = Client(None, AGENT, Community("public"), None, opts=quick, transport=mn.client(MANAGER, 40001, AGENT, 161))
-    c2 = Client(None, AGENT, Community("public"), None, port=162, opts=quick,
-                transport=mn.client(MANAGER, 40002, AGENT, 162))
-    c3 = Client(None, AGENT, Community("public"), None, port=163, opts=quick.with_(check_community=True),
-                transport=mn.client(MANAGER, 40003, AGENT, 163))
-    c4 = Client(None, AGENT, Community("public"), None, port=163, opts=quick,
-                transport=mn.client(MANAGER, 40004, AGENT, 163))
-    var results: dict[str, list[Outcome]] = {}
-
-    def check() -> None:
-        testing.assertEqual(timeout_hint(results["port"][0], "other port"), "1 datagram from another source")
-        testing.assertEqual(timeout_hint(results["version"][0], "version"), "1 datagram of another SNMP version")
-        testing.assertEqual(timeout_hint(results["community"][0], "community"), "1 datagram failed authentication")
-        testing.assertEqual(vbs_of(results["unchecked"][0], "community not checked"),
-                            [VarBind(SYS_DESCR, OctetString(DESCR))])
-
-    def reported(label: str, outs: list[Outcome]) -> None:
-        results[label] = outs
-        if len(results) == 4:
-            report(t, outcome(check))
-
     proc def __startup__():
+        mn = MemNet()
+        other = mn.server(AGENT, 1161)
+        a1 = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), None,
+                   Faults(respond_from_other_port=True, other_port=other))
+        a2 = Agent(mn.server(AGENT, 162), make_view(), agent_config([]), None, Faults(wrong_version=True))
+        a3 = Agent(mn.server(AGENT, 163), make_view(), agent_config([]), None, Faults(wrong_community=True))
+        quick = Options(timeout=0.2, retries=0)
+        c1 = Client(None, AGENT, Community("public"), None, opts=quick, transport=mn.client(MANAGER, 40001, AGENT, 161))
+        c2 = Client(None, AGENT, Community("public"), None, port=162, opts=quick,
+                    transport=mn.client(MANAGER, 40002, AGENT, 162))
+        c3 = Client(None, AGENT, Community("public"), None, port=163, opts=quick.with_(check_community=True),
+                    transport=mn.client(MANAGER, 40003, AGENT, 163))
+        c4 = Client(None, AGENT, Community("public"), None, port=163, opts=quick,
+                    transport=mn.client(MANAGER, 40004, AGENT, 163))
+        results: dict[str, list[Outcome]] = {}
+
+        def check() -> None:
+            testing.assertEqual(timeout_hint(results["port"][0], "other port"), "1 datagram from another source")
+            testing.assertEqual(timeout_hint(results["version"][0], "version"), "1 datagram of another SNMP version")
+            testing.assertEqual(timeout_hint(results["community"][0], "community"), "1 datagram failed authentication")
+            testing.assertEqual(vbs_of(results["unchecked"][0], "community not checked"),
+                                [VarBind(SYS_DESCR, OctetString(DESCR))])
+
+        def reported(label: str, outs: list[Outcome]) -> None:
+            results[label] = outs
+            if len(results) == 4:
+                report(t, outcome(check))
+
         t.timeout(30.0)
         for c, label in [(c1, "port"), (c2, "version"), (c3, "community"), (c4, "unchecked")]:
             col = Collector(label, reported)
@@ -985,54 +984,54 @@ actor _test_notify_v3_sha512(t: testing.AsyncT):
 
 actor _test_v3_agent_reboot(t: testing.AsyncT):
     """The agent reboots (boots + 1), then changes its engine ID: the Client resynchronises, then rediscovers"""
-    u = _sha_aes()
-    mn = MemNet()
-    agent = Agent(mn.server(AGENT, 161), make_view(), agent_config([u]), t.log_handler)
-    c = _client(mn, u, 40001, OPTS, t.log_handler)
-    new_engine = h("80001f888001020304050607")
-    var step = 0
-
-    def fail(what: str, r: ?Response, err: ?errors.SnmpError) -> bool:
-        if err is not None:
-            t.failure(AssertionError(what + ": " + str(err)))
-            return True
-        return False
-
-    def got_third(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
-        if fail("after the engine ID change", r, err):
-            return
-        info = c.engine_info()
-        s = c.stats()
-        def check() -> None:
-            testing.assertEqual(vbs_of(Outcome(r, err), "get"), [VarBind(SYS_DESCR, OctetString(DESCR))])
-            if info is not None:
-                testing.assertEqual((info.engine_id, info.boots), (new_engine, 1))
-            else:
-                raise AssertionError("no engine info")
-            # discovery, notInTimeWindows after the reboot, unknownEngineIDs, discovery again
-            testing.assertEqual((s.reports, s.timeouts), (4, 0), str(s))
-        report(t, outcome(check))
-
-    def got_second(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
-        if fail("after the reboot", r, err):
-            return
-        boots = -1
-        info = c.engine_info()
-        if info is not None:
-            boots = info.boots
-        if boots != AGENT_BOOTS + 1:
-            t.failure(AssertionError("boots not learned after the reboot: %d" % boots))
-            return
-        agent.reboot(1, new_engine)
-        c.get(got_third, [SYS_DESCR])
-
-    def got_first(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
-        if fail("first get", r, err):
-            return
-        agent.reboot()
-        c.get(got_second, [SYS_DESCR])
-
     proc def __startup__():
+        u = _sha_aes()
+        mn = MemNet()
+        agent = Agent(mn.server(AGENT, 161), make_view(), agent_config([u]), t.log_handler)
+        c = _client(mn, u, 40001, OPTS, t.log_handler)
+        new_engine = h("80001f888001020304050607")
+        step = 0
+
+        def fail(what: str, r: ?Response, err: ?errors.SnmpError) -> bool:
+            if err is not None:
+                t.failure(AssertionError(what + ": " + str(err)))
+                return True
+            return False
+
+        def got_third(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+            if fail("after the engine ID change", r, err):
+                return
+            info = c.engine_info()
+            s = c.stats()
+            def check() -> None:
+                testing.assertEqual(vbs_of(Outcome(r, err), "get"), [VarBind(SYS_DESCR, OctetString(DESCR))])
+                if info is not None:
+                    testing.assertEqual((info.engine_id, info.boots), (new_engine, 1))
+                else:
+                    raise AssertionError("no engine info")
+                # discovery, notInTimeWindows after the reboot, unknownEngineIDs, discovery again
+                testing.assertEqual((s.reports, s.timeouts), (4, 0), str(s))
+            report(t, outcome(check))
+
+        def got_second(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+            if fail("after the reboot", r, err):
+                return
+            boots = -1
+            info = c.engine_info()
+            if info is not None:
+                boots = info.boots
+            if boots != AGENT_BOOTS + 1:
+                t.failure(AssertionError("boots not learned after the reboot: %d" % boots))
+                return
+            agent.reboot(1, new_engine)
+            c.get(got_third, [SYS_DESCR])
+
+        def got_first(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+            if fail("first get", r, err):
+                return
+            agent.reboot()
+            c.get(got_second, [SYS_DESCR])
+
         t.timeout(30.0)
         c.get(got_first, [SYS_DESCR])
 
@@ -1044,39 +1043,38 @@ actor _test_v3_agent_restart_boots_lost(t: testing.AsyncT):
     after a docker restart): two requests in flight both get authenticated notInTimeWindows Reports that fail
     RFC 3414 3.2 step 7b; the Client resynchronises from the first, the second is then in the
     window, and both are resent: no request is lost"""
-    u = _sha_aes()
-    mn = MemNet()
-    agent = Agent(mn.server(AGENT, 161), make_view(), agent_config([u]), t.log_handler)
-    c = _client(mn, u, 40001, OPTS.with_(max_in_flight=2), t.log_handler)
-
-    def reported(label: str, outs: list[Outcome]) -> None:
-        info = c.engine_info()
-        s = c.stats()
-        def run() -> None:
-            testing.assertEqual(len(outs), 3, "one callback per request")
-            testing.assertEqual(vbs_of(outs[0], "before the restart"), [VarBind(SYS_DESCR, OctetString(DESCR))])
-            r1 = ok(outs[1], "first request after the restart")
-            testing.assertEqual((r1.varbinds, r1.attempts), ([VarBind(SYS_DESCR, OctetString(DESCR))], 2))
-            r2 = ok(outs[2], "second request after the restart")
-            testing.assertEqual((r2.varbinds, r2.attempts), ([VarBind(e([1, 1, 0]), Integer(42))], 2))
-            if info is not None:
-                testing.assertEqual((info.engine_id, info.boots), (h(AGENT_ENGINE), 1))
-                testing.assertTrue(info.time < 10, "time %d" % info.time)
-            else:
-                raise AssertionError("no engine info")
-            # discovery and the two notInTimeWindows Reports; nothing dropped, nothing timed out
-            testing.assertEqual((s.reports, s.timeouts, s.drops_auth, s.retries), (3, 0, 0, 0), str(s))
-        report(t, outcome(run))
-
-    col = Collector("restart", reported)
-
-    def got_first(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
-        col.completed(cl, r, err)
-        agent.reboot(1)
-        c.get(col.completed, [SYS_DESCR])
-        c.get(col.completed, [e([1, 1, 0])])
-
     proc def __startup__():
+        u = _sha_aes()
+        mn = MemNet()
+        agent = Agent(mn.server(AGENT, 161), make_view(), agent_config([u]), t.log_handler)
+        c = _client(mn, u, 40001, OPTS.with_(max_in_flight=2), t.log_handler)
+        col = Collector("restart", reported)
+
+        def reported(label: str, outs: list[Outcome]) -> None:
+            info = c.engine_info()
+            s = c.stats()
+            def run() -> None:
+                testing.assertEqual(len(outs), 3, "one callback per request")
+                testing.assertEqual(vbs_of(outs[0], "before the restart"), [VarBind(SYS_DESCR, OctetString(DESCR))])
+                r1 = ok(outs[1], "first request after the restart")
+                testing.assertEqual((r1.varbinds, r1.attempts), ([VarBind(SYS_DESCR, OctetString(DESCR))], 2))
+                r2 = ok(outs[2], "second request after the restart")
+                testing.assertEqual((r2.varbinds, r2.attempts), ([VarBind(e([1, 1, 0]), Integer(42))], 2))
+                if info is not None:
+                    testing.assertEqual((info.engine_id, info.boots), (h(AGENT_ENGINE), 1))
+                    testing.assertTrue(info.time < 10, "time %d" % info.time)
+                else:
+                    raise AssertionError("no engine info")
+                # discovery and the two notInTimeWindows Reports; nothing dropped, nothing timed out
+                testing.assertEqual((s.reports, s.timeouts, s.drops_auth, s.retries), (3, 0, 0, 0), str(s))
+            report(t, outcome(run))
+
+        def got_first(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+            col.completed(cl, r, err)
+            agent.reboot(1)
+            c.get(col.completed, [SYS_DESCR])
+            c.get(col.completed, [e([1, 1, 0])])
+
         t.timeout(30.0)
         c.get(got_first, [SYS_DESCR])
         col.expect(3)
@@ -1086,14 +1084,14 @@ actor _test_v3_agent_restart_boots_lost(t: testing.AsyncT):
 
 actor _test_fault_too_big_v3(t: testing.AsyncT):
     """SNMPv3 authPriv with too_big_over: the GET is split into new exchanges and merged in order"""
-    def check(outs: list[Outcome], c: Client) -> None:
-        testing.assertEqual(vbs_of(outs[0], "split get"), [VarBind(e([9, i, 0]), big(i)) for i in range(1, 9)])
-        testing.assertEqual(c.stats().timeouts, 0)
-
-    run = _FaultRun(t, Faults(too_big_over=500), None, _sha_aes(), OPTS, check)
-    c = run.client()
-
     proc def __startup__():
+        run = _FaultRun(t, Faults(too_big_over=500), None, _sha_aes(), OPTS, check)
+        c = run.client()
+
+        def check(outs: list[Outcome], c: Client) -> None:
+            testing.assertEqual(vbs_of(outs[0], "split get"), [VarBind(e([9, i, 0]), big(i)) for i in range(1, 9)])
+            testing.assertEqual(c.stats().timeouts, 0)
+
         t.timeout(30.0)
 
         c.get(run.completed(), [e([9, i, 0]) for i in range(1, 9)])
@@ -1104,27 +1102,26 @@ actor _test_fault_too_big_v3(t: testing.AsyncT):
 
 actor _test_inform_retransmission_dedup(t: testing.AsyncT):
     """A v2c inform whose Response is lost is retransmitted; the receiver's dedup_window delivers it once"""
-    mn = MemNet(NetFaults(drop_first_n=1, to_address=MANAGER))
-    var got: list[Notification] = []
-
-    def received(r: NotificationReceiver, n: Notification) -> None:
-        got.append(n)
-
-    rcv = NotificationReceiver(mn.server(RECEIVER, 162), ReceiverConfig(["public"], [], [], h(RECEIVER_ENGINE), 1, 60.0),
-                               received, t.log_handler)
-    c = Client(None, RECEIVER, Community("public"), t.log_handler, port=162, opts=Options(timeout=0.2, retries=2),
-               transport=mn.client(MANAGER, 42001, RECEIVER, 162))
-
-    def acked(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
-        st = rcv.stats()
-        def check() -> None:
-            resp = ok(Outcome(r, err), "inform")
-            testing.assertEqual(resp.attempts, 2)
-            testing.assertEqual(len(got), 1, "delivered once")
-            testing.assertEqual((st["delivered"], st["duplicates"], st["acked"]), (1, 1, 2), str(st))
-        report(t, outcome(check))
-
     proc def __startup__():
+        mn = MemNet(NetFaults(drop_first_n=1, to_address=MANAGER))
+        got: list[Notification] = []
+        rcv = NotificationReceiver(mn.server(RECEIVER, 162), ReceiverConfig(["public"], [], [], h(RECEIVER_ENGINE), 1, 60.0),
+                                   received, t.log_handler)
+        c = Client(None, RECEIVER, Community("public"), t.log_handler, port=162, opts=Options(timeout=0.2, retries=2),
+                   transport=mn.client(MANAGER, 42001, RECEIVER, 162))
+
+        def received(r: NotificationReceiver, n: Notification) -> None:
+            got.append(n)
+
+        def acked(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+            st = rcv.stats()
+            def check() -> None:
+                resp = ok(Outcome(r, err), "inform")
+                testing.assertEqual(resp.attempts, 2)
+                testing.assertEqual(len(got), 1, "delivered once")
+                testing.assertEqual((st["delivered"], st["duplicates"], st["acked"]), (1, 1, 2), str(st))
+            report(t, outcome(check))
+
         t.timeout(30.0)
         c.inform(acked, notify.TRAP_LINK_DOWN, [VarBind(e([1, 1, 0]), Integer(3))], 500)
 
@@ -1338,29 +1335,29 @@ def _gated(g: _Gate, inner: ServerTransport) -> ServerTransport:
 actor _test_resync_then_silence(t: testing.AsyncT):
     """A notInTimeWindows Report, then the agent goes silent: the request still waits its whole retry budget
     after the resend (three attempts of 0.2 s), and the retries go out one by one"""
-    u = _sha_aes()
-    mn = MemNet()
-    srv = mn.server(AGENT, 161)
-    # datagrams the agent sends: the discovery Report, the notInTimeWindows Report, then nothing
-    agent = Agent(_gated(_Gate(srv, 2), srv), make_view(), agent_config([u]), t.log_handler,
-                  Faults(report_not_in_time_window_once=True))
-    c = _client(mn, u, 40001, Options(timeout=0.2, retries=2), t.log_handler)
-
-    def got(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
-        s = c.stats()
-        sends = [d.dst_port for d in mn.history() if d.src_port == 40001]
-        def check() -> None:
-            e = err
-            if isinstance(e, errors.TimeoutError):
-                testing.assertEqual(e.attempts, 4, "the request, the resend and two retries")
-                testing.assertTrue(e.elapsed >= 0.55, "gave up after %.3f s, before the resend's budget" % e.elapsed)
-            else:
-                raise AssertionError("expected a TimeoutError, got " + describe(Outcome(r, err)))
-            testing.assertEqual((s.retries, s.timeouts), (2, 1), str(s))
-            testing.assertEqual(len(sends), 5, "probe and four attempts")
-        report(t, outcome(check))
-
     proc def __startup__():
+        u = _sha_aes()
+        mn = MemNet()
+        srv = mn.server(AGENT, 161)
+        # datagrams the agent sends: the discovery Report, the notInTimeWindows Report, then nothing
+        agent = Agent(_gated(_Gate(srv, 2), srv), make_view(), agent_config([u]), t.log_handler,
+                      Faults(report_not_in_time_window_once=True))
+        c = _client(mn, u, 40001, Options(timeout=0.2, retries=2), t.log_handler)
+
+        def got(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+            s = c.stats()
+            sends = [d.dst_port for d in mn.history() if d.src_port == 40001]
+            def check() -> None:
+                e = err
+                if isinstance(e, errors.TimeoutError):
+                    testing.assertEqual(e.attempts, 4, "the request, the resend and two retries")
+                    testing.assertTrue(e.elapsed >= 0.55, "gave up after %.3f s, before the resend's budget" % e.elapsed)
+                else:
+                    raise AssertionError("expected a TimeoutError, got " + describe(Outcome(r, err)))
+                testing.assertEqual((s.retries, s.timeouts), (2, 1), str(s))
+                testing.assertEqual(len(sends), 5, "probe and four attempts")
+            report(t, outcome(check))
+
         t.timeout(30.0)
         c.get(got, [SYS_DESCR])
 

@@ -284,12 +284,12 @@ def request_steps() -> list[Step]:
 
 actor _test_requests(t: testing.AsyncT):
     """get, getnext, bulkget and set (v1, v2c, v3): stdout, stderr and exit codes as net-snmp's tools"""
-    mn = MemNet()
-
-    def finished(failures: list[str]) -> None:
-        finish(t, failures)
-
     proc def __startup__():
+        mn = MemNet()
+
+        def finished(failures: list[str]) -> None:
+            finish(t, failures)
+
         t.timeout(60.0)
 
         ag = Agent(mn.server(AGENT, 161), make_view(), make_config(), None)
@@ -347,12 +347,12 @@ def walk_steps() -> list[Step]:
 
 actor _test_walks(t: testing.AsyncT):
     """walk, bulkwalk and table as snmpwalk and snmpbulkwalk print them"""
-    mn = MemNet()
-
-    def finished(failures: list[str]) -> None:
-        finish(t, failures)
-
     proc def __startup__():
+        mn = MemNet()
+
+        def finished(failures: list[str]) -> None:
+            finish(t, failures)
+
         t.timeout(60.0)
 
         ag = Agent(mn.server(AGENT, 161), make_view(), make_config(), None)
@@ -364,32 +364,32 @@ actor _test_walks(t: testing.AsyncT):
 
 actor _test_walk_faults(t: testing.AsyncT):
     """A walk that meets a non-increasing OID (exit 1) or an error-status (exit 2), as net-snmp reports them"""
-    mn = MemNet()
-    pub = ["-v2c", "-c", "public", AGENT]
-    steps = [
-        Step(["walk"] + pub + [EP + ".10"],
-             table_lines([1], [1, 2], False) + EP + ".10.1.1.2 = INTEGER: 103\n",
-             "Error: OID not increasing: " + EP + ".10.1.1.2\n >= " + EP + ".10.1.1.2\n\n", 1),
-        Step(["bulkwalk", "-Cr3"] + pub + [EP + ".10"], table_lines([1], [1, 2], False) + EP + ".10.1.1.2 = INTEGER: 103\n",
-             "Error: OID not increasing: " + EP + ".10.1.1.2\n >= " + EP + ".10.1.1.2\n\n", 1, False),
-        Step(["walk", "-v2c", "-c", "public", "10.0.0.3", EP + ".10"],
-             table_lines([1], [1, 2, 3], False) + table_lines([2], [1, 2], False),
-             "Error in packet.\nReason: (genError) A general failure occured\nFailed object: " + EP + ".10.1.2.2\n\n", 2),
-        # table (Client.get_table): the rows found before the error, then the error
-        Step(["table"] + pub + [EP + ".10.1.1"], "",
-             "Error: OID not increasing: " + EP + ".10.1.1.2\n >= " + EP + ".10.1.1.2\n\n", 1, False),
-        Step(["table", "-Cr1", "-v2c", "-c", "public", "10.0.0.3", EP + ".10.1.2"], table_lines([2], [1, 2], True),
-             "Error in packet.\nReason: (genError) A general failure occured\nFailed object: " + EP + ".10.1.2.2\n\n", 2),
-        # GETBULK from 10.1.2.2 (the last OID of the first response) names the faulty OID
-        Step(["bulkwalk", "-Cr5", "-v2c", "-c", "public", "10.0.0.3", EP + ".10"],
-             table_lines([1], [1, 2, 3], False) + table_lines([2], [1, 2], False),
-             "Error in packet.\nReason: (genError) A general failure occured\nFailed object: " + EP + ".10.1.2.2\n\n", 2),
-    ]
-
-    def finished(failures: list[str]) -> None:
-        finish(t, failures)
-
     proc def __startup__():
+        mn = MemNet()
+        pub = ["-v2c", "-c", "public", AGENT]
+        steps = [
+            Step(["walk"] + pub + [EP + ".10"],
+                 table_lines([1], [1, 2], False) + EP + ".10.1.1.2 = INTEGER: 103\n",
+                 "Error: OID not increasing: " + EP + ".10.1.1.2\n >= " + EP + ".10.1.1.2\n\n", 1),
+            Step(["bulkwalk", "-Cr3"] + pub + [EP + ".10"], table_lines([1], [1, 2], False) + EP + ".10.1.1.2 = INTEGER: 103\n",
+                 "Error: OID not increasing: " + EP + ".10.1.1.2\n >= " + EP + ".10.1.1.2\n\n", 1, False),
+            Step(["walk", "-v2c", "-c", "public", "10.0.0.3", EP + ".10"],
+                 table_lines([1], [1, 2, 3], False) + table_lines([2], [1, 2], False),
+                 "Error in packet.\nReason: (genError) A general failure occured\nFailed object: " + EP + ".10.1.2.2\n\n", 2),
+            # table (Client.get_table): the rows found before the error, then the error
+            Step(["table"] + pub + [EP + ".10.1.1"], "",
+                 "Error: OID not increasing: " + EP + ".10.1.1.2\n >= " + EP + ".10.1.1.2\n\n", 1, False),
+            Step(["table", "-Cr1", "-v2c", "-c", "public", "10.0.0.3", EP + ".10.1.2"], table_lines([2], [1, 2], True),
+                 "Error in packet.\nReason: (genError) A general failure occured\nFailed object: " + EP + ".10.1.2.2\n\n", 2),
+            # GETBULK from 10.1.2.2 (the last OID of the first response) names the faulty OID
+            Step(["bulkwalk", "-Cr5", "-v2c", "-c", "public", "10.0.0.3", EP + ".10"],
+                 table_lines([1], [1, 2, 3], False) + table_lines([2], [1, 2], False),
+                 "Error in packet.\nReason: (genError) A general failure occured\nFailed object: " + EP + ".10.1.2.2\n\n", 2),
+        ]
+
+        def finished(failures: list[str]) -> None:
+            finish(t, failures)
+
         t.timeout(60.0)
 
         bad = Agent(mn.server(AGENT, 161), make_view(), make_config(), None, Faults(non_increasing_at=e([10, 1, 1, 3])))
@@ -459,12 +459,12 @@ def parity_steps() -> list[Step]:
 
 actor _test_parity(t: testing.AsyncT):
     """Command lines checked against net-snmp's output (interop/clicheck.sh): exact stdout, stderr, exit code"""
-    mn = MemNet()
-
-    def finished(failures: list[str]) -> None:
-        finish(t, failures)
-
     proc def __startup__():
+        mn = MemNet()
+
+        def finished(failures: list[str]) -> None:
+            finish(t, failures)
+
         t.timeout(60.0)
 
         ag = Agent(mn.server(AGENT, 161), make_view(), make_config(), None)
@@ -773,37 +773,36 @@ actor Recorder():
 
 actor _test_tcp_watch(t: testing.AsyncT):
     """TcpWatch passes everything on and reports a failed connection before any message, and one that is up, once"""
-    refused = "TCP connection to 10.0.0.1:161 failed: connection refused"
-    closed = "TCP connection to 10.0.0.1:161 closed by the peer"
-    broken = "TCP connection to 10.0.0.1:161 lost: broken pipe"
-
-    f1 = FakeLink()
-    w1 = TcpWatch()
-    r1 = Recorder()
-    f2 = FakeLink()
-    w2 = TcpWatch()
-    r2 = Recorder()
-
-    def settled() -> None:
-        e1 = r1.events()
-        e2 = r2.events()
-        def checks() -> None:
-            # a connection lost after it was up is no failed connection; registered after the
-            # failure, the callback still gets it, once
-            testing.assertEqual(e1, ["error " + closed, "error " + broken, "error " + refused,
-                                     "error TCP connection to 10.0.0.1:161 failed: network is unreachable",
-                                     "failed: Connection refused"])
-            # once the agent has answered, a failed connection is only passed on; the connection that
-            # came up is reported once, also to a callback registered afterwards
-            testing.assertEqual(e2, ["data 2 octets from 10.0.0.1:161", "error " + refused, "up"])
-        report(t, outcome(checks))
-
-    def registration_due() -> None:
-        w1.on_failure(r1.connection_failed)
-        w2.on_connect(r2.connected)
-        after 0.1: settled()
-
     proc def __startup__():
+        refused = "TCP connection to 10.0.0.1:161 failed: connection refused"
+        closed = "TCP connection to 10.0.0.1:161 closed by the peer"
+        broken = "TCP connection to 10.0.0.1:161 lost: broken pipe"
+        f1 = FakeLink()
+        w1 = TcpWatch()
+        r1 = Recorder()
+        f2 = FakeLink()
+        w2 = TcpWatch()
+        r2 = Recorder()
+
+        def settled() -> None:
+            e1 = r1.events()
+            e2 = r2.events()
+            def checks() -> None:
+                # a connection lost after it was up is no failed connection; registered after the
+                # failure, the callback still gets it, once
+                testing.assertEqual(e1, ["error " + closed, "error " + broken, "error " + refused,
+                                         "error TCP connection to 10.0.0.1:161 failed: network is unreachable",
+                                         "failed: Connection refused"])
+                # once the agent has answered, a failed connection is only passed on; the connection that
+                # came up is reported once, also to a callback registered afterwards
+                testing.assertEqual(e2, ["data 2 octets from 10.0.0.1:161", "error " + refused, "up"])
+            report(t, outcome(checks))
+
+        def registration_due() -> None:
+            w1.on_failure(r1.connection_failed)
+            w2.on_connect(r2.connected)
+            after 0.1: settled()
+
         t.timeout(10.0)
 
         t1 = w1.watch(fake_transport(f1))
@@ -973,24 +972,24 @@ actor LabWalk(t: testing.EnvT, args: list[str], expected_file: str, sort_lines: 
     sort_lines compares the sorted lines (a table printed in row order
     against a recorded walk in column order); tree: the MIBs to print with.
     """
-    mn = MemNet()
-    o = cliopts.parse(["actsnmp", "agent"])
-
-    def walked(expected: str, r: Result) -> None:
-        out = sorted_lines(r.out) if sort_lines else r.out
-        if r.code == 0 and r.err == "" and out == expected:
-            t.success()
-        else:
-            n = 0
-            got = out.split("\n")
-            want = expected.split("\n")
-            while n < len(got) and n < len(want) and got[n] == want[n]:
-                n += 1
-            t.failure(AssertionError("exit %d, err %r; first difference at line %d: got %r, expected %r"
-                                     % (r.code, r.err, n + 1, got[n] if n < len(got) else "<end>",
-                                        want[n] if n < len(want) else "<end>")))
-
     proc def __startup__():
+        mn = MemNet()
+        o = cliopts.parse(["actsnmp", "agent"])
+
+        def walked(expected: str, r: Result) -> None:
+            out = sorted_lines(r.out) if sort_lines else r.out
+            if r.code == 0 and r.err == "" and out == expected:
+                t.success()
+            else:
+                n = 0
+                got = out.split("\n")
+                want = expected.split("\n")
+                while n < len(got) and n < len(want) and got[n] == want[n]:
+                    n += 1
+                t.failure(AssertionError("exit %d, err %r; first difference at line %d: got %r, expected %r"
+                                         % (r.code, r.err, n + 1, got[n] if n < len(got) else "<end>",
+                                            want[n] if n < len(want) else "<end>")))
+
         config = actsnmp.agent_config(o, read_text(t, cliopts.LAB_WRITE_RULES), read_text(t, cliopts.LAB_USERS))
         view = mibview.load_snmprec(read_text(t, cliopts.LAB_SNMPREC))
         expected_text = read_text(t, expected_file)
@@ -1166,12 +1165,12 @@ def mib_steps() -> list[Step]:
 
 actor _test_with_mibs(t: testing.AsyncT):
     """get, walk, bulkwalk, table and set with MIBs: names in and out, values as net-snmp prints them with MIBs"""
-    mn = MemNet()
-
-    def finished(failures: list[str]) -> None:
-        finish(t, failures)
-
     proc def __startup__():
+        mn = MemNet()
+
+        def finished(failures: list[str]) -> None:
+            finish(t, failures)
+
         t.timeout(60.0)
 
         ag = Agent(mn.server(AGENT, 161), make_view(), make_config(), None)

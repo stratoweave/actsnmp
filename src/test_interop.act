@@ -1553,71 +1553,71 @@ actor _SnmpdRestart(t: testing.EnvT, users_from_file: list[LabUser]):
     answers with an authenticated notInTimeWindows Report (RFC 3414 3.2
     step 7b). The Client resynchronises from it and resends.
     """
-    cap = udp_cap(t)
-    u = find_user(users_from_file, "u_sha_aes")
-
-    def finished(name: str, got: dict[str, Outcome]) -> None:
-        def run() -> None:
-            same_lines(lines_of(outcome_of(got, "before"), "before"),
-                       [".1.3.6.1.4.1.8072.9999.1.1.18.0 = INTEGER: 2147483647"], "before the restart")
-            ib = outcome_of(got, "info before").info
-            if ib is not None:
-                check(ib.boots == 1 and ib.time >= RESTART_MIN_UPTIME - 5, "engine before: " + repr(ib))
-            else:
-                raise AssertionError("no engine info before the restart")
-            o = outcome_of(got, "restart")
-            check(o.code == 0, "docker restart: %d %s" % (o.code, clip(o.text)))
-            response(outcome_of(got, "probe"), "snmpd answers again")
-            # the request, snmpd's authenticated notInTimeWindows Report (time back by more than 150 s),
-            # the resend with the resynchronised clock
-            r = response(outcome_of(got, "after restart"), "the first request after the restart")
-            same_lines(lines(r.varbinds), [".1.3.6.1.4.1.8072.9999.1.1.18.0 = INTEGER: 2147483647"],
-                       "the first request after the restart")
-            check(r.attempts == 2, "%d datagrams for the first request after the restart" % r.attempts)
-            same_lines(lines_of(outcome_of(got, "again"), "again"),
-                       [".1.3.6.1.4.1.8072.9999.1.1.18.0 = INTEGER: 2147483647"], "the next request")
-            ia = outcome_of(got, "info after").info
-            if ia is not None:
-                check(ia.engine_id == SNMPD.engine_id and ia.boots == 1 and ia.time < 60, "engine after: " + repr(ia))
-            else:
-                raise AssertionError("no engine info after the restart")
-            st = outcome_of(got, "info after").stats
-            if st is not None:
-                # one discovery and the notInTimeWindows Report; no request lost, nothing dropped
-                check(st.reports == 2 and st.timeouts == 0 and st.retries == 0 and st.drops_auth == 0,
-                      "counters: " + str(st))
-        report_env(t, outcome(run))
-
-    def restart() -> None:
-        c = Client(cap, LOCAL4, u, None, port=SNMPD.port, opts=Options(timeout=1.0, retries=1))
-        probe = Client(cap, LOCAL4, Community("public"), None, port=SNMPD.port, opts=Options(timeout=1.0, retries=30))
-        steps = [get_step("before", c, [b([1, 18, 0])]), info_step("info before", c),
-                 shell_step("restart", ["docker", "restart", "actsnmp-snmpd"], 60.0),
-                 get_step("probe", probe, [b([1, 1, 0])]),
-                 get_step("after restart", c, [b([1, 18, 0])]),
-                 get_step("again", c, [b([1, 18, 0])]), info_step("info after", c)]
-        s = Script("restart", steps, finished, t.env.process)
-
-    def measured(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-        c.close()
-        uptime = 0
-        if r is not None:
-            v = r.varbinds[0].value
-            if isinstance(v, Integer):
-                uptime = v.value
-        else:
-            t.failure(AssertionError("GET snmpEngineTime.0: " + str(e)))
-            return
-        if uptime < RESTART_MIN_UPTIME:
-            after now float(RESTART_MIN_UPTIME - uptime): restart()
-        else:
-            restart()
-
-    def lab_up() -> None:
-        m = Client(cap, LOCAL4, Community("public"), None, port=SNMPD.port, opts=OPTS)
-        m.get(measured, [SNMP_ENGINE_TIME])
-
     proc def __startup__():
+        cap = udp_cap(t)
+        u = find_user(users_from_file, "u_sha_aes")
+
+        def finished(name: str, got: dict[str, Outcome]) -> None:
+            def run() -> None:
+                same_lines(lines_of(outcome_of(got, "before"), "before"),
+                           [".1.3.6.1.4.1.8072.9999.1.1.18.0 = INTEGER: 2147483647"], "before the restart")
+                ib = outcome_of(got, "info before").info
+                if ib is not None:
+                    check(ib.boots == 1 and ib.time >= RESTART_MIN_UPTIME - 5, "engine before: " + repr(ib))
+                else:
+                    raise AssertionError("no engine info before the restart")
+                o = outcome_of(got, "restart")
+                check(o.code == 0, "docker restart: %d %s" % (o.code, clip(o.text)))
+                response(outcome_of(got, "probe"), "snmpd answers again")
+                # the request, snmpd's authenticated notInTimeWindows Report (time back by more than 150 s),
+                # the resend with the resynchronised clock
+                r = response(outcome_of(got, "after restart"), "the first request after the restart")
+                same_lines(lines(r.varbinds), [".1.3.6.1.4.1.8072.9999.1.1.18.0 = INTEGER: 2147483647"],
+                           "the first request after the restart")
+                check(r.attempts == 2, "%d datagrams for the first request after the restart" % r.attempts)
+                same_lines(lines_of(outcome_of(got, "again"), "again"),
+                           [".1.3.6.1.4.1.8072.9999.1.1.18.0 = INTEGER: 2147483647"], "the next request")
+                ia = outcome_of(got, "info after").info
+                if ia is not None:
+                    check(ia.engine_id == SNMPD.engine_id and ia.boots == 1 and ia.time < 60, "engine after: " + repr(ia))
+                else:
+                    raise AssertionError("no engine info after the restart")
+                st = outcome_of(got, "info after").stats
+                if st is not None:
+                    # one discovery and the notInTimeWindows Report; no request lost, nothing dropped
+                    check(st.reports == 2 and st.timeouts == 0 and st.retries == 0 and st.drops_auth == 0,
+                          "counters: " + str(st))
+            report_env(t, outcome(run))
+
+        def restart() -> None:
+            c = Client(cap, LOCAL4, u, None, port=SNMPD.port, opts=Options(timeout=1.0, retries=1))
+            probe = Client(cap, LOCAL4, Community("public"), None, port=SNMPD.port, opts=Options(timeout=1.0, retries=30))
+            steps = [get_step("before", c, [b([1, 18, 0])]), info_step("info before", c),
+                     shell_step("restart", ["docker", "restart", "actsnmp-snmpd"], 60.0),
+                     get_step("probe", probe, [b([1, 1, 0])]),
+                     get_step("after restart", c, [b([1, 18, 0])]),
+                     get_step("again", c, [b([1, 18, 0])]), info_step("info after", c)]
+            s = Script("restart", steps, finished, t.env.process)
+
+        def measured(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            c.close()
+            uptime = 0
+            if r is not None:
+                v = r.varbinds[0].value
+                if isinstance(v, Integer):
+                    uptime = v.value
+            else:
+                t.failure(AssertionError("GET snmpEngineTime.0: " + str(e)))
+                return
+            if uptime < RESTART_MIN_UPTIME:
+                after now float(RESTART_MIN_UPTIME - uptime): restart()
+            else:
+                restart()
+
+        def lab_up() -> None:
+            m = Client(cap, LOCAL4, Community("public"), None, port=SNMPD.port, opts=OPTS)
+            m.get(measured, [SNMP_ENGINE_TIME])
+
         t.timeout(300.0)
         t.require("interop")
 
@@ -2109,68 +2109,67 @@ actor _test_snmpd_tcp(t: testing.EnvT):
     """snmpd over TCP: GET of the scalars with SNMPv1, SNMPv2c and SNMPv3 authPriv (discovery on the
     connection), GETNEXT, GETBULK, bulk walks of the dataset with SNMPv2c and SNMPv3, GETNEXT walks and IPv6,
     without a retry; a refused connection is a TimeoutError whose hint is the refusal"""
-
-    def finished(full, full_v1, scal, name: str, got: dict[str, Outcome]) -> None:
-        def run() -> None:
-            failures: list[str] = []
-
-            def gets() -> None:
-                same_lines(lines_of(outcome_of(got, "v2c get scalars"), "v2c"), scal,
-                           "SNMPv2c GET of the 70 scalars")
-                same_lines(lines_of(outcome_of(got, "v1 get scalars"), "v1"), v1_get_lines(scal),
-                           "SNMPv1 GET of the 70 scalars")
-                same_lines(lines_of(outcome_of(got, "v3 get scalars"), "v3"), scal, "SNMPv3 GET of the 70 scalars")
-                same_lines(lines_of(outcome_of(got, "ipv6 v3 get scalars"), "ipv6 v3"), scal,
-                           "SNMPv3 GET of the 70 scalars over IPv6")
-            attempt(failures, "GET", gets)
-
-            def getnext() -> None:
-                same_lines(lines_of(outcome_of(got, "v2c getnext"), "getnext"),
-                           next_lines(full, [BASE, b([1, 19, 0]), b([10, 1, 1])]), "GETNEXT")
-                same_lines(lines_of(outcome_of(got, "v2c getbulk"), "getbulk"),
-                           next_lines(full, [b([1])]) + under(full, b([10, 1, 2]))[:3], "GETBULK N=1 R=3")
-            attempt(failures, "GETNEXT and GETBULK", getnext)
-
-            def walks() -> None:
-                same_lines(lines(walk_result(outcome_of(got, "v2c bulk walk"), "v2c bulk walk")), full,
-                           "SNMPv2c bulk walk of B")
-                same_lines(lines(walk_result(outcome_of(got, "v3 bulk walk"), "v3 bulk walk")), full,
-                           "SNMPv3 bulk walk of B")
-                same_lines(lines(walk_result(outcome_of(got, "v2c getnext walk"), "v2c getnext walk")),
-                           under(full, b([10])), "SNMPv2c GETNEXT walk of B.10")
-                same_lines(lines(walk_result(outcome_of(got, "v1 walk"), "v1 walk")), under(full_v1, b([11])),
-                           "SNMPv1 walk of B.11")
-                same_lines(lines(walk_result(outcome_of(got, "ipv6 bulk walk"), "ipv6 bulk walk")),
-                           under(full, b([12])), "bulk walk of B.12 over IPv6")
-            attempt(failures, "walks", walks)
-
-            def one_attempt_each() -> None:
-                for label in ["v2c stats", "v1 stats", "v3 stats"]:
-                    st = outcome_of(got, label).stats
-                    if st is not None:
-                        check(st.retries == 0 and st.timeouts == 0 and st.transport_failures == 0,
-                              label + ": " + str(st))
-                    else:
-                        raise AssertionError(label + ": no stats")
-                info = outcome_of(got, "v3 stats").info
-                if info is not None:
-                    check(info.engine_id == SNMPD.engine_id, "discovered engine ID 0x" + info.engine_id.hex())
-                else:
-                    raise AssertionError("v3: no engine information")
-            attempt(failures, "retries", one_attempt_each)
-
-            def refused() -> None:
-                e = expect_timeout(outcome_of(got, "refused"), "refused")
-                check(e.hint == "send error: TCP connection to 127.0.0.1:%d failed: connection refused" % CLOSED_PORT,
-                      "hint: " + str(e.hint))
-            attempt(failures, "refused", refused)
-            all_passed(failures)
-        report_env(t, outcome(run))
-
-    def lab_up(full, full_v1, scal, steps) -> None:
-        s = Script("tcp", steps, (lambda name, got: finished(full, full_v1, scal, name, got)))
-
     proc def __startup__():
+        def finished(full, full_v1, scal, name: str, got: dict[str, Outcome]) -> None:
+            def run() -> None:
+                failures: list[str] = []
+
+                def gets() -> None:
+                    same_lines(lines_of(outcome_of(got, "v2c get scalars"), "v2c"), scal,
+                               "SNMPv2c GET of the 70 scalars")
+                    same_lines(lines_of(outcome_of(got, "v1 get scalars"), "v1"), v1_get_lines(scal),
+                               "SNMPv1 GET of the 70 scalars")
+                    same_lines(lines_of(outcome_of(got, "v3 get scalars"), "v3"), scal, "SNMPv3 GET of the 70 scalars")
+                    same_lines(lines_of(outcome_of(got, "ipv6 v3 get scalars"), "ipv6 v3"), scal,
+                               "SNMPv3 GET of the 70 scalars over IPv6")
+                attempt(failures, "GET", gets)
+
+                def getnext() -> None:
+                    same_lines(lines_of(outcome_of(got, "v2c getnext"), "getnext"),
+                               next_lines(full, [BASE, b([1, 19, 0]), b([10, 1, 1])]), "GETNEXT")
+                    same_lines(lines_of(outcome_of(got, "v2c getbulk"), "getbulk"),
+                               next_lines(full, [b([1])]) + under(full, b([10, 1, 2]))[:3], "GETBULK N=1 R=3")
+                attempt(failures, "GETNEXT and GETBULK", getnext)
+
+                def walks() -> None:
+                    same_lines(lines(walk_result(outcome_of(got, "v2c bulk walk"), "v2c bulk walk")), full,
+                               "SNMPv2c bulk walk of B")
+                    same_lines(lines(walk_result(outcome_of(got, "v3 bulk walk"), "v3 bulk walk")), full,
+                               "SNMPv3 bulk walk of B")
+                    same_lines(lines(walk_result(outcome_of(got, "v2c getnext walk"), "v2c getnext walk")),
+                               under(full, b([10])), "SNMPv2c GETNEXT walk of B.10")
+                    same_lines(lines(walk_result(outcome_of(got, "v1 walk"), "v1 walk")), under(full_v1, b([11])),
+                               "SNMPv1 walk of B.11")
+                    same_lines(lines(walk_result(outcome_of(got, "ipv6 bulk walk"), "ipv6 bulk walk")),
+                               under(full, b([12])), "bulk walk of B.12 over IPv6")
+                attempt(failures, "walks", walks)
+
+                def one_attempt_each() -> None:
+                    for label in ["v2c stats", "v1 stats", "v3 stats"]:
+                        st = outcome_of(got, label).stats
+                        if st is not None:
+                            check(st.retries == 0 and st.timeouts == 0 and st.transport_failures == 0,
+                                  label + ": " + str(st))
+                        else:
+                            raise AssertionError(label + ": no stats")
+                    info = outcome_of(got, "v3 stats").info
+                    if info is not None:
+                        check(info.engine_id == SNMPD.engine_id, "discovered engine ID 0x" + info.engine_id.hex())
+                    else:
+                        raise AssertionError("v3: no engine information")
+                attempt(failures, "retries", one_attempt_each)
+
+                def refused() -> None:
+                    e = expect_timeout(outcome_of(got, "refused"), "refused")
+                    check(e.hint == "send error: TCP connection to 127.0.0.1:%d failed: connection refused" % CLOSED_PORT,
+                          "hint: " + str(e.hint))
+                attempt(failures, "refused", refused)
+                all_passed(failures)
+            report_env(t, outcome(run))
+
+        def lab_up(full, full_v1, scal, steps) -> None:
+            s = Script("tcp", steps, (lambda name, got: finished(full, full_v1, scal, name, got)))
+
         lab = lab_users(t)
 
         t.timeout(120.0)

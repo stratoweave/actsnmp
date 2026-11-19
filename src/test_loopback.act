@@ -216,30 +216,30 @@ actor _test_notifications_ipv4(t: testing.EnvT):
 
 actor _test_icmp_unreachable(t: testing.EnvT):
     """A GET to a closed UDP port times out with the hint "ICMP port unreachable\""""
-    ucap = net.UDPCap(net.NetCap(t.env.cap))
-
-    def got(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-        c.close()
-        def check() -> None:
-            if isinstance(e, errors.TimeoutError):
-                testing.assertEqual(e.hint, "ICMP port unreachable")
-                testing.assertTrue(c.stats().unreachable >= 1, "Stats.unreachable")
-            else:
-                raise AssertionError("expected a TimeoutError, got " + (str(e) if e is not None else "a response"))
-        report_env(t, outcome(check))
-
-    def listening(st: ServerTransport, error: ?str) -> None:
-        if error is not None:
-            t.failure(AssertionError("listen failed: " + error))
-            return
-        # bind, note the port, close: nothing listens there afterwards
-        port = st.local_port()
-        st.close()
-        c = Client(net.UDPConnectCap(ucap), "127.0.0.1", Community("public"), t.log_handler, port=port,
-                   opts=Options(timeout=0.3, retries=1))
-        c.get(got, [SYS_DESCR])
-
     proc def __startup__():
+        ucap = net.UDPCap(net.NetCap(t.env.cap))
+
+        def got(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            c.close()
+            def check() -> None:
+                if isinstance(e, errors.TimeoutError):
+                    testing.assertEqual(e.hint, "ICMP port unreachable")
+                    testing.assertTrue(c.stats().unreachable >= 1, "Stats.unreachable")
+                else:
+                    raise AssertionError("expected a TimeoutError, got " + (str(e) if e is not None else "a response"))
+            report_env(t, outcome(check))
+
+        def listening(st: ServerTransport, error: ?str) -> None:
+            if error is not None:
+                t.failure(AssertionError("listen failed: " + error))
+                return
+            # bind, note the port, close: nothing listens there afterwards
+            port = st.local_port()
+            st.close()
+            c = Client(net.UDPConnectCap(ucap), "127.0.0.1", Community("public"), t.log_handler, port=port,
+                       opts=Options(timeout=0.3, retries=1))
+            c.get(got, [SYS_DESCR])
+
         t.timeout(15.0)
 
         udp_server_transport(net.UDPListenCap(ucap), "127.0.0.1", 0, listening, t.log_handler)
@@ -477,20 +477,19 @@ actor _test_tcp_server_idle_timeout_reconnects(t: testing.EnvT):
 
 actor _test_tcp_refused(t: testing.EnvT):
     """A GET to a closed TCP port times out with the refused connection as the hint"""
-
-    def got(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-        stats = c.stats()
-        c.close()
-        def check() -> None:
-            if isinstance(e, errors.TimeoutError):
-                testing.assertEqual(e.hint, "send error: TCP connection to 127.0.0.1:%d failed: connection refused"
-                                    % TCP_CLOSED_PORT)
-                testing.assertEqual(stats.unreachable, 0)
-            else:
-                raise AssertionError("expected a TimeoutError, got " + (str(e) if e is not None else "a response"))
-        report_env(t, outcome(check))
-
     proc def __startup__():
+        def got(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            stats = c.stats()
+            c.close()
+            def check() -> None:
+                if isinstance(e, errors.TimeoutError):
+                    testing.assertEqual(e.hint, "send error: TCP connection to 127.0.0.1:%d failed: connection refused"
+                                        % TCP_CLOSED_PORT)
+                    testing.assertEqual(stats.unreachable, 0)
+                else:
+                    raise AssertionError("expected a TimeoutError, got " + (str(e) if e is not None else "a response"))
+            report_env(t, outcome(check))
+
         t.timeout(15.0)
 
         c = _tcp_client(t, TCP_CLOSED_PORT, Community("public"), Options(timeout=0.3, retries=1))
@@ -910,37 +909,37 @@ actor _test_tcp_cli_servers(t: testing.EnvT):
 
 actor _test_host_lookup(t: testing.EnvT):
     """HostLookup: AAAA only for udp6: and tcp6: (localhost is ::1, an IPv4 address does not resolve), else IPv4 first"""
-    dcap = net.DNSCap(net.NetCap(t.env.cap))
-    var found: dict[str, str] = {}
-    var lookups: list[actsnmp.HostLookup] = []
-
-    proc def _found(name: str, address: str) -> None:
-        found[name] = address
-        if len(found) == 4:
-            if found["localhost v6"] == "":
-                _skip_env(t, "the hosts file gives localhost no IPv6 address")
-                return
-            def check() -> None:
-                testing.assertEqual(found["localhost v6"], "::1")
-                testing.assertEqual(found["localhost"], "127.0.0.1")
-                testing.assertEqual(found["127.0.0.1 v6"], "")
-                # no IPv4 address: the IPv6 one
-                testing.assertEqual(found["::1"], "::1")
-            report_env(t, outcome(check))
-
-    def resolved_v6(address: str) -> None:
-        _found("localhost v6", address)
-
-    def resolved_any(address: str) -> None:
-        _found("localhost", address)
-
-    def resolved_v4_as_v6(address: str) -> None:
-        _found("127.0.0.1 v6", address)
-
-    def resolved_v6_only(address: str) -> None:
-        _found("::1", address)
-
     proc def __startup__():
+        dcap = net.DNSCap(net.NetCap(t.env.cap))
+        found: dict[str, str] = {}
+        lookups: list[actsnmp.HostLookup] = []
+
+        proc def _found(name: str, address: str) -> None:
+            found[name] = address
+            if len(found) == 4:
+                if found["localhost v6"] == "":
+                    _skip_env(t, "the hosts file gives localhost no IPv6 address")
+                    return
+                def check() -> None:
+                    testing.assertEqual(found["localhost v6"], "::1")
+                    testing.assertEqual(found["localhost"], "127.0.0.1")
+                    testing.assertEqual(found["127.0.0.1 v6"], "")
+                    # no IPv4 address: the IPv6 one
+                    testing.assertEqual(found["::1"], "::1")
+                report_env(t, outcome(check))
+
+        def resolved_v6(address: str) -> None:
+            _found("localhost v6", address)
+
+        def resolved_any(address: str) -> None:
+            _found("localhost", address)
+
+        def resolved_v4_as_v6(address: str) -> None:
+            _found("127.0.0.1 v6", address)
+
+        def resolved_v6_only(address: str) -> None:
+            _found("::1", address)
+
         t.timeout(15.0)
 
         lookups.append(actsnmp.HostLookup(dcap, "localhost", True, resolved_v6))

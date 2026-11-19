@@ -144,26 +144,26 @@ def _test_datagram_repr() -> None:
 
 actor _test_mem_roundtrip(t: testing.AsyncT):
     """A datagram and its reply cross a mem_pair with the sources of the two ends"""
-    mn = MemNet()
-    var log: list[(bytes, str, int)] = []
-
-    def check(p: (client: Transport, server: ServerTransport)) -> None:
-        testing.assertEqual(log, [(b"ping", "10.0.0.2", 40000), (b"pong", "10.0.0.1", 161)])
-        testing.assertEqual(repr(mn.stats()), _counts(sent=2, delivered=2))
-        testing.assertEqual(p.server.local_port(), 161)
-
-    def server_received(p: (client: Transport, server: ServerTransport), data: bytes, address: str, port: int) -> None:
-        log.append((data, address, port))
-        p.server.send_to(b"pong", address, port)
-
-    def client_received(p: (client: Transport, server: ServerTransport), data: bytes, address: str, port: int) -> None:
-        log.append((data, address, port))
-        report(t, outcome((lambda: check(p))))
-
-    def client_failed(message: str, fatal: bool) -> None:
-        t.failure(AssertionError("unexpected error: " + message))
-
     proc def __startup__():
+        mn = MemNet()
+        log: list[(bytes, str, int)] = []
+
+        def check(p: (client: Transport, server: ServerTransport)) -> None:
+            testing.assertEqual(log, [(b"ping", "10.0.0.2", 40000), (b"pong", "10.0.0.1", 161)])
+            testing.assertEqual(repr(mn.stats()), _counts(sent=2, delivered=2))
+            testing.assertEqual(p.server.local_port(), 161)
+
+        def server_received(p: (client: Transport, server: ServerTransport), data: bytes, address: str, port: int) -> None:
+            log.append((data, address, port))
+            p.server.send_to(b"pong", address, port)
+
+        def client_received(p: (client: Transport, server: ServerTransport), data: bytes, address: str, port: int) -> None:
+            log.append((data, address, port))
+            report(t, outcome((lambda: check(p))))
+
+        def client_failed(message: str, fatal: bool) -> None:
+            t.failure(AssertionError("unexpected error: " + message))
+
         p = mem_pair(mn)
 
         p.server.set_receiver((lambda data, address, port: server_received(p, data, address, port)))
@@ -175,28 +175,28 @@ actor _test_mem_roundtrip(t: testing.AsyncT):
 
 actor _test_mem_order(t: testing.AsyncT):
     """Many datagrams in both directions keep their order"""
-    mn = MemNet()
-    count = 100
-    var at_server: list[bytes] = []
-    var at_client: list[bytes] = []
-
-    def check() -> None:
-        testing.assertEqual(at_server, _numbered(count))
-        testing.assertEqual(at_client, [b"re:" + d for d in _numbered(count)])
-
-    def server_received(p: (client: Transport, server: ServerTransport), data: bytes, address: str, port: int) -> None:
-        at_server.append(data)
-        p.server.send_to(b"re:" + data, address, port)
-
-    def client_received(data: bytes, address: str, port: int) -> None:
-        at_client.append(data)
-        if len(at_client) == count:
-            report(t, outcome(check))
-
-    def client_failed(message: str, fatal: bool) -> None:
-        t.failure(AssertionError("unexpected error: " + message))
-
     proc def __startup__():
+        mn = MemNet()
+        count = 100
+        at_server: list[bytes] = []
+        at_client: list[bytes] = []
+
+        def check() -> None:
+            testing.assertEqual(at_server, _numbered(count))
+            testing.assertEqual(at_client, [b"re:" + d for d in _numbered(count)])
+
+        def server_received(p: (client: Transport, server: ServerTransport), data: bytes, address: str, port: int) -> None:
+            at_server.append(data)
+            p.server.send_to(b"re:" + data, address, port)
+
+        def client_received(data: bytes, address: str, port: int) -> None:
+            at_client.append(data)
+            if len(at_client) == count:
+                report(t, outcome(check))
+
+        def client_failed(message: str, fatal: bool) -> None:
+            t.failure(AssertionError("unexpected error: " + message))
+
         p = mem_pair(mn, "192.0.2.2", 5000, "192.0.2.1", 1161)
 
         p.server.set_receiver((lambda data, address, port: server_received(p, data, address, port)))
@@ -209,32 +209,32 @@ actor _test_mem_order(t: testing.AsyncT):
 
 actor _test_mem_many_peers(t: testing.AsyncT):
     """One server, three clients on ephemeral ports: replies reach the right client"""
-    mn = MemNet()
-    var at_server: list[(bytes, str, int)] = []
-    var at_clients: list[(int, bytes, str, int)] = []
-
-    def check() -> None:
-        testing.assertEqual(sorted(at_server), [(b"c0", "10.0.0.2", 49152), (b"c1", "10.0.0.3", 49153),
-                                                (b"c2", "10.0.0.4", 49154)])
-        testing.assertEqual(sorted(at_clients), [(0, b"to 10.0.0.2", "10.0.0.1", 161),
-                                                 (1, b"to 10.0.0.3", "10.0.0.1", 161),
-                                                 (2, b"to 10.0.0.4", "10.0.0.1", 161)])
-
-    def server_received(srv: ServerTransport, data: bytes, address: str, port: int) -> None:
-        at_server.append((data, address, port))
-        srv.send_to(b"to " + address.encode(), address, port)
-
-    def client_failed(message: str, fatal: bool) -> None:
-        t.failure(AssertionError("unexpected error: " + message))
-
-    def receiver(i: int) -> action(bytes, str, int) -> None:
-        def client_received(data: bytes, address: str, port: int) -> None:
-            at_clients.append((i, data, address, port))
-            if len(at_clients) == 3:
-                report(t, outcome(check))
-        return client_received
-
     proc def __startup__():
+        mn = MemNet()
+        at_server: list[(bytes, str, int)] = []
+        at_clients: list[(int, bytes, str, int)] = []
+
+        def check() -> None:
+            testing.assertEqual(sorted(at_server), [(b"c0", "10.0.0.2", 49152), (b"c1", "10.0.0.3", 49153),
+                                                    (b"c2", "10.0.0.4", 49154)])
+            testing.assertEqual(sorted(at_clients), [(0, b"to 10.0.0.2", "10.0.0.1", 161),
+                                                     (1, b"to 10.0.0.3", "10.0.0.1", 161),
+                                                     (2, b"to 10.0.0.4", "10.0.0.1", 161)])
+
+        def server_received(srv: ServerTransport, data: bytes, address: str, port: int) -> None:
+            at_server.append((data, address, port))
+            srv.send_to(b"to " + address.encode(), address, port)
+
+        def client_failed(message: str, fatal: bool) -> None:
+            t.failure(AssertionError("unexpected error: " + message))
+
+        def receiver(i: int) -> action(bytes, str, int) -> None:
+            def client_received(data: bytes, address: str, port: int) -> None:
+                at_clients.append((i, data, address, port))
+                if len(at_clients) == 3:
+                    report(t, outcome(check))
+            return client_received
+
         srv = mn.server("10.0.0.1", 161)
         clients = [mn.client("10.0.0.%d" % (i + 2), 0, "10.0.0.1", 161) for i in range(3)]
 
@@ -248,52 +248,53 @@ actor _test_mem_many_peers(t: testing.AsyncT):
 
 actor _test_mem_bind_rules(t: testing.AsyncT):
     """Ephemeral port allocation, address conflicts and invalid arguments"""
-    mn = MemNet()
-
-    # Each call uses the result, so it is synchronous and a ValueError in
-    # MemNet reaches the caller
-    def server_fails(address: str, port: int) -> bool:
-        try:
-            s = mn.server(address, port)
-        except ValueError:
-            return True
-        return False
-
-    def client_fails(address: str, port: int, peer_port: int) -> bool:
-        try:
-            c = mn.client(address, port, "10.0.0.1", peer_port)
-        except ValueError:
-            return True
-        return False
-
-    def pair_fails() -> bool:
-        try:
-            p = mem_pair(mn, server_addr="10.0.0.1", server_port=161)
-        except ValueError:
-            return True
-        return False
-
-    def check() -> None:
-        testing.assertEqual(mn.server("10.0.0.1", 0).local_port(), 49152)
-        testing.assertEqual(mn.server("10.0.0.1", 0).local_port(), 49153)
-        testing.assertEqual(mn.server("10.0.0.9", 0).local_port(), 49154)
-        testing.assertEqual(mn.server("10.0.0.1", 161).local_port(), 161)
-        testing.assertEqual(mn.server("10.0.0.2", 161).local_port(), 161)
-        testing.assertTrue(server_fails("10.0.0.1", 161), "address in use")
-        testing.assertTrue(server_fails("10.0.0.1", 49152), "ephemeral address in use")
-        testing.assertTrue(client_fails("10.0.0.1", 161, 161), "client on an address in use")
-        testing.assertTrue(server_fails("", 161), "empty address")
-        testing.assertTrue(server_fails("10.0.0.3", -1), "port -1")
-        testing.assertTrue(server_fails("10.0.0.3", 65536), "port 65536")
-        testing.assertTrue(client_fails("10.0.0.3", 1, 0), "peer port 0")
-        testing.assertTrue(client_fails("10.0.0.3", 1, 65536), "peer port 65536")
-        testing.assertTrue(pair_fails(), "mem_pair on an address in use")
-        testing.assertFalse(server_fails("10.0.0.3", 65535), "port 65535")
-        p = mem_pair(mn, "10.0.0.5", 0, "10.0.0.6", 0)
-        testing.assertEqual(p.server.local_port(), 49155)
-        testing.assertEqual(mn.stats().sent, 0)
-
     proc def __startup__():
+        mn = MemNet()
+
+        # Each call uses the result, so it is synchronous and a ValueError in
+        # MemNet reaches the caller
+
+        def server_fails(address: str, port: int) -> bool:
+            try:
+                s = mn.server(address, port)
+            except ValueError:
+                return True
+            return False
+
+        def client_fails(address: str, port: int, peer_port: int) -> bool:
+            try:
+                c = mn.client(address, port, "10.0.0.1", peer_port)
+            except ValueError:
+                return True
+            return False
+
+        def pair_fails() -> bool:
+            try:
+                p = mem_pair(mn, server_addr="10.0.0.1", server_port=161)
+            except ValueError:
+                return True
+            return False
+
+        def check() -> None:
+            testing.assertEqual(mn.server("10.0.0.1", 0).local_port(), 49152)
+            testing.assertEqual(mn.server("10.0.0.1", 0).local_port(), 49153)
+            testing.assertEqual(mn.server("10.0.0.9", 0).local_port(), 49154)
+            testing.assertEqual(mn.server("10.0.0.1", 161).local_port(), 161)
+            testing.assertEqual(mn.server("10.0.0.2", 161).local_port(), 161)
+            testing.assertTrue(server_fails("10.0.0.1", 161), "address in use")
+            testing.assertTrue(server_fails("10.0.0.1", 49152), "ephemeral address in use")
+            testing.assertTrue(client_fails("10.0.0.1", 161, 161), "client on an address in use")
+            testing.assertTrue(server_fails("", 161), "empty address")
+            testing.assertTrue(server_fails("10.0.0.3", -1), "port -1")
+            testing.assertTrue(server_fails("10.0.0.3", 65536), "port 65536")
+            testing.assertTrue(client_fails("10.0.0.3", 1, 0), "peer port 0")
+            testing.assertTrue(client_fails("10.0.0.3", 1, 65536), "peer port 65536")
+            testing.assertTrue(pair_fails(), "mem_pair on an address in use")
+            testing.assertFalse(server_fails("10.0.0.3", 65535), "port 65535")
+            p = mem_pair(mn, "10.0.0.5", 0, "10.0.0.6", 0)
+            testing.assertEqual(p.server.local_port(), 49155)
+            testing.assertEqual(mn.stats().sent, 0)
+
         report(t, outcome(check))
 
     __startup__()
@@ -301,25 +302,25 @@ actor _test_mem_bind_rules(t: testing.AsyncT):
 
 actor _test_mem_buffered_until_receiver(t: testing.AsyncT):
     """Datagrams that arrive before set_receiver are kept (up to MAX_BUFFERED) and delivered in order"""
-    mn = MemNet()
-    total = transport.MAX_BUFFERED + 5
-    var got: list[bytes] = []
-
-    def check() -> None:
-        testing.assertEqual(got, _numbered(transport.MAX_BUFFERED) + [b"after"])
-        testing.assertEqual(repr(mn.stats()), _counts(sent=total + 2, delivered=total + 2))
-
-    def late_received(data: bytes, address: str, port: int) -> None:
-        got.append(data)
-        if data == b"after":
-            report(t, outcome(check))
-
-    def marker_received(late: ServerTransport, sender: ServerTransport, data: bytes, address: str, port: int) -> None:
-        # MemNet delivered every earlier datagram to late before this one
-        late.set_receiver(late_received)
-        sender.send_to(b"after", "10.0.0.1", 161)
-
     proc def __startup__():
+        mn = MemNet()
+        total = transport.MAX_BUFFERED + 5
+        got: list[bytes] = []
+
+        def check() -> None:
+            testing.assertEqual(got, _numbered(transport.MAX_BUFFERED) + [b"after"])
+            testing.assertEqual(repr(mn.stats()), _counts(sent=total + 2, delivered=total + 2))
+
+        def late_received(data: bytes, address: str, port: int) -> None:
+            got.append(data)
+            if data == b"after":
+                report(t, outcome(check))
+
+        def marker_received(late: ServerTransport, sender: ServerTransport, data: bytes, address: str, port: int) -> None:
+            # MemNet delivered every earlier datagram to late before this one
+            late.set_receiver(late_received)
+            sender.send_to(b"after", "10.0.0.1", 161)
+
         sender = mn.server("10.0.0.9", 9)
         late = mn.server("10.0.0.1", 161)
         marker = mn.server("10.0.0.3", 3)
@@ -334,28 +335,28 @@ actor _test_mem_buffered_until_receiver(t: testing.AsyncT):
 
 actor _test_mem_replace_receiver(t: testing.AsyncT):
     """set_receiver replaces the callbacks; later datagrams go to the new ones"""
-    mn = MemNet()
-    var log: list[str] = []
-
-    def check() -> None:
-        testing.assertEqual(log, ["first a", "second b"])
-
-    def client_failed(message: str, fatal: bool) -> None:
-        t.failure(AssertionError("unexpected error: " + message))
-
-    def second_received(data: bytes, address: str, port: int) -> None:
-        log.append("second " + data.decode())
-        report(t, outcome(check))
-
-    def first_received(p: (client: Transport, server: ServerTransport), data: bytes, address: str, port: int) -> None:
-        log.append("first " + data.decode())
-        p.client.set_receiver(second_received, client_failed)
-        p.server.send_to(b"b", "10.0.0.2", 40000)
-
-    def server_received(p: (client: Transport, server: ServerTransport), data: bytes, address: str, port: int) -> None:
-        p.server.send_to(b"a", address, port)
-
     proc def __startup__():
+        mn = MemNet()
+        log: list[str] = []
+
+        def check() -> None:
+            testing.assertEqual(log, ["first a", "second b"])
+
+        def client_failed(message: str, fatal: bool) -> None:
+            t.failure(AssertionError("unexpected error: " + message))
+
+        def second_received(data: bytes, address: str, port: int) -> None:
+            log.append("second " + data.decode())
+            report(t, outcome(check))
+
+        def first_received(p: (client: Transport, server: ServerTransport), data: bytes, address: str, port: int) -> None:
+            log.append("first " + data.decode())
+            p.client.set_receiver(second_received, client_failed)
+            p.server.send_to(b"b", "10.0.0.2", 40000)
+
+        def server_received(p: (client: Transport, server: ServerTransport), data: bytes, address: str, port: int) -> None:
+            p.server.send_to(b"a", address, port)
+
         p = mem_pair(mn)
 
         p.server.set_receiver((lambda data, address, port: server_received(p, data, address, port)))
@@ -367,23 +368,23 @@ actor _test_mem_replace_receiver(t: testing.AsyncT):
 
 actor _test_mem_inject_and_history(t: testing.AsyncT):
     """MemNet.send injects from any source; history records datagrams as sent, before faults"""
-    mn = MemNet(NetFaults(corrupt_byte=0, to_port=40000))
-    var got: list[(bytes, str, int)] = []
-
-    def check() -> None:
-        testing.assertEqual(got, [(b"\xbehi", "192.0.2.66", 6666)])
-        hist = mn.history()
-        testing.assertEqual(len(hist), 1)
-        testing.assertEqual(repr(hist[0]), "Datagram(192.0.2.66:6666 -> 10.0.0.2:40000, 416869)")
-
-    def received(data: bytes, address: str, port: int) -> None:
-        got.append((data, address, port))
-        report(t, outcome(check))
-
-    def failed(message: str, fatal: bool) -> None:
-        t.failure(AssertionError("unexpected error: " + message))
-
     proc def __startup__():
+        mn = MemNet(NetFaults(corrupt_byte=0, to_port=40000))
+        got: list[(bytes, str, int)] = []
+
+        def check() -> None:
+            testing.assertEqual(got, [(b"\xbehi", "192.0.2.66", 6666)])
+            hist = mn.history()
+            testing.assertEqual(len(hist), 1)
+            testing.assertEqual(repr(hist[0]), "Datagram(192.0.2.66:6666 -> 10.0.0.2:40000, 416869)")
+
+        def received(data: bytes, address: str, port: int) -> None:
+            got.append((data, address, port))
+            report(t, outcome(check))
+
+        def failed(message: str, fatal: bool) -> None:
+            t.failure(AssertionError("unexpected error: " + message))
+
         p = mem_pair(mn)
 
         p.client.set_receiver(received, failed)
@@ -394,31 +395,31 @@ actor _test_mem_inject_and_history(t: testing.AsyncT):
 
 actor _test_mem_unroutable(t: testing.AsyncT):
     """Datagrams for an unbound address are dropped; a client sender gets a non-fatal REFUSED and stays usable"""
-    mn = MemNet()
-    var errors: list[(str, bool)] = []
-
-    def check() -> None:
-        testing.assertEqual(errors, [(transport.REFUSED, False)])
-        testing.assertEqual(repr(mn.stats()), _counts(sent=3, unroutable=2, delivered=1))
-
-    def late_received(data: bytes, address: str, port: int) -> None:
-        if data == b"again":
-            report(t, outcome(check))
-
-    def client_failed(cl: Transport, message: str, fatal: bool) -> None:
-        errors.append((message, fatal))
-        # Bind the missing peer, then send again over the same transport
-        s = mn.server("10.0.0.7", 7)
-        s.set_receiver(late_received)
-        cl.send(b"again")
-
-    def client_received(data: bytes, address: str, port: int) -> None:
-        t.failure(AssertionError("unexpected datagram"))
-
-    def server_received(data: bytes, address: str, port: int) -> None:
-        t.failure(AssertionError("unexpected datagram at the server"))
-
     proc def __startup__():
+        mn = MemNet()
+        errors: list[(str, bool)] = []
+
+        def check() -> None:
+            testing.assertEqual(errors, [(transport.REFUSED, False)])
+            testing.assertEqual(repr(mn.stats()), _counts(sent=3, unroutable=2, delivered=1))
+
+        def late_received(data: bytes, address: str, port: int) -> None:
+            if data == b"again":
+                report(t, outcome(check))
+
+        def client_failed(cl: Transport, message: str, fatal: bool) -> None:
+            errors.append((message, fatal))
+            # Bind the missing peer, then send again over the same transport
+            s = mn.server("10.0.0.7", 7)
+            s.set_receiver(late_received)
+            cl.send(b"again")
+
+        def client_received(data: bytes, address: str, port: int) -> None:
+            t.failure(AssertionError("unexpected datagram"))
+
+        def server_received(data: bytes, address: str, port: int) -> None:
+            t.failure(AssertionError("unexpected datagram at the server"))
+
         srv = mn.server("10.0.0.1", 161)
         cl = mn.client("10.0.0.2", 40000, "10.0.0.7", 7)
 
@@ -434,24 +435,24 @@ actor _test_mem_unroutable(t: testing.AsyncT):
 
 actor _test_mem_errors_and_data_in_order(t: testing.AsyncT):
     """A client gets errors and datagrams in the order MemNet produced them; a server ignores errors"""
-    mn = MemNet()
-    var log: list[str] = []
-
-    def check() -> None:
-        testing.assertEqual(log, ["error " + transport.REFUSED, "data one", "error " + transport.REFUSED, "data two"])
-
-    def client_received(data: bytes, address: str, port: int) -> None:
-        log.append("data " + data.decode())
-        if data == b"two":
-            report(t, outcome(check))
-
-    def client_failed(message: str, fatal: bool) -> None:
-        log.append("error " + message)
-
-    def server_received(data: bytes, address: str, port: int) -> None:
-        log.append("server got " + data.decode())
-
     proc def __startup__():
+        mn = MemNet()
+        log: list[str] = []
+
+        def check() -> None:
+            testing.assertEqual(log, ["error " + transport.REFUSED, "data one", "error " + transport.REFUSED, "data two"])
+
+        def client_received(data: bytes, address: str, port: int) -> None:
+            log.append("data " + data.decode())
+            if data == b"two":
+                report(t, outcome(check))
+
+        def client_failed(message: str, fatal: bool) -> None:
+            log.append("error " + message)
+
+        def server_received(data: bytes, address: str, port: int) -> None:
+            log.append("server got " + data.decode())
+
         srv = mn.server("10.0.0.1", 161)
         cl = mn.client("10.0.0.2", 40000, "10.0.0.1", 161)
 
@@ -470,27 +471,27 @@ actor _test_mem_errors_and_data_in_order(t: testing.AsyncT):
 
 actor _test_mem_spoofed_copy_not_refused(t: testing.AsyncT):
     """A forged copy for an unbound address never makes MemNet send REFUSED to the forged source"""
-    mn = MemNet(NetFaults(spoof_source=True))
-    var log: list[str] = []
-
-    def check() -> None:
-        testing.assertEqual(log, ["sender " + transport.REFUSED])
-        testing.assertEqual(repr(mn.stats()), _counts(sent=1, spoofed=1, unroutable=2))
-
-    def settled() -> None:
-        report(t, outcome(check))
-
-    def received(data: bytes, address: str, port: int) -> None:
-        log.append("data")
-
-    def sender_failed(message: str, fatal: bool) -> None:
-        log.append("sender " + message)
-        after now NOTHING_WAIT: settled()
-
-    def bystander_failed(message: str, fatal: bool) -> None:
-        log.append("bystander " + message)
-
     proc def __startup__():
+        mn = MemNet(NetFaults(spoof_source=True))
+        log: list[str] = []
+
+        def check() -> None:
+            testing.assertEqual(log, ["sender " + transport.REFUSED])
+            testing.assertEqual(repr(mn.stats()), _counts(sent=1, spoofed=1, unroutable=2))
+
+        def settled() -> None:
+            report(t, outcome(check))
+
+        def received(data: bytes, address: str, port: int) -> None:
+            log.append("data")
+
+        def sender_failed(message: str, fatal: bool) -> None:
+            log.append("sender " + message)
+            after now NOTHING_WAIT: settled()
+
+        def bystander_failed(message: str, fatal: bool) -> None:
+            log.append("bystander " + message)
+
         sender = mn.client("10.0.0.2", 40000, "10.0.0.7", 7)
         bystander = mn.client("10.0.0.2", 40001, "10.0.0.7", 7)
 
@@ -503,25 +504,25 @@ actor _test_mem_spoofed_copy_not_refused(t: testing.AsyncT):
 
 actor _test_mem_oversize(t: testing.AsyncT):
     """A datagram above MAX_DATAGRAM is dropped with a non-fatal error; MAX_DATAGRAM itself passes"""
-    mn = MemNet()
-    var errors: list[(str, bool)] = []
-
-    def check(size: int) -> None:
-        testing.assertEqual(size, transport.MAX_DATAGRAM)
-        testing.assertEqual(errors, [("Failed to send UDP datagram: message too long", False)])
-        testing.assertEqual(repr(mn.stats()), _counts(sent=2, oversize=1, delivered=1))
-
-    def server_received(data: bytes, address: str, port: int) -> None:
-        report(t, outcome(lambda: check(len(data))))
-
-    def client_received(data: bytes, address: str, port: int) -> None:
-        t.failure(AssertionError("unexpected datagram"))
-
-    def client_failed(p: (client: Transport, server: ServerTransport), message: str, fatal: bool) -> None:
-        errors.append((message, fatal))
-        p.client.send(pseudo_random(transport.MAX_DATAGRAM, 2))
-
     proc def __startup__():
+        mn = MemNet()
+        errors: list[(str, bool)] = []
+
+        def check(size: int) -> None:
+            testing.assertEqual(size, transport.MAX_DATAGRAM)
+            testing.assertEqual(errors, [("Failed to send UDP datagram: message too long", False)])
+            testing.assertEqual(repr(mn.stats()), _counts(sent=2, oversize=1, delivered=1))
+
+        def server_received(data: bytes, address: str, port: int) -> None:
+            report(t, outcome(lambda: check(len(data))))
+
+        def client_received(data: bytes, address: str, port: int) -> None:
+            t.failure(AssertionError("unexpected datagram"))
+
+        def client_failed(p: (client: Transport, server: ServerTransport), message: str, fatal: bool) -> None:
+            errors.append((message, fatal))
+            p.client.send(pseudo_random(transport.MAX_DATAGRAM, 2))
+
         p = mem_pair(mn)
 
         p.server.set_receiver(server_received)
@@ -533,28 +534,28 @@ actor _test_mem_oversize(t: testing.AsyncT):
 
 actor _test_mem_close(t: testing.AsyncT):
     """close() is idempotent; nothing is delivered to or sent from a closed endpoint"""
-    mn = MemNet()
-    var log: list[str] = []
-
-    def check() -> None:
-        testing.assertEqual(log, [])
-        # "to closed server" and the injected "to closed client"
-        testing.assertEqual(mn.stats().sent, 2)
-
-    def settled() -> None:
-        report(t, outcome(check))
-
-    def server_received(data: bytes, address: str, port: int) -> None:
-        log.append("server got " + data.decode())
-
-    def client_received(data: bytes, address: str, port: int) -> None:
-        log.append("client got " + data.decode())
-
-    def client_failed(message: str, fatal: bool) -> None:
-        if not transport.is_unreachable(message):
-            log.append("client error " + message)
-
     proc def __startup__():
+        mn = MemNet()
+        log: list[str] = []
+
+        def check() -> None:
+            testing.assertEqual(log, [])
+            # "to closed server" and the injected "to closed client"
+            testing.assertEqual(mn.stats().sent, 2)
+
+        def settled() -> None:
+            report(t, outcome(check))
+
+        def server_received(data: bytes, address: str, port: int) -> None:
+            log.append("server got " + data.decode())
+
+        def client_received(data: bytes, address: str, port: int) -> None:
+            log.append("client got " + data.decode())
+
+        def client_failed(message: str, fatal: bool) -> None:
+            if not transport.is_unreachable(message):
+                log.append("client error " + message)
+
         p = mem_pair(mn)
 
         p.server.set_receiver(server_received)
@@ -576,28 +577,28 @@ actor _test_mem_close(t: testing.AsyncT):
 
 actor _test_mem_wrapped_transport(t: testing.AsyncT):
     """A Transport built from other procs wraps one: here it records what is sent"""
-    mn = MemNet()
-    var recorded: list[bytes] = []
-
-    def record(inner: Transport, data: bytes) -> None:
-        recorded.append(data)
-        inner.send(data)
-
-    def check() -> None:
-        testing.assertEqual(recorded, [b"one", b"two"])
-
-    def server_received(p: (client: Transport, server: ServerTransport), data: bytes, address: str, port: int) -> None:
-        if data == b"two":
-            p.server.send_to(b"done", address, port)
-
-    def client_received(wrapped: Transport, data: bytes, address: str, port: int) -> None:
-        wrapped.close()
-        report(t, outcome(check))
-
-    def client_failed(message: str, fatal: bool) -> None:
-        t.failure(AssertionError("unexpected error: " + message))
-
     proc def __startup__():
+        mn = MemNet()
+        recorded: list[bytes] = []
+
+        def record(inner: Transport, data: bytes) -> None:
+            recorded.append(data)
+            inner.send(data)
+
+        def check() -> None:
+            testing.assertEqual(recorded, [b"one", b"two"])
+
+        def server_received(p: (client: Transport, server: ServerTransport), data: bytes, address: str, port: int) -> None:
+            if data == b"two":
+                p.server.send_to(b"done", address, port)
+
+        def client_received(wrapped: Transport, data: bytes, address: str, port: int) -> None:
+            wrapped.close()
+            report(t, outcome(check))
+
+        def client_failed(message: str, fatal: bool) -> None:
+            t.failure(AssertionError("unexpected error: " + message))
+
         p = mem_pair(mn)
         inner = p.client
 
@@ -782,32 +783,32 @@ actor _test_fault_delay_with_reorder(t: testing.AsyncT):
 
 actor _test_fault_selector(t: testing.AsyncT):
     """Faults apply only to datagrams for to_address and to_port: here only the client gets duplicates"""
-    mn = MemNet(NetFaults(duplicate=True, to_address="10.0.0.2", to_port=40000))
-    var at_server: list[bytes] = []
-    var at_client: list[bytes] = []
-
-    def check() -> None:
-        testing.assertEqual(at_server, [b"a", b"end"])
-        testing.assertEqual(at_client, [b"b", b"b"])
-        testing.assertEqual(repr(mn.stats()), _counts(sent=3, duplicated=1, delivered=4))
-
-    def settled() -> None:
-        report(t, outcome(check))
-
-    def server_received(p: (client: Transport, server: ServerTransport), data: bytes, address: str, port: int) -> None:
-        at_server.append(data)
-        if data == b"end":
-            p.server.send_to(b"b", address, port)
-
-    def client_received(data: bytes, address: str, port: int) -> None:
-        at_client.append(data)
-        if len(at_client) == 2:
-            after now NOTHING_WAIT: settled()
-
-    def client_failed(message: str, fatal: bool) -> None:
-        t.failure(AssertionError("unexpected error: " + message))
-
     proc def __startup__():
+        mn = MemNet(NetFaults(duplicate=True, to_address="10.0.0.2", to_port=40000))
+        at_server: list[bytes] = []
+        at_client: list[bytes] = []
+
+        def check() -> None:
+            testing.assertEqual(at_server, [b"a", b"end"])
+            testing.assertEqual(at_client, [b"b", b"b"])
+            testing.assertEqual(repr(mn.stats()), _counts(sent=3, duplicated=1, delivered=4))
+
+        def settled() -> None:
+            report(t, outcome(check))
+
+        def server_received(p: (client: Transport, server: ServerTransport), data: bytes, address: str, port: int) -> None:
+            at_server.append(data)
+            if data == b"end":
+                p.server.send_to(b"b", address, port)
+
+        def client_received(data: bytes, address: str, port: int) -> None:
+            at_client.append(data)
+            if len(at_client) == 2:
+                after now NOTHING_WAIT: settled()
+
+        def client_failed(message: str, fatal: bool) -> None:
+            t.failure(AssertionError("unexpected error: " + message))
+
         p = mem_pair(mn)
 
         p.server.set_receiver((lambda data, address, port: server_received(p, data, address, port)))
@@ -820,32 +821,32 @@ actor _test_fault_selector(t: testing.AsyncT):
 
 actor _test_fault_set_faults(t: testing.AsyncT):
     """set_faults replaces the faults and restarts the numbering; None turns them off"""
-    mn = MemNet(NetFaults(drop_first_n=1))
-    var got: list[bytes] = []
-
-    def check() -> None:
-        testing.assertEqual(got, [b"1", b"3", b"4"])
-        testing.assertEqual(repr(mn.stats()), _counts(sent=5, dropped=2, delivered=3))
-
-    def server_received(p: (client: Transport, server: ServerTransport), data: bytes, address: str, port: int) -> None:
-        got.append(data)
-        if data == b"1":
-            mn.set_faults(NetFaults(drop_first_n=1))
-            p.client.send(b"2")
-            p.client.send(b"3")
-        elif data == b"3":
-            mn.set_faults(None)
-            p.client.send(b"4")
-        else:
-            report(t, outcome(check))
-
-    def client_failed(message: str, fatal: bool) -> None:
-        t.failure(AssertionError("unexpected error: " + message))
-
-    def client_received(data: bytes, address: str, port: int) -> None:
-        pass
-
     proc def __startup__():
+        mn = MemNet(NetFaults(drop_first_n=1))
+        got: list[bytes] = []
+
+        def check() -> None:
+            testing.assertEqual(got, [b"1", b"3", b"4"])
+            testing.assertEqual(repr(mn.stats()), _counts(sent=5, dropped=2, delivered=3))
+
+        def server_received(p: (client: Transport, server: ServerTransport), data: bytes, address: str, port: int) -> None:
+            got.append(data)
+            if data == b"1":
+                mn.set_faults(NetFaults(drop_first_n=1))
+                p.client.send(b"2")
+                p.client.send(b"3")
+            elif data == b"3":
+                mn.set_faults(None)
+                p.client.send(b"4")
+            else:
+                report(t, outcome(check))
+
+        def client_failed(message: str, fatal: bool) -> None:
+            t.failure(AssertionError("unexpected error: " + message))
+
+        def client_received(data: bytes, address: str, port: int) -> None:
+            pass
+
         p = mem_pair(mn)
 
         p.server.set_receiver((lambda data, address, port: server_received(p, data, address, port)))
@@ -858,22 +859,22 @@ actor _test_fault_set_faults(t: testing.AsyncT):
 
 actor _test_fault_set_faults_releases_held(t: testing.AsyncT):
     """set_faults delivers a datagram that reorder holds back at once, before anything sent later"""
-    mn = MemNet(NetFaults(reorder=True))
-    var got: list[bytes] = []
-
-    def check() -> None:
-        testing.assertEqual(got, [b"0", b"2", b"1"])
-        testing.assertEqual(repr(mn.stats()), _counts(sent=3, reordered=1, delivered=3))
-
-    def settled() -> None:
-        report(t, outcome(check))
-
-    def received(data: bytes, address: str, port: int) -> None:
-        got.append(data)
-        if len(got) == 3:
-            after now NOTHING_WAIT: settled()
-
     proc def __startup__():
+        mn = MemNet(NetFaults(reorder=True))
+        got: list[bytes] = []
+
+        def check() -> None:
+            testing.assertEqual(got, [b"0", b"2", b"1"])
+            testing.assertEqual(repr(mn.stats()), _counts(sent=3, reordered=1, delivered=3))
+
+        def settled() -> None:
+            report(t, outcome(check))
+
+        def received(data: bytes, address: str, port: int) -> None:
+            got.append(data)
+            if len(got) == 3:
+                after now NOTHING_WAIT: settled()
+
         srv = mn.server("10.0.0.1", 161)
 
         srv.set_receiver(received)
@@ -888,21 +889,21 @@ actor _test_fault_set_faults_releases_held(t: testing.AsyncT):
 
 actor _test_fault_set_faults_releases_delayed(t: testing.AsyncT):
     """set_faults delivers delayed datagrams at once, in order, before anything sent later"""
-    mn = MemNet(NetFaults(delay=60.0))
-    start = time.monotonic_ns()
-    var got: list[bytes] = []
-
-    def check() -> None:
-        testing.assertEqual(got, _numbered(4))
-        testing.assertEqual(repr(mn.stats()), _counts(sent=4, delayed=3, delivered=4))
-        testing.assertTrue(_elapsed(start) < 30.0)
-
-    def received(data: bytes, address: str, port: int) -> None:
-        got.append(data)
-        if len(got) == 4:
-            report(t, outcome(check))
-
     proc def __startup__():
+        mn = MemNet(NetFaults(delay=60.0))
+        start = time.monotonic_ns()
+        got: list[bytes] = []
+
+        def check() -> None:
+            testing.assertEqual(got, _numbered(4))
+            testing.assertEqual(repr(mn.stats()), _counts(sent=4, delayed=3, delivered=4))
+            testing.assertTrue(_elapsed(start) < 30.0)
+
+        def received(data: bytes, address: str, port: int) -> None:
+            got.append(data)
+            if len(got) == 4:
+                report(t, outcome(check))
+
         srv = mn.server("10.0.0.1", 161)
 
         srv.set_receiver(received)
@@ -2108,18 +2109,18 @@ actor _test_tcp_host_name_is_fatal(t: testing.EnvT):
 
 actor _test_tcp_option_validation(t: testing.EnvT):
     """tcp_transport() and tcp_server_transport() raise ValueError for invalid options"""
-    tcap = net.TCPCap(net.NetCap(t.env.cap))
-    ccap = net.TCPConnectCap(tcap)
-    lcap = net.TCPListenCap(tcap)
-    var accepted: list[str] = []
-
-    def ignored(s: ServerTransport, error: ?str) -> None:
-        pass
-
-    def check() -> None:
-        testing.assertEqual(accepted, [])
-
     proc def __startup__():
+        tcap = net.TCPCap(net.NetCap(t.env.cap))
+        ccap = net.TCPConnectCap(tcap)
+        lcap = net.TCPListenCap(tcap)
+        accepted: list[str] = []
+
+        def ignored(s: ServerTransport, error: ?str) -> None:
+            pass
+
+        def check() -> None:
+            testing.assertEqual(accepted, [])
+
         try:
             transport.tcp_transport(ccap, "127.0.0.1", 161, connect_timeout=0.0)
             accepted.append("connect_timeout 0")
