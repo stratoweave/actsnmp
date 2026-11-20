@@ -970,7 +970,9 @@ actor _test_attach_and_close(t: testing.AsyncT):
         after_detach = d.stats()
         d.close()
 
-    c2.get(got_pending, [SYS_DESCR])
+    # c2 sends its request to the Dispatcher before get() returns, so it is recorded before c1's: c1 and c2
+    # run in parallel, and c1's whole GET could otherwise finish before c2 has sent anything
+    await async c2.get(got_pending, [SYS_DESCR])
     c1.get(got_first, [SYS_DESCR])
 
 
