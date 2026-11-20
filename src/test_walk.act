@@ -949,7 +949,7 @@ actor _test_walk_close(t: testing.AsyncT):
     __startup__()
 
 
-def check_invalid(r: dict[str, Got]) -> None:
+proc def check_invalid(r: dict[str, Got]) -> None:
     for label in ["one arc", "no columns", "bad column", "nested columns", "same column", "bad index prefix"]:
         e = failed_with(r[label], label)
         testing.assertTrue(isinstance(e, errors.EncodeError), label + ": " + str(e))
@@ -962,13 +962,13 @@ def check_invalid(r: dict[str, Got]) -> None:
 
 actor _test_walk_invalid_arguments(t: testing.AsyncT):
     """Invalid roots and columns, and a full queue, are reported through the callback"""
-    mn = MemNet()
-    h = Harness(t, 8, check_invalid)
-
-    def ignored(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-        pass
-
     proc def __startup__():
+        mn = MemNet()
+        h = Harness(t, 8, check_invalid)
+
+        def ignored(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            pass
+
         t.timeout(30.0)
 
         c = client(mn, v2c(), 40001, Options(timeout=5.0, retries=0, max_queued=1))
@@ -985,7 +985,6 @@ actor _test_walk_invalid_arguments(t: testing.AsyncT):
         c.get(ignored, [b([1])])
         c.walk(Sink("queue full", h.got).walked, b([1]))
 
-    __startup__()
 
 # Tables ############################################################################################
 

@@ -1047,43 +1047,43 @@ actor _test_attach_and_close(t: testing.AsyncT):
     __startup__()
 
 
-def _no_send(data: bytes, address: str, port: int) -> None:
+proc def _no_send(data: bytes, address: str, port: int) -> None:
     pass
 
-def _no_receiver(on_data: action(bytes, str, int) -> None) -> None:
+proc def _no_receiver(on_data: action(bytes, str, int) -> None) -> None:
     pass
 
-def _no_close() -> None:
+proc def _no_close() -> None:
     pass
 
-def _no_port() -> int:
+proc def _no_port() -> int:
     return 0
 
 actor _test_dead_socket(t: testing.AsyncT):
     """A Dispatcher over a ServerTransport that is not bound (local_port() 0) is closed from the start"""
-    dead = ServerTransport(_no_send, _no_receiver, _no_close, _no_port)
-    d = Dispatcher(dead, t.log_handler)
-    c = client_via(d, AGENT, Community("public"))
 
-    def got(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
-        cl.close()
-        def check() -> None:
-            if isinstance(err, errors.TransportError):
-                testing.assertFalse(err.transient)
-            else:
-                raise AssertionError("expected a TransportError")
-            testing.assertEqual(d.local_port(), 0)
-        report(t, outcome(check))
+    def __startup__():
+        dead = ServerTransport(_no_send, _no_receiver, _no_close, _no_port)
+        d = Dispatcher(dead, t.log_handler)
 
-    proc def __startup__():
+        def got(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+            cl.close()
+            def check() -> None:
+                if isinstance(err, errors.TransportError):
+                    testing.assertFalse(err.transient)
+                else:
+                    raise AssertionError("expected a TransportError")
+                testing.assertEqual(d.local_port(), 0)
+            report(t, outcome(check))
+
         t.timeout(10.0)
+
+        c = client_via(d, AGENT, Community("public"))
 
         c.get(got, [SYS_DESCR])
 
 
-    # Full Client flows through the Dispatcher ##########################################################
-
-    __startup__()
+# Full Client flows through the Dispatcher ##########################################################
 
 
 actor _test_client_flows(t: testing.AsyncT):
