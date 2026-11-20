@@ -391,22 +391,15 @@ actor Tally(want: int, on_done: action(dict[str, Got]) -> None):
     def count() -> int:
         return len(got)
 
-
 # Routing ##########################################################################################
+
 
 actor _test_routing(t: testing.AsyncT):
     """Clients of two agents over one socket get their own answers; a datagram from an unknown source is unroutable"""
     proc def __startup__():
         mn = MemNet()
-        a1 = Agent(mn.server(AGENT, 161), make_view(b"agent one"), agent_config([]), None)
-        a2 = Agent(mn.server(AGENT2, 161), make_view(b"agent two"), agent_config([]), None)
-        d = mem_dispatcher(mn, t.log_handler)
-        c1 = client_via(d, AGENT, Community("public"))
-        c2 = client_via(d, AGENT2, Community("public"))
-        tally = Tally(4, tallied)
-        # injected before the requests, so the Dispatcher has seen it when the last answer comes
 
-        def tallied(got: dict[str, Got]) -> None:
+        def tallied(c1: Client, c2: Client, d: Dispatcher, got: dict[str, Got]) -> None:
             s = d.stats()
             s1 = c1.stats()
             s2 = c2.stats()
@@ -425,27 +418,30 @@ actor _test_routing(t: testing.AsyncT):
             report(t, outcome(check))
 
         t.timeout(20.0)
+
+        a1 = Agent(mn.server(AGENT, 161), make_view(b"agent one"), agent_config([]), None)
+        a2 = Agent(mn.server(AGENT2, 161), make_view(b"agent two"), agent_config([]), None)
+        d = mem_dispatcher(mn, t.log_handler)
+        c1 = client_via(d, AGENT, Community("public"))
+        c2 = client_via(d, AGENT2, Community("public"))
+
+        tally = Tally(4, (lambda got: tallied(c1, c2, d, got)))
+        # injected before the requests, so the Dispatcher has seen it when the last answer comes
         mn.send(_community(message.SNMP_V2C, pdu.RESPONSE, 7), "10.0.0.99", 161, MANAGER, MPORT)
         c1.get(tally.completed("c1 get"), [SYS_DESCR])
         c2.get(tally.completed("c2 get"), [SYS_DESCR])
         c1.get_next(tally.completed("c1 next"), [e([1, 1, 0])])
         c2.get_bulk(tally.completed("c2 bulk"), [e([10, 1, 1])], 0, 2)
 
-    __startup__()
 
 
 actor _test_shared_peer_communities(t: testing.AsyncT):
     """Two SNMPv2c communities of one agent, 8 requests in flight each: every answer reaches the Client that asked"""
     proc def __startup__():
         mn = MemNet()
-        a = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), None)
-        d = mem_dispatcher(mn, t.log_handler)
         o8 = OPTS.with_(max_in_flight=8)
-        pub = client_via(d, AGENT, Community("public"), o8)
-        priv = client_via(d, AGENT, Community("private"), o8)
-        tally = Tally(41, tallied)
 
-        def tallied(got: dict[str, Got]) -> None:
+        def tallied(d: Dispatcher, priv: Client, pub: Client, got: dict[str, Got]) -> None:
             s = d.stats()
             sp = pub.stats()
             sq = priv.stats()
@@ -464,13 +460,20 @@ actor _test_shared_peer_communities(t: testing.AsyncT):
             report(t, outcome(check))
 
         t.timeout(30.0)
+
+        a = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), None)
+        d = mem_dispatcher(mn, t.log_handler)
+
+        pub = client_via(d, AGENT, Community("public"), o8)
+        priv = client_via(d, AGENT, Community("private"), o8)
+
+        tally = Tally(41, (lambda got: tallied(d, priv, pub, got)))
         for i in range(1, 21):
             pub.get(tally.completed("pub %d" % i), [e([20, i, 0])])
             j = 20 + i
             priv.set(tally.completed("priv %d" % j), [VarBind(e([20, j, 0]), Integer(1000 + j))])
         pub.set(tally.completed("pub set"), [VarBind(e([20, 1, 0]), Integer(5))])
 
-    __startup__()
 
 
 actor _test_shared_peer_v3_users(t: testing.AsyncT):
@@ -478,13 +481,9 @@ actor _test_shared_peer_v3_users(t: testing.AsyncT):
     proc def __startup__():
         users = [noauth(), md5(), sha_aes(), sha256_des()]
         mn = MemNet()
-        a = Agent(mn.server(AGENT, 161), make_view(), agent_config(users), None)
-        d = mem_dispatcher(mn, t.log_handler)
         clients: list[Client] = []
-        v2 = client_via(d, AGENT, Community("public"), OPTS.with_(max_in_flight=4))
-        tally = Tally(3 * len(users) + 1, tallied)
 
-        def tallied(got: dict[str, Got]) -> None:
+        def tallied(d: Dispatcher, v2: Client, got: dict[str, Got]) -> None:
             s = d.stats()
             infos = [c.engine_info() for c in clients]
             stats = [c.stats() for c in clients]
@@ -510,8 +509,15 @@ actor _test_shared_peer_v3_users(t: testing.AsyncT):
             report(t, outcome(check))
 
         t.timeout(60.0)
+
+        a = Agent(mn.server(AGENT, 161), make_view(), agent_config(users), None)
+        d = mem_dispatcher(mn, t.log_handler)
+
         for u in users:
             clients.append(client_via(d, AGENT, u, OPTS.with_(max_in_flight=4)))
+        v2 = client_via(d, AGENT, Community("public"), OPTS.with_(max_in_flight=4))
+
+        tally = Tally(3 * len(users) + 1, (lambda got: tallied(d, v2, got)))
         for k in range(len(users)):
             c = clients[k]
             name = users[k].user
@@ -521,9 +527,7 @@ actor _test_shared_peer_v3_users(t: testing.AsyncT):
         v2.get(tally.completed("v2c get"), [SYS_DESCR])
 
 
-            # Id collisions #####################################################################################
-
-    __startup__()
+# Id collisions #####################################################################################
 
 
 actor Recorder():
@@ -547,14 +551,19 @@ actor Recorder():
 def v2key(id: int) -> int:
     return (1 << 32) | id
 
-actor _test_collision_raw(t: testing.AsyncT):
+proc def _test_collision_raw(t: testing.AsyncT):
     """A request whose id another transport of the peer has recorded is not sent (ID_IN_USE), also after
     that transport closed, until the record expires; another version's id space does not collide"""
+    t.timeout(20.0)
     mn = MemNet()
     a = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), None)
     d = mem_dispatcher(mn, t.log_handler, id_lifetime=2.0)
     ta = d.attach(AGENT, 161)
     tb = d.attach(AGENT, 161)
+    CollisionRawActor(t, d, ta, tb)
+
+
+actor CollisionRawActor(t: testing.AsyncT, d: Dispatcher, ta, tb):
     var phase = 1
     var phase1: ?DispatcherStats = None
     var phase2: ?DispatcherStats = None
@@ -620,15 +629,12 @@ actor _test_collision_raw(t: testing.AsyncT):
         _progress()
 
     proc def __startup__():
-        t.timeout(20.0)
         ta.set_receiver(a_received, a_failed)
         tb.set_receiver(b_received, b_failed)
         ta.send(_community(message.SNMP_V2C, pdu.GET, 42))
         tb.send(_community(message.SNMP_V2C, pdu.GET, 42))
         tb.send(_community(message.SNMP_V1, pdu.GET, 42))
         tb.send(_community(message.SNMP_V2C, pdu.GET, 43))
-
-    __startup__()
 
 
 actor _Refuser(inner: Transport, pattern: list[bool]):
@@ -661,6 +667,7 @@ actor _Refuser(inner: Transport, pattern: list[bool]):
     def refused() -> list[int]:
         return _refused.copy()
 
+
 def refusing(r: _Refuser) -> Transport:
     def _send(data: bytes) -> None:
         r.send(data)
@@ -675,21 +682,11 @@ actor _test_client_redraws(t: testing.AsyncT):
     SNMPv3 discovery and GET, SNMPv2c inform)"""
     proc def __startup__():
         mn = MemNet()
-        a = Agent(mn.server(AGENT, 161), make_view(), agent_config([sha_aes()]), None)
-        rcv = NotificationReceiver(mn.server(RECEIVER, 162), ReceiverConfig(["public"], [], [], h(RECEIVER_ENGINE), 1),
-                                   ignored, None)
-        r2 = _Refuser(mn.client(MANAGER, 40001, AGENT, 161), [True, True])
-        r3 = _Refuser(mn.client(MANAGER, 40002, AGENT, 161), [True, False, True])
-        ri = _Refuser(mn.client(MANAGER, 40003, RECEIVER, 162), [True])
-        c2 = Client(None, AGENT, Community("public"), t.log_handler, opts=OPTS, transport=refusing(r2))
-        c3 = Client(None, AGENT, sha_aes(), t.log_handler, opts=OPTS, transport=refusing(r3))
-        ci = Client(None, RECEIVER, Community("public"), t.log_handler, port=162, opts=OPTS, transport=refusing(ri))
-        tally = Tally(3, tallied)
 
         def ignored(r: NotificationReceiver, n: Notification) -> None:
             pass
 
-        def tallied(got: dict[str, Got]) -> None:
+        def tallied(c2: Client, c3: Client, ci: Client, r2: _Refuser, r3: _Refuser, ri: _Refuser, got: dict[str, Got]) -> None:
             s2 = c2.stats()
             s3 = c3.stats()
             si = ci.stats()
@@ -716,11 +713,23 @@ actor _test_client_redraws(t: testing.AsyncT):
             report(t, outcome(check))
 
         t.timeout(30.0)
+
+        a = Agent(mn.server(AGENT, 161), make_view(), agent_config([sha_aes()]), None)
+
+        rcv = NotificationReceiver(mn.server(RECEIVER, 162), ReceiverConfig(["public"], [], [], h(RECEIVER_ENGINE), 1),
+                                   ignored, None)
+        r2 = _Refuser(mn.client(MANAGER, 40001, AGENT, 161), [True, True])
+        r3 = _Refuser(mn.client(MANAGER, 40002, AGENT, 161), [True, False, True])
+        ri = _Refuser(mn.client(MANAGER, 40003, RECEIVER, 162), [True])
+        c2 = Client(None, AGENT, Community("public"), t.log_handler, opts=OPTS, transport=refusing(r2))
+        c3 = Client(None, AGENT, sha_aes(), t.log_handler, opts=OPTS, transport=refusing(r3))
+        ci = Client(None, RECEIVER, Community("public"), t.log_handler, port=162, opts=OPTS, transport=refusing(ri))
+
+        tally = Tally(3, (lambda got: tallied(c2, c3, ci, r2, r3, ri, got)))
         c2.get(tally.completed("v2c"), [SYS_DESCR])
         c3.get(tally.completed("v3"), [SYS_DESCR])
         ci.inform(tally.completed("inform"), Oid([1, 3, 6, 1, 6, 3, 1, 1, 5, 4]), [VarBind(e([1, 1, 0]), Integer(1))], 100)
 
-    __startup__()
 
 
 actor _test_collisions_16bit(t: testing.AsyncT):
@@ -728,14 +737,9 @@ actor _test_collisions_16bit(t: testing.AsyncT):
     GET of a Client redraws until a free id (Stats.id_collisions, DispatcherStats.collisions) and succeeds"""
     proc def __startup__():
         mn = MemNet()
-        a = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), None)
-        d = mem_dispatcher(mn, t.log_handler, max_ids=40000)
-        raw = d.attach(AGENT, 161)
         rr = Recorder()
-        c = client_via(d, AGENT, Community("public"), Options(timeout=5.0, retries=0, request_id_bits=16))
-        tally = Tally(10, tallied)
 
-        def tallied(got: dict[str, Got]) -> None:
+        def tallied(c: Client, d: Dispatcher, raw: Transport, got: dict[str, Got]) -> None:
             s = d.stats()
             sc = c.stats()
             def check() -> None:
@@ -753,31 +757,34 @@ actor _test_collisions_16bit(t: testing.AsyncT):
             report(t, outcome(check))
 
         t.timeout(120.0)
+
+        a = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), None)
+        d = mem_dispatcher(mn, t.log_handler, max_ids=40000)
+        raw = d.attach(AGENT, 161)
+
         raw.set_receiver(rr.received, rr.failed)
         # a community the agent drops silently: the ids stay recorded, nothing answers them
         for id in range(1, 32768):
             if id % 16 != 0:
                 p = Pdu(pdu.GET, id, 0, 0, [VarBind(SYS_DESCR, Integer(1))])
                 raw.send(message.encode_community(CommunityMessage(message.SNMP_V2C, b"nobody", p)))
+        c = client_via(d, AGENT, Community("public"), Options(timeout=5.0, retries=0, request_id_bits=16))
+
+        tally = Tally(10, (lambda got: tallied(c, d, raw, got)))
         for i in range(1, 11):
             c.get(tally.completed("get %d" % i), [e([20, i, 0])])
 
 
-            # Late answers, multi-homed agents ##################################################################
-
-    __startup__()
+# Late answers, multi-homed agents ##################################################################
 
 
 actor _test_late_answer_after_detach(t: testing.AsyncT):
     """An answer that comes after its Client closed is dropped (late), not handed to another Client of the peer"""
     mn = MemNet(NetFaults(delay=1.0, to_address=MANAGER))
-    a = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), None)
-    d = mem_dispatcher(mn, t.log_handler)
-    early = client_via(d, AGENT, Community("public"), Options(timeout=0.1, retries=0))
     var other: ?Client = None
     var timeout_seen: ?Got = None
 
-    def tallied(got: dict[str, Got]) -> None:
+    def tallied(d: Dispatcher, got: dict[str, Got]) -> None:
         s = d.stats()
         o = other
         so = o.stats() if o is not None else None
@@ -793,9 +800,7 @@ actor _test_late_answer_after_detach(t: testing.AsyncT):
             o.close()
         report(t, outcome(check))
 
-    tally = Tally(1, tallied)
-
-    def got_early(c: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+    def got_early(d: Dispatcher, tally: Tally, c: Client, r: ?Response, err: ?errors.SnmpError) -> None:
         timeout_seen = Got(r=r, e=err)
         c.close()
         # attached to the same peer after the first one closed; its answer comes after the late one
@@ -805,35 +810,37 @@ actor _test_late_answer_after_detach(t: testing.AsyncT):
 
     proc def __startup__():
         t.timeout(20.0)
-        early.get(got_early, [e([20, 1, 0])])
 
-    __startup__()
+        a = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), None)
+        d = mem_dispatcher(mn, t.log_handler)
+        early = client_via(d, AGENT, Community("public"), Options(timeout=0.1, retries=0))
+
+        tally = Tally(1, (lambda got: tallied(d, got)))
+
+        early.get((lambda c, r, err: got_early(d, tally, c, r, err)), [e([20, 1, 0])])
+
 
 
 actor _Relay(mn: MemNet, front: str, behind: str):
     """A multi-homed agent: requests to front:161 are answered from behind:161 (forwarded with their source)"""
-    srv = mn.server(front, 161)
 
     def received(data: bytes, src_address: str, src_port: int) -> None:
         mn.send(data, src_address, src_port, behind, 161)
 
     proc def __startup__():
+        srv = mn.server(front, 161)
+
         srv.set_receiver(received)
 
-    __startup__()
 
 
 actor _MultiHomed(t: testing.AsyncT, strict: bool):
     """SNMPv2c and SNMPv3 (with discovery) against an agent that answers from another address"""
     mn = MemNet()
-    a = Agent(mn.server(OTHER, 161), make_view(), agent_config([sha_aes()]), None)
     relay = _Relay(mn, AGENT, OTHER)
-    d = mem_dispatcher(mn, t.log_handler, strict_source=strict)
     o = Options(timeout=0.3, retries=1)
-    c2 = client_via(d, AGENT, Community("public"), o)
-    c3 = client_via(d, AGENT, sha_aes(), o)
 
-    def tallied(got: dict[str, Got]) -> None:
+    def tallied(c2: Client, c3: Client, d: Dispatcher, got: dict[str, Got]) -> None:
         s = d.stats()
         s2 = c2.stats()
         def check() -> None:
@@ -851,13 +858,18 @@ actor _MultiHomed(t: testing.AsyncT, strict: bool):
         c3.close()
         report(t, outcome(check))
 
-    tally = Tally(2, tallied)
-
     proc def __startup__():
+        a = Agent(mn.server(OTHER, 161), make_view(), agent_config([sha_aes()]), None)
+
+        d = mem_dispatcher(mn, t.log_handler, strict_source=strict)
+
+        c2 = client_via(d, AGENT, Community("public"), o)
+        c3 = client_via(d, AGENT, sha_aes(), o)
+
+        tally = Tally(2, (lambda got: tallied(c2, c3, d, got)))
         c2.get(tally.completed("v2c"), [SYS_DESCR])
         c3.get(tally.completed("v3"), [SYS_DESCR])
 
-    __startup__()
 
 
 actor _test_multihomed_strict(t: testing.AsyncT):
@@ -867,7 +879,6 @@ actor _test_multihomed_strict(t: testing.AsyncT):
     proc def __startup__():
         t.timeout(20.0)
 
-    __startup__()
 
 
 actor _test_multihomed_loose(t: testing.AsyncT):
@@ -877,20 +888,16 @@ actor _test_multihomed_loose(t: testing.AsyncT):
     proc def __startup__():
         t.timeout(20.0)
 
-    __startup__()
 
 
 actor _test_loose_ambiguous(t: testing.AsyncT):
     """strict_source=False: an answer from an unknown source whose id two peers' requests have is dropped"""
     proc def __startup__():
         mn = MemNet()
-        d = mem_dispatcher(mn, t.log_handler, strict_source=False)
-        t1 = d.attach(AGENT, 161)
-        t2 = d.attach(AGENT2, 161)
         r1 = Recorder()
         r2 = Recorder()
 
-        def settled() -> None:
+        def settled(d: Dispatcher, t1: Transport, t2: Transport) -> None:
             s = d.stats()
             k1 = r1.keys_seen()
             k2 = r2.keys_seen()
@@ -902,30 +909,31 @@ actor _test_loose_ambiguous(t: testing.AsyncT):
             t2.close()
             report(t, outcome(check))
 
-        # answers from a source nobody attached: id 77 (two peers), 78 (one), 79 (none)
-
         t.timeout(20.0)
+
+        d = mem_dispatcher(mn, t.log_handler, strict_source=False)
+        t1 = d.attach(AGENT, 161)
+        t2 = d.attach(AGENT2, 161)
+
         t1.set_receiver(r1.received, r1.failed)
         t2.set_receiver(r2.received, r2.failed)
         t1.send(_community(message.SNMP_V2C, pdu.GET, 77))
         t2.send(_community(message.SNMP_V2C, pdu.GET, 77))
         t2.send(_community(message.SNMP_V2C, pdu.GET, 78))
 
+        # answers from a source nobody attached: id 77 (two peers), 78 (one), 79 (none)
         mn.send(_community(message.SNMP_V2C, pdu.RESPONSE, 77), OTHER, 161, MANAGER, MPORT)
         mn.send(_community(message.SNMP_V2C, pdu.RESPONSE, 78), OTHER, 161, MANAGER, MPORT)
         mn.send(_community(message.SNMP_V2C, pdu.RESPONSE, 79), OTHER, 161, MANAGER, MPORT)
-        after QUIET: settled()
+        after QUIET: settled(d, t1, t2)
 
 
-            # Address forms #####################################################################################
-
-    __startup__()
+# Address forms #####################################################################################
 
 
 actor _Echo(mn: MemNet, bind: str, reply_from: str):
     """A scripted agent on bind:161 that answers every SNMPv2c request with sysDescr.0 = "echo", sent as if
     from reply_from:161 (another text form of its address)"""
-    srv = mn.server(bind, 161)
 
     def received(data: bytes, src_address: str, src_port: int) -> None:
         c, m = message.decode(data)
@@ -937,27 +945,20 @@ actor _Echo(mn: MemNet, bind: str, reply_from: str):
                 mn.send(out, reply_from, 161, src_address, src_port)
 
     proc def __startup__():
+        srv = mn.server(bind, 161)
+
         srv.set_receiver(received)
 
-    __startup__()
 
 
 actor _test_address_forms(t: testing.AsyncT):
     """IPv4-mapped and IPv6 addresses in any text form, attached and as answer sources, route to their Client"""
     proc def __startup__():
         mn = MemNet()
-        a4 = Agent(mn.server(AGENT, 161), make_view(b"v4"), agent_config([]), None)
-        a6 = Agent(mn.server("2001:db8::1", 161), make_view(b"v6"), agent_config([]), None)
         m4 = _Echo(mn, "10.0.0.3", "::ffff:10.0.0.3")
         m6 = _Echo(mn, "2001:db8::3", "2001:0DB8:0:0::0:3")
-        d = mem_dispatcher(mn, t.log_handler)
-        cmap = client_via(d, "::FFFF:10.0.0.1", Community("public"))
-        c6 = client_via(d, "2001:DB8:0:0:0:0:0:1", Community("public"))
-        ce4 = client_via(d, "10.0.0.3", Community("public"))
-        ce6 = client_via(d, "2001:db8::3", Community("public"))
-        tally = Tally(4, tallied)
 
-        def tallied(got: dict[str, Got]) -> None:
+        def tallied(c6: Client, ce4: Client, ce6: Client, cmap: Client, d: Dispatcher, got: dict[str, Got]) -> None:
             s = d.stats()
             def check() -> None:
                 testing.assertEqual(vbs_of(got_of("mapped", got), "mapped"), [VarBind(SYS_DESCR, OctetString(b"v4"))])
@@ -970,30 +971,35 @@ actor _test_address_forms(t: testing.AsyncT):
             report(t, outcome(check))
 
         t.timeout(20.0)
+
+        a4 = Agent(mn.server(AGENT, 161), make_view(b"v4"), agent_config([]), None)
+        a6 = Agent(mn.server("2001:db8::1", 161), make_view(b"v6"), agent_config([]), None)
+
+        d = mem_dispatcher(mn, t.log_handler)
+        cmap = client_via(d, "::FFFF:10.0.0.1", Community("public"))
+        c6 = client_via(d, "2001:DB8:0:0:0:0:0:1", Community("public"))
+        ce4 = client_via(d, "10.0.0.3", Community("public"))
+        ce6 = client_via(d, "2001:db8::3", Community("public"))
+
+        tally = Tally(4, (lambda got: tallied(c6, ce4, ce6, cmap, d, got)))
         cmap.get(tally.completed("mapped"), [SYS_DESCR])
         c6.get(tally.completed("v6"), [SYS_DESCR])
         ce4.get(tally.completed("echo4"), [SYS_DESCR])
         ce6.get(tally.completed("echo6"), [SYS_DESCR])
 
 
-            # Attach, detach, close #############################################################################
-
-    __startup__()
+# Attach, detach, close #############################################################################
 
 
 actor _test_attach_and_close(t: testing.AsyncT):
     """attach() refuses names and bad ports; Client.close() detaches; Dispatcher.close() fails pending requests
     with a permanent TransportError, and transports attached afterwards fail at once"""
     mn = MemNet()
-    a = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), None)
-    d = mem_dispatcher(mn, t.log_handler)
     var refusals: list[str] = []
-    c1 = client_via(d, AGENT, Community("public"))
-    c2 = client_via(d, AGENT2, Community("public"), Options(timeout=30.0, retries=0))   # nobody answers
     var before: ?DispatcherStats = None
     var after_detach: ?DispatcherStats = None
 
-    def tallied(got: dict[str, Got]) -> None:
+    def tallied(c2: Client, d: Dispatcher, got: dict[str, Got]) -> None:
         s = d.stats()
         def check() -> None:
             testing.assertEqual(refusals, ["refused", "refused", "refused", "refused"])
@@ -1015,14 +1021,12 @@ actor _test_attach_and_close(t: testing.AsyncT):
         c2.close()
         report(t, outcome(check))
 
-    tally = Tally(3, tallied)
-
-    def got_pending(c: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+    def got_pending(d: Dispatcher, tally: Tally, c: Client, r: ?Response, err: ?errors.SnmpError) -> None:
         tally.put("pending", Got(r=r, e=err))
         c3 = client_via(d, AGENT, Community("public"))
         c3.get(tally.completed("after close"), [SYS_DESCR])
 
-    def got_first(c: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+    def got_first(d: Dispatcher, tally: Tally, c: Client, r: ?Response, err: ?errors.SnmpError) -> None:
         tally.put("get", Got(r=r, e=err))
         before = d.stats()
         # the Client's close() calls the Dispatcher before this actor's next call does
@@ -1030,21 +1034,26 @@ actor _test_attach_and_close(t: testing.AsyncT):
         after_detach = d.stats()
         d.close()
 
-    # c2 sends its request to the Dispatcher before get() returns, so it is recorded before c1's: c1 and c2
-    # run in parallel, and c1's whole GET could otherwise finish before c2 has sent anything
-
     proc def __startup__():
         t.timeout(20.0)
+
+        a = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), None)
+        d = mem_dispatcher(mn, t.log_handler)
+
         for spec in [("localhost", 161), ("10.0.0.1", 0), ("10.0.0.1", 65536), ("", 161)]:
             try:
                 tr = d.attach(spec.0, spec.1)
                 refusals.append("accepted " + spec.0)
             except ValueError:
                 refusals.append("refused")
-        await async c2.get(got_pending, [SYS_DESCR])
-        c1.get(got_first, [SYS_DESCR])
+        c1 = client_via(d, AGENT, Community("public"))
+        c2 = client_via(d, AGENT2, Community("public"), Options(timeout=30.0, retries=0))   # nobody answers
 
-    __startup__()
+        tally = Tally(3, (lambda got: tallied(c2, d, got)))
+
+        await async c2.get((lambda c, r, err: got_pending(d, tally, c, r, err)), [SYS_DESCR])
+        c1.get((lambda c, r, err: got_first(d, tally, c, r, err)), [SYS_DESCR])
+
 
 
 proc def _no_send(data: bytes, address: str, port: int) -> None:
@@ -1091,29 +1100,19 @@ actor _test_client_flows(t: testing.AsyncT):
     through one Dispatcher, several Clients per peer"""
     users = [sha_aes(), md5()]
     mn = MemNet()
-    a = Agent(mn.server(AGENT, 161), make_view(), agent_config(users), None)
     var blocks: list[str] = []
 
     def received(r: NotificationReceiver, n: Notification) -> None:
         blocks.append(fmt.canon_notification(n).split("\n")[0])
 
-    rcv = NotificationReceiver(mn.server(RECEIVER, 162),
-                               ReceiverConfig(["public"], [sha_aes()], [], h(RECEIVER_ENGINE), 1), received, None)
-    d = mem_dispatcher(mn, t.log_handler)
     o = Options(timeout=2.0, retries=1, max_repetitions=4)
-    v2 = client_via(d, AGENT, Community("public"), o)
-    v2w = client_via(d, AGENT, Community("private"), o)
-    v3 = client_via(d, AGENT, sha_aes(), o)
-    v3b = client_via(d, AGENT, md5(), o.with_(use_bulk=False))
-    n2 = client_via(d, RECEIVER, Community("public"), o, port=162)
-    n3 = client_via(d, RECEIVER, sha_aes(), o, port=162)
     trap_oid = Oid([1, 3, 6, 1, 6, 3, 1, 1, 5, 4])
     payload = [VarBind(e([1, 1, 0]), Integer(5))]
     full = full_view()
     tab: list[VarBind] = full[2:17]
     var walks_left = 2
 
-    def tallied(got: dict[str, Got]) -> None:
+    def tallied(d: Dispatcher, n2: Client, n3: Client, v2: Client, v2w: Client, v3: Client, v3b: Client, got: dict[str, Got]) -> None:
         s = d.stats()
         info = v3.engine_info()
         bl = sorted(blocks)
@@ -1148,45 +1147,57 @@ actor _test_client_flows(t: testing.AsyncT):
             c.close()
         report(t, outcome(check))
 
-    tally = Tally(11, tallied)
-
-    def written(c: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+    def written(tally: Tally, v3: Client, c: Client, r: ?Response, err: ?errors.SnmpError) -> None:
         tally.put("v2c set", Got(r=r, e=err))
         v3.get(tally.completed("v3 get"), [e([20, 9, 0])])
 
-    proc def walk_done(label: str, vbs: list[VarBind], err: ?errors.SnmpError) -> None:
+    proc def walk_done(tally: Tally, v2w: Client, v3: Client, label: str, vbs: list[VarBind], err: ?errors.SnmpError) -> None:
         tally.put(label, Got(vbs=vbs, e=err))
         walks_left -= 1
         if walks_left == 0:
             # the SET changes a walked variable: only after both walks
-            v2w.set(written, [VarBind(e([20, 9, 0]), Integer(99))])
+            v2w.set((lambda c, r, err: written(tally, v3, c, r, err)), [VarBind(e([20, 9, 0]), Integer(99))])
 
-    def v2_walked(c: Client, vbs: list[VarBind], err: ?errors.SnmpError) -> None:
-        walk_done("v2c walk", vbs, err)
+    def v2_walked(tally: Tally, v2w: Client, v3: Client, c: Client, vbs: list[VarBind], err: ?errors.SnmpError) -> None:
+        walk_done(tally, v2w, v3, "v2c walk", vbs, err)
 
-    def v3b_walked(c: Client, vbs: list[VarBind], err: ?errors.SnmpError) -> None:
-        walk_done("v3 getnext walk", vbs, err)
+    def v3b_walked(tally: Tally, v2w: Client, v3: Client, c: Client, vbs: list[VarBind], err: ?errors.SnmpError) -> None:
+        walk_done(tally, v2w, v3, "v3 getnext walk", vbs, err)
 
-    def trap_sent(c: Client, err: ?errors.SnmpError) -> None:
+    def trap_sent(n2: Client, tally: Tally, c: Client, err: ?errors.SnmpError) -> None:
         tally.put("trap", Got(e=err))
         # the receiver gets the trap before the inform that follows it from the same Client
         n2.inform(tally.completed("inform v2c"), trap_oid, payload, 200)
 
     proc def __startup__():
         t.timeout(60.0)
-        v2.walk(v2_walked, Oid([1, 3, 6, 1, 4, 1, 8072, 9999, 1]))
+
+        a = Agent(mn.server(AGENT, 161), make_view(), agent_config(users), None)
+
+        rcv = NotificationReceiver(mn.server(RECEIVER, 162),
+                                   ReceiverConfig(["public"], [sha_aes()], [], h(RECEIVER_ENGINE), 1), received, None)
+        d = mem_dispatcher(mn, t.log_handler)
+
+        v2 = client_via(d, AGENT, Community("public"), o)
+        v2w = client_via(d, AGENT, Community("private"), o)
+        v3 = client_via(d, AGENT, sha_aes(), o)
+        v3b = client_via(d, AGENT, md5(), o.with_(use_bulk=False))
+        n2 = client_via(d, RECEIVER, Community("public"), o, port=162)
+        n3 = client_via(d, RECEIVER, sha_aes(), o, port=162)
+
+        tally = Tally(11, (lambda got: tallied(d, n2, n3, v2, v2w, v3, v3b, got)))
+
+        v2.walk((lambda c, vbs, err: v2_walked(tally, v2w, v3, c, vbs, err)), Oid([1, 3, 6, 1, 4, 1, 8072, 9999, 1]))
         v2.walk_stream(tally.got_batch("v2c stream"), tally.stream_ended("v2c stream"), e([10]))
         v2.get_table(tally.got_table("v2c table"), [e([10, 1, 1]), e([10, 1, 2]), e([10, 1, 3])])
         v3.discover(tally.discovered("v3 discover"))
         v3.walk(tally.walked("v3 walk"), e([10]))
-        v3b.walk(v3b_walked, Oid([1, 3, 6, 1, 4, 1, 8072, 9999, 1]))
-        n2.trap(trap_sent, trap_oid, payload, 100)
+        v3b.walk((lambda c, vbs, err: v3b_walked(tally, v2w, v3, c, vbs, err)), Oid([1, 3, 6, 1, 4, 1, 8072, 9999, 1]))
+        n2.trap((lambda c, err: trap_sent(n2, tally, c, err)), trap_oid, payload, 100)
         n3.inform(tally.completed("inform v3"), trap_oid, payload, 300)
 
 
-    # Faults ############################################################################################
-
-    __startup__()
+# Faults ############################################################################################
 
 
 actor _test_faults(t: testing.AsyncT):
@@ -1194,16 +1205,11 @@ actor _test_faults(t: testing.AsyncT):
     (two communities, an SNMPv3 user) walk it with retries and each gets exactly its walk"""
     proc def __startup__():
         mn = MemNet(NetFaults(drop_every_nth=5, duplicate=True, reorder=True, spoof_source=True, to_address=MANAGER))
-        a = Agent(mn.server(AGENT, 161), make_view(), agent_config([sha_aes()]), None)
-        d = mem_dispatcher(mn, t.log_handler)
         o = Options(timeout=0.3, retries=5, max_repetitions=6)
-        clients = [client_via(d, AGENT, Community("public"), o), client_via(d, AGENT, Community("private"), o),
-                   client_via(d, AGENT, sha_aes(), o)]
         labels = ["public", "private", "u_sha_aes"]
         full = full_view()
-        tally = Tally(3, tallied)
 
-        def tallied(got: dict[str, Got]) -> None:
+        def tallied(clients: list[Client], d: Dispatcher, got: dict[str, Got]) -> None:
             s = d.stats()
             ns = mn.stats()
             cs = [c.stats() for c in clients]
@@ -1219,13 +1225,19 @@ actor _test_faults(t: testing.AsyncT):
             report(t, outcome(check))
 
         t.timeout(60.0)
+
+        a = Agent(mn.server(AGENT, 161), make_view(), agent_config([sha_aes()]), None)
+        d = mem_dispatcher(mn, t.log_handler)
+
+        clients = [client_via(d, AGENT, Community("public"), o), client_via(d, AGENT, Community("private"), o),
+                   client_via(d, AGENT, sha_aes(), o)]
+
+        tally = Tally(3, (lambda got: tallied(clients, d, got)))
         for k in range(len(labels)):
             clients[k].walk(tally.walked(labels[k]), Oid([1, 3, 6, 1, 4, 1, 8072, 9999, 1]))
 
 
-            # Record bounds and lifetime, redraws, spoofers, zones ##############################################
-
-    __startup__()
+# Record bounds and lifetime, redraws, spoofers, zones ##############################################
 
 
 def _v2c_request(community: bytes, pdu_type: int, request_id: int, oid: Oid) -> bytes:
@@ -1249,12 +1261,11 @@ proc def first_request_id(hist: list[transport.Datagram], oid: Oid) -> int:
 actor _SlowAgent(mn: MemNet, slow: Oid, delay: float):
     """A scripted SNMPv2c agent on AGENT:161: answers every GET at once with Integer(7) for its first OID, and a
     GET of slow after delay seconds"""
-    srv = mn.server(AGENT, 161)
 
-    def _reply_due(out: bytes, address: str, port: int) -> None:
+    def _reply_due(srv: ServerTransport, out: bytes, address: str, port: int) -> None:
         srv.send_to(out, address, port)
 
-    def received(data: bytes, src_address: str, src_port: int) -> None:
+    def received(srv: ServerTransport, data: bytes, src_address: str, src_port: int) -> None:
         c, m = message.decode(data)
         if c is not None:
             p = c.pdu
@@ -1262,14 +1273,15 @@ actor _SlowAgent(mn: MemNet, slow: Oid, delay: float):
                 r = Pdu(pdu.RESPONSE, p.request_id, 0, 0, [VarBind(p.varbinds[0].oid, Integer(7))])
                 out = message.encode_community(CommunityMessage(c.version, c.community, r))
                 if p.varbinds[0].oid == slow:
-                    after delay: _reply_due(out, src_address, src_port)
+                    after delay: _reply_due(srv, out, src_address, src_port)
                 else:
                     srv.send_to(out, src_address, src_port)
 
     proc def __startup__():
-        srv.set_receiver(received)
+        srv = mn.server(AGENT, 161)
 
-    __startup__()
+        srv.set_receiver((lambda data, src_address, src_port: received(srv, data, src_address, src_port)))
+
 
 
 actor _test_slow_answer_on_shared_peer(t: testing.AsyncT):
@@ -1279,16 +1291,13 @@ actor _test_slow_answer_on_shared_peer(t: testing.AsyncT):
     mn = MemNet()
     slow = e([99, 0])
     ag = _SlowAgent(mn, slow, 1.0)
-    d = mem_dispatcher(mn, t.log_handler)
-    a = client_via(d, AGENT, Community("public"), Options(timeout=3.0, retries=0, max_in_flight=8))
-    other = d.attach(AGENT, 161)
     rec = Recorder()
     var quick_ok = 0
     var quick_done = 0
     var slow_outcome: ?Got = None
     var ended = False
 
-    proc def _maybe_end() -> None:
+    proc def _maybe_end(a: Client, d: Dispatcher, other: Transport) -> None:
         g = slow_outcome
         if g is not None and quick_done == 3000 and not ended:
             ended = True
@@ -1304,24 +1313,29 @@ actor _test_slow_answer_on_shared_peer(t: testing.AsyncT):
                 testing.assertEqual((s.unroutable, s.routed, sa.timeouts), (0, 3001, 0), str(s) + " " + str(sa))
             report(t, outcome(check))
 
-    def got_quick(c: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+    def got_quick(a: Client, d: Dispatcher, other: Transport, c: Client, r: ?Response, err: ?errors.SnmpError) -> None:
         quick_done += 1
         if err is None:
             quick_ok += 1
-        _maybe_end()
+        _maybe_end(a, d, other)
 
-    def got_slow(c: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+    def got_slow(a: Client, d: Dispatcher, other: Transport, c: Client, r: ?Response, err: ?errors.SnmpError) -> None:
         slow_outcome = Got(r=r, e=err)
-        _maybe_end()
+        _maybe_end(a, d, other)
 
     proc def __startup__():
         t.timeout(60.0)
-        other.set_receiver(rec.received, rec.failed)
-        a.get(got_slow, [slow])
-        for i in range(3000):
-            a.get(got_quick, [e([20, 1 + i % 64, 0])])
 
-    __startup__()
+        d = mem_dispatcher(mn, t.log_handler)
+        a = client_via(d, AGENT, Community("public"), Options(timeout=3.0, retries=0, max_in_flight=8))
+        other = d.attach(AGENT, 161)
+
+        other.set_receiver(rec.received, rec.failed)
+
+        a.get((lambda c, r, err: got_slow(a, d, other, c, r, err)), [slow])
+        for i in range(3000):
+            a.get((lambda c, r, err: got_quick(a, d, other, c, r, err)), [e([20, 1 + i % 64, 0])])
+
 
 
 actor _test_pending_records_kept(t: testing.AsyncT):
@@ -1329,14 +1343,10 @@ actor _test_pending_records_kept(t: testing.AsyncT):
     transport of the agent cannot take their ids (ID_IN_USE) or get their answers, and the third GET is not sent
     until there is room (back-pressure: its retry goes out once the first two are answered)"""
     mn = MemNet(NetFaults(delay=1.0, to_address=MANAGER))
-    a = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), None)
-    d = mem_dispatcher(mn, t.log_handler, max_ids=2)
-    ca = client_via(d, AGENT, Community("public"), Options(timeout=1.5, retries=1, max_in_flight=4))
-    tb = d.attach(AGENT, 161)
     rb = Recorder()
     var stolen = -1
 
-    def tallied(got: dict[str, Got]) -> None:
+    def tallied(ca: Client, d: Dispatcher, tb: Transport, got: dict[str, Got]) -> None:
         s = d.stats()
         keys_b = rb.keys_seen()
         errs_b = rb.errors_seen()
@@ -1353,34 +1363,36 @@ actor _test_pending_records_kept(t: testing.AsyncT):
             testing.assertEqual((s.collisions, s.refused, s.unroutable), (1, 1, 0), str(s))
         report(t, outcome(check))
 
-    tally = Tally(3, tallied)
-
-    def steal_due() -> None:
+    def steal_due(tb: Transport) -> None:
         stolen = first_request_id(mn.history(), e([20, 1, 0]))
         tb.send(_v2c_request(b"nobody", pdu.GET, stolen, SYS_DESCR))
 
     proc def __startup__():
         t.timeout(30.0)
+
+        a = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), None)
+        d = mem_dispatcher(mn, t.log_handler, max_ids=2)
+        ca = client_via(d, AGENT, Community("public"), Options(timeout=1.5, retries=1, max_in_flight=4))
+        tb = d.attach(AGENT, 161)
+
         tb.set_receiver(rb.received, rb.failed)
+
+        tally = Tally(3, (lambda got: tallied(ca, d, tb, got)))
+
         for i in range(1, 4):
             ca.get(tally.completed("get %d" % i), [e([20, i, 0])])
-        after 0.3: steal_due()
+        after 0.3: steal_due(tb)
 
-    __startup__()
 
 
 actor _test_records_outlive_short_lifetime(t: testing.AsyncT):
     """id_lifetime 0.5 s, a Client that waits up to 3 s and an answer that takes 1 s: the record lives as long as
     the Client waits, so another transport of the agent cannot take the id (ID_IN_USE) or get the answer"""
     mn = MemNet(NetFaults(delay=1.0, to_address=MANAGER))
-    a = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), None)
-    d = mem_dispatcher(mn, t.log_handler, id_lifetime=0.5)
-    ca = client_via(d, AGENT, Community("public"), Options(timeout=3.0, retries=0))
-    tb = d.attach(AGENT, 161)
     rb = Recorder()
     var stolen = -1
 
-    def tallied(got: dict[str, Got]) -> None:
+    def tallied(ca: Client, d: Dispatcher, tb: Transport, got: dict[str, Got]) -> None:
         s = d.stats()
         keys_b = rb.keys_seen()
         errs_b = rb.errors_seen()
@@ -1395,33 +1407,35 @@ actor _test_records_outlive_short_lifetime(t: testing.AsyncT):
             testing.assertEqual((s.collisions, s.unroutable), (1, 0), str(s))
         report(t, outcome(check))
 
-    tally = Tally(1, tallied)
-
-    def steal_due() -> None:
+    def steal_due(tb: Transport) -> None:
         stolen = first_request_id(mn.history(), e([20, 1, 0]))
         tb.send(_v2c_request(b"nobody", pdu.GET, stolen, SYS_DESCR))
 
     proc def __startup__():
         t.timeout(20.0)
-        tb.set_receiver(rb.received, rb.failed)
-        ca.get(tally.completed("get"), [e([20, 1, 0])])
-        after 0.7: steal_due()
 
-    __startup__()
+        a = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), None)
+        d = mem_dispatcher(mn, t.log_handler, id_lifetime=0.5)
+        ca = client_via(d, AGENT, Community("public"), Options(timeout=3.0, retries=0))
+        tb = d.attach(AGENT, 161)
+
+        tb.set_receiver(rb.received, rb.failed)
+
+        tally = Tally(1, (lambda got: tallied(ca, d, tb, got)))
+
+        ca.get(tally.completed("get"), [e([20, 1, 0])])
+        after 0.7: steal_due(tb)
+
 
 
 actor _test_redraws_bounded(t: testing.AsyncT):
     """request_id_bits=16 and every id of the peer recorded by another transport: a GET (timeout 0.5 s, no
     retries) fails at once with QueueFullError instead of redrawing until the records expire"""
     mn = MemNet()
-    a = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), None)
-    d = mem_dispatcher(mn, None, id_lifetime=4.0, max_ids=40000)
-    raw = d.attach(AGENT, 161)
     rr = Recorder()
-    c = client_via(d, AGENT, Community("public"), Options(timeout=0.5, retries=0, request_id_bits=16))
     var started = 0.0
 
-    def got(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+    def got(raw: Transport, cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
         elapsed = _ms() - started
         sc = cl.stats()
         cl.close()
@@ -1433,18 +1447,24 @@ actor _test_redraws_bounded(t: testing.AsyncT):
             testing.assertEqual(sc.id_collisions, client.MAX_REDRAWS + 1, "redraws: " + str(sc))
         report(t, outcome(check))
 
-    def start_due() -> None:
+    def start_due(c: Client, raw: Transport) -> None:
         started = _ms()
-        c.get(got, [SYS_DESCR])
+        c.get((lambda cl, r, err: got(raw, cl, r, err)), [SYS_DESCR])
 
     proc def __startup__():
         t.timeout(60.0)
+
+        a = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), None)
+        d = mem_dispatcher(mn, None, id_lifetime=4.0, max_ids=40000)
+        raw = d.attach(AGENT, 161)
+
         raw.set_receiver(rr.received, rr.failed)
         for id in range(1, 32768):
             raw.send(_v2c_request(b"nobody", pdu.GET, id, SYS_DESCR))
-        after 0.5: start_due()
+        c = client_via(d, AGENT, Community("public"), Options(timeout=0.5, retries=0, request_id_bits=16))
 
-    __startup__()
+        after 0.5: start_due(c, raw)
+
 
 
 actor _test_redraw_keeps_attempt_timer(t: testing.AsyncT):
@@ -1452,10 +1472,6 @@ actor _test_redraw_keeps_attempt_timer(t: testing.AsyncT):
     after its two attempt timeouts with TimeoutError.attempts 2 (a redraw neither counts nor restarts the timer)"""
     proc def __startup__():
         mn = MemNet()
-        a = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), None)
-        rf = _Refuser(mn.client(MANAGER, 40001, AGENT, 161), [True, True])
-        c = Client(None, AGENT, Community("nobody"), t.log_handler, opts=Options(timeout=0.5, retries=1),
-                   transport=refusing(rf))
         started = _ms()
 
         def got(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
@@ -1472,9 +1488,14 @@ actor _test_redraw_keeps_attempt_timer(t: testing.AsyncT):
             report(t, outcome(check))
 
         t.timeout(20.0)
+
+        a = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), None)
+        rf = _Refuser(mn.client(MANAGER, 40001, AGENT, 161), [True, True])
+        c = Client(None, AGENT, Community("nobody"), t.log_handler, opts=Options(timeout=0.5, retries=1),
+                   transport=refusing(rf))
+
         c.get(got, [SYS_DESCR])
 
-    __startup__()
 
 
 actor _test_loose_spoofer(t: testing.AsyncT):
@@ -1482,7 +1503,6 @@ actor _test_loose_spoofer(t: testing.AsyncT):
     secret19); an off-path sender that knows only the Dispatcher's port answers every id once from 192.0.2.66
     with a forged value and another community: no Client accepts it"""
     mn = MemNet()
-    d = mem_dispatcher(mn, None, strict_source=False)
     var clients: list[Client] = []
     var outcomes: list[str] = []
     var polls = 0
@@ -1490,11 +1510,11 @@ actor _test_loose_spoofer(t: testing.AsyncT):
     def got(c: Client, r: ?Response, err: ?errors.SnmpError) -> None:
         outcomes.append(describe(Got(r=r, e=err)))
 
-    def poll_due() -> None:
+    def poll_due(d: Dispatcher) -> None:
         s = d.stats()
         polls += 1
         if s.received < 32767 and polls < 100:
-            after 0.2: poll_due()
+            after 0.2: poll_due(d)
             return
         out = outcomes.copy()
         for c in clients:
@@ -1505,24 +1525,27 @@ actor _test_loose_spoofer(t: testing.AsyncT):
             testing.assertEqual((s.received, s.routed), (32767, 0), str(s))
         report(t, outcome(check))
 
-    def spoof_due() -> None:
+    def spoof_due(d: Dispatcher) -> None:
         for id in range(1, 32768):
             p = Pdu(pdu.RESPONSE, id, 0, 0, [VarBind(SYS_DESCR, OctetString(b"forged"))])
             mn.send(message.encode_community(CommunityMessage(message.SNMP_V2C, b"x", p)), "192.0.2.66", 4444,
                     MANAGER, MPORT)
-        after 0.5: poll_due()
+        after 0.5: poll_due(d)
 
     proc def __startup__():
         t.timeout(60.0)
+
+        d = mem_dispatcher(mn, None, strict_source=False)
+
         for k in range(20):
             addr = "10.1.0.%d" % (k + 1)
             clients.append(client_via(d, addr, Community("secret%d" % k),
                                       Options(timeout=20.0, retries=0, request_id_bits=16)))
+
         for k in range(20):
             clients[k].get(got, [SYS_DESCR])
-        after 0.3: spoof_due()
+        after 0.3: spoof_due(d)
 
-    __startup__()
 
 
 actor _test_attach_refuses_zones(t: testing.AsyncT):
@@ -1530,13 +1553,15 @@ actor _test_attach_refuses_zones(t: testing.AsyncT):
     request would be dropped with only a log warning"""
     proc def __startup__():
         mn = MemNet()
-        d = mem_dispatcher(mn, t.log_handler)
         outcomes: list[str] = []
 
         def check() -> None:
             testing.assertEqual(outcomes, ["refused", "refused", "refused"])
 
         t.timeout(10.0)
+
+        d = mem_dispatcher(mn, t.log_handler)
+
         for spec in ["fe80::1%eth0", "::1%lo", "fe80::1%1"]:
             try:
                 tr = d.attach(spec, 161)
@@ -1546,7 +1571,6 @@ actor _test_attach_refuses_zones(t: testing.AsyncT):
 
         report(t, outcome(check))
 
-    __startup__()
 
 
 actor _test_attach_family(t: testing.AsyncT):
@@ -1561,6 +1585,7 @@ actor _test_attach_family(t: testing.AsyncT):
             testing.assertEqual(outcomes, ["10.0.0.100 ++-", "0.0.0.0 ++-", "2001:db8::100 --+", ":: +++", " +++"])
 
         t.timeout(10.0)
+
         for local in ["10.0.0.100", "0.0.0.0", "2001:db8::100", "::", ""]:
             d = Dispatcher(mn.server(local if local != "" else "mem", 0), None, local_address=local)
             row: list[str] = []
@@ -1576,7 +1601,6 @@ actor _test_attach_family(t: testing.AsyncT):
 
         report(t, outcome(check))
 
-    __startup__()
 
 
 actor _test_full_hint(t: testing.AsyncT):
@@ -1584,13 +1608,8 @@ actor _test_full_hint(t: testing.AsyncT):
     out with the refusal as its hint (DispatcherStats.refused)"""
     proc def __startup__():
         mn = MemNet(NetFaults(delay=1.0, to_address=MANAGER))
-        a = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), None)
-        d = mem_dispatcher(mn, t.log_handler, max_ids=1)
-        ca = client_via(d, AGENT, Community("public"), Options(timeout=0.5, retries=0, max_in_flight=2))
-        other = d.attach(AGENT, 161)
-        tally = Tally(2, tallied)
 
-        def tallied(got: dict[str, Got]) -> None:
+        def tallied(ca: Client, d: Dispatcher, other: Transport, got: dict[str, Got]) -> None:
             s = d.stats()
             sa = ca.stats()
             ca.close()
@@ -1612,28 +1631,28 @@ actor _test_full_hint(t: testing.AsyncT):
             report(t, outcome(check))
 
         t.timeout(20.0)
+
+        a = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), None)
+        d = mem_dispatcher(mn, t.log_handler, max_ids=1)
+        ca = client_via(d, AGENT, Community("public"), Options(timeout=0.5, retries=0, max_in_flight=2))
+        other = d.attach(AGENT, 161)
+
+        tally = Tally(2, (lambda got: tallied(ca, d, other, got)))
         ca.get(tally.completed("first"), [e([20, 1, 0])])
         ca.get(tally.completed("second"), [e([20, 2, 0])])
 
-    __startup__()
 
 
 actor _test_record_bounds(t: testing.AsyncT):
     """max_ids=4: a Client's 40 answered GETs leave 4 answered records, and the records of 12 timed-out GETs to
     a silent peer make room once their Client no longer waits (no refusal), on shared peers"""
     mn = MemNet()
-    a = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), None)
-    d = mem_dispatcher(mn, t.log_handler, max_ids=4)
-    busy = client_via(d, AGENT, Community("public"))
-    idle = d.attach(AGENT, 161)
-    dead = client_via(d, AGENT2, Community("public"), Options(timeout=0.05, retries=0))
-    idle2 = d.attach(AGENT2, 161)
     var left_busy = 40
     var left_dead = 12
     var errs: list[str] = []
     var reported = False
 
-    proc def _maybe_end() -> None:
+    proc def _maybe_end(busy: Client, d: Dispatcher, dead: Client, idle: Transport, idle2: Transport) -> None:
         if left_busy == 0 and left_dead == 0 and not reported:
             reported = True
             s = d.stats()
@@ -1647,32 +1666,39 @@ actor _test_record_bounds(t: testing.AsyncT):
                 testing.assertTrue(s.records <= 8, "4 answered, at most 4 pending: " + str(s))
             report(t, outcome(check))
 
-    def got_busy(c: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+    def got_busy(busy: Client, d: Dispatcher, dead: Client, idle: Transport, idle2: Transport, c: Client, r: ?Response, err: ?errors.SnmpError) -> None:
         if err is not None:
             errs.append("busy: " + str(err))
         left_busy -= 1
         if left_busy > 0:
-            c.get(got_busy, [e([20, 1 + left_busy % 64, 0])])
-        _maybe_end()
+            c.get((lambda c, r, err: got_busy(busy, d, dead, idle, idle2, c, r, err)), [e([20, 1 + left_busy % 64, 0])])
+        _maybe_end(busy, d, dead, idle, idle2)
 
-    def got_dead(c: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+    def got_dead(busy: Client, d: Dispatcher, dead: Client, idle: Transport, idle2: Transport, c: Client, r: ?Response, err: ?errors.SnmpError) -> None:
         if not isinstance(err, errors.TimeoutError):
             errs.append("dead: " + describe(Got(r=r, e=err)))
         left_dead -= 1
         if left_dead > 0:
             # one hold later (budget 0.05 s plus one attempt timeout): the oldest record may go
-            after 0.12: _dead_due()
-        _maybe_end()
+            after 0.12: _dead_due(busy, d, dead, idle, idle2)
+        _maybe_end(busy, d, dead, idle, idle2)
 
-    def _dead_due() -> None:
-        dead.get(got_dead, [SYS_DESCR])
+    def _dead_due(busy: Client, d: Dispatcher, dead: Client, idle: Transport, idle2: Transport) -> None:
+        dead.get((lambda c, r, err: got_dead(busy, d, dead, idle, idle2, c, r, err)), [SYS_DESCR])
 
     proc def __startup__():
         t.timeout(30.0)
-        busy.get(got_busy, [e([20, 1, 0])])
-        dead.get(got_dead, [SYS_DESCR])
 
-    __startup__()
+        a = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), None)
+        d = mem_dispatcher(mn, t.log_handler, max_ids=4)
+        busy = client_via(d, AGENT, Community("public"))
+        idle = d.attach(AGENT, 161)
+        dead = client_via(d, AGENT2, Community("public"), Options(timeout=0.05, retries=0))
+        idle2 = d.attach(AGENT2, 161)
+
+        busy.get((lambda c, r, err: got_busy(busy, d, dead, idle, idle2, c, r, err)), [e([20, 1, 0])])
+        dead.get((lambda c, r, err: got_dead(busy, d, dead, idle, idle2, c, r, err)), [SYS_DESCR])
+
 
 
 actor _test_room_from_shorter_holds(t: testing.AsyncT):
@@ -1681,14 +1707,9 @@ actor _test_room_from_shorter_holds(t: testing.AsyncT):
     is sent (no refusal)"""
     proc def __startup__():
         mn = MemNet(NetFaults(delay=1.0, to_address=MANAGER))
-        a = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), None)
-        d = mem_dispatcher(mn, t.log_handler, max_ids=2)
         long = Options(timeout=3.0, retries=0, max_in_flight=4)
-        ca = client_via(d, AGENT, Community("public"), long)
-        other = d.attach(AGENT, 161)
-        tally = Tally(3, tallied)
 
-        def tallied(got: dict[str, Got]) -> None:
+        def tallied(ca: Client, d: Dispatcher, other: Transport, got: dict[str, Got]) -> None:
             s = d.stats()
             ca.close()
             other.close()
@@ -1699,15 +1720,23 @@ actor _test_room_from_shorter_holds(t: testing.AsyncT):
                 testing.assertEqual((s.sent, s.refused), (3, 0), str(s))
             report(t, outcome(check))
 
-        def third_due() -> None:
+        def third_due(ca: Client, tally: Tally) -> None:
             ca.get(tally.completed("third"), [e([20, 3, 0])])
 
         t.timeout(20.0)
+
+        a = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), None)
+        d = mem_dispatcher(mn, t.log_handler, max_ids=2)
+
+        ca = client_via(d, AGENT, Community("public"), long)
+        other = d.attach(AGENT, 161)
+
+        tally = Tally(3, (lambda got: tallied(ca, d, other, got)))
+
         ca.get(tally.completed("long"), [e([20, 1, 0])])
         ca.get(tally.completed("short"), [e([20, 2, 0])], Options(timeout=0.05, retries=0))
-        after 0.3: third_due()
+        after 0.3: third_due(ca, tally)
 
-    __startup__()
 
 
 actor _test_strict_per_attach(t: testing.AsyncT):
@@ -1716,16 +1745,10 @@ actor _test_strict_per_attach(t: testing.AsyncT):
     sources, even with the right community and id (only the loose transports' requests are candidates)"""
     proc def __startup__():
         mn = MemNet()
-        a = Agent(mn.server(OTHER, 161), make_view(), agent_config([]), None)
         relay = _Relay(mn, AGENT, OTHER)
-        ds = Dispatcher(mn.server(MANAGER, MPORT), t.log_handler)
-        dl = Dispatcher(mn.server(MANAGER, MPORT + 1), t.log_handler, False)
         o = Options(timeout=0.3, retries=1)
-        loose_on_strict = Client(None, AGENT, Community("public"), None, opts=o, transport=ds.attach(AGENT, 161, False))
-        strict_on_loose = Client(None, AGENT, Community("public"), None, opts=o, transport=dl.attach(AGENT, 161, True))
-        tally = Tally(2, tallied)
 
-        def tallied(got: dict[str, Got]) -> None:
+        def tallied(dl: Dispatcher, ds: Dispatcher, loose_on_strict: Client, strict_on_loose: Client, got: dict[str, Got]) -> None:
             s1 = ds.stats()
             s2 = dl.stats()
             loose_on_strict.close()
@@ -1740,13 +1763,21 @@ actor _test_strict_per_attach(t: testing.AsyncT):
             report(t, outcome(check))
 
         t.timeout(30.0)
+
+        a = Agent(mn.server(OTHER, 161), make_view(), agent_config([]), None)
+
+        ds = Dispatcher(mn.server(MANAGER, MPORT), t.log_handler)
+        dl = Dispatcher(mn.server(MANAGER, MPORT + 1), t.log_handler, False)
+
+        loose_on_strict = Client(None, AGENT, Community("public"), None, opts=o, transport=ds.attach(AGENT, 161, False))
+        strict_on_loose = Client(None, AGENT, Community("public"), None, opts=o, transport=dl.attach(AGENT, 161, True))
+
+        tally = Tally(2, (lambda got: tallied(dl, ds, loose_on_strict, strict_on_loose, got)))
         loose_on_strict.get(tally.completed("loose on strict"), [SYS_DESCR])
         strict_on_loose.get(tally.completed("strict on loose"), [SYS_DESCR])
 
 
-            # Real UDP (env tests) ##############################################################################
-
-    __startup__()
+# Real UDP (env tests) ##############################################################################
 
 
 proc def listen_cap(t: testing.EnvT) -> net.UDPListenCap:
@@ -1802,7 +1833,6 @@ actor _UdpEcho(t: testing.EnvT, address: str, on_ready: action(int) -> None):
     proc def __startup__():
         transport.udp_server_transport(listen_cap(t), address, 0, listening, None)
 
-    __startup__()
 
 
 actor _test_udp_dual_stack(t: testing.EnvT):
@@ -1860,9 +1890,9 @@ actor _test_udp_dual_stack(t: testing.EnvT):
 
     proc def __startup__():
         t.timeout(30.0)
+
         transport.udp_server_transport(listen_cap(t), "127.0.0.1", 0, agent_listening, None)
 
-    __startup__()
 
 
 actor _test_udp_source_address(t: testing.EnvT):
@@ -1901,9 +1931,9 @@ actor _test_udp_source_address(t: testing.EnvT):
 
     proc def __startup__():
         t.timeout(30.0)
+
         echo = _UdpEcho(t, "127.0.0.1", echo_listening)
 
-    __startup__()
 
 
 actor _test_udp_listen_failure(t: testing.EnvT):
@@ -1927,7 +1957,6 @@ actor _test_udp_listen_failure(t: testing.EnvT):
 
         dispatcher.udp_dispatcher(listen_cap(t), "192.0.2.1", 0, disp_listening, None)
 
-    __startup__()
 
 
 actor _test_udp_family_refused(t: testing.EnvT):
@@ -1965,12 +1994,11 @@ actor _test_udp_family_refused(t: testing.EnvT):
             dispatcher.udp_dispatcher(listen_cap(t), "::1", 0, v6_listening, t.log_handler)
 
         t.timeout(30.0)
+
         dispatcher.udp_dispatcher(listen_cap(t), "0.0.0.0", 0, v4_listening, t.log_handler)
 
 
-            # The fleet: thousands of Clients, one socket
-
-    __startup__()
+# The fleet: thousands of Clients, one socket
 
 
 FLEET_CLIENTS = 2000
@@ -2089,7 +2117,6 @@ actor _Fleet(t: testing.EnvT, shared: bool, n: int, agents: int, gets: int, wind
     proc def __startup__():
         transport.udp_server_transport(listen_cap(t), "127.0.0.1", 0, agent_listening, None)
 
-    __startup__()
 
 
 actor _FleetRunner(c: Client, gets: int, descr: OctetString, on_done: action(list[str], int) -> None):
@@ -2114,7 +2141,6 @@ actor _FleetRunner(c: Client, gets: int, descr: OctetString, on_done: action(lis
     proc def __startup__():
         c.get(got, [SYS_DESCR])
 
-    __startup__()
 
 
 actor _test_udp_fleet_dispatcher(t: testing.EnvT):
@@ -2125,7 +2151,6 @@ actor _test_udp_fleet_dispatcher(t: testing.EnvT):
     proc def __startup__():
         t.timeout(120.0)
 
-    __startup__()
 
 
 actor _test_udp_fleet_connected(t: testing.EnvT):
@@ -2134,7 +2159,9 @@ actor _test_udp_fleet_connected(t: testing.EnvT):
 
     proc def __startup__():
         limit = max_open_files(t)
+
         t.timeout(120.0)
+
         if limit >= 0 and limit < FLEET_CLIENTS + 1000:
             try:
                 t.skip("the open-files limit %d is too low for %d connected sockets" % (limit, FLEET_CLIENTS))
@@ -2142,7 +2169,3 @@ actor _test_udp_fleet_connected(t: testing.EnvT):
                 pass
         else:
             f = _Fleet(t, False, FLEET_CLIENTS, FLEET_AGENTS, FLEET_GETS, FLEET_WINDOW)
-
-    __startup__()
-
-

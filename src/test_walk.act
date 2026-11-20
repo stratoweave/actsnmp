@@ -292,7 +292,6 @@ actor _test_walks(t: testing.AsyncT):
         c3.walk(Sink("v3 getnext", h.got).walked, b([1]), OPTS.with_(use_bulk=False))
         c3.walk(Sink("v3 bulk", h.got).walked, b([1]), OPTS.with_(max_repetitions=7))
 
-    __startup__()
 
 
 def check_end_of_view(r: dict[str, Got]) -> None:
@@ -322,7 +321,6 @@ actor _test_walk_end_of_mib_view(t: testing.AsyncT):
         c2.walk(Sink("past the end", h.got).walked, Oid([2, 999]))
         c1.walk(Sink("v1 past the end", h.got).walked, Oid([2, 999]))
 
-    __startup__()
 
 
 def check_root_get(r: dict[str, Got]) -> None:
@@ -361,7 +359,6 @@ actor _test_walk_empty_subtree_gets_root(t: testing.AsyncT):
         s2 = Sink("missing stream", h.got)
         c2.walk_stream(s2.got_batch, s2.stream_ended, b([4]))
 
-    __startup__()
 
 # Ordering, loops and agent faults ##################################################################
 
@@ -409,7 +406,6 @@ actor _test_walk_not_increasing(t: testing.AsyncT):
         c2.walk(Sink("unchecked root", h.got).walked, b([1, 11, 0]), unchecked)
         c2.walk(Sink("unrelated", h.got).walked, b([2, 1, 1]))
 
-    __startup__()
 
 
 actor _test_walk_disorder_scripted(t: testing.AsyncT):
@@ -489,7 +485,6 @@ actor _test_walk_disorder_scripted(t: testing.AsyncT):
         c1 = client(mn, v1(), 40002, OPTS.with_(v1_fix_errors=False))
         c1.walk(Sink("v1 noSuchName", got).walked, nsn)
 
-    __startup__()
 
 
 def check_truncated(r: dict[str, Got]) -> None:
@@ -527,7 +522,6 @@ actor _test_walk_truncated_bulk(t: testing.AsyncT):
         c0.walk_stream(s0.got_batch, s0.stream_ended, b([1]))
         c0.walk(Sink("getnext", h.got).walked, b([1]), OPTS.with_(use_bulk=False))
 
-    __startup__()
 
 
 actor _test_walk_adaptive_too_big(t: testing.AsyncT):
@@ -583,7 +577,6 @@ actor _test_walk_adaptive_too_big(t: testing.AsyncT):
         c.walk(Sink("first", (lambda label, g: got(c, plain, label, g))).walked, b([5]))
         plain.walk(Sink("plain", (lambda label, g: got(c, plain, label, g))).walked, b([5]), OPTS.with_(adaptive_bulk=False))
 
-    __startup__()
 
 
 actor _test_walk_adaptive_timeout(t: testing.AsyncT):
@@ -632,7 +625,6 @@ actor _test_walk_adaptive_timeout(t: testing.AsyncT):
         mn.set_faults(NetFaults(drop_first_n=1, to_address=MANAGER, to_port=40001))
         c.walk(Sink("first", (lambda label, g: got(c, label, g))).walked, b([5]))
 
-    __startup__()
 
 
 actor _test_walk_adaptive_timeout_v3(t: testing.AsyncT):
@@ -668,7 +660,6 @@ actor _test_walk_adaptive_timeout_v3(t: testing.AsyncT):
 
         c.discover((lambda cl, info, e: discovered(c, cl, info, e)))
 
-    __startup__()
 
 
 def regrow_sequence(top: int, low: int, length: int) -> list[int]:
@@ -717,7 +708,6 @@ actor _test_walk_adaptive_regrow(t: testing.AsyncT):
 
         c.walk(Sink("learn", (lambda label, g: got(agent, c, label, g))).walked, b([5]))
 
-    __startup__()
 
 
 actor _test_walk_adaptive_regrow_backoff(t: testing.AsyncT):
@@ -752,7 +742,6 @@ actor _test_walk_adaptive_regrow_backoff(t: testing.AsyncT):
 
         c.walk(walked, b([7]))
 
-    __startup__()
 
 
 actor _test_walk_retries_mid_walk(t: testing.AsyncT):
@@ -789,7 +778,6 @@ actor _test_walk_retries_mid_walk(t: testing.AsyncT):
 
         c.walk_stream((lambda cl, vbs: got_batch(agent, cl, vbs)), (lambda cl, count, e: stream_ended(c, cl, count, e)), b([1]))
 
-    __startup__()
 
 
 def check_errors(r: dict[str, Got]) -> None:
@@ -834,7 +822,6 @@ actor _test_walk_errors_and_limits(t: testing.AsyncT):
         c2.walk_stream(s.got_batch, s.stream_ended, b([1]), OPTS.with_(max_walk_varbinds=7))
         c2.walk(Sink("limit 1", h.got).walked, b([1]), OPTS.with_(max_walk_varbinds=1))
 
-    __startup__()
 
 # Cancel, close, invalid arguments ##################################################################
 
@@ -900,7 +887,6 @@ actor _test_walk_cancel(t: testing.AsyncT):
         c.cancel(ht)
         hs = c.walk_stream((lambda cl, vbs: got_batch(c, cl, vbs)), (lambda cl, count, e: stream_ended(c, cl, count, e)), b([1]))
 
-    __startup__()
 
 
 actor _test_walk_close(t: testing.AsyncT):
@@ -946,7 +932,6 @@ actor _test_walk_close(t: testing.AsyncT):
         c.get_table(Sink("table", got).got_table, [b([2, 1, 1]), b([2, 1, 3])])
         c.walk_stream((lambda cl, vbs: got_batch(c, cl, vbs)), stream_ended, b([1]))
 
-    __startup__()
 
 
 proc def check_invalid(r: dict[str, Got]) -> None:
@@ -1051,7 +1036,6 @@ actor _test_tables(t: testing.AsyncT):
         client(mn, shaaes(), 40004).get_table(Sink("v3", h.got).got_table, cols, OPTS.with_(max_repetitions=5))
         client(mn, v2c(), 40005).walk(Sink("unrelated walk", h.got).walked, b([1]))
 
-    __startup__()
 
 # Queued requests of a finished table, slow agents ###################################################
 
@@ -1084,7 +1068,6 @@ actor _test_table_cancel_sends_once(t: testing.AsyncT):
         c.cancel(h)
         after now 0.6: report(t, outcome((lambda: check(c))))
 
-    __startup__()
 
 
 actor _test_table_timeout_sends_once(t: testing.AsyncT):
@@ -1110,7 +1093,6 @@ actor _test_table_timeout_sends_once(t: testing.AsyncT):
 
         c.get_table(got_table, [b([2, 1, 1]), b([2, 1, 2]), b([2, 1, 3])])
 
-    __startup__()
 
 
 def slow_view() -> MibView:
@@ -1151,7 +1133,6 @@ actor _test_walk_adaptive_slow_agent(t: testing.AsyncT):
 
         c.walk((lambda cl, vbs, e: walked(c, cl, vbs, e)), b([8, 1, 1]))
 
-    __startup__()
 
 # Tables that share an index, narrowed tables, truncation ############################################
 
@@ -1226,7 +1207,6 @@ actor _test_tables_shared_index(t: testing.AsyncT):
                     OPTS.with_(max_walk_varbinds=4, max_repetitions=1))
         c.get_table(Sink("under the limit", h.got).got_table, [IF_DESCR], OPTS.with_(max_walk_varbinds=4))
 
-    __startup__()
 
 # Lab dataset (env tests) ###########################################################################
 
@@ -1293,7 +1273,6 @@ actor _test_lab_walks_v2c(t: testing.EnvT):
         s = Sink("stream", g.got)
         c.walk_stream(s.got_batch, s.stream_ended, BASE, OPTS.with_(max_repetitions=40))
 
-    __startup__()
 
 
 actor _test_lab_walks_v1(t: testing.EnvT):
@@ -1315,7 +1294,6 @@ actor _test_lab_walks_v1(t: testing.EnvT):
         g = Gather(1, (lambda r, calls: gathered(expected, r, calls)))
         client(mn, v1(), 40001).walk(Sink("v1", g.got).walked, BASE)
 
-    __startup__()
 
 
 actor _test_lab_walks_v3(t: testing.EnvT):
@@ -1339,7 +1317,6 @@ actor _test_lab_walks_v3(t: testing.EnvT):
         c.walk(Sink("getnext", g.got).walked, BASE, OPTS.with_(use_bulk=False))
         c.walk(Sink("bulk", g.got).walked, BASE)
 
-    __startup__()
 
 
 def lab_columns(table: int, n: int) -> list[Oid]:
@@ -1392,7 +1369,6 @@ actor _test_lab_tables(t: testing.EnvT):
         client(mn, v1(), 40002).get_table(Sink("v1 table", g.got).got_table, lab_columns(10, 7))
         client(mn2, v2c(), 40001).get_table(Sink("table cut mid-row", g.got).got_table, lab_columns(10, 7))
 
-    __startup__()
 
 
 actor _test_lab_bulk_walk_time(t: testing.EnvT):
@@ -1435,5 +1411,3 @@ actor _test_lab_bulk_walk_time(t: testing.EnvT):
 
         started = ms()
         c.walk((lambda cl, vbs, e: walked_m25(c, expected, cl, vbs, e)), BASE)
-
-    __startup__()

@@ -191,7 +191,6 @@ actor Script(mn: MemNet, steps: list[Step], first_port: int, on_done: action(lis
     proc def __startup__():
         _next()
 
-    __startup__()
 
 
 proc def finish(t: testing.AsyncT, failures: list[str]) -> None:
@@ -296,7 +295,6 @@ actor _test_requests(t: testing.AsyncT):
 
         Script(mn, request_steps(), 41000, finished)
 
-    __startup__()
 
 # Walks and tables ##################################################################################
 
@@ -359,7 +357,6 @@ actor _test_walks(t: testing.AsyncT):
 
         Script(mn, walk_steps(), 42000, finished)
 
-    __startup__()
 
 
 actor _test_walk_faults(t: testing.AsyncT):
@@ -398,7 +395,6 @@ actor _test_walk_faults(t: testing.AsyncT):
 
         Script(mn, steps, 43000, finished)
 
-    __startup__()
 
 # net-snmp parity ####################################################################################
 
@@ -474,7 +470,6 @@ actor _test_parity(t: testing.AsyncT):
 
         Script(mn, parity_steps(), 46000, finished)
 
-    __startup__()
 
 
 def _test_failure_texts() -> None:
@@ -641,7 +636,6 @@ actor _test_notifications(t: testing.AsyncT):
         rcv = NotificationReceiver(mn.server(RECEIVER, 162), config, printer.received, None)
         Script(mn, trap_steps(), 44000, steps_finished)
 
-    __startup__()
 
 
 def _test_trapd_text() -> None:
@@ -822,7 +816,6 @@ actor _test_tcp_watch(t: testing.AsyncT):
         w2.connected()
         after 0.2: registration_due()
 
-    __startup__()
 
 
 actor _test_tcp_commands(t: testing.AsyncT):
@@ -906,7 +899,6 @@ actor _test_tcp_commands(t: testing.AsyncT):
         up_cmd.connected()
         after 0.05: refusal_due()
 
-    __startup__()
 
 # Helpers ###########################################################################################
 
@@ -998,7 +990,6 @@ actor LabWalk(t: testing.EnvT, args: list[str], expected_file: str, sort_lines: 
 
         run_cli(mn, 45000, args, (lambda r: walked(expected, r)), tree)
 
-    __startup__()
 
 
 actor _test_lab_bulkwalk(t: testing.EnvT):
@@ -1009,7 +1000,6 @@ actor _test_lab_bulkwalk(t: testing.EnvT):
         LabWalk(t, ["bulkwalk", "-v2c", "-c", "public", AGENT, ".1.3.6.1.4.1.8072.9999.1"],
                 "interop/expected/netsnmp/snmpd-dataset.On.txt", False)
 
-    __startup__()
 
 
 actor _test_lab_walk_v1(t: testing.EnvT):
@@ -1020,7 +1010,6 @@ actor _test_lab_walk_v1(t: testing.EnvT):
         LabWalk(t, ["walk", "-v1", "-c", "public", AGENT, ".1.3.6.1.4.1.8072.9999.1"],
                 "interop/expected/netsnmp/snmpd-dataset-v1.On.txt", False)
 
-    __startup__()
 
 
 actor _test_lab_bulkwalk_hex(t: testing.EnvT):
@@ -1032,7 +1021,6 @@ actor _test_lab_bulkwalk_hex(t: testing.EnvT):
                     "-X", "privpass123", "-Ox", "--hexOutputLength=0", AGENT, ".1.3.6.1.4.1.8072.9999.1"],
                 "interop/expected/netsnmp/snmpd-dataset.On-Ox.txt", False)
 
-    __startup__()
 
 
 actor _test_lab_table(t: testing.EnvT):
@@ -1044,7 +1032,6 @@ actor _test_lab_table(t: testing.EnvT):
                    + [".1.3.6.1.4.1.8072.9999.1.10.1.%d" % c for c in range(1, 8)],
                 "interop/expected/canon/table.txt", True)
 
-    __startup__()
 
 
 actor _test_lab_table_v1(t: testing.EnvT):
@@ -1056,7 +1043,6 @@ actor _test_lab_table_v1(t: testing.EnvT):
                     ".1.3.6.1.4.1.8072.9999.1.11.1.2", ".1.3.6.1.4.1.8072.9999.1.11.1.3"],
                 "interop/expected/canon/strtable.txt", True)
 
-    __startup__()
 
 # With MIBs ########################################################################################
 
@@ -1177,7 +1163,6 @@ actor _test_with_mibs(t: testing.AsyncT):
 
         Script(mn, mib_steps(), 46000, finished, cli_tree())
 
-    __startup__()
 
 
 def _test_mib_texts() -> None:
@@ -1215,7 +1200,6 @@ actor _test_lab_mib_walk(t: testing.EnvT):
         LabWalk(t, ["bulkwalk", "-m", "ACTSNMP-LAB-MIB", "-v2c", "-c", "public", AGENT, ".1.3.6.1.4.1.8072.9999.1"],
                 "interop/expected/netsnmp/snmpd-dataset.lab-mib.txt", False, ld.tree)
 
-    __startup__()
 
 
 actor _test_lab_mib_walk_ox(t: testing.EnvT):
@@ -1228,7 +1212,6 @@ actor _test_lab_mib_walk_ox(t: testing.EnvT):
         LabWalk(t, ["bulkwalk", "-OX", "-m", "ACTSNMP-LAB-MIB", "-v2c", "-c", "public", AGENT, ".1.3.6.1.4.1.8072.9999.1"],
                 "interop/expected/netsnmp/snmpd-dataset.lab-mib-OX.txt", False, ld.tree)
 
-    __startup__()
 
 
 actor _test_load_messages(t: testing.EnvT):
@@ -1249,5 +1232,3 @@ actor _test_load_messages(t: testing.EnvT):
             t.success()
         else:
             t.failure(AssertionError("messages %r, %r, note %r" % (a.messages, b.messages, note)))
-
-    __startup__()

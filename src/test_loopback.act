@@ -93,7 +93,6 @@ actor _AgentGet(t: testing.EnvT, address: str, sec: Security):
     proc def __startup__():
         udp_server_transport(net.UDPListenCap(ucap), address, 0, listening, t.log_handler)
 
-    __startup__()
 
 
 actor _test_v2c_get_ipv4(t: testing.EnvT):
@@ -103,7 +102,6 @@ actor _test_v2c_get_ipv4(t: testing.EnvT):
     proc def __startup__():
         t.timeout(15.0)
 
-    __startup__()
 
 
 actor _test_v2c_get_ipv6(t: testing.EnvT):
@@ -113,7 +111,6 @@ actor _test_v2c_get_ipv6(t: testing.EnvT):
     proc def __startup__():
         t.timeout(15.0)
 
-    __startup__()
 
 
 actor _test_v3_auth_priv_get_ipv4(t: testing.EnvT):
@@ -123,7 +120,6 @@ actor _test_v3_auth_priv_get_ipv4(t: testing.EnvT):
     proc def __startup__():
         t.timeout(15.0)
 
-    __startup__()
 
 
 actor _test_v3_auth_priv_get_ipv6(t: testing.EnvT):
@@ -133,7 +129,6 @@ actor _test_v3_auth_priv_get_ipv6(t: testing.EnvT):
     proc def __startup__():
         t.timeout(15.0)
 
-    __startup__()
 
 
 actor _test_notifications_ipv4(t: testing.EnvT):
@@ -211,7 +206,6 @@ actor _test_notifications_ipv4(t: testing.EnvT):
 
         udp_server_transport(net.UDPListenCap(ucap), "127.0.0.1", 0, listening, t.log_handler)
 
-    __startup__()
 
 
 actor _test_icmp_unreachable(t: testing.EnvT):
@@ -244,7 +238,6 @@ actor _test_icmp_unreachable(t: testing.EnvT):
 
         udp_server_transport(net.UDPListenCap(ucap), "127.0.0.1", 0, listening, t.log_handler)
 
-    __startup__()
 
 # TCP ##############################################################################################
 
@@ -345,7 +338,6 @@ actor _TcpGet(t: testing.EnvT, k: int, sec: Security):
 
         server = _TcpAgent(t, _tcp_ports(k), view(), _users(sec), listening)
 
-    __startup__()
 
 
 actor _test_tcp_v2c_get(t: testing.EnvT):
@@ -393,7 +385,6 @@ actor _test_tcp_walk(t: testing.EnvT):
 
         server = _TcpAgent(t, _tcp_ports(2), MibView(rows + [VarBind(SYS_DESCR, OctetString(DESCR))]), [], listening)
 
-    __startup__()
 
 
 actor _test_tcp_large_response(t: testing.EnvT):
@@ -427,7 +418,6 @@ actor _test_tcp_large_response(t: testing.EnvT):
 
         server = _TcpAgent(t, _tcp_ports(3), MibView(big), [], listening)
 
-    __startup__()
 
 
 actor _test_tcp_server_idle_timeout_reconnects(t: testing.EnvT):
@@ -472,7 +462,6 @@ actor _test_tcp_server_idle_timeout_reconnects(t: testing.EnvT):
 
         server = _TcpAgent(t, _tcp_ports(4), view(), [], listening, idle_timeout=0.15)
 
-    __startup__()
 
 
 actor _test_tcp_refused(t: testing.EnvT):
@@ -495,7 +484,6 @@ actor _test_tcp_refused(t: testing.EnvT):
         c = _tcp_client(t, TCP_CLOSED_PORT, Community("public"), Options(timeout=0.3, retries=1))
         c.get(got, [SYS_DESCR])
 
-    __startup__()
 
 
 actor _test_tcp_max_connections(t: testing.EnvT):
@@ -549,7 +537,6 @@ actor _test_tcp_max_connections(t: testing.EnvT):
 
         server = _TcpAgent(t, _tcp_ports(5), view(), [], listening, max_connections=1)
 
-    __startup__()
 
 
 actor _test_tcp_notifications(t: testing.EnvT):
@@ -636,7 +623,6 @@ actor _test_tcp_notifications(t: testing.EnvT):
         listener = ListenTcp(net.TCPListenCap(net.TCPCap(net.NetCap(t.env.cap))), "127.0.0.1", _tcp_ports(6), TCP_RANGE,
                              listening, t.log_handler)
 
-    __startup__()
 
 # The CLI over TCP #################################################################################
 
@@ -708,7 +694,6 @@ actor _CliScript(t: testing.EnvT, steps: list[_Step], on_done: action(list[str])
     proc def __startup__():
         _next()
 
-    __startup__()
 
 
 def _sha_aes_args() -> list[str]:
@@ -758,7 +743,6 @@ actor _test_tcp_cli(t: testing.EnvT):
 
         server = _TcpAgent(t, _tcp_ports(7), view(), [sha_aes()], listening)
 
-    __startup__()
 
 
 actor _test_tcp_cli_slow_agent(t: testing.EnvT):
@@ -796,7 +780,6 @@ actor _test_tcp_cli_slow_agent(t: testing.EnvT):
 
         server = _TcpAgent(t, _tcp_ports(10), view(), [], listening, delay=1.5)
 
-    __startup__()
 
 
 actor _ServeTcp(t: testing.EnvT, command: str, first_port: int, on_listening: action(int, str) -> None,
@@ -836,7 +819,6 @@ actor _ServeTcp(t: testing.EnvT, command: str, first_port: int, on_listening: ac
     proc def __startup__():
         _start()
 
-    __startup__()
 
 
 actor _test_tcp_cli_servers(t: testing.EnvT):
@@ -904,7 +886,6 @@ actor _test_tcp_cli_servers(t: testing.EnvT):
         agent = _ServeTcp(t, "agent", _tcp_ports(8), agent_listening, trapd_out)
         trapd = _ServeTcp(t, "trapd", _tcp_ports(9), trapd_listening, trapd_out)
 
-    __startup__()
 
 
 actor _test_host_lookup(t: testing.EnvT):
@@ -946,5 +927,3 @@ actor _test_host_lookup(t: testing.EnvT):
         lookups.append(actsnmp.HostLookup(dcap, "localhost", False, resolved_any))
         lookups.append(actsnmp.HostLookup(dcap, "127.0.0.1", True, resolved_v4_as_v6))
         lookups.append(actsnmp.HostLookup(dcap, "::1", False, resolved_v6_only))
-
-    __startup__()

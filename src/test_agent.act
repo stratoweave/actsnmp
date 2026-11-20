@@ -355,7 +355,6 @@ actor _exchange(report: proc(?Exception) -> None, ag: Agent, client: Transport, 
             after now QUIET: settled()
         after now watchdog: settled()
 
-    __startup__()
 
 
 proc def _client(mn: MemNet) -> Transport:
@@ -513,7 +512,6 @@ actor _test_v2c_get(t: testing.AsyncT):
              [v2c(get_pdu(12345, [o(SYS_DESCR)] + q)), v2c(get_pdu(-5, [eo("1.1.0")])),
               v2c(get_pdu(2147483647, [eo("1.1.0")]), "private")], 3, check)
 
-    __startup__()
 
 
 actor _test_v2c_get_next(t: testing.AsyncT):
@@ -530,7 +528,6 @@ actor _test_v2c_get_next(t: testing.AsyncT):
                  resp(2, [VarBind(o(ENGINE_ID_OID), EndOfMibView()), VarBind(o("2.999"), EndOfMibView()),
                           VarBind(eo("5.1.0"), NoSuchObject())])]))
 
-    __startup__()
 
 
 actor _test_v2c_get_bulk_layout(t: testing.AsyncT):
@@ -550,7 +547,6 @@ actor _test_v2c_get_bulk_layout(t: testing.AsyncT):
                  resp(3, [VarBind(o("2.999"), EndOfMibView()), VarBind(eo("2.1.2.1"), OctetString(b"row-1")),
                           VarBind(eo("2.1.2.2"), OctetString(b"row-2"))])]))
 
-    __startup__()
 
 
 actor _test_v2c_get_bulk_edges(t: testing.AsyncT):
@@ -574,7 +570,6 @@ actor _test_v2c_get_bulk_edges(t: testing.AsyncT):
                  resp(5, [VarBind(o("2.999"), EndOfMibView())]),
                  resp(6, [VarBind(o(ENGINE_ID_OID), EndOfMibView())])]))
 
-    __startup__()
 
 
 def _check_bulk_cap(replies: list[Reply], stats: dict[str, int]) -> None:
@@ -601,7 +596,6 @@ actor _test_v2c_get_bulk_cap(t: testing.AsyncT):
               v2c(bulk_pdu(2, 0, 1000, [eo("1"), eo("2"), eo("3")])),
               v2c(bulk_pdu(3, 12, 5, [eo("1") for i in range(12)]))], 3, check)
 
-    __startup__()
 
 
 def _check_bulk_size(replies: list[Reply], stats: dict[str, int]) -> None:
@@ -618,7 +612,6 @@ actor _test_v2c_get_bulk_shortened_to_size(t: testing.AsyncT):
 
         _run(t, test_view(), config(max_msg_size=1000), None, [v2c(bulk_pdu(1, 0, 10, [eo("4")]))], 1, check)
 
-    __startup__()
 
 
 def _check_too_big(replies: list[Reply], stats: dict[str, int]) -> None:
@@ -635,7 +628,6 @@ actor _test_v2c_too_big(t: testing.AsyncT):
              [v2c(get_pdu(1, [eo("4.1.0"), eo("4.2.0"), eo("4.3.0")])), v2c(get_pdu(2, [eo("4.1.0")]))], 2,
              check)
 
-    __startup__()
 
 
 actor _test_v1_too_big(t: testing.AsyncT):
@@ -646,7 +638,6 @@ actor _test_v1_too_big(t: testing.AsyncT):
         _run(t, test_view(), config(max_msg_size=1000), None, [v1(get_pdu(1, q))], 1,
              expect_pdus(message.SNMP_V1, [resp(1, vbs_of(q), pdu.TOO_BIG)]))
 
-    __startup__()
 
 
 def _check_too_big_dropped(replies: list[Reply], stats: dict[str, int]) -> None:
@@ -662,7 +653,6 @@ actor _test_v1_too_big_dropped(t: testing.AsyncT):
         _run(t, test_view(), config(max_msg_size=484), None, [v1(get_pdu(1, [eo("4.1.0") for i in range(40)]))], 0,
              check)
 
-    __startup__()
 
 # SNMPv1 ############################################################################################
 
@@ -681,7 +671,6 @@ actor _test_v1_get(t: testing.AsyncT):
                  resp(3, vbs_of([eo("1.99.0")]), pdu.NO_SUCH_NAME, 1),
                  resp(4, vbs_of([eo("1.1.0"), eo("1.3.0"), eo("5.1.0")]), pdu.NO_SUCH_NAME, 3)]))
 
-    __startup__()
 
 
 actor _test_v1_get_next(t: testing.AsyncT):
@@ -698,7 +687,6 @@ actor _test_v1_get_next(t: testing.AsyncT):
                  resp(2, vbs_of([eo("1.1.0"), o(ENGINE_ID_OID)]), pdu.NO_SUCH_NAME, 2),
                  resp(3, vbs_of([eo("4.3.0")]), pdu.NO_SUCH_NAME, 1)]))
 
-    __startup__()
 
 
 def _check_v1_bulk(replies: list[Reply], stats: dict[str, int]) -> None:
@@ -718,7 +706,6 @@ actor _test_v1_get_bulk_answered_like_snmpd(t: testing.AsyncT):
              [raw_bulk(message.SNMP_V1, 1, 0, 3, [eo("1.1.0")]),
               raw_bulk(message.SNMP_V1, 2, 1, 3, [eo("1.1.0"), eo("4.2.0")])], 2, check)
 
-    __startup__()
 
 # SET ###############################################################################################
 
@@ -761,7 +748,6 @@ actor _test_internal_error_contained(t: testing.AsyncT):
         _run(t, view, config(), None, [v2c(get_pdu(1, [eo("77.1.0")])), v2c(get_pdu(2, [eo("1.1.0")]))], 1,
              check)
 
-    __startup__()
 
 
 actor _test_v2c_set(t: testing.AsyncT):
@@ -777,7 +763,6 @@ actor _test_v2c_set(t: testing.AsyncT):
              expect_pdus(message.SNMP_V2C, [resp(1, new), resp(2, new), resp(3, [VarBind(eo("3.2.0"), OctetString(b""))]),
                                             resp(4, [VarBind(eo("3.2.0"), OctetString(b""))])]))
 
-    __startup__()
 
 
 def _set_error_cases() -> list[(VarBind, int)]:
@@ -825,7 +810,6 @@ actor _test_v2c_set_errors(t: testing.AsyncT):
         _run(t, test_view(), config(), None, _set_error_requests(message.SNMP_V2C), len(_set_error_cases()),
              expect_pdus(message.SNMP_V2C, _set_error_replies(message.SNMP_V2C)))
 
-    __startup__()
 
 
 actor _test_v1_set_errors(t: testing.AsyncT):
@@ -835,7 +819,6 @@ actor _test_v1_set_errors(t: testing.AsyncT):
         _run(t, test_view(), config(), None, _set_error_requests(message.SNMP_V1), len(_set_error_cases()),
              expect_pdus(message.SNMP_V1, _set_error_replies(message.SNMP_V1)))
 
-    __startup__()
 
 
 actor _test_set_atomic_and_access(t: testing.AsyncT):
@@ -852,7 +835,6 @@ actor _test_set_atomic_and_access(t: testing.AsyncT):
               v1(set_pdu(5, [good, c64]), "private"), v1(set_pdu(6, [good]), "private"), v1(get_pdu(7, [eo("3.1.0")]))], 7,
              _check_atomic)
 
-    __startup__()
 
 
 def _check_atomic(replies: list[Reply], stats: dict[str, int]) -> None:
@@ -890,7 +872,6 @@ actor _test_gen_err_for_unencodable_values(t: testing.AsyncT):
              [v2c(get_pdu(1, [eo("1.1.0"), eo("6.1.0")])), v2c(next_pdu(2, [eo("5.1.0")])),
               v2c(bulk_pdu(3, 1, 2, [eo("1.1.0"), eo("5.1.0")]))], 3, check)
 
-    __startup__()
 
 # What is dropped ####################################################################################
 
@@ -920,7 +901,6 @@ actor _test_drops(t: testing.AsyncT):
               raw_community(message.SNMP_V1, "public", pdu.encode_pdu(Pdu(pdu.TRAP_V2, 6, 0, 0, vbs))),
               v2c(get_pdu(99, [eo("1.1.0")]))], 1, check)
 
-    __startup__()
 
 # SNMPv3 ############################################################################################
 
@@ -939,7 +919,6 @@ actor _test_v3_discovery(t: testing.AsyncT):
 
         _run(t, test_view(), config(), None, [h(DISCOVERY_REQUEST)], 1, check)
 
-    __startup__()
 
 
 def _check_refusals(replies: list[Reply], stats: dict[str, int]) -> None:
@@ -986,7 +965,6 @@ actor _test_v3_refusals(t: testing.AsyncT):
               # a wrong privacy key decrypts to garbage: counted, dropped without a Report (as snmpd)
               v3(wrong_priv, "sha_aes", usm.LEVEL_AUTH_PRIV, get_pdu(6, [eo("1.1.0")]), 16)], 5, check)
 
-    __startup__()
 
 
 def _check_v3_levels(replies: list[Reply], stats: dict[str, int]) -> None:
@@ -1010,7 +988,6 @@ actor _test_v3_levels(t: testing.AsyncT):
              [v3_user("noauth", get_pdu(31, q), 21), v3_user("sha", get_pdu(32, q), 22),
               v3_user("sha_aes", get_pdu(33, q), 23), v3_user("md5_des", get_pdu(34, q), 24)], 4, check)
 
-    __startup__()
 
 
 def _check_v3_contexts(replies: list[Reply], stats: dict[str, int]) -> None:
@@ -1034,7 +1011,6 @@ actor _test_v3_contexts(t: testing.AsyncT):
               v3_user("sha_aes", get_pdu(2, g), 42, context_engine_id=h("8000000006")),
               v3_user("noauth", get_pdu(3, g), 43)], 2, check)
 
-    __startup__()
 
 
 def _check_v3_set(replies: list[Reply], stats: dict[str, int]) -> None:
@@ -1058,7 +1034,6 @@ actor _test_v3_set_and_read_only_user(t: testing.AsyncT):
               v3_user("ro_sha_aes", set_pdu(2, [VarBind(eo("3.1.0"), Integer(1))]), 52),
               v3_user("noauth", get_pdu(3, [eo("3.1.0")]), 53)], 3, check)
 
-    __startup__()
 
 
 def _check_v3_too_big(replies: list[Reply], stats: dict[str, int]) -> None:
@@ -1079,7 +1054,6 @@ actor _test_v3_too_big(t: testing.AsyncT):
              [v3_user("sha_aes", get_pdu(1, [eo("4.1.0")]), 61, max_size=484),
               v3_user("sha_aes", get_pdu(2, [eo("4.1.0")]), 62, max_size=1000)], 2, check)
 
-    __startup__()
 
 
 def _check_v3_bulk_size(replies: list[Reply], stats: dict[str, int]) -> None:
@@ -1098,7 +1072,6 @@ actor _test_v3_get_bulk_shortened(t: testing.AsyncT):
         _run(t, test_view(), config(), None, [v3_user("md5_des", bulk_pdu(1, 0, 10, [eo("4")]), 71, max_size=1100)], 1,
              check)
 
-    __startup__()
 
 
 PRIVS: list[int] = [usm.PRIV_DES, usm.PRIV_AES128, usm.PRIV_AES192, usm.PRIV_AES256, usm.PRIV_AES192C,
@@ -1139,7 +1112,6 @@ actor _test_v3_combos_md5(t: testing.AsyncT):
     proc def __startup__():
         _combos(t, usm.AUTH_MD5)
 
-    __startup__()
 
 
 actor _test_v3_combos_sha(t: testing.AsyncT):
@@ -1148,7 +1120,6 @@ actor _test_v3_combos_sha(t: testing.AsyncT):
     proc def __startup__():
         _combos(t, usm.AUTH_SHA1)
 
-    __startup__()
 
 
 actor _test_v3_combos_sha224(t: testing.AsyncT):
@@ -1157,7 +1128,6 @@ actor _test_v3_combos_sha224(t: testing.AsyncT):
     proc def __startup__():
         _combos(t, usm.AUTH_SHA224)
 
-    __startup__()
 
 
 actor _test_v3_combos_sha256(t: testing.AsyncT):
@@ -1166,7 +1136,6 @@ actor _test_v3_combos_sha256(t: testing.AsyncT):
     proc def __startup__():
         _combos(t, usm.AUTH_SHA256)
 
-    __startup__()
 
 
 actor _test_v3_combos_sha384(t: testing.AsyncT):
@@ -1175,7 +1144,6 @@ actor _test_v3_combos_sha384(t: testing.AsyncT):
     proc def __startup__():
         _combos(t, usm.AUTH_SHA384)
 
-    __startup__()
 
 
 actor _test_v3_combos_sha512(t: testing.AsyncT):
@@ -1184,7 +1152,6 @@ actor _test_v3_combos_sha512(t: testing.AsyncT):
     proc def __startup__():
         _combos(t, usm.AUTH_SHA512)
 
-    __startup__()
 
 
 def _check_reboot(replies: list[Reply], stats: dict[str, int]) -> None:
@@ -1213,7 +1180,6 @@ actor _test_reboot(t: testing.AsyncT):
                   [h(DISCOVERY_REQUEST), v3_user("sha", get_pdu(12, g), 2, 1), v3_user("sha", get_pdu(13, g), 3, 2),
                    v2c(get_pdu(14, [o(ENGINE_ID_OID)]))], 4, check)
 
-    __startup__()
 
 
 def _check_set_value_and_view(replies: list[Reply], stats: dict[str, int]) -> None:
@@ -1242,7 +1208,6 @@ actor _test_set_value_and_view(t: testing.AsyncT):
                   [v2c(get_pdu(1, [eo("1.1.0"), eo("9.1.0"), eo("1.2.0"), o(ENGINE_ID_OID), o(SYS_UPTIME)]))], 1,
                   check)
 
-    __startup__()
 
 
 def _check_new_engine(replies: list[Reply], stats: dict[str, int]) -> None:
@@ -1277,7 +1242,6 @@ actor _test_reboot_with_new_engine_id(t: testing.AsyncT):
                    v3(sha, "sha", usm.LEVEL_AUTH_NO_PRIV, get_pdu(13, [o(ENGINE_ID_OID)]), 3, 9, 0, OTHER_ENGINE_ID),
                    v2c(get_pdu(14, [o(ENGINE_ID_OID), o(SYS_UPTIME)]))], 4, check)
 
-    __startup__()
 
 # Faults ############################################################################################
 
@@ -1297,7 +1261,6 @@ actor _test_fault_drop_first_n(t: testing.AsyncT):
               v2c(set_pdu(2, [VarBind(eo("3.1.0"), Integer(2))]), "private"), v2c(get_pdu(3, [eo("3.1.0")]))], 1,
              check)
 
-    __startup__()
 
 
 def _check_wrong_request_id(replies: list[Reply], stats: dict[str, int]) -> None:
@@ -1321,7 +1284,6 @@ actor _test_fault_wrong_request_id(t: testing.AsyncT):
              [v2c(get_pdu(7, [eo("1.1.0")])), v3_user("sha_aes", get_pdu(-8, [eo("1.1.0")]), 81)], 4,
              check)
 
-    __startup__()
 
 
 def _check_wrong_community_version(replies: list[Reply], stats: dict[str, int]) -> None:
@@ -1343,7 +1305,6 @@ actor _test_fault_wrong_community_and_version(t: testing.AsyncT):
         _run(t, test_view(), config(), Faults(wrong_community=True, wrong_version=True),
              [v2c(get_pdu(1, [eo("1.2.0")])), v1(get_pdu(2, [eo("1.1.0")]))], 2, check)
 
-    __startup__()
 
 
 def _check_trailing(replies: list[Reply], stats: dict[str, int]) -> None:
@@ -1367,7 +1328,6 @@ actor _test_fault_trailing_bytes(t: testing.AsyncT):
         _run(t, test_view(), config(), Faults(trailing_bytes=b"\xde\xad"),
              [v2c(get_pdu(1, [eo("1.1.0")])), h(DISCOVERY_REQUEST)], 2, check)
 
-    __startup__()
 
 
 actor _test_fault_non_increasing_at(t: testing.AsyncT):
@@ -1379,7 +1339,6 @@ actor _test_fault_non_increasing_at(t: testing.AsyncT):
               v1(next_pdu(4, [eo("2.1.1.1")]))], 4,
              _check_non_increasing)
 
-    __startup__()
 
 
 def _check_non_increasing(replies: list[Reply], stats: dict[str, int]) -> None:
@@ -1410,7 +1369,6 @@ actor _test_fault_too_big_over(t: testing.AsyncT):
              [v2c(get_pdu(1, [eo("4.1.0")])), v2c(bulk_pdu(2, 0, 2, [eo("1")])), v2c(bulk_pdu(3, 0, 2, [eo("4")])),
               v1(get_pdu(4, [eo("4.1.0")]))], 4, check)
 
-    __startup__()
 
 
 actor _test_fault_truncate_bulk(t: testing.AsyncT):
@@ -1424,7 +1382,6 @@ actor _test_fault_truncate_bulk(t: testing.AsyncT):
                           VarBind(eo("2.1.1.2"), Integer(2))]),
                  resp(2, [VarBind(eo("2.1.1.1"), Integer(1)), VarBind(eo("2.1.2.1"), OctetString(b"row-1"))])]))
 
-    __startup__()
 
 
 actor _test_fault_truncate_bulk_empty(t: testing.AsyncT):
@@ -1434,7 +1391,6 @@ actor _test_fault_truncate_bulk_empty(t: testing.AsyncT):
         _run(t, test_view(), config(), Faults(truncate_bulk=0), [v2c(bulk_pdu(1, 1, 5, [eo("1"), eo("2.1.1")]))], 1,
              expect_pdus(message.SNMP_V2C, [resp(1, [])]))
 
-    __startup__()
 
 
 actor _test_fault_error_at(t: testing.AsyncT):
@@ -1446,7 +1402,6 @@ actor _test_fault_error_at(t: testing.AsyncT):
               v1(get_pdu(4, [eo("1.3.0")])), v2c(set_pdu(5, [VarBind(eo("1.3.0"), Integer(1))]), "private")], 5,
              _check_error_at)
 
-    __startup__()
 
 
 def _check_error_at(replies: list[Reply], stats: dict[str, int]) -> None:
@@ -1480,7 +1435,6 @@ actor _test_fault_report_not_in_time_window_once(t: testing.AsyncT):
              [v3_user("noauth", get_pdu(1, g), 91), v3_user("sha_aes", get_pdu(2, g), 92),
               v3_user("sha_aes", get_pdu(3, g), 93), v3_user("sha", get_pdu(4, g), 94)], 4, check)
 
-    __startup__()
 
 
 def _check_other_port(replies: list[Reply], stats: dict[str, int]) -> None:
@@ -1504,7 +1458,6 @@ actor _test_fault_respond_from_other_port(t: testing.AsyncT):
         _exchange(_async_report(t), ag, _client(mn), [v2c(get_pdu(1, [eo("1.1.0")])), h(DISCOVERY_REQUEST)], 2,
                   check)
 
-    __startup__()
 
 
 def _check_set_faults(replies: list[Reply], stats: dict[str, int]) -> None:
@@ -1526,7 +1479,6 @@ actor _test_set_faults(t: testing.AsyncT):
         _exchange(_async_report(t), ag, _client(mn), [v2c(get_pdu(1, [eo("1.1.0")])), v2c(get_pdu(2, [eo("1.1.0")]))], 2,
                   check)
 
-    __startup__()
 
 
 def _check_v3_unanswered(replies: list[Reply], stats: dict[str, int]) -> None:
@@ -1549,7 +1501,6 @@ actor _test_v3_unanswered_pdus(t: testing.AsyncT):
               v3_user("noauth", Pdu(pdu.REPORT, 4, 0, 0, vbs), 104),
               v3_user("noauth", get_pdu(5, [eo("1.1.0")]), 105)], 2, check)
 
-    __startup__()
 
 
 def _check_retransmissions(replies: list[Reply], stats: dict[str, int]) -> None:
@@ -1568,7 +1519,6 @@ actor _test_retransmissions_answered(t: testing.AsyncT):
 
         _run(t, test_view(), config(), None, [s, s, g, g], 4, check)
 
-    __startup__()
 
 
 actor _test_close(t: testing.AsyncT):
@@ -1600,7 +1550,6 @@ actor _test_close(t: testing.AsyncT):
         client.send(v2c(get_pdu(1, [eo("1.1.0")])))
         after now QUIET: settled(ag, client)
 
-    __startup__()
 
 
 def _check_stats_keys(replies: list[Reply], stats: dict[str, int]) -> None:
@@ -1616,7 +1565,6 @@ actor _test_stats_keys(t: testing.AsyncT):
 
         _run(t, test_view(), config(), None, [], 0, check)
 
-    __startup__()
 
 # The lab dataset (env tests) ########################################################################
 
@@ -1728,7 +1676,6 @@ actor _walk(t: testing.EnvT, mode: int, expected_file: str):
         client.set_receiver((lambda data, address, port: received(ag, client, expected, data, address, port)), (lambda message, fatal: failed(ag, client, expected, message, fatal)))
         client.send(request())
 
-    __startup__()
 
 
 actor _test_lab_walk_getnext(t: testing.EnvT):
@@ -1737,7 +1684,6 @@ actor _test_lab_walk_getnext(t: testing.EnvT):
     proc def __startup__():
         _walk(t, WALK_GETNEXT, LAB_CANON)
 
-    __startup__()
 
 
 actor _test_lab_walk_v1(t: testing.EnvT):
@@ -1746,7 +1692,6 @@ actor _test_lab_walk_v1(t: testing.EnvT):
     proc def __startup__():
         _walk(t, WALK_V1, LAB_CANON_V1)
 
-    __startup__()
 
 
 actor _test_lab_walk_bulk(t: testing.EnvT):
@@ -1755,7 +1700,6 @@ actor _test_lab_walk_bulk(t: testing.EnvT):
     proc def __startup__():
         _walk(t, WALK_BULK, LAB_CANON)
 
-    __startup__()
 
 
 actor _test_lab_walk_v3_bulk(t: testing.EnvT):
@@ -1764,7 +1708,6 @@ actor _test_lab_walk_v3_bulk(t: testing.EnvT):
     proc def __startup__():
         _walk(t, WALK_V3_BULK, LAB_CANON)
 
-    __startup__()
 
 
 def _check_lab_users(users: list[Usm], keys: list[?LocalizedUser]) -> proc(list[Reply], dict[str, int]) -> None:
@@ -1800,7 +1743,6 @@ actor _test_lab_users(t: testing.EnvT):
             ag = Agent(mn.server(AGENT_ADDR, AGENT_PORT), view, cfg, t.log_handler)
             _exchange(_env_report(t), ag, _client(mn), reqs, len(reqs), _check_lab_users(cfg.users, keys), 100.0)
 
-    __startup__()
 
 # GETBULK caps #####################################################################################
 
@@ -1852,5 +1794,3 @@ actor _test_getbulk_non_repeaters_not_capped(t: testing.AsyncT):
         c.send(_bulk300(10, 1000, [Oid(base + [i, 0]) for i in range(1, 11)] + [Oid(base)]))
         c.send(_bulk300(150, 0, [Oid(base + [i, 0]) for i in range(1, 151)]))
         after 2.0: fin()
-
-    __startup__()

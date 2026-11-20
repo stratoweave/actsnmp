@@ -215,6 +215,7 @@ actor Collector(label: str, on_done: action(str, list[Outcome]) -> None):
     def count() -> int:
         return len(got)
 
+
 def _client(mn: MemNet, sec: security.Security, port: int, opts: Options=OPTS, log: ?logging.Handler=None) -> Client:
     return Client(None, AGENT, sec, log, opts=opts, transport=mn.client(MANAGER, port, AGENT, 161))
 
@@ -224,7 +225,6 @@ def _client(mn: MemNet, sec: security.Security, port: int, opts: Options=OPTS, l
 actor _test_v2c_ops(t: testing.AsyncT):
     """SNMPv2c: get, get_next, get_bulk and set with every SET error status, through the real Client and Agent"""
     mn = MemNet()
-    agent = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), t.log_handler)
     var results: dict[str, list[Outcome]] = {}
 
     def check() -> None:
@@ -263,18 +263,24 @@ actor _test_v2c_ops(t: testing.AsyncT):
         if len(results) == 2:
             report(t, outcome(check))
 
-    pub = _client(mn, Community("public"), 40001, OPTS, t.log_handler)
     cp = Collector("public", reported)
-    priv = _client(mn, Community("private"), 40002, OPTS, t.log_handler)
+
     cq = Collector("private", reported)
 
     proc def __startup__():
         t.timeout(30.0)
+
+        agent = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), t.log_handler)
+
+        pub = _client(mn, Community("public"), 40001, OPTS, t.log_handler)
+
         pub.get(cp.completed, [SYS_DESCR, e([6, 1, 0]), e([3, 1, 0]), e([4, 1, 0]), e([1, 1, 1]), e([99, 0])])
         pub.get_next(cp.completed, [e([1, 1, 0]), e([10, 1, 1]), Oid([2, 999])])
         pub.get_bulk(cp.completed, [e([1, 1, 0]), e([10, 1, 1]), e([10, 1, 2])], 1, 3)
         pub.set(cp.completed, [VarBind(e([1, 1, 0]), Integer(1))])
         cp.expect(4)
+
+        priv = _client(mn, Community("private"), 40002, OPTS, t.log_handler)
 
         priv.set(cq.completed, [VarBind(e([1, 1, 0]), Integer(7))])
         priv.get(cq.completed, [e([1, 1, 0])])
@@ -287,13 +293,11 @@ actor _test_v2c_ops(t: testing.AsyncT):
         priv.get(cq.completed, [e([1, 1, 0])])
         cq.expect(9)
 
-    __startup__()
 
 
 actor _test_v1_ops(t: testing.AsyncT):
     """SNMPv1: exceptions and Counter64 become noSuchName (fixed by the Client), GETBULK goes as GETNEXT, SET errors mapped"""
     mn = MemNet()
-    agent = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), t.log_handler)
     var results: dict[str, list[Outcome]] = {}
 
     def check() -> None:
@@ -326,13 +330,17 @@ actor _test_v1_ops(t: testing.AsyncT):
         if len(results) == 2:
             report(t, outcome(check))
 
-    pub = _client(mn, Community("public", message.SNMP_V1), 40001, OPTS, t.log_handler)
     cp = Collector("public", reported)
-    priv = _client(mn, Community("private", message.SNMP_V1), 40002, OPTS, t.log_handler)
+
     cq = Collector("private", reported)
 
     proc def __startup__():
         t.timeout(30.0)
+
+        agent = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), t.log_handler)
+
+        pub = _client(mn, Community("public", message.SNMP_V1), 40001, OPTS, t.log_handler)
+
         pub.get(cp.completed, [SYS_DESCR, e([3, 1, 0]), e([6, 1, 0])])
         pub.get(cp.completed, [e([1, 1, 1])])
         pub.get_next(cp.completed, [e([2, 1, 0])])
@@ -343,6 +351,8 @@ actor _test_v1_ops(t: testing.AsyncT):
         pub.get_next(cp.completed, [e([5, 1, 0]), Oid([2, 999])])
         cp.expect(8)
 
+        priv = _client(mn, Community("private", message.SNMP_V1), 40002, OPTS, t.log_handler)
+
         priv.set(cq.completed, [VarBind(e([1, 1, 0]), Integer(9))])
         priv.set(cq.completed, [VarBind(SYS_DESCR, OctetString(b"x"))])
         priv.set(cq.completed, [VarBind(e([1, 1, 0]), OctetString(b"x"))])
@@ -352,16 +362,13 @@ actor _test_v1_ops(t: testing.AsyncT):
         cq.expect(6)
 
 
-    # SNMPv3: every authentication and privacy protocol ###############################################
-
-    __startup__()
+# SNMPv3: every authentication and privacy protocol ###############################################
 
 
 actor _V3Group(t: testing.AsyncT, auth: str):
     """Every lab user with authentication protocol auth, each with its own Client discovering the agent from cold"""
     users = lab_users(auth)
     mn = MemNet()
-    agent = Agent(mn.server(AGENT, 161), make_view(), agent_config(users), None)
     var clients: dict[str, Client] = {}
     var results: dict[str, list[Outcome]] = {}
 
@@ -400,6 +407,8 @@ actor _V3Group(t: testing.AsyncT, auth: str):
             report(t, outcome(check))
 
     proc def __startup__():
+        agent = Agent(mn.server(AGENT, 161), make_view(), agent_config(users), None)
+
         for i in range(len(users)):
             u = users[i]
             n = i + 1
@@ -413,7 +422,6 @@ actor _V3Group(t: testing.AsyncT, auth: str):
             c.get_bulk(col.completed, [e([10, 1, 1])], 0, 3)
             col.expect(5)
 
-    __startup__()
 
 
 actor _test_v3_md5(t: testing.AsyncT):
@@ -423,7 +431,6 @@ actor _test_v3_md5(t: testing.AsyncT):
     proc def __startup__():
         t.timeout(120.0)
 
-    __startup__()
 
 
 actor _test_v3_sha(t: testing.AsyncT):
@@ -433,7 +440,6 @@ actor _test_v3_sha(t: testing.AsyncT):
     proc def __startup__():
         t.timeout(120.0)
 
-    __startup__()
 
 
 actor _test_v3_sha224(t: testing.AsyncT):
@@ -443,7 +449,6 @@ actor _test_v3_sha224(t: testing.AsyncT):
     proc def __startup__():
         t.timeout(120.0)
 
-    __startup__()
 
 
 actor _test_v3_sha256(t: testing.AsyncT):
@@ -453,7 +458,6 @@ actor _test_v3_sha256(t: testing.AsyncT):
     proc def __startup__():
         t.timeout(120.0)
 
-    __startup__()
 
 
 actor _test_v3_sha384(t: testing.AsyncT):
@@ -463,7 +467,6 @@ actor _test_v3_sha384(t: testing.AsyncT):
     proc def __startup__():
         t.timeout(120.0)
 
-    __startup__()
 
 
 actor _test_v3_sha512(t: testing.AsyncT):
@@ -473,18 +476,15 @@ actor _test_v3_sha512(t: testing.AsyncT):
     proc def __startup__():
         t.timeout(120.0)
 
-    __startup__()
 
 
 actor _test_v3_discover(t: testing.AsyncT):
     """discover() from cold reports the agent's engine ID and boots; a request after it needs no second probe"""
     u = Usm.from_passwords("u_sha_aes", usm.AUTH_SHA1, "authpass123", usm.PRIV_AES128, "privpass123")
     mn = MemNet()
-    agent = Agent(mn.server(AGENT, 161), make_view(), agent_config([u]), t.log_handler)
-    c = _client(mn, u, 40001, OPTS, t.log_handler)
     var info: ?EngineInfo = None
 
-    def got(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+    def got(c: Client, cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
         s = c.stats()
         def check() -> None:
             testing.assertEqual(vbs_of(Outcome(r, err), "get"), [VarBind(SYS_DESCR, OctetString(DESCR))])
@@ -496,29 +496,34 @@ actor _test_v3_discover(t: testing.AsyncT):
             testing.assertEqual(s.reports, 1, "one discovery Report: " + str(s))
         report(t, outcome(check))
 
-    def discovered(cl: Client, i: ?EngineInfo, err: ?errors.SnmpError) -> None:
+    def discovered(c: Client, cl: Client, i: ?EngineInfo, err: ?errors.SnmpError) -> None:
         if err is not None:
             t.failure(AssertionError("discovery failed: " + str(err)))
             return
         info = i
-        c.get(got, [SYS_DESCR])
+        c.get((lambda cl, r, err: got(c, cl, r, err)), [SYS_DESCR])
 
     proc def __startup__():
         t.timeout(30.0)
-        c.discover(discovered)
+
+        agent = Agent(mn.server(AGENT, 161), make_view(), agent_config([u]), t.log_handler)
+        c = _client(mn, u, 40001, OPTS, t.log_handler)
+
+        c.discover((lambda cl, i, err: discovered(c, cl, i, err)))
 
 
-    # Faults seen through the real Client ##############################################################
-
-    __startup__()
+# Faults seen through the real Client ##############################################################
 
 
-actor _FaultRun(t: testing.AsyncT, faults: ?Faults, net_faults: ?NetFaults, sec: security.Security, opts: Options,
-                check: proc(list[Outcome], Client) -> None, other_port: int=0):
-    """An Agent with faults on a MemNet (net_faults on the answers to the manager), one Client, and requests"""
+proc def _fault_run(t: testing.AsyncT, faults: ?Faults, net_faults: ?NetFaults, sec: security.Security, opts: Options,
+                    check: proc(list[Outcome], Client) -> None, other_port: int=0) -> _FaultRun:
     mn = MemNet(net_faults)
     agent = Agent(mn.server(AGENT, 161), make_view(), agent_config([_sha_aes()]), t.log_handler, faults)
     c = _client(mn, sec, 40001, opts, t.log_handler)
+    return _FaultRun(t, c, check)
+
+actor _FaultRun(t: testing.AsyncT, c: Client, check: proc(list[Outcome], Client) -> None):
+    """An Agent with faults on a MemNet (net_faults on the answers to the manager), one Client, and requests"""
 
     def reported(label: str, outs: list[Outcome]) -> None:
         def run() -> None:
@@ -540,16 +545,13 @@ actor _FaultRun(t: testing.AsyncT, faults: ?Faults, net_faults: ?NetFaults, sec:
         # expect n outcomes, but report only after QUIET more seconds (to catch a second callback)
         after now QUIET: col.expect(n)
 
+
 def _sha_aes() -> Usm:
     return Usm.from_passwords("u_sha_aes", usm.AUTH_SHA1, "authpass123", usm.PRIV_AES128, "privpass123")
 
 actor _test_fault_drop_first_n(t: testing.AsyncT):
     """drop_first_n: the lost answer is retried; the SET was applied once and its retry meets the same value"""
     proc def __startup__():
-        run = _FaultRun(t, Faults(drop_first_n=1), None, Community("public"), Options(timeout=0.2, retries=2), check)
-        c = run.client()
-        completed = run.completed()
-
         def check(outs: list[Outcome], c: Client) -> None:
             r = ok(outs[0], "get")
             testing.assertEqual((r.varbinds, r.attempts), ([VarBind(SYS_DESCR, OctetString(DESCR))], 2))
@@ -558,20 +560,18 @@ actor _test_fault_drop_first_n(t: testing.AsyncT):
 
         t.timeout(30.0)
 
+        run = _fault_run(t, Faults(drop_first_n=1), None, Community("public"), Options(timeout=0.2, retries=2), check)
+        c = run.client()
+        completed = run.completed()
         c.get(completed, [SYS_DESCR])
         c.get(completed, [e([1, 1, 0])])
         run.expect(2)
 
-    __startup__()
 
 
 actor _test_fault_wrong_request_id(t: testing.AsyncT):
     """wrong_request_id: the copy with another request-id is dropped, the genuine Response taken"""
     proc def __startup__():
-        run = _FaultRun(t, Faults(wrong_request_id=True), None, Community("public"), OPTS, check)
-        c = run.client()
-        completed = run.completed()
-
         def check(outs: list[Outcome], c: Client) -> None:
             testing.assertEqual(vbs_of(outs[0], "get"), [VarBind(SYS_DESCR, OctetString(DESCR))])
             testing.assertEqual(vbs_of(outs[1], "get_next"), [VarBind(e([2, 1, 0]), OctetString(b"hello"))])
@@ -580,20 +580,18 @@ actor _test_fault_wrong_request_id(t: testing.AsyncT):
 
         t.timeout(30.0)
 
+        run = _fault_run(t, Faults(wrong_request_id=True), None, Community("public"), OPTS, check)
+        c = run.client()
+        completed = run.completed()
         c.get(completed, [SYS_DESCR])
         c.get_next(completed, [e([1, 1, 0])])
         run.expect(2)
 
-    __startup__()
 
 
 actor _test_net_duplicate(t: testing.AsyncT):
     """Every answer duplicated by the network: each callback exactly once, the copies dropped"""
     proc def __startup__():
-        run = _FaultRun(t, None, NetFaults(duplicate=True, to_address=MANAGER), Community("public"), OPTS, check)
-        c = run.client()
-        completed = run.completed()
-
         def check(outs: list[Outcome], c: Client) -> None:
             testing.assertEqual(len(outs), 3, "exactly one callback per request")
             for o in outs:
@@ -603,20 +601,18 @@ actor _test_net_duplicate(t: testing.AsyncT):
 
         t.timeout(30.0)
 
+        run = _fault_run(t, None, NetFaults(duplicate=True, to_address=MANAGER), Community("public"), OPTS, check)
+        c = run.client()
+        completed = run.completed()
         for _ in range(3):
             c.get(completed, [SYS_DESCR])
         run.quietly(3)
 
-    __startup__()
 
 
 actor _test_net_late(t: testing.AsyncT):
     """Answers delayed beyond the timeout: the late answer to the first attempt completes the request"""
     proc def __startup__():
-        run = _FaultRun(t, None, NetFaults(delay=0.3, to_address=MANAGER), Community("public"),
-                        Options(timeout=0.2, retries=2), check)
-        c = run.client()
-
         def check(outs: list[Outcome], c: Client) -> None:
             r = ok(outs[0], "get")
             testing.assertEqual((r.varbinds, r.attempts), ([VarBind(SYS_DESCR, OctetString(DESCR))], 2))
@@ -626,19 +622,17 @@ actor _test_net_late(t: testing.AsyncT):
 
         t.timeout(30.0)
 
+        run = _fault_run(t, None, NetFaults(delay=0.3, to_address=MANAGER), Community("public"),
+                        Options(timeout=0.2, retries=2), check)
+        c = run.client()
         c.get(run.completed(), [SYS_DESCR])
         run.expect(1)
 
-    __startup__()
 
 
 actor _test_fault_not_in_time_window_once(t: testing.AsyncT):
     """SNMPv3: a forced authenticated notInTimeWindows Report makes the Client resynchronise and resend once"""
     proc def __startup__():
-        run = _FaultRun(t, Faults(report_not_in_time_window_once=True), None, _sha_aes(), OPTS, check)
-        c = run.client()
-        completed = run.completed()
-
         def check(outs: list[Outcome], c: Client) -> None:
             testing.assertEqual(vbs_of(outs[0], "get"), [VarBind(SYS_DESCR, OctetString(DESCR))])
             testing.assertEqual(vbs_of(outs[1], "get"), [VarBind(e([1, 1, 0]), Integer(42))])
@@ -647,20 +641,19 @@ actor _test_fault_not_in_time_window_once(t: testing.AsyncT):
 
         t.timeout(30.0)
 
+        run = _fault_run(t, Faults(report_not_in_time_window_once=True), None, _sha_aes(), OPTS, check)
+        c = run.client()
+        completed = run.completed()
         c.get(completed, [SYS_DESCR])
         c.get(completed, [e([1, 1, 0])])
         run.expect(2)
 
-    __startup__()
 
 
 actor _test_fault_too_big(t: testing.AsyncT):
     """too_big_over: a GET is split until each part fits, a GETBULK halves max-repetitions, a SET reports tooBig"""
     proc def __startup__():
         oids = [e([9, i, 0]) for i in range(1, 9)]
-        run = _FaultRun(t, Faults(too_big_over=300), None, Community("private"), OPTS, check)
-        c = run.client()
-        completed = run.completed()
 
         def check(outs: list[Outcome], c: Client) -> None:
             testing.assertEqual(vbs_of(outs[0], "split get"), [VarBind(e([9, i, 0]), big(i)) for i in range(1, 9)])
@@ -670,39 +663,35 @@ actor _test_fault_too_big(t: testing.AsyncT):
             testing.assertEqual(status_of(outs[2], "set"), (pdu.TOO_BIG, 0))
 
         t.timeout(30.0)
+
+        run = _fault_run(t, Faults(too_big_over=300), None, Community("private"), OPTS, check)
+        c = run.client()
+        completed = run.completed()
         c.get(completed, oids)
         c.get_bulk(completed, [e([9, 1, 0])], 0, 8)
         c.set(completed, [VarBind(e([20, i, 0]), Integer(i)) for i in range(1, 30)])
         run.expect(3)
 
-    __startup__()
 
 
 actor _test_fault_truncate_bulk(t: testing.AsyncT):
     """truncate_bulk: the Client returns the shortened GETBULK answer as it is"""
     proc def __startup__():
-        run = _FaultRun(t, Faults(truncate_bulk=2), None, Community("public"), OPTS, check)
-        c = run.client()
-
         def check(outs: list[Outcome], c: Client) -> None:
             testing.assertEqual(vbs_of(outs[0], "get_bulk"), [table(1, 1), table(2, 1)])
 
         t.timeout(30.0)
 
+        run = _fault_run(t, Faults(truncate_bulk=2), None, Community("public"), OPTS, check)
+        c = run.client()
         c.get_bulk(run.completed(), [e([10, 1, 1]), e([10, 1, 2])], 0, 5)
         run.expect(1)
 
-    __startup__()
 
 
 actor _test_fault_error_at(t: testing.AsyncT):
     """error_at: the injected error-status reaches the caller with its index, OID and transient flag"""
     proc def __startup__():
-        run = _FaultRun(t, Faults(error_at=e([5, 1, 0]), error_status=pdu.RESOURCE_UNAVAILABLE), None,
-                        Community("public"), OPTS, check)
-        c = run.client()
-        completed = run.completed()
-
         def check(outs: list[Outcome], c: Client) -> None:
             testing.assertEqual(status_of(outs[0], "get"), (pdu.RESOURCE_UNAVAILABLE, 2))
             err = outs[0].e
@@ -713,30 +702,21 @@ actor _test_fault_error_at(t: testing.AsyncT):
 
         t.timeout(30.0)
 
+        run = _fault_run(t, Faults(error_at=e([5, 1, 0]), error_status=pdu.RESOURCE_UNAVAILABLE), None,
+                        Community("public"), OPTS, check)
+        c = run.client()
+        completed = run.completed()
         c.get(completed, [e([1, 1, 0]), e([5, 1, 0])])
         c.get(completed, [e([6, 1, 0])])
         run.expect(2)
 
-    __startup__()
 
 
 actor _test_fault_wrong_source_version_community(t: testing.AsyncT):
     """Answers from another port, in the wrong version or (checked) with the wrong community time out with a hint"""
     proc def __startup__():
         mn = MemNet()
-        other = mn.server(AGENT, 1161)
-        a1 = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), None,
-                   Faults(respond_from_other_port=True, other_port=other))
-        a2 = Agent(mn.server(AGENT, 162), make_view(), agent_config([]), None, Faults(wrong_version=True))
-        a3 = Agent(mn.server(AGENT, 163), make_view(), agent_config([]), None, Faults(wrong_community=True))
         quick = Options(timeout=0.2, retries=0)
-        c1 = Client(None, AGENT, Community("public"), None, opts=quick, transport=mn.client(MANAGER, 40001, AGENT, 161))
-        c2 = Client(None, AGENT, Community("public"), None, port=162, opts=quick,
-                    transport=mn.client(MANAGER, 40002, AGENT, 162))
-        c3 = Client(None, AGENT, Community("public"), None, port=163, opts=quick.with_(check_community=True),
-                    transport=mn.client(MANAGER, 40003, AGENT, 163))
-        c4 = Client(None, AGENT, Community("public"), None, port=163, opts=quick,
-                    transport=mn.client(MANAGER, 40004, AGENT, 163))
         results: dict[str, list[Outcome]] = {}
 
         def check() -> None:
@@ -752,22 +732,32 @@ actor _test_fault_wrong_source_version_community(t: testing.AsyncT):
                 report(t, outcome(check))
 
         t.timeout(30.0)
+
+        other = mn.server(AGENT, 1161)
+        a1 = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), None,
+                   Faults(respond_from_other_port=True, other_port=other))
+        a2 = Agent(mn.server(AGENT, 162), make_view(), agent_config([]), None, Faults(wrong_version=True))
+        a3 = Agent(mn.server(AGENT, 163), make_view(), agent_config([]), None, Faults(wrong_community=True))
+
+        c1 = Client(None, AGENT, Community("public"), None, opts=quick, transport=mn.client(MANAGER, 40001, AGENT, 161))
+        c2 = Client(None, AGENT, Community("public"), None, port=162, opts=quick,
+                    transport=mn.client(MANAGER, 40002, AGENT, 162))
+        c3 = Client(None, AGENT, Community("public"), None, port=163, opts=quick.with_(check_community=True),
+                    transport=mn.client(MANAGER, 40003, AGENT, 163))
+        c4 = Client(None, AGENT, Community("public"), None, port=163, opts=quick,
+                    transport=mn.client(MANAGER, 40004, AGENT, 163))
+
         for c, label in [(c1, "port"), (c2, "version"), (c3, "community"), (c4, "unchecked")]:
             col = Collector(label, reported)
             c.get(col.completed, [SYS_DESCR])
             col.expect(1)
 
-    __startup__()
 
 
 actor _test_fault_trailing_bytes(t: testing.AsyncT):
     """Octets after the message: ignored in SNMPv2c, an undecodable message in SNMPv3 (dropped, the request times out)"""
     u = _sha_aes()
     mn = MemNet()
-    a1 = Agent(mn.server(AGENT, 161), make_view(), agent_config([u]), None, Faults(trailing_bytes=b"\x00\x00"))
-    c1 = Client(None, AGENT, Community("public"), None, opts=OPTS, transport=mn.client(MANAGER, 40001, AGENT, 161))
-    c2 = Client(None, AGENT, u, None, opts=Options(timeout=0.3, retries=0),
-                transport=mn.client(MANAGER, 40002, AGENT, 161))
     var results: dict[str, list[Outcome]] = {}
 
     def check() -> None:
@@ -785,15 +775,20 @@ actor _test_fault_trailing_bytes(t: testing.AsyncT):
 
     proc def __startup__():
         t.timeout(30.0)
+
+        a1 = Agent(mn.server(AGENT, 161), make_view(), agent_config([u]), None, Faults(trailing_bytes=b"\x00\x00"))
+        c1 = Client(None, AGENT, Community("public"), None, opts=OPTS, transport=mn.client(MANAGER, 40001, AGENT, 161))
+        c2 = Client(None, AGENT, u, None, opts=Options(timeout=0.3, retries=0),
+                    transport=mn.client(MANAGER, 40002, AGENT, 161))
+
         c1.get(k1.completed, [SYS_DESCR])
         k1.expect(1)
+
         c2.get(k2.completed, [SYS_DESCR])
         k2.expect(1)
 
 
-    # Notifications: Client.trap / trap_v1 / inform to the NotificationReceiver #######################
-
-    __startup__()
+# Notifications: Client.trap / trap_v1 / inform to the NotificationReceiver #######################
 
 
 def block(head: str, lines: list[str]) -> str:
@@ -850,11 +845,11 @@ actor _NotifyRun(t: testing.AsyncT, users: list[Usm], communities: list[str], wa
         rcv = NotificationReceiver(mn.server(RECEIVER, 162), ReceiverConfig(communities, users, [], h(RECEIVER_ENGINE), 1),
                                    received, None)
 
-    __startup__()
 
 
 actor _test_notify_v1_v2c(t: testing.AsyncT):
     """trap_v1, trap and inform over SNMPv1/v2c: delivered, informs acknowledged, canonical blocks as the lab's"""
+
     def check(blocks: list[str], st: dict[str, int], outcomes: dict[str, list[Outcome]]) -> None:
         r = ok(outcomes["inform"][0], "inform")
         testing.assertEqual(r.varbinds, notify.build_trap_v2(500, notify.TRAP_LINK_DOWN, [VarBind(e([1, 1, 0]), Integer(3))]))
@@ -869,24 +864,22 @@ actor _test_notify_v1_v2c(t: testing.AsyncT):
         testing.assertEqual((st["delivered"], st["acked"], st["dropped_community"]), (3, 1, 1), str(st))
 
     run = _NotifyRun(t, [], ["public"], 3, check)
-    # The receiver drops a trap of a community it does not accept, and nothing follows that the check could wait
-    # for. So that trap goes into the network before the Clients send theirs: the receiver drops it first.
-    secret = pdu.Pdu(pdu.TRAP_V2, 1, 0, 0, notify.build_trap_v2(1, notify.TRAP_COLD_START, []))
-    v1 = run.client(Community("public", message.SNMP_V1), 42001)
-    v2 = run.client(Community("public"), 42002)
-    col = run.collector("inform")
 
     proc def __startup__():
         t.timeout(30.0)
 
+        # Deliver the rejected community before starting clients whose answers finish the test.
+        secret = pdu.Pdu(pdu.TRAP_V2, 1, 0, 0, notify.build_trap_v2(1, notify.TRAP_COLD_START, []))
         await async run.inject(message.encode_community(message.CommunityMessage(message.SNMP_V2C, b"secret", secret)),
                                42003)
+        v1 = run.client(Community("public", message.SNMP_V1), 42001)
+        v2 = run.client(Community("public"), 42002)
         v1.trap_v1(run.trap_sent, ENTERPRISE, b"\xc0\x00\x02\x01", 6, 42, [VarBind(e([1, 1, 0]), Integer(0))], 12345)
         v2.trap(run.trap_sent, notify.TRAP_COLD_START, [VarBind(e([2, 1, 0]), OctetString(b"Hello, SNMP!"))], 12345)
+        col = run.collector("inform")
         v2.inform(col.completed, notify.TRAP_LINK_DOWN, [VarBind(e([1, 1, 0]), Integer(3))], 500)
         col.expect(1)
 
-    __startup__()
 
 
 actor _NotifyV3(t: testing.AsyncT, auth: str):
@@ -919,7 +912,6 @@ actor _NotifyV3(t: testing.AsyncT, auth: str):
             c.inform(col.completed, notify.TRAP_LINK_DOWN, [VarBind(e([1, 1, 0]), Integer(i))], 2000 + i)
             col.expect(1)
 
-    __startup__()
 
 
 actor _test_notify_v3_md5(t: testing.AsyncT):
@@ -929,7 +921,6 @@ actor _test_notify_v3_md5(t: testing.AsyncT):
     proc def __startup__():
         t.timeout(120.0)
 
-    __startup__()
 
 
 actor _test_notify_v3_sha(t: testing.AsyncT):
@@ -939,7 +930,6 @@ actor _test_notify_v3_sha(t: testing.AsyncT):
     proc def __startup__():
         t.timeout(120.0)
 
-    __startup__()
 
 
 actor _test_notify_v3_sha224(t: testing.AsyncT):
@@ -949,7 +939,6 @@ actor _test_notify_v3_sha224(t: testing.AsyncT):
     proc def __startup__():
         t.timeout(120.0)
 
-    __startup__()
 
 
 actor _test_notify_v3_sha256(t: testing.AsyncT):
@@ -959,7 +948,6 @@ actor _test_notify_v3_sha256(t: testing.AsyncT):
     proc def __startup__():
         t.timeout(120.0)
 
-    __startup__()
 
 
 actor _test_notify_v3_sha384(t: testing.AsyncT):
@@ -969,7 +957,6 @@ actor _test_notify_v3_sha384(t: testing.AsyncT):
     proc def __startup__():
         t.timeout(120.0)
 
-    __startup__()
 
 
 actor _test_notify_v3_sha512(t: testing.AsyncT):
@@ -979,7 +966,6 @@ actor _test_notify_v3_sha512(t: testing.AsyncT):
     proc def __startup__():
         t.timeout(120.0)
 
-    __startup__()
 
 
 actor _test_v3_agent_reboot(t: testing.AsyncT):
@@ -987,8 +973,6 @@ actor _test_v3_agent_reboot(t: testing.AsyncT):
     proc def __startup__():
         u = _sha_aes()
         mn = MemNet()
-        agent = Agent(mn.server(AGENT, 161), make_view(), agent_config([u]), t.log_handler)
-        c = _client(mn, u, 40001, OPTS, t.log_handler)
         new_engine = h("80001f888001020304050607")
         step = 0
 
@@ -998,7 +982,7 @@ actor _test_v3_agent_reboot(t: testing.AsyncT):
                 return True
             return False
 
-        def got_third(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+        def got_third(c: Client, cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
             if fail("after the engine ID change", r, err):
                 return
             info = c.engine_info()
@@ -1013,7 +997,7 @@ actor _test_v3_agent_reboot(t: testing.AsyncT):
                 testing.assertEqual((s.reports, s.timeouts), (4, 0), str(s))
             report(t, outcome(check))
 
-        def got_second(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+        def got_second(agent: Agent, c: Client, cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
             if fail("after the reboot", r, err):
                 return
             boots = -1
@@ -1024,18 +1008,21 @@ actor _test_v3_agent_reboot(t: testing.AsyncT):
                 t.failure(AssertionError("boots not learned after the reboot: %d" % boots))
                 return
             agent.reboot(1, new_engine)
-            c.get(got_third, [SYS_DESCR])
+            c.get((lambda cl, r, err: got_third(c, cl, r, err)), [SYS_DESCR])
 
-        def got_first(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+        def got_first(agent: Agent, c: Client, cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
             if fail("first get", r, err):
                 return
             agent.reboot()
-            c.get(got_second, [SYS_DESCR])
+            c.get((lambda cl, r, err: got_second(agent, c, cl, r, err)), [SYS_DESCR])
 
         t.timeout(30.0)
-        c.get(got_first, [SYS_DESCR])
 
-    __startup__()
+        agent = Agent(mn.server(AGENT, 161), make_view(), agent_config([u]), t.log_handler)
+        c = _client(mn, u, 40001, OPTS, t.log_handler)
+
+        c.get((lambda cl, r, err: got_first(agent, c, cl, r, err)), [SYS_DESCR])
+
 
 
 actor _test_v3_agent_restart_boots_lost(t: testing.AsyncT):
@@ -1046,11 +1033,8 @@ actor _test_v3_agent_restart_boots_lost(t: testing.AsyncT):
     proc def __startup__():
         u = _sha_aes()
         mn = MemNet()
-        agent = Agent(mn.server(AGENT, 161), make_view(), agent_config([u]), t.log_handler)
-        c = _client(mn, u, 40001, OPTS.with_(max_in_flight=2), t.log_handler)
-        col = Collector("restart", reported)
 
-        def reported(label: str, outs: list[Outcome]) -> None:
+        def reported(c: Client, label: str, outs: list[Outcome]) -> None:
             info = c.engine_info()
             s = c.stats()
             def run() -> None:
@@ -1069,35 +1053,38 @@ actor _test_v3_agent_restart_boots_lost(t: testing.AsyncT):
                 testing.assertEqual((s.reports, s.timeouts, s.drops_auth, s.retries), (3, 0, 0, 0), str(s))
             report(t, outcome(run))
 
-        def got_first(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+        def got_first(agent: Agent, c: Client, col: Collector, cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
             col.completed(cl, r, err)
             agent.reboot(1)
             c.get(col.completed, [SYS_DESCR])
             c.get(col.completed, [e([1, 1, 0])])
 
         t.timeout(30.0)
-        c.get(got_first, [SYS_DESCR])
+
+        agent = Agent(mn.server(AGENT, 161), make_view(), agent_config([u]), t.log_handler)
+        c = _client(mn, u, 40001, OPTS.with_(max_in_flight=2), t.log_handler)
+
+        col = Collector("restart", (lambda label, outs: reported(c, label, outs)))
+
+        c.get((lambda cl, r, err: got_first(agent, c, col, cl, r, err)), [SYS_DESCR])
         col.expect(3)
 
-    __startup__()
 
 
 actor _test_fault_too_big_v3(t: testing.AsyncT):
     """SNMPv3 authPriv with too_big_over: the GET is split into new exchanges and merged in order"""
     proc def __startup__():
-        run = _FaultRun(t, Faults(too_big_over=500), None, _sha_aes(), OPTS, check)
-        c = run.client()
-
         def check(outs: list[Outcome], c: Client) -> None:
             testing.assertEqual(vbs_of(outs[0], "split get"), [VarBind(e([9, i, 0]), big(i)) for i in range(1, 9)])
             testing.assertEqual(c.stats().timeouts, 0)
 
         t.timeout(30.0)
 
+        run = _fault_run(t, Faults(too_big_over=500), None, _sha_aes(), OPTS, check)
+        c = run.client()
         c.get(run.completed(), [e([9, i, 0]) for i in range(1, 9)])
         run.expect(1)
 
-    __startup__()
 
 
 actor _test_inform_retransmission_dedup(t: testing.AsyncT):
@@ -1105,15 +1092,11 @@ actor _test_inform_retransmission_dedup(t: testing.AsyncT):
     proc def __startup__():
         mn = MemNet(NetFaults(drop_first_n=1, to_address=MANAGER))
         got: list[Notification] = []
-        rcv = NotificationReceiver(mn.server(RECEIVER, 162), ReceiverConfig(["public"], [], [], h(RECEIVER_ENGINE), 1, 60.0),
-                                   received, t.log_handler)
-        c = Client(None, RECEIVER, Community("public"), t.log_handler, port=162, opts=Options(timeout=0.2, retries=2),
-                   transport=mn.client(MANAGER, 42001, RECEIVER, 162))
 
         def received(r: NotificationReceiver, n: Notification) -> None:
             got.append(n)
 
-        def acked(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+        def acked(rcv: NotificationReceiver, cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
             st = rcv.stats()
             def check() -> None:
                 resp = ok(Outcome(r, err), "inform")
@@ -1123,18 +1106,20 @@ actor _test_inform_retransmission_dedup(t: testing.AsyncT):
             report(t, outcome(check))
 
         t.timeout(30.0)
-        c.inform(acked, notify.TRAP_LINK_DOWN, [VarBind(e([1, 1, 0]), Integer(3))], 500)
 
-    __startup__()
+        rcv = NotificationReceiver(mn.server(RECEIVER, 162), ReceiverConfig(["public"], [], [], h(RECEIVER_ENGINE), 1, 60.0),
+                                   received, t.log_handler)
+        c = Client(None, RECEIVER, Community("public"), t.log_handler, port=162, opts=Options(timeout=0.2, retries=2),
+                   transport=mn.client(MANAGER, 42001, RECEIVER, 162))
+
+        c.inform((lambda cl, r, err: acked(rcv, cl, r, err)), notify.TRAP_LINK_DOWN, [VarBind(e([1, 1, 0]), Integer(3))], 500)
+
 
 
 actor _test_discovery_budgets(t: testing.AsyncT):
     """Discovery keeps each request's own budget: a long one outlives a short Client default, a short one fails early"""
     u = _sha_aes()
     mn = MemNet(NetFaults(delay=0.5, to_address=MANAGER))
-    agent = Agent(mn.server(AGENT, 161), make_view(), agent_config([u]), t.log_handler)
-    # the Client's default would give up after 0.05 s; the agent's answers take 0.5 s
-    c = _client(mn, u, 40001, Options(timeout=0.05, retries=0, max_in_flight=2), t.log_handler)
     var log: list[str] = []
     var short_elapsed = 0.0
     var started = 0.0
@@ -1157,14 +1142,17 @@ actor _test_discovery_budgets(t: testing.AsyncT):
 
     proc def __startup__():
         t.timeout(30.0)
+
+        agent = Agent(mn.server(AGENT, 161), make_view(), agent_config([u]), t.log_handler)
+        # the Client's default would give up after 0.05 s; the agent's answers take 0.5 s
+        c = _client(mn, u, 40001, Options(timeout=0.05, retries=0, max_in_flight=2), t.log_handler)
+
         started = float(time.monotonic_ns()) / 1e9
         c.get(got_long, [SYS_DESCR], Options(timeout=3.0, retries=0))
         c.get(got_short, [SYS_DESCR], Options(timeout=0.2, retries=0))
 
 
-    # Logging ##########################################################################################
-
-    __startup__()
+# Logging ##########################################################################################
 
 
 actor _LogLines():
@@ -1175,6 +1163,7 @@ actor _LogLines():
 
     def all() -> list[str]:
         return texts
+
 
 class _CaptureSink(logging.Sink):
     # Every formatted message, with its data, goes to a _LogLines actor
@@ -1198,7 +1187,6 @@ actor _test_logs_never_show_secrets(t: testing.AsyncT):
     u = _sha_aes()
     mn = MemNet()
     cfg = AgentConfig({secret: True}, [u], h(AGENT_ENGINE), AGENT_BOOTS, write_rules())
-    agent = Agent(mn.server(AGENT, 161), make_view(), cfg, handler)
     var got = 0
     var done_count = 0
 
@@ -1228,32 +1216,33 @@ actor _test_logs_never_show_secrets(t: testing.AsyncT):
         if err is not None:
             t.failure(AssertionError(str(err)))
 
-    rcv = NotificationReceiver(mn.server(RECEIVER, 162), ReceiverConfig([secret], [u], [], h(RECEIVER_ENGINE), 1),
-                               received, handler)
-    c2 = _client(mn, Community(secret), 40001, OPTS, handler)
-    c3 = _client(mn, u, 40002, OPTS, handler)
-    n1 = Client(None, RECEIVER, Community(secret, message.SNMP_V1), handler, port=162, opts=OPTS,
-                transport=mn.client(MANAGER, 42001, RECEIVER, 162))
-    n2 = Client(None, RECEIVER, Community(secret), handler, port=162, opts=OPTS,
-                transport=mn.client(MANAGER, 42002, RECEIVER, 162))
-    n3 = Client(None, RECEIVER, u, handler, port=162, opts=OPTS, transport=mn.client(MANAGER, 42003, RECEIVER, 162))
-
     proc def __startup__():
         t.timeout(30.0)
+
         handler.add_sink(_CaptureSink(lines))
         handler.set_output_level(logging.ALL)
+
+        agent = Agent(mn.server(AGENT, 161), make_view(), cfg, handler)
+
+        rcv = NotificationReceiver(mn.server(RECEIVER, 162), ReceiverConfig([secret], [u], [], h(RECEIVER_ENGINE), 1),
+                                   received, handler)
+        c2 = _client(mn, Community(secret), 40001, OPTS, handler)
         c2.get(completed, [SYS_DESCR])
         c2.set(completed, [VarBind(e([1, 1, 0]), Integer(5))])
+        c3 = _client(mn, u, 40002, OPTS, handler)
         c3.get(completed, [SYS_DESCR])
+        n1 = Client(None, RECEIVER, Community(secret, message.SNMP_V1), handler, port=162, opts=OPTS,
+                    transport=mn.client(MANAGER, 42001, RECEIVER, 162))
         n1.trap_v1(trap_sent, ENTERPRISE, b"\xc0\x00\x02\x01", 6, 1, [VarBind(e([1, 1, 0]), Integer(1))], 1)
+        n2 = Client(None, RECEIVER, Community(secret), handler, port=162, opts=OPTS,
+                    transport=mn.client(MANAGER, 42002, RECEIVER, 162))
         n2.trap(trap_sent, notify.TRAP_COLD_START, [], 1)
+        n3 = Client(None, RECEIVER, u, handler, port=162, opts=OPTS, transport=mn.client(MANAGER, 42003, RECEIVER, 162))
         n3.trap(trap_sent, notify.TRAP_COLD_START, [], 1)
         n3.inform(completed, notify.TRAP_LINK_DOWN, [VarBind(e([1, 1, 0]), Integer(3))], 2)
 
 
-    # Retry timers after a resynchronisation #############################################################
-
-    __startup__()
+# Retry timers after a resynchronisation #############################################################
 
 
 actor _ResyncStaleTimer(t: testing.AsyncT, delay: float, retries: int):
@@ -1262,11 +1251,9 @@ actor _ResyncStaleTimer(t: testing.AsyncT, delay: float, retries: int):
     resend's (it fired as a current timer and failed or retransmitted the request early)"""
     u = _sha_aes()
     mn = MemNet()
-    agent = Agent(mn.server(AGENT, 161), make_view(), agent_config([u]), t.log_handler)
-    c = _client(mn, u, 40001, Options(timeout=0.25, retries=retries), t.log_handler)
     var started = 0.0
 
-    def got_second(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+    def got_second(c: Client, cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
         waited = float(time.monotonic_ns()) / 1e9 - started
         s = c.stats()
         def check() -> None:
@@ -1276,22 +1263,23 @@ actor _ResyncStaleTimer(t: testing.AsyncT, delay: float, retries: int):
             testing.assertEqual(s.retries, 0, "no retransmission: " + str(s))
         report(t, outcome(check))
 
-    def got_first(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+    def got_first(agent: Agent, c: Client, cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
         if err is not None:
             t.failure(AssertionError("first get: " + str(err)))
             return
         agent.reboot()
         mn.set_faults(NetFaults(delay=delay, to_address=MANAGER))
         started = float(time.monotonic_ns()) / 1e9
-        c.get(got_second, [SYS_DESCR])
+        c.get((lambda cl, r, err: got_second(c, cl, r, err)), [SYS_DESCR])
 
     proc def __startup__():
-        c.get(got_first, [SYS_DESCR])
+        agent = Agent(mn.server(AGENT, 161), make_view(), agent_config([u]), t.log_handler)
+        c = _client(mn, u, 40001, Options(timeout=0.25, retries=retries), t.log_handler)
 
-    # The resend goes out when the Report arrives, delay after the request, and its answer comes delay later:
-    # after the first attempt's timeout (0.25 s) when delay is 0.15 s, but within the resend's own timeout
+        c.get((lambda cl, r, err: got_first(agent, c, cl, r, err)), [SYS_DESCR])
 
-    __startup__()
+# The resend goes out when the Report arrives, delay after the request, and its answer comes delay later:
+# after the first attempt's timeout (0.25 s) when delay is 0.15 s, but within the resend's own timeout
 
 
 actor _test_resync_stale_timer_retries0(t: testing.AsyncT):
@@ -1301,7 +1289,6 @@ actor _test_resync_stale_timer_retries0(t: testing.AsyncT):
     proc def __startup__():
         t.timeout(30.0)
 
-    __startup__()
 
 
 actor _test_resync_stale_timer_retries1(t: testing.AsyncT):
@@ -1311,7 +1298,6 @@ actor _test_resync_stale_timer_retries1(t: testing.AsyncT):
     proc def __startup__():
         t.timeout(30.0)
 
-    __startup__()
 
 
 actor _Gate(inner: ServerTransport, allow: int):
@@ -1322,6 +1308,7 @@ actor _Gate(inner: ServerTransport, allow: int):
         sent += 1
         if sent <= allow:
             inner.send_to(data, address, port)
+
 
 def _gated(g: _Gate, inner: ServerTransport) -> ServerTransport:
     def _send_to(data: bytes, address: str, port: int) -> None:
@@ -1338,13 +1325,8 @@ actor _test_resync_then_silence(t: testing.AsyncT):
     proc def __startup__():
         u = _sha_aes()
         mn = MemNet()
-        srv = mn.server(AGENT, 161)
-        # datagrams the agent sends: the discovery Report, the notInTimeWindows Report, then nothing
-        agent = Agent(_gated(_Gate(srv, 2), srv), make_view(), agent_config([u]), t.log_handler,
-                      Faults(report_not_in_time_window_once=True))
-        c = _client(mn, u, 40001, Options(timeout=0.2, retries=2), t.log_handler)
 
-        def got(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+        def got(c: Client, cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
             s = c.stats()
             sends = [d.dst_port for d in mn.history() if d.src_port == 40001]
             def check() -> None:
@@ -1359,8 +1341,11 @@ actor _test_resync_then_silence(t: testing.AsyncT):
             report(t, outcome(check))
 
         t.timeout(30.0)
-        c.get(got, [SYS_DESCR])
 
-    __startup__()
+        srv = mn.server(AGENT, 161)
+        # datagrams the agent sends: the discovery Report, the notInTimeWindows Report, then nothing
+        agent = Agent(_gated(_Gate(srv, 2), srv), make_view(), agent_config([u]), t.log_handler,
+                      Faults(report_not_in_time_window_once=True))
+        c = _client(mn, u, 40001, Options(timeout=0.2, retries=2), t.log_handler)
 
-
+        c.get((lambda cl, r, err: got(c, cl, r, err)), [SYS_DESCR])

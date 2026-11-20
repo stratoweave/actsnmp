@@ -445,7 +445,6 @@ actor Script(name: str, steps: list[Step], on_done: action(str, dict[str, Outcom
     proc def __startup__():
         _advance()
 
-    __startup__()
 
 
 actor Gather(want: int, on_done: action(dict[str, dict[str, Outcome]]) -> None):
@@ -483,7 +482,6 @@ actor LabGate(t: testing.EnvT, on_up: action() -> None):
     proc def __startup__():
         c.get(probed, [b([1, 1, 0])])
 
-    __startup__()
 
 
 def _decode(data: bytes) -> str:
@@ -510,7 +508,6 @@ actor Shell(processes: EnvProcess, cmd: list[str], on_done: action(int, str, str
     proc def __startup__():
         _p = processes.run(cmd, _exited, _failed, timeout=limit)
 
-    __startup__()
 
 # Checks #############################################################################################
 
@@ -791,7 +788,6 @@ actor _Communities(t: testing.EnvT, a: LabAgent):
 
         gate = LabGate(t, (lambda: lab_up(scal, system)))
 
-    __startup__()
 
 
 actor _test_snmpd_communities(t: testing.EnvT):
@@ -802,7 +798,6 @@ actor _test_snmpd_communities(t: testing.EnvT):
         t.require("interop")
         r = _Communities(t, SNMPD)
 
-    __startup__()
 
 
 actor _test_snmpsim_communities(t: testing.EnvT):
@@ -813,7 +808,6 @@ actor _test_snmpsim_communities(t: testing.EnvT):
         t.require("interop")
         r = _Communities(t, SNMPSIM)
 
-    __startup__()
 
 # SNMPv3: every lab user ############################################################################
 
@@ -947,7 +941,6 @@ actor _V3Users(t: testing.EnvT, a: LabAgent):
 
         gate = LabGate(t, (lambda: lab_up(scal)))
 
-    __startup__()
 
 
 actor _test_snmpd_v3_users(t: testing.EnvT):
@@ -958,7 +951,6 @@ actor _test_snmpd_v3_users(t: testing.EnvT):
         t.require("interop")
         r = _V3Users(t, SNMPD)
 
-    __startup__()
 
 
 actor _test_snmpsim_v3_users(t: testing.EnvT):
@@ -969,7 +961,6 @@ actor _test_snmpsim_v3_users(t: testing.EnvT):
         t.require("interop")
         r = _V3Users(t, SNMPSIM)
 
-    __startup__()
 
 # SNMPv3: negative cases ############################################################################
 
@@ -1062,7 +1053,6 @@ actor _V3Negative(t: testing.EnvT, a: LabAgent):
             c = Client(cap, LOCAL4, cs.1, None, port=a.port, opts=neg)
             scripts.append((cs.0, [get_step("get", c, [b([1, 18, 0])]), info_step("info", c)]))
 
-    __startup__()
 
 
 actor _test_snmpd_v3_negative(t: testing.EnvT):
@@ -1074,7 +1064,6 @@ actor _test_snmpd_v3_negative(t: testing.EnvT):
         t.require("interop")
         r = _V3Negative(t, SNMPD)
 
-    __startup__()
 
 
 actor _test_snmpsim_v3_negative(t: testing.EnvT):
@@ -1086,7 +1075,6 @@ actor _test_snmpsim_v3_negative(t: testing.EnvT):
         t.require("interop")
         r = _V3Negative(t, SNMPSIM)
 
-    __startup__()
 
 # Full walks of the dataset #########################################################################
 
@@ -1144,7 +1132,6 @@ actor _Walks(t: testing.EnvT, a: LabAgent, users: list[str]):
 
         gate = LabGate(t, (lambda: lab_up(full, full_v1)))
 
-    __startup__()
 
 
 actor _test_snmpd_walks(t: testing.EnvT):
@@ -1156,7 +1143,6 @@ actor _test_snmpd_walks(t: testing.EnvT):
         t.require("interop")
         r = _Walks(t, SNMPD, ["u_noauth", "u_sha256_aes", "u_md5_aes256", "u_sha512_aes256c"])
 
-    __startup__()
 
 
 actor _test_snmpsim_walks(t: testing.EnvT):
@@ -1167,7 +1153,6 @@ actor _test_snmpsim_walks(t: testing.EnvT):
         t.require("interop")
         r = _Walks(t, SNMPSIM, ["u_noauth", "u_sha256_aes", "u_md5_aes192c", "u_sha_3des"])
 
-    __startup__()
 
 # Tables and GETBULK caps ###########################################################################
 
@@ -1275,7 +1260,6 @@ actor _Tables(t: testing.EnvT, a: LabAgent, user: str, users_from_file: list[Lab
 
         gate = LabGate(t, (lambda: lab_up(bigtable, full, full_v1, scal_oids, strtable, table)))
 
-    __startup__()
 
 
 actor _test_snmpd_tables(t: testing.EnvT):
@@ -1286,7 +1270,6 @@ actor _test_snmpd_tables(t: testing.EnvT):
         t.require("interop")
         r = _tables(t, SNMPD, "u_sha_aes192")
 
-    __startup__()
 
 
 actor _test_snmpsim_tables(t: testing.EnvT):
@@ -1297,7 +1280,6 @@ actor _test_snmpsim_tables(t: testing.EnvT):
         t.require("interop")
         r = _tables(t, SNMPSIM, "u_md5_3des")
 
-    __startup__()
 
 # snmpd's own tables ###############################################################################
 
@@ -1367,7 +1349,6 @@ actor _test_snmpd_real_mib(t: testing.EnvT):
 
         gate = LabGate(t, lab_up)
 
-    __startup__()
 
 
 def type_of(line: str) -> str:
@@ -1455,7 +1436,6 @@ actor _test_snmpd_full_mib(t: testing.EnvT):
 
         gate = LabGate(t, lab_up)
 
-    __startup__()
 
 # Large responses ##################################################################################
 
@@ -1520,7 +1500,6 @@ actor _test_snmpd_large(t: testing.EnvT):
         t.require("interop")
         r = _large(t, SNMPD)
 
-    __startup__()
 
 
 actor _test_snmpsim_large(t: testing.EnvT):
@@ -1531,7 +1510,6 @@ actor _test_snmpsim_large(t: testing.EnvT):
         t.require("interop")
         r = _large(t, SNMPSIM)
 
-    __startup__()
 
 # An agent restart under a long-lived Client #########################################################
 
@@ -1623,7 +1601,6 @@ actor _SnmpdRestart(t: testing.EnvT, users_from_file: list[LabUser]):
 
         gate = LabGate(t, lab_up)
 
-    __startup__()
 
 # SET ##############################################################################################
 
@@ -1822,7 +1799,6 @@ actor _Set(t: testing.EnvT, a: LabAgent, users_from_file: list[LabUser]):
 
         gate = LabGate(t, (lambda: lab_up(initial)))
 
-    __startup__()
 
 
 actor _test_snmpd_set(t: testing.EnvT):
@@ -1833,7 +1809,6 @@ actor _test_snmpd_set(t: testing.EnvT):
         t.require("interop")
         r = _set(t, SNMPD)
 
-    __startup__()
 
 
 actor _test_snmpsim_set(t: testing.EnvT):
@@ -1844,7 +1819,6 @@ actor _test_snmpsim_set(t: testing.EnvT):
         t.require("interop")
         r = _set(t, SNMPSIM)
 
-    __startup__()
 
 # snmpsim's pathological dataset ####################################################################
 
@@ -2036,7 +2010,6 @@ actor _test_snmpsim_pathological(t: testing.EnvT):
 
         gate = LabGate(t, lab_up)
 
-    __startup__()
 
 
 actor _test_snmpsim_slow(t: testing.EnvT):
@@ -2091,7 +2064,6 @@ actor _test_snmpsim_slow(t: testing.EnvT):
 
         gate = LabGate(t, lab_up)
 
-    __startup__()
 
 # SNMP over TCP (RFC 3430) #########################################################################
 
@@ -2204,7 +2176,6 @@ actor _test_snmpd_tcp(t: testing.EnvT):
 
         gate = LabGate(t, (lambda: lab_up(full, full_v1, scal, steps)))
 
-    __startup__()
 
 # Notifications: our sender to the lab's snmptrapd #################################################
 
@@ -2411,7 +2382,6 @@ actor _test_trap_to_snmptrapd(t: testing.EnvT):
             want.append(v3_block(u.sec, pdu.INFORM, 3001000 + i, NOTIF.child([0, 300 + i]), full))
         n = _ToSnmptrapd(t, steps, want)
 
-    __startup__()
 
 
 actor _test_tcp_trap_to_snmptrapd(t: testing.EnvT):
@@ -2466,7 +2436,6 @@ actor _test_tcp_trap_to_snmptrapd(t: testing.EnvT):
             want.append(v3_block(u, pdu.INFORM, 3001000 + i, NOTIF.child([0, 300 + i]), full))
         n = _ToSnmptrapd(t, steps, want)
 
-    __startup__()
 
 # Notifications: the lab's senders to our NotificationReceiver ######################################
 
@@ -2577,7 +2546,6 @@ actor _Matrix(t: testing.EnvT, flag: str, expected_file: str, address: str=LOCAL
 
         gate = LabGate(t, (lambda: lab_up(users_text)))
 
-    __startup__()
 
 
 actor _test_receiver_matrix_quick(t: testing.EnvT):
@@ -2588,7 +2556,6 @@ actor _test_receiver_matrix_quick(t: testing.EnvT):
         t.require("interop")
         r = _Matrix(t, "--quick", "matrix-quick.txt")
 
-    __startup__()
 
 
 actor _test_receiver_matrix_full(t: testing.EnvT):
@@ -2599,7 +2566,6 @@ actor _test_receiver_matrix_full(t: testing.EnvT):
         t.require("interop")
         r = _Matrix(t, "", "matrix.txt")
 
-    __startup__()
 
 
 actor _test_receiver_matrix_all_users(t: testing.EnvT):
@@ -2610,7 +2576,6 @@ actor _test_receiver_matrix_all_users(t: testing.EnvT):
         t.require("interop")
         r = _Matrix(t, "--all-users", "matrix-all.txt")
 
-    __startup__()
 
 
 actor _test_receiver_matrix_quick_ipv6(t: testing.EnvT):
@@ -2621,7 +2586,6 @@ actor _test_receiver_matrix_quick_ipv6(t: testing.EnvT):
         t.require("interop")
         r = _Matrix(t, "--quick", "matrix-quick.txt", LOCAL6)
 
-    __startup__()
 
 
 actor _test_receiver_matrix_full_tcp(t: testing.EnvT):
@@ -2632,7 +2596,6 @@ actor _test_receiver_matrix_full_tcp(t: testing.EnvT):
         t.require("interop")
         r = _Matrix(t, "", "", tcp=True)
 
-    __startup__()
 
 
 actor _test_receiver_matrix_quick_tcp6(t: testing.EnvT):
@@ -2644,7 +2607,6 @@ actor _test_receiver_matrix_quick_tcp6(t: testing.EnvT):
         t.require("interop")
         r = _Matrix(t, "--quick", "", LOCAL6, tcp=True)
 
-    __startup__()
 
 # The shared-socket Dispatcher ######################################################################
 
@@ -2739,5 +2701,3 @@ actor _LabDispatcher(t: testing.EnvT, users_from_file: list[LabUser]):
         lcap = net.UDPListenCap(net.UDPCap(net.NetCap(t.env.cap)))
 
         gate = LabGate(t, (lambda: lab_up(full, full_v1, lcap, scal)))
-
-    __startup__()

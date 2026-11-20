@@ -170,7 +170,6 @@ actor _test_mem_roundtrip(t: testing.AsyncT):
         p.client.set_receiver((lambda data, address, port: client_received(p, data, address, port)), client_failed)
         p.client.send(b"ping")
 
-    __startup__()
 
 
 actor _test_mem_order(t: testing.AsyncT):
@@ -204,7 +203,6 @@ actor _test_mem_order(t: testing.AsyncT):
         for d in _numbered(count):
             p.client.send(d)
 
-    __startup__()
 
 
 actor _test_mem_many_peers(t: testing.AsyncT):
@@ -243,7 +241,6 @@ actor _test_mem_many_peers(t: testing.AsyncT):
             clients[i].set_receiver(receiver(i), client_failed)
             clients[i].send(("c%d" % i).encode())
 
-    __startup__()
 
 
 actor _test_mem_bind_rules(t: testing.AsyncT):
@@ -297,7 +294,6 @@ actor _test_mem_bind_rules(t: testing.AsyncT):
 
         report(t, outcome(check))
 
-    __startup__()
 
 
 actor _test_mem_buffered_until_receiver(t: testing.AsyncT):
@@ -330,7 +326,6 @@ actor _test_mem_buffered_until_receiver(t: testing.AsyncT):
             sender.send_to(d, "10.0.0.1", 161)
         sender.send_to(b"marker", "10.0.0.3", 3)
 
-    __startup__()
 
 
 actor _test_mem_replace_receiver(t: testing.AsyncT):
@@ -363,7 +358,6 @@ actor _test_mem_replace_receiver(t: testing.AsyncT):
         p.client.set_receiver((lambda data, address, port: first_received(p, data, address, port)), client_failed)
         p.client.send(b"go")
 
-    __startup__()
 
 
 actor _test_mem_inject_and_history(t: testing.AsyncT):
@@ -390,7 +384,6 @@ actor _test_mem_inject_and_history(t: testing.AsyncT):
         p.client.set_receiver(received, failed)
         mn.send(b"Ahi", "192.0.2.66", 6666, "10.0.0.2", 40000)
 
-    __startup__()
 
 
 actor _test_mem_unroutable(t: testing.AsyncT):
@@ -430,7 +423,6 @@ actor _test_mem_unroutable(t: testing.AsyncT):
         mn.send(b"nobody", "10.0.0.1", 161, "10.9.9.9", 9)
         cl.send(b"first")
 
-    __startup__()
 
 
 actor _test_mem_errors_and_data_in_order(t: testing.AsyncT):
@@ -466,7 +458,6 @@ actor _test_mem_errors_and_data_in_order(t: testing.AsyncT):
         mn.send(b"lost", "10.0.0.2", 40000, "10.0.0.9", 9)
         mn.send(b"two", "10.0.0.9", 9, "10.0.0.2", 40000)
 
-    __startup__()
 
 
 actor _test_mem_spoofed_copy_not_refused(t: testing.AsyncT):
@@ -499,7 +490,6 @@ actor _test_mem_spoofed_copy_not_refused(t: testing.AsyncT):
         bystander.set_receiver(received, bystander_failed)
         sender.send(b"x")
 
-    __startup__()
 
 
 actor _test_mem_oversize(t: testing.AsyncT):
@@ -529,7 +519,6 @@ actor _test_mem_oversize(t: testing.AsyncT):
         p.client.set_receiver(client_received, (lambda message, fatal: client_failed(p, message, fatal)))
         p.client.send(pseudo_random(transport.MAX_DATAGRAM + 1, 1))
 
-    __startup__()
 
 
 actor _test_mem_close(t: testing.AsyncT):
@@ -572,7 +561,6 @@ actor _test_mem_close(t: testing.AsyncT):
         mn.send(b"to closed client", "10.0.0.1", 161, "10.0.0.2", 40000)
         after now NOTHING_WAIT: settled()
 
-    __startup__()
 
 
 actor _test_mem_wrapped_transport(t: testing.AsyncT):
@@ -609,7 +597,6 @@ actor _test_mem_wrapped_transport(t: testing.AsyncT):
         wrapped.send(b"one")
         wrapped.send(b"two")
 
-    __startup__()
 
 # MemNet: faults ###################################################################################
 
@@ -653,7 +640,6 @@ actor _fault_run(t: testing.AsyncT, faults: NetFaults, sends: list[bytes], expec
         for d in sends:
             p.client.send(d)
 
-    __startup__()
 
 
 def _from_client(data: list[bytes]) -> list[(bytes, int)]:
@@ -666,7 +652,6 @@ actor _test_fault_drop_first_n(t: testing.AsyncT):
         _fault_run(t, NetFaults(drop_first_n=2), _numbered(5), _from_client([b"2", b"3", b"4"]),
                    _counts(sent=5, dropped=2, delivered=3))
 
-    __startup__()
 
 
 actor _test_fault_drop_every_nth(t: testing.AsyncT):
@@ -676,7 +661,6 @@ actor _test_fault_drop_every_nth(t: testing.AsyncT):
         _fault_run(t, NetFaults(drop_every_nth=3), _numbered(7), _from_client([b"0", b"1", b"3", b"4", b"6"]),
                    _counts(sent=7, dropped=2, delivered=5))
 
-    __startup__()
 
 
 actor _test_fault_drops_combined(t: testing.AsyncT):
@@ -686,7 +670,6 @@ actor _test_fault_drops_combined(t: testing.AsyncT):
         _fault_run(t, NetFaults(drop_first_n=1, drop_every_nth=2), _numbered(8), _from_client([b"2", b"4", b"6"]),
                    _counts(sent=8, dropped=5, delivered=3))
 
-    __startup__()
 
 
 actor _test_fault_duplicate(t: testing.AsyncT):
@@ -696,7 +679,6 @@ actor _test_fault_duplicate(t: testing.AsyncT):
         _fault_run(t, NetFaults(duplicate=True), _numbered(3), _from_client([b"0", b"0", b"1", b"1", b"2", b"2"]),
                    _counts(sent=3, duplicated=3, delivered=6))
 
-    __startup__()
 
 
 actor _test_fault_corrupt_byte(t: testing.AsyncT):
@@ -706,7 +688,6 @@ actor _test_fault_corrupt_byte(t: testing.AsyncT):
         _fault_run(t, NetFaults(corrupt_byte=1), [b"\x10\x20\x30", b"\x40", b""],
                    _from_client([b"\x10\xdf\x30", b"\x40", b""]), _counts(sent=3, corrupted=1, delivered=3))
 
-    __startup__()
 
 
 actor _test_fault_spoof_source(t: testing.AsyncT):
@@ -717,7 +698,6 @@ actor _test_fault_spoof_source(t: testing.AsyncT):
                    [(b"a", 40001), (b"a", 40000), (b"b", 40001), (b"b", 40000)],
                    _counts(sent=2, spoofed=2, delivered=4))
 
-    __startup__()
 
 
 actor _test_fault_order_of_application(t: testing.AsyncT):
@@ -728,7 +708,6 @@ actor _test_fault_order_of_application(t: testing.AsyncT):
                    [(b"\xffb", 40001), (b"\xffb", 40000), (b"\xffb", 40000)],
                    _counts(sent=2, dropped=1, corrupted=1, spoofed=1, duplicated=1, delivered=3))
 
-    __startup__()
 
 
 actor _test_fault_reorder_pairs(t: testing.AsyncT):
@@ -738,7 +717,6 @@ actor _test_fault_reorder_pairs(t: testing.AsyncT):
         _fault_run(t, NetFaults(reorder=True), _numbered(4), _from_client([b"1", b"0", b"3", b"2"]),
                    _counts(sent=4, reordered=2, delivered=4))
 
-    __startup__()
 
 
 actor _test_fault_reorder_odd_tail(t: testing.AsyncT):
@@ -748,7 +726,6 @@ actor _test_fault_reorder_odd_tail(t: testing.AsyncT):
         _fault_run(t, NetFaults(reorder=True), _numbered(3), _from_client([b"1", b"0", b"2"]),
                    _counts(sent=3, reordered=1, delivered=3), transport.REORDER_HOLD)
 
-    __startup__()
 
 
 actor _test_fault_reorder_with_copies(t: testing.AsyncT):
@@ -758,7 +735,6 @@ actor _test_fault_reorder_with_copies(t: testing.AsyncT):
         _fault_run(t, NetFaults(reorder=True, duplicate=True), _numbered(2), _from_client([b"1", b"1", b"0", b"0"]),
                    _counts(sent=2, duplicated=2, reordered=1, delivered=4))
 
-    __startup__()
 
 
 actor _test_fault_delay(t: testing.AsyncT):
@@ -768,7 +744,6 @@ actor _test_fault_delay(t: testing.AsyncT):
         _fault_run(t, NetFaults(delay=0.1), _numbered(20), _from_client(_numbered(20)),
                    _counts(sent=20, delayed=20, delivered=20), 0.1)
 
-    __startup__()
 
 
 actor _test_fault_delay_with_reorder(t: testing.AsyncT):
@@ -778,7 +753,6 @@ actor _test_fault_delay_with_reorder(t: testing.AsyncT):
         _fault_run(t, NetFaults(reorder=True, delay=0.05), _numbered(2), _from_client([b"1", b"0"]),
                    _counts(sent=2, reordered=1, delayed=2, delivered=2), 0.05)
 
-    __startup__()
 
 
 actor _test_fault_selector(t: testing.AsyncT):
@@ -816,7 +790,6 @@ actor _test_fault_selector(t: testing.AsyncT):
         p.client.send(b"a")
         p.client.send(b"end")
 
-    __startup__()
 
 
 actor _test_fault_set_faults(t: testing.AsyncT):
@@ -854,7 +827,6 @@ actor _test_fault_set_faults(t: testing.AsyncT):
         p.client.send(b"0")
         p.client.send(b"1")
 
-    __startup__()
 
 
 actor _test_fault_set_faults_releases_held(t: testing.AsyncT):
@@ -884,7 +856,6 @@ actor _test_fault_set_faults_releases_held(t: testing.AsyncT):
         mn.send(b"1", "10.0.0.2", 40000, "10.0.0.1", 161)
         mn.send(b"2", "10.0.0.2", 40000, "10.0.0.1", 161)
 
-    __startup__()
 
 
 actor _test_fault_set_faults_releases_delayed(t: testing.AsyncT):
@@ -912,7 +883,6 @@ actor _test_fault_set_faults_releases_delayed(t: testing.AsyncT):
         mn.set_faults(None)
         mn.send(b"3", "10.0.0.2", 40000, "10.0.0.1", 161)
 
-    __startup__()
 
 # UDP ##############################################################################################
 
@@ -988,7 +958,6 @@ actor _udp_roundtrip(t: testing.EnvT, listen_address: str, connect_address: str,
         after now SOCKET_WATCHDOG: timed_out()
         transport.udp_server_transport(net.UDPListenCap(ucap), listen_address, 0, listening, t.log_handler)
 
-    __startup__()
 
 
 actor _test_udp_ipv4_roundtrip(t: testing.EnvT):
@@ -997,7 +966,6 @@ actor _test_udp_ipv4_roundtrip(t: testing.EnvT):
     proc def __startup__():
         _udp_roundtrip(t, "127.0.0.1", "127.0.0.1", False)
 
-    __startup__()
 
 
 actor _test_udp_ipv6_roundtrip(t: testing.EnvT):
@@ -1006,7 +974,6 @@ actor _test_udp_ipv6_roundtrip(t: testing.EnvT):
     proc def __startup__():
         _udp_roundtrip(t, "::1", "::1", True)
 
-    __startup__()
 
 
 actor _test_udp_dual_stack_source_normalized(t: testing.EnvT):
@@ -1015,7 +982,6 @@ actor _test_udp_dual_stack_source_normalized(t: testing.EnvT):
     proc def __startup__():
         _udp_roundtrip(t, "::", "127.0.0.1", True)
 
-    __startup__()
 
 
 actor _test_udp_unreachable_then_usable(t: testing.EnvT):
@@ -1120,7 +1086,6 @@ actor _test_udp_unreachable_then_usable(t: testing.EnvT):
         after now SOCKET_WATCHDOG: timed_out()
         transport.udp_server_transport(net.UDPListenCap(ucap), "127.0.0.1", 0, first_listening, t.log_handler)
 
-    __startup__()
 
 
 actor _test_udp_hostname_queues_until_connected(t: testing.EnvT):
@@ -1186,7 +1151,6 @@ actor _test_udp_hostname_queues_until_connected(t: testing.EnvT):
         # "::" takes the A and the AAAA answer for localhost alike
         transport.udp_server_transport(net.UDPListenCap(ucap), "::", 0, listening, t.log_handler)
 
-    __startup__()
 
 
 actor _udp_setup_failure(t: testing.EnvT, address: str, port: int, expect: str):
@@ -1237,7 +1201,6 @@ actor _udp_setup_failure(t: testing.EnvT, address: str, port: int, expect: str):
         after now SOCKET_WATCHDOG: timed_out(c)
         c.set_receiver((lambda data, address, port: received(c, data, address, port)), (lambda message, fatal: failed(c, message, fatal)))
 
-    __startup__()
 
 
 actor _test_udp_invalid_port_is_fatal(t: testing.EnvT):
@@ -1246,7 +1209,6 @@ actor _test_udp_invalid_port_is_fatal(t: testing.EnvT):
     proc def __startup__():
         _udp_setup_failure(t, "127.0.0.1", 0, "port 0 is outside 1..65535")
 
-    __startup__()
 
 
 actor _test_udp_port_too_high_is_fatal(t: testing.EnvT):
@@ -1255,7 +1217,6 @@ actor _test_udp_port_too_high_is_fatal(t: testing.EnvT):
     proc def __startup__():
         _udp_setup_failure(t, "::1", 65536, "UDP setup for [::1]:65536 failed")
 
-    __startup__()
 
 
 actor _test_udp_name_resolution_failure_is_fatal(t: testing.EnvT):
@@ -1264,7 +1225,6 @@ actor _test_udp_name_resolution_failure_is_fatal(t: testing.EnvT):
     proc def __startup__():
         _udp_setup_failure(t, "", 161, "UDP setup for :161 failed")
 
-    __startup__()
 
 
 actor _test_udp_server_failures(t: testing.EnvT):
@@ -1321,7 +1281,6 @@ actor _test_udp_server_failures(t: testing.EnvT):
         after now SOCKET_WATCHDOG: timed_out()
         transport.udp_server_transport(net.UDPListenCap(ucap), "127.0.0.1", 70000, bad_port_failed, t.log_handler)
 
-    __startup__()
 
 
 actor _test_udp_close_idempotent(t: testing.EnvT):
@@ -1380,7 +1339,6 @@ actor _test_udp_close_idempotent(t: testing.EnvT):
 
         transport.udp_server_transport(net.UDPListenCap(ucap), "127.0.0.1", 0, listening, t.log_handler)
 
-    __startup__()
 
 # Stream framing ###################################################################################
 
@@ -1649,7 +1607,6 @@ actor _tcp_roundtrip(t: testing.EnvT, address: str, first_port: int, optional_ip
 
         after now SOCKET_WATCHDOG: timed_out()
 
-    __startup__()
 
 
 actor _test_tcp_ipv4_roundtrip(t: testing.EnvT):
@@ -1658,7 +1615,6 @@ actor _test_tcp_ipv4_roundtrip(t: testing.EnvT):
     proc def __startup__():
         _tcp_roundtrip(t, "127.0.0.1", _tcp_port_range(0), False)
 
-    __startup__()
 
 
 actor _test_tcp_ipv6_roundtrip(t: testing.EnvT):
@@ -1667,7 +1623,6 @@ actor _test_tcp_ipv6_roundtrip(t: testing.EnvT):
     proc def __startup__():
         _tcp_roundtrip(t, "::1", _tcp_port_range(1), True)
 
-    __startup__()
 
 
 actor _tcp_pair(t: testing.EnvT, first_port: int, server_idle_timeout: float, client_idle_timeout: float,
@@ -1760,7 +1715,6 @@ actor _tcp_pair(t: testing.EnvT, first_port: int, server_idle_timeout: float, cl
 
         after now SOCKET_WATCHDOG: timed_out()
 
-    __startup__()
 
 
 actor _test_tcp_lost_framing(t: testing.EnvT):
@@ -1981,7 +1935,6 @@ actor _test_tcp_refused(t: testing.EnvT):
         c.send(GET_SYS_DESCR)
         c.send(GET_SYS_DESCR)
 
-    __startup__()
 
 
 actor _test_tcp_connect_timeout(t: testing.EnvT):
@@ -2032,7 +1985,6 @@ actor _test_tcp_connect_timeout(t: testing.EnvT):
         c.set_receiver((lambda data, address, port: received(c, data, address, port)), (lambda message, fatal: failed(c, message, fatal)))
         c.send(GET_SYS_DESCR)
 
-    __startup__()
 
 
 actor _tcp_setup_failure(t: testing.EnvT, address: str, port: int, expect: str):
@@ -2077,7 +2029,6 @@ actor _tcp_setup_failure(t: testing.EnvT, address: str, port: int, expect: str):
         after now SOCKET_WATCHDOG: timed_out(c)
         c.set_receiver((lambda data, address_seen, port_seen: received(c, data, address_seen, port_seen)), (lambda message, fatal: failed(c, message, fatal)))
 
-    __startup__()
 
 
 actor _test_tcp_invalid_port_is_fatal(t: testing.EnvT):
@@ -2086,7 +2037,6 @@ actor _test_tcp_invalid_port_is_fatal(t: testing.EnvT):
     proc def __startup__():
         _tcp_setup_failure(t, "127.0.0.1", 0, "TCP setup for 127.0.0.1:0 failed: port 0 is outside 1..65535")
 
-    __startup__()
 
 
 actor _test_tcp_port_too_high_is_fatal(t: testing.EnvT):
@@ -2095,7 +2045,6 @@ actor _test_tcp_port_too_high_is_fatal(t: testing.EnvT):
     proc def __startup__():
         _tcp_setup_failure(t, "127.0.0.1", 65536, "TCP setup for 127.0.0.1:65536 failed: port 65536 is outside 1..65535")
 
-    __startup__()
 
 
 actor _test_tcp_host_name_is_fatal(t: testing.EnvT):
@@ -2104,7 +2053,6 @@ actor _test_tcp_host_name_is_fatal(t: testing.EnvT):
     proc def __startup__():
         _tcp_setup_failure(t, "localhost", 161, "TCP setup for localhost:161 failed: not an IPv4 or IPv6 address")
 
-    __startup__()
 
 
 actor _test_tcp_option_validation(t: testing.EnvT):
@@ -2157,7 +2105,6 @@ actor _test_tcp_option_validation(t: testing.EnvT):
 
         report_env(t, outcome(check))
 
-    __startup__()
 
 
 actor _test_tcp_server_failures(t: testing.EnvT):
@@ -2222,7 +2169,6 @@ actor _test_tcp_server_failures(t: testing.EnvT):
         after now SOCKET_WATCHDOG: timed_out()
         transport.tcp_server_transport(lcap, "127.0.0.1", 0, listen_failed, t.log_handler)
 
-    __startup__()
 
 
 actor _test_tcp_close_idempotent(t: testing.EnvT):
@@ -2277,5 +2223,3 @@ actor _test_tcp_close_idempotent(t: testing.EnvT):
 
     proc def __startup__():
         t.timeout(SOCKET_WATCHDOG + 2.0)
-
-    __startup__()
