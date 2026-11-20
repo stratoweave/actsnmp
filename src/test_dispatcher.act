@@ -7,7 +7,6 @@ Clients of 20 agents over one socket, timed against a socket per Client
 (see the log with --show-log).
 """
 
-import file
 import logging
 import net
 import testing
@@ -34,7 +33,7 @@ from receiver import NotificationReceiver, ReceiverConfig
 from security import Community, Security, Usm
 from transport import MemNet, NetFaults, ServerTransport, Transport
 from values import Integer, Null, OctetString, VarBind
-from testutil import h, outcome, read_text, report, report_env
+from testutil import h, outcome, report, report_env
 
 SYS_DESCR = Oid([1, 3, 6, 1, 2, 1, 1, 1, 0])
 
@@ -1650,19 +1649,13 @@ proc def connect_cap(t: testing.EnvT) -> net.UDPConnectCap:
     return net.UDPConnectCap(net.UDPCap(net.NetCap(t.env.cap)))
 
 proc def open_fds(t: testing.EnvT) -> int:
-    """The number of open file descriptors of this process (the entries of /dev/fd: Linux links it to
-    /proc/self/fd, and macOS has no /proc)"""
-    return len(file.FS(file.FileCap(t.env.cap)).listdir("/dev/fd"))
+    """The number of open file descriptors of this process"""
+    return int(t.env.rts.fd_stats().open!)
 
 proc def max_open_files(t: testing.EnvT) -> int:
-    """The soft RLIMIT_NOFILE of this process (/proc/self/limits), -1 if unknown"""
-    try:
-        for line in read_text(t, "/proc/self/limits").split("\n"):
-            if line.startswith("Max open files"):
-                return int(line[len("Max open files"):].strip().split(" ")[0])
-    except Exception:
-        pass
-    return -1
+    """The most file descriptors this process may have open, -1 if unknown"""
+    limit = t.env.rts.fd_stats().limit
+    return int(limit) if limit is not None else -1
 
 def _ms() -> float:
     return float(time.monotonic_ns()) / 1000000.0
@@ -1877,7 +1870,6 @@ actor _Fleet(t: testing.EnvT, shared: bool, n: int, agents: int, gets: int, wind
     var disp: ?Dispatcher = None
     var clients: list[Client] = []
     var fds_before = 0
-    var fds_with_clients = 0
     var started = 0.0
     var next_client = 0
     var finished = 0
@@ -1886,7 +1878,11 @@ actor _Fleet(t: testing.EnvT, shared: bool, n: int, agents: int, gets: int, wind
 
     proc def _finish() -> None:
         elapsed = _ms() - started
-        fds_after = open_fds(t)
+        # Counted with every Client done and none closed yet. fds_before can include sockets of the previous
+        # iteration still closing (closing is asynchronous, and acton test runs a test several times in one
+        # process), so the connected Clients are checked against the descriptors open, not those added
+        fds = open_fds(t)
+        added = fds - fds_before
         d = disp
         s = d.stats() if d is not None else None
         retries = 0
@@ -1895,19 +1891,17 @@ actor _Fleet(t: testing.EnvT, shared: bool, n: int, agents: int, gets: int, wind
         rate = float(n * gets) * 1000.0 / elapsed
         log.info("fleet", {"mode": "dispatcher" if shared else "connected sockets", "clients": n, "agents": agents,
                            "requests": n * gets, "ms": elapsed, "requests_per_s": rate, "retries": retries,
-                           "fds_added_by_clients": fds_with_clients - fds_before, "fds_after": fds_after - fds_before})
+                           "fds_added_by_clients": added})
         def check() -> None:
             testing.assertEqual(wrong, [], "every GET answered by its own agent")
             testing.assertEqual(answers, n * gets)
             if shared:
-                testing.assertTrue(fds_with_clients - fds_before <= 8,
-                                   "%d Clients over one socket added %d file descriptors" % (n, fds_with_clients - fds_before))
+                testing.assertTrue(added <= 8, "%d Clients over one socket added %d file descriptors" % (n, added))
                 if s is not None:
                     testing.assertEqual((s.endpoints, s.peers, s.unroutable), (n, agents, 0), str(s))
                     testing.assertTrue(s.routed >= n * gets, str(s))
             else:
-                testing.assertTrue(fds_with_clients - fds_before >= n,
-                                   "%d connected Clients added %d file descriptors" % (n, fds_with_clients - fds_before))
+                testing.assertTrue(fds >= n, "%d connected Clients, %d file descriptors open" % (n, fds))
         for c in clients:
             c.close()
         if d is not None:
@@ -1941,7 +1935,6 @@ actor _Fleet(t: testing.EnvT, shared: bool, n: int, agents: int, gets: int, wind
                 clients.append(client_via(d, peer.0, sec, o, port=peer.1))
             else:
                 clients.append(Client(connect_cap(t), peer.0, sec, None, port=peer.1, opts=o))
-        fds_with_clients = open_fds(t)
         started = _ms()
         for _ in range(min([n, window])):
             _run_next()
