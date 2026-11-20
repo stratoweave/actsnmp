@@ -719,7 +719,7 @@ actor Command(o: CliOptions, c: Client, out: action(str) -> None, err: action(st
             # command if the connection fails, and without either the connect timeout does
             _trap_handed = True
             wait = TRAP_LINGER if _connection_up else tcp_connect_timeout(o) + TRAP_LINGER
-            after wait: _trap_written()
+            after now wait: _trap_written()
         else:
             _finish(0)
 
@@ -755,7 +755,7 @@ actor Command(o: CliOptions, c: Client, out: action(str) -> None, err: action(st
         if not _connection_up:
             _connection_up = True
             if _trap_handed:
-                after TRAP_LINGER: _trap_written()
+                after now TRAP_LINGER: _trap_written()
 
     # dispatch ----------------------------------------------------------------------------------------
 
@@ -954,7 +954,7 @@ actor main(env):
 
     def finished(code: int) -> None:
         if _trap:
-            after TRAP_LINGER: env.exit(code)
+            after now TRAP_LINGER: env.exit(code)
         else:
             env.exit(code)
 
