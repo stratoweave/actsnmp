@@ -7,7 +7,6 @@ Clients of 20 agents over one socket, timed against a socket per Client
 (see the log with --show-log).
 """
 
-import file
 import logging
 import net
 import testing
@@ -34,7 +33,7 @@ from receiver import NotificationReceiver, ReceiverConfig
 from security import Community, Security, Usm
 from transport import MemNet, NetFaults, ServerTransport, Transport
 from values import Integer, Null, OctetString, VarBind
-from testutil import h, outcome, read_text, report, report_env
+from testutil import h, outcome, report, report_env
 
 SYS_DESCR = Oid([1, 3, 6, 1, 2, 1, 1, 1, 0])
 
@@ -1650,19 +1649,13 @@ proc def connect_cap(t: testing.EnvT) -> net.UDPConnectCap:
     return net.UDPConnectCap(net.UDPCap(net.NetCap(t.env.cap)))
 
 proc def open_fds(t: testing.EnvT) -> int:
-    """The number of open file descriptors of this process (the entries of /dev/fd: Linux links it to
-    /proc/self/fd, and macOS has no /proc)"""
-    return len(file.FS(file.FileCap(t.env.cap)).listdir("/dev/fd"))
+    """The number of open file descriptors of this process"""
+    return int(t.env.rts.fd_stats().open!)
 
 proc def max_open_files(t: testing.EnvT) -> int:
-    """The soft RLIMIT_NOFILE of this process (/proc/self/limits), -1 if unknown"""
-    try:
-        for line in read_text(t, "/proc/self/limits").split("\n"):
-            if line.startswith("Max open files"):
-                return int(line[len("Max open files"):].strip().split(" ")[0])
-    except Exception:
-        pass
-    return -1
+    """The most file descriptors this process may have open, -1 if unknown"""
+    limit = t.env.rts.fd_stats().limit
+    return int(limit) if limit is not None else -1
 
 def _ms() -> float:
     return float(time.monotonic_ns()) / 1000000.0
