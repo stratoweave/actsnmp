@@ -1877,7 +1877,6 @@ actor _Fleet(t: testing.EnvT, shared: bool, n: int, agents: int, gets: int, wind
     var disp: ?Dispatcher = None
     var clients: list[Client] = []
     var fds_before = 0
-    var fds_with_clients = 0
     var started = 0.0
     var next_client = 0
     var finished = 0
@@ -1886,7 +1885,11 @@ actor _Fleet(t: testing.EnvT, shared: bool, n: int, agents: int, gets: int, wind
 
     proc def _finish() -> None:
         elapsed = _ms() - started
-        fds_after = open_fds(t)
+        # Counted with every Client done and none closed yet. fds_before can include sockets of the previous
+        # iteration still closing (closing is asynchronous, and acton test runs a test several times in one
+        # process), so the connected Clients are checked against the descriptors open, not those added
+        fds = open_fds(t)
+        added = fds - fds_before
         d = disp
         s = d.stats() if d is not None else None
         retries = 0
@@ -1895,19 +1898,17 @@ actor _Fleet(t: testing.EnvT, shared: bool, n: int, agents: int, gets: int, wind
         rate = float(n * gets) * 1000.0 / elapsed
         log.info("fleet", {"mode": "dispatcher" if shared else "connected sockets", "clients": n, "agents": agents,
                            "requests": n * gets, "ms": elapsed, "requests_per_s": rate, "retries": retries,
-                           "fds_added_by_clients": fds_with_clients - fds_before, "fds_after": fds_after - fds_before})
+                           "fds_added_by_clients": added})
         def check() -> None:
             testing.assertEqual(wrong, [], "every GET answered by its own agent")
             testing.assertEqual(answers, n * gets)
             if shared:
-                testing.assertTrue(fds_with_clients - fds_before <= 8,
-                                   "%d Clients over one socket added %d file descriptors" % (n, fds_with_clients - fds_before))
+                testing.assertTrue(added <= 8, "%d Clients over one socket added %d file descriptors" % (n, added))
                 if s is not None:
                     testing.assertEqual((s.endpoints, s.peers, s.unroutable), (n, agents, 0), str(s))
                     testing.assertTrue(s.routed >= n * gets, str(s))
             else:
-                testing.assertTrue(fds_with_clients - fds_before >= n,
-                                   "%d connected Clients added %d file descriptors" % (n, fds_with_clients - fds_before))
+                testing.assertTrue(fds >= n, "%d connected Clients, %d file descriptors open" % (n, fds))
         for c in clients:
             c.close()
         if d is not None:
@@ -1941,7 +1942,6 @@ actor _Fleet(t: testing.EnvT, shared: bool, n: int, agents: int, gets: int, wind
                 clients.append(client_via(d, peer.0, sec, o, port=peer.1))
             else:
                 clients.append(Client(connect_cap(t), peer.0, sec, None, port=peer.1, opts=o))
-        fds_with_clients = open_fds(t)
         started = _ms()
         for _ in range(min([n, window])):
             _run_next()
