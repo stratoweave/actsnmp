@@ -937,6 +937,12 @@ actor _test_udp_unreachable_then_usable(t: testing.EnvT):
         refused += 1
         if refused == 1:
             listen_again()
+        elif srv is not None:
+            # A probe sent before the first refusal came in can be refused too. The kernel keeps that error for
+            # the socket's next call, and when that is the send of "again", "again" is not sent: send it again
+            c = cl
+            if c is not None:
+                c.send(b"again")
 
     def probe(n: int) -> None:
         # Repeat until the first listener is gone and the kernel refuses
