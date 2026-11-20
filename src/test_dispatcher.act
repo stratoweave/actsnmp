@@ -1841,12 +1841,17 @@ actor _test_udp_family_refused(t: testing.EnvT):
 FLEET_CLIENTS = 2000
 FLEET_AGENTS = 20
 FLEET_GETS = 5
+# Clients making their GETs at a time. The answers to all their GETs can arrive while the Dispatcher's socket is
+# not read, and its receive buffer holds 238 of them on Linux (212992 octets, 896 per datagram); the kernel drops
+# the rest, as the dispatcher module documentation says. With all 2000 Clients at once, thousands of attempts lost
+# their answers, and now and then all four attempts of a GET did.
+FLEET_WINDOW = 100
 
-actor _Fleet(t: testing.EnvT, shared: bool, n: int, agents: int, gets: int):
+actor _Fleet(t: testing.EnvT, shared: bool, n: int, agents: int, gets: int, window: int):
     """n Clients (SNMPv2c, every 4th with community "private") of `agents` Agents on 127.0.0.1 and ::1, each
-    making `gets` GETs one after another, all Clients at once; over one Dispatcher (shared) or with a
-    connected UDP socket per Client. Checks every answer, logs the time, and how many file descriptors the
-    Clients added"""
+    making `gets` GETs one after another, `window` Clients at a time (all attached at once); over one Dispatcher
+    (shared) or with a connected UDP socket per Client. Checks every answer, logs the time, and how many file
+    descriptors the Clients added"""
     log = logging.Logger(t.log_handler)
     var servers: list[ServerTransport] = []
     var ports: list[(str, int)] = []
@@ -1855,6 +1860,7 @@ actor _Fleet(t: testing.EnvT, shared: bool, n: int, agents: int, gets: int):
     var fds_before = 0
     var fds_with_clients = 0
     var started = 0.0
+    var next_client = 0
     var finished = 0
     var wrong: list[str] = []
     var answers = 0
@@ -1891,10 +1897,17 @@ actor _Fleet(t: testing.EnvT, shared: bool, n: int, agents: int, gets: int):
             st.close()
         report_env(t, outcome(check))
 
+    proc def _run_next() -> None:
+        i = next_client
+        next_client += 1
+        _FleetRunner(clients[i], gets, OctetString(("agent %d" % (i % len(ports))).encode()), runner_finished)
+
     def runner_finished(errs: list[str], n_answers: int) -> None:
         wrong.extend(errs)
         answers += n_answers
         finished += 1
+        if next_client < n:
+            _run_next()
         if finished == n:
             _finish()
 
@@ -1911,9 +1924,8 @@ actor _Fleet(t: testing.EnvT, shared: bool, n: int, agents: int, gets: int):
                 clients.append(Client(connect_cap(t), peer.0, sec, None, port=peer.1, opts=o))
         fds_with_clients = open_fds(t)
         started = _ms()
-        for i in range(n):
-            peer = ports[i % len(ports)]
-            _FleetRunner(clients[i], gets, OctetString(("agent %d" % (i % len(ports))).encode()), runner_finished)
+        for _ in range(min([n, window])):
+            _run_next()
 
     def disp_listening(d: Dispatcher, error: ?str) -> None:
         if error is not None:
@@ -1965,10 +1977,10 @@ actor _FleetRunner(c: Client, gets: int, descr: OctetString, on_done: action(lis
 
 
 actor _test_udp_fleet_dispatcher(t: testing.EnvT):
-    """2000 Clients of 20 agents (127.0.0.1 and ::1) over ONE Dispatcher socket: 10000 GETs, every answer right,
-    the file descriptors stay flat (the time is logged: --show-log)"""
+    """2000 Clients of 20 agents (127.0.0.1 and ::1) over ONE Dispatcher socket: 10000 GETs of 100 Clients at a time,
+    every answer right, the file descriptors stay flat (the time is logged: --show-log)"""
     t.timeout(120.0)
-    f = _Fleet(t, True, FLEET_CLIENTS, FLEET_AGENTS, FLEET_GETS)
+    f = _Fleet(t, True, FLEET_CLIENTS, FLEET_AGENTS, FLEET_GETS, FLEET_WINDOW)
 
 
 actor _test_udp_fleet_connected(t: testing.EnvT):
@@ -1982,4 +1994,4 @@ actor _test_udp_fleet_connected(t: testing.EnvT):
         except testing.AbortTest:
             pass
     else:
-        f = _Fleet(t, False, FLEET_CLIENTS, FLEET_AGENTS, FLEET_GETS)
+        f = _Fleet(t, False, FLEET_CLIENTS, FLEET_AGENTS, FLEET_GETS, FLEET_WINDOW)
