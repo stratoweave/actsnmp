@@ -1984,7 +1984,9 @@ actor _test_v3_discovery_failures(t: testing.AsyncT):
 
     def next_case() -> None:
         tr = mn.client(MANAGER, 41000 + n, AGENT, 161)
-        cl = Client(None, AGENT, _shaaes(), t.log_handler, opts=FAST, transport=tr)
+        # the silent agent's cases time out after FAST's 50 ms; the agent answers the others, which wait for
+        # that answer as long as SLOW allows
+        cl = Client(None, AGENT, _shaaes(), t.log_handler, opts=FAST if n < 2 else SLOW, transport=tr)
         if n == 0:
             cl.get(got, _oids(1))
         elif n == 1:

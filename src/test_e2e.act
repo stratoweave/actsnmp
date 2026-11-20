@@ -745,6 +745,11 @@ actor _NotifyRun(t: testing.AsyncT, users: list[Usm], communities: list[str], wa
     def client(sec: security.Security, port: int) -> Client:
         return Client(None, RECEIVER, sec, None, port=162, opts=OPTS, transport=mn.client(MANAGER, port, RECEIVER, 162))
 
+    def inject(data: bytes, port: int) -> None:
+        """Send data to the receiver as if from MANAGER:port, straight into the network: once this returns, the
+        receiver gets it before anything sent afterwards"""
+        await async mn.send(data, MANAGER, port, RECEIVER, 162)
+
     def collector(label: str) -> Collector:
         expected += 1
         return Collector(label, reported)
@@ -770,11 +775,14 @@ actor _test_notify_v1_v2c(t: testing.AsyncT):
         testing.assertEqual((st["delivered"], st["acked"], st["dropped_community"]), (3, 1, 1), str(st))
 
     run = _NotifyRun(t, [], ["public"], 3, check)
+    # The receiver drops a trap of a community it does not accept, and nothing follows that the check could wait
+    # for. So that trap goes into the network before the Clients send theirs: the receiver drops it first.
+    secret = pdu.Pdu(pdu.TRAP_V2, 1, 0, 0, notify.build_trap_v2(1, notify.TRAP_COLD_START, []))
+    await async run.inject(message.encode_community(message.CommunityMessage(message.SNMP_V2C, b"secret", secret)),
+                           42003)
     v1 = run.client(Community("public", message.SNMP_V1), 42001)
     v2 = run.client(Community("public"), 42002)
-    bad = run.client(Community("secret"), 42003)
     v1.trap_v1(run.trap_sent, ENTERPRISE, b"\xc0\x00\x02\x01", 6, 42, [VarBind(e([1, 1, 0]), Integer(0))], 12345)
-    bad.trap(run.trap_sent, notify.TRAP_COLD_START, [], 1)
     v2.trap(run.trap_sent, notify.TRAP_COLD_START, [VarBind(e([2, 1, 0]), OctetString(b"Hello, SNMP!"))], 12345)
     col = run.collector("inform")
     v2.inform(col.completed, notify.TRAP_LINK_DOWN, [VarBind(e([1, 1, 0]), Integer(3))], 500)

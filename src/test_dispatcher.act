@@ -551,32 +551,30 @@ actor _test_collision_raw(t: testing.AsyncT):
     d = mem_dispatcher(mn, t.log_handler, id_lifetime=2.0)
     ta = d.attach(AGENT, 161)
     tb = d.attach(AGENT, 161)
-    ra = Recorder()
-    rb = Recorder()
-    ta.set_receiver(ra.received, ra.failed)
-    tb.set_receiver(rb.received, rb.failed)
+    var phase = 1
     var phase1: ?DispatcherStats = None
     var phase2: ?DispatcherStats = None
     var keys_a: list[int] = []
+    var errs_a: list[str] = []
     var keys_b: list[int] = []
     var errs_b: list[str] = []
+    var keys_b1: list[int] = []
+    var errs_b1: list[str] = []
 
     def settled() -> None:
         s = d.stats()
-        kb = rb.keys_seen()
-        eb = rb.errors_seen()
         def check() -> None:
-            testing.assertEqual(keys_a, [v2key(42)], "ta got the answer to its id 42")
-            testing.assertEqual(sorted(keys_b), sorted([42, v2key(43)]), "tb: the SNMPv1 id 42 and the SNMPv2c id 43")
-            testing.assertEqual(errs_b, [transport.ID_IN_USE + "42"])
+            testing.assertEqual((keys_a, errs_a), ([v2key(42)], []), "ta got the answer to its id 42")
+            testing.assertEqual(sorted(keys_b1), sorted([42, v2key(43)]), "tb: the SNMPv1 id 42 and the SNMPv2c id 43")
+            testing.assertEqual(errs_b1, [transport.ID_IN_USE + "42"])
             p1 = phase1
             if p1 is not None:
                 testing.assertEqual((p1.collisions, p1.sent, p1.routed, p1.endpoints), (1, 3, 3, 2), str(p1))
             p2 = phase2
             if p2 is not None:
                 testing.assertEqual((p2.collisions, p2.endpoints), (2, 1), "the closed transport's id: " + str(p2))
-            testing.assertEqual(sorted(kb), sorted([42, v2key(43), v2key(42)]), "id 42 is free after the lifetime")
-            testing.assertEqual(eb, [transport.ID_IN_USE + "42", transport.ID_IN_USE + "42"])
+            testing.assertEqual(sorted(keys_b), sorted([42, v2key(43), v2key(42)]), "id 42 is free after the lifetime")
+            testing.assertEqual(errs_b, [transport.ID_IN_USE + "42", transport.ID_IN_USE + "42"])
             testing.assertEqual((s.collisions, s.sent, s.routed, s.unroutable, s.late), (2, 4, 4, 0, 0), str(s))
         tb.close()
         report(t, outcome(check))
@@ -584,25 +582,45 @@ actor _test_collision_raw(t: testing.AsyncT):
     def resend_due() -> None:
         tb.send(_community(message.SNMP_V2C, pdu.GET, 42))
 
-    def phase2_due() -> None:
-        phase2 = d.stats()
-        after 2.3: resend_due()
-        after 2.3 + QUIET: settled()
+    proc def _progress() -> None:
+        # Each phase begins once the answers and refusals of the one before are in; at the end QUIET shows
+        # that nothing more comes
+        if phase == 1 and len(keys_a) >= 1 and len(keys_b) >= 2 and len(errs_b) >= 1:
+            phase = 2
+            phase1 = d.stats()
+            keys_b1 = keys_b.copy()
+            errs_b1 = errs_b.copy()
+            ta.close()
+            tb.send(_community(message.SNMP_V2C, pdu.GET, 42))
+        elif phase == 2 and len(errs_b) >= 2:
+            phase = 3
+            phase2 = d.stats()
+            after now 2.3: resend_due()
+        elif phase == 3 and len(keys_b) >= 3:
+            phase = 4
+            after now QUIET: settled()
 
-    def phase1_due() -> None:
-        phase1 = d.stats()
-        keys_a = ra.keys_seen()
-        keys_b = rb.keys_seen()
-        errs_b = rb.errors_seen()
-        ta.close()
-        tb.send(_community(message.SNMP_V2C, pdu.GET, 42))
-        after QUIET: phase2_due()
+    def a_received(data: bytes, src_address: str, src_port: int) -> None:
+        keys_a.append(answer_key(data))
+        _progress()
 
+    def a_failed(message: str, fatal: bool) -> None:
+        errs_a.append(message)
+
+    def b_received(data: bytes, src_address: str, src_port: int) -> None:
+        keys_b.append(answer_key(data))
+        _progress()
+
+    def b_failed(message: str, fatal: bool) -> None:
+        errs_b.append(message + (" (fatal)" if fatal else ""))
+        _progress()
+
+    ta.set_receiver(a_received, a_failed)
+    tb.set_receiver(b_received, b_failed)
     ta.send(_community(message.SNMP_V2C, pdu.GET, 42))
     tb.send(_community(message.SNMP_V2C, pdu.GET, 42))
     tb.send(_community(message.SNMP_V1, pdu.GET, 42))
     tb.send(_community(message.SNMP_V2C, pdu.GET, 43))
-    after QUIET: phase1_due()
 
 
 actor _Refuser(inner: Transport, pattern: list[bool]):
@@ -970,7 +988,9 @@ actor _test_attach_and_close(t: testing.AsyncT):
         after_detach = d.stats()
         d.close()
 
-    c2.get(got_pending, [SYS_DESCR])
+    # c2 sends its request to the Dispatcher before get() returns, so it is recorded before c1's: c1 and c2
+    # run in parallel, and c1's whole GET could otherwise finish before c2 has sent anything
+    await async c2.get(got_pending, [SYS_DESCR])
     c1.get(got_first, [SYS_DESCR])
 
 
@@ -1839,12 +1859,17 @@ actor _test_udp_family_refused(t: testing.EnvT):
 FLEET_CLIENTS = 2000
 FLEET_AGENTS = 20
 FLEET_GETS = 5
+# Clients making their GETs at a time. The answers to all their GETs can arrive while the Dispatcher's socket is
+# not read, and its receive buffer holds 238 of them on Linux (212992 octets, 896 per datagram); the kernel drops
+# the rest, as the dispatcher module documentation says. With all 2000 Clients at once, thousands of attempts lost
+# their answers, and now and then all four attempts of a GET did.
+FLEET_WINDOW = 100
 
-actor _Fleet(t: testing.EnvT, shared: bool, n: int, agents: int, gets: int):
+actor _Fleet(t: testing.EnvT, shared: bool, n: int, agents: int, gets: int, window: int):
     """n Clients (SNMPv2c, every 4th with community "private") of `agents` Agents on 127.0.0.1 and ::1, each
-    making `gets` GETs one after another, all Clients at once; over one Dispatcher (shared) or with a
-    connected UDP socket per Client. Checks every answer, logs the time, and how many file descriptors the
-    Clients added"""
+    making `gets` GETs one after another, `window` Clients at a time (all attached at once); over one Dispatcher
+    (shared) or with a connected UDP socket per Client. Checks every answer, logs the time, and how many file
+    descriptors the Clients added"""
     log = logging.Logger(t.log_handler)
     var servers: list[ServerTransport] = []
     var ports: list[(str, int)] = []
@@ -1853,6 +1878,7 @@ actor _Fleet(t: testing.EnvT, shared: bool, n: int, agents: int, gets: int):
     var fds_before = 0
     var fds_with_clients = 0
     var started = 0.0
+    var next_client = 0
     var finished = 0
     var wrong: list[str] = []
     var answers = 0
@@ -1889,10 +1915,17 @@ actor _Fleet(t: testing.EnvT, shared: bool, n: int, agents: int, gets: int):
             st.close()
         report_env(t, outcome(check))
 
+    proc def _run_next() -> None:
+        i = next_client
+        next_client += 1
+        _FleetRunner(clients[i], gets, OctetString(("agent %d" % (i % len(ports))).encode()), runner_finished)
+
     def runner_finished(errs: list[str], n_answers: int) -> None:
         wrong.extend(errs)
         answers += n_answers
         finished += 1
+        if next_client < n:
+            _run_next()
         if finished == n:
             _finish()
 
@@ -1909,9 +1942,8 @@ actor _Fleet(t: testing.EnvT, shared: bool, n: int, agents: int, gets: int):
                 clients.append(Client(connect_cap(t), peer.0, sec, None, port=peer.1, opts=o))
         fds_with_clients = open_fds(t)
         started = _ms()
-        for i in range(n):
-            peer = ports[i % len(ports)]
-            _FleetRunner(clients[i], gets, OctetString(("agent %d" % (i % len(ports))).encode()), runner_finished)
+        for _ in range(min([n, window])):
+            _run_next()
 
     def disp_listening(d: Dispatcher, error: ?str) -> None:
         if error is not None:
@@ -1963,10 +1995,10 @@ actor _FleetRunner(c: Client, gets: int, descr: OctetString, on_done: action(lis
 
 
 actor _test_udp_fleet_dispatcher(t: testing.EnvT):
-    """2000 Clients of 20 agents (127.0.0.1 and ::1) over ONE Dispatcher socket: 10000 GETs, every answer right,
-    the file descriptors stay flat (the time is logged: --show-log)"""
+    """2000 Clients of 20 agents (127.0.0.1 and ::1) over ONE Dispatcher socket: 10000 GETs of 100 Clients at a time,
+    every answer right, the file descriptors stay flat (the time is logged: --show-log)"""
     t.timeout(120.0)
-    f = _Fleet(t, True, FLEET_CLIENTS, FLEET_AGENTS, FLEET_GETS)
+    f = _Fleet(t, True, FLEET_CLIENTS, FLEET_AGENTS, FLEET_GETS, FLEET_WINDOW)
 
 
 actor _test_udp_fleet_connected(t: testing.EnvT):
@@ -1980,4 +2012,4 @@ actor _test_udp_fleet_connected(t: testing.EnvT):
         except testing.AbortTest:
             pass
     else:
-        f = _Fleet(t, False, FLEET_CLIENTS, FLEET_AGENTS, FLEET_GETS)
+        f = _Fleet(t, False, FLEET_CLIENTS, FLEET_AGENTS, FLEET_GETS, FLEET_WINDOW)
