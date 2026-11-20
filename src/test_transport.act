@@ -52,8 +52,9 @@ proc def _skip_env(t: testing.EnvT, reason: str) -> None:
         pass
 
 proc def _open_fds(t: testing.EnvT) -> int:
-    # The number of open file descriptors of this process (the entries of /proc/self/fd)
-    return len(file.FS(file.FileCap(t.env.cap)).listdir("/proc/self/fd"))
+    # The number of open file descriptors of this process (the entries of /dev/fd: Linux links it to
+    # /proc/self/fd, and macOS has no /proc)
+    return len(file.FS(file.FileCap(t.env.cap)).listdir("/dev/fd"))
 
 def _ipv6_unavailable(error: str) -> bool:
     # The errors a host without usable IPv6 loopback gives when binding ::1 or ::
