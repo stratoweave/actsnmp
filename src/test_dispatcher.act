@@ -1650,8 +1650,9 @@ proc def connect_cap(t: testing.EnvT) -> net.UDPConnectCap:
     return net.UDPConnectCap(net.UDPCap(net.NetCap(t.env.cap)))
 
 proc def open_fds(t: testing.EnvT) -> int:
-    """The number of open file descriptors of this process (the entries of /proc/self/fd)"""
-    return len(file.FS(file.FileCap(t.env.cap)).listdir("/proc/self/fd"))
+    """The number of open file descriptors of this process (the entries of /dev/fd: Linux links it to
+    /proc/self/fd, and macOS has no /proc)"""
+    return len(file.FS(file.FileCap(t.env.cap)).listdir("/dev/fd"))
 
 proc def max_open_files(t: testing.EnvT) -> int:
     """The soft RLIMIT_NOFILE of this process (/proc/self/limits), -1 if unknown"""
