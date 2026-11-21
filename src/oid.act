@@ -46,23 +46,19 @@ class Oid(object):
         t = s[1:] if s.startswith(".") else s
         if t == "":
             raise ValueError("invalid OID %r: no arcs" % s)
-        arcs: list[int] = []
-        for p in t.split("."):
+        parts = t.split(".")
+        for p in parts:
             if p == "" or len(p) > 10 or not (p.isascii() and p.isdecimal()):
                 raise ValueError("invalid OID %r" % s)
             a = int(p)
             if a > ber.MAX_ARC:
                 raise ValueError("invalid OID %r: arc %d exceeds 2^32-1" % (s, a))
-            arcs.append(a)
-        return Oid(arcs)
+        return Oid([int(p) for p in parts])
 
     def __str__(self) -> str:
         """Return the arcs joined by dots, without a leading dot: "1.3.6.1.2.1.1.1.0" """
         text = _ARC_TEXT
-        parts: list[str] = []
-        for a in self.arcs:
-            parts.append(text[a] if a < 1024 else str(a))
-        return ".".join(parts)
+        return ".".join([text[a] if a < 1024 else str(a) for a in self.arcs])
 
     def __repr__(self) -> str:
         return "Oid(" + self.__str__() + ")"
@@ -117,9 +113,7 @@ class Oid(object):
         n = len(self.arcs)
         if n == 0 or self.arcs[n - 1] == ber.MAX_ARC:
             return None
-        arcs = self.arcs.copy()
-        arcs[n - 1] += 1
-        return Oid(arcs)
+        return Oid(self.arcs[:n - 1] + [self.arcs[n - 1] + 1])
 
     def key(self) -> bytes:
         """Return the arcs packed as 4-octet big-endian integers

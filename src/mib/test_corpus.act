@@ -210,67 +210,72 @@ c OBJECT IDENTIFIER ::= { iso 2 }
 
 actor _test_corpus_parse(t: testing.EnvT):
     """Parse every corpus file and write the per-file TSV and a summary (see the module doc)."""
-    t.require("mibcorpus")
-    t.timeout(1800.0)
-    fc = file.FileCap(t.env.cap)
-    fs = file.FS(fc)
-    cdir = CORPUS_DIR
-    ed = t.env.vars.getenv("MIBCORPUS_DIR")
-    if ed is not None and ed != "":
-        cdir = ed
-    odir = OUT_DIR
-    eo = t.env.vars.getenv("MIBCORPUS_OUT")
-    if eo is not None and eo != "":
-        odir = eo
-    spec = ""
-    ec = t.env.vars.getenv("MIBCORPUS_CHUNK")
-    if ec is not None:
-        spec = ec.strip()
-    files = sorted(fs.listdir(cdir))
-    only = ""
-    eon = t.env.vars.getenv("MIBCORPUS_ONLY")
-    if eon is not None:
-        only = eon.strip()
-    if only != "":
-        files = [x.strip() for x in only.split(",") if x.strip() != ""]
-    lo, hi = chunk_bounds(spec, len(files))
-    suffix = ""
-    if only != "":
-        suffix = ".only"
-    elif lo != 0 or hi != len(files):
-        suffix = ".part" + spec.replace("/", "of")
     alldiags: list[str] = []
-    st = SweepStats()
     rows: list[str] = [TSV_HEADER]
-    unreadable = 0
-    for i in range(lo, hi):
-        nm = files[i]
-        path = cdir + "/" + nm
-        data = b""
-        try:
-            data = mib.source.read_bytes(fc, path)
-        except OSError:
-            unreadable += 1
-            continue
-        t0 = time.monotonic_ns()
-        r = mib.parser.parse_bytes(data, nm)
-        ns = time.monotonic_ns() - t0
-        st.add(nm, len(data), ns, r)
-        rows.append(tsv_row(nm, len(data), ns, r))
+
+    proc def __startup__():
+        t.require("mibcorpus")
+        t.timeout(1800.0)
+        fc = file.FileCap(t.env.cap)
+        fs = file.FS(fc)
+        cdir = CORPUS_DIR
+        ed = t.env.vars.getenv("MIBCORPUS_DIR")
+        if ed is not None and ed != "":
+            cdir = ed
+        odir = OUT_DIR
+        eo = t.env.vars.getenv("MIBCORPUS_OUT")
+        if eo is not None and eo != "":
+            odir = eo
+        spec = ""
+        ec = t.env.vars.getenv("MIBCORPUS_CHUNK")
+        if ec is not None:
+            spec = ec.strip()
+        files = sorted(fs.listdir(cdir))
+        only = ""
+        eon = t.env.vars.getenv("MIBCORPUS_ONLY")
+        if eon is not None:
+            only = eon.strip()
         if only != "":
-            alldiags.append(mib.diag.format_all(r.diags))
-    write_text(fc, odir + "/" + OUT_NAME + suffix + ".tsv", "\n".join(rows) + "\n")
-    if only != "":
-        write_text(fc, odir + "/" + OUT_NAME + suffix + ".diags.txt", "\n".join(alldiags) + "\n")
-    write_text(fc, odir + "/" + OUT_NAME + suffix + ".summary.txt",
-               "corpus " + cdir + " files [" + str(lo) + ", " + str(hi) + ") of " + str(len(files)) +
-               ", unreadable " + str(unreadable) + "\n" + st.report() + "\n")
-    testing.assertEqual(st.by_level[0], 0)
-    testing.assertEqual(unreadable, 0)
-    if spec == "" and only == "":
-        testing.assertTrue(st.files > 13000)
-    testing.assertTrue(st.files_by_max_level[1] * 100 <= st.files)
-    t.success()
+            files = [x.strip() for x in only.split(",") if x.strip() != ""]
+        lo, hi = chunk_bounds(spec, len(files))
+        suffix = ""
+        if only != "":
+            suffix = ".only"
+        elif lo != 0 or hi != len(files):
+            suffix = ".part" + spec.replace("/", "of")
+
+        st = SweepStats()
+
+        unreadable = 0
+        for i in range(lo, hi):
+            nm = files[i]
+            path = cdir + "/" + nm
+            data = b""
+            try:
+                data = mib.source.read_bytes(fc, path)
+            except OSError:
+                unreadable += 1
+                continue
+            t0 = time.monotonic_ns()
+            r = mib.parser.parse_bytes(data, nm)
+            ns = time.monotonic_ns() - t0
+            st.add(nm, len(data), ns, r)
+            rows.append(tsv_row(nm, len(data), ns, r))
+            if only != "":
+                alldiags.append(mib.diag.format_all(r.diags))
+        write_text(fc, odir + "/" + OUT_NAME + suffix + ".tsv", "\n".join(rows) + "\n")
+        if only != "":
+            write_text(fc, odir + "/" + OUT_NAME + suffix + ".diags.txt", "\n".join(alldiags) + "\n")
+        write_text(fc, odir + "/" + OUT_NAME + suffix + ".summary.txt",
+                   "corpus " + cdir + " files [" + str(lo) + ", " + str(hi) + ") of " + str(len(files)) +
+                   ", unreadable " + str(unreadable) + "\n" + st.report() + "\n")
+        testing.assertEqual(st.by_level[0], 0)
+        testing.assertEqual(unreadable, 0)
+        if spec == "" and only == "":
+            testing.assertTrue(st.files > 13000)
+        testing.assertTrue(st.files_by_max_level[1] * 100 <= st.files)
+        t.success()
+
 
 
 def _lcg(x: int) -> int:
@@ -307,36 +312,38 @@ actor _test_corpus_mutations(t: testing.EnvT):
     """Every 7th corpus file, mutated 3 times with 4 random edits each (quotes, `--`, braces,
     line ends, deletions): the front end never raises, never reports an internal error, and a
     mutated file never takes more than 20 times as long as the original plus 50 ms."""
-    t.require("mibcorpus")
-    t.timeout(1800.0)
-    fc = file.FileCap(t.env.cap)
-    fs = file.FS(fc)
-    files = sorted(fs.listdir(CORPUS_DIR))
-    n = 0
-    worst = 0.0
-    worst_name = ""
-    for i in range(0, len(files), 7):
-        nm = files[i]
-        data = b""
-        try:
-            data = mib.source.read_bytes(fc, CORPUS_DIR + "/" + nm)
-        except OSError:
-            continue
-        t0 = time.monotonic_ns()
-        mib.parser.parse_bytes(data, nm)
-        base = time.monotonic_ns() - t0
-        for k in range(3):
-            md = mutate(data, i * 31 + k, 4)
-            t1 = time.monotonic_ns()
-            r = mib.parser.parse_bytes(md, nm)
-            dt = time.monotonic_ns() - t1
-            n += 1
-            for d in r.diags:
-                testing.assertTrue(d.level > 0, nm + " mutation " + str(k) + ": " + str(d))
-            ratio = float(dt) / float(base + 50000000)
-            if ratio > worst:
-                worst = ratio
-                worst_name = nm + " mutation " + str(k)
-    write_text(fc, OUT_DIR + "/" + OUT_NAME + ".mutations.txt", "mutated parses " + str(n) + ", worst time ratio " + str(round(worst, 3)) + " (" + worst_name + ")\n")
-    testing.assertTrue(worst < 20.0, worst_name)
-    t.success()
+
+    proc def __startup__():
+        t.require("mibcorpus")
+        t.timeout(1800.0)
+        fc = file.FileCap(t.env.cap)
+        fs = file.FS(fc)
+        files = sorted(fs.listdir(CORPUS_DIR))
+        n = 0
+        worst = 0.0
+        worst_name = ""
+        for i in range(0, len(files), 7):
+            nm = files[i]
+            data = b""
+            try:
+                data = mib.source.read_bytes(fc, CORPUS_DIR + "/" + nm)
+            except OSError:
+                continue
+            t0 = time.monotonic_ns()
+            mib.parser.parse_bytes(data, nm)
+            base = time.monotonic_ns() - t0
+            for k in range(3):
+                md = mutate(data, i * 31 + k, 4)
+                t1 = time.monotonic_ns()
+                r = mib.parser.parse_bytes(md, nm)
+                dt = time.monotonic_ns() - t1
+                n += 1
+                for d in r.diags:
+                    testing.assertTrue(d.level > 0, nm + " mutation " + str(k) + ": " + str(d))
+                ratio = float(dt) / float(base + 50000000)
+                if ratio > worst:
+                    worst = ratio
+                    worst_name = nm + " mutation " + str(k)
+        write_text(fc, OUT_DIR + "/" + OUT_NAME + ".mutations.txt", "mutated parses " + str(n) + ", worst time ratio " + str(round(worst, 3)) + " (" + worst_name + ")\n")
+        testing.assertTrue(worst < 20.0, worst_name)
+        t.success()

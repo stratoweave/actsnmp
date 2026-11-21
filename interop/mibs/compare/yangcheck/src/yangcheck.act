@@ -183,84 +183,86 @@ actor main(env):
     rfc = file.ReadFileCap(fc)
     paths: list[str] = []
     keep_going = False
-    for a in env.argv[1:]:
-        if a == "--meta":
-            continue
-        if a == "--keep-going":
-            keep_going = True
-            continue
-        if a.startswith("@"):
-            lf = file.ReadFile(rfc, a[1:])
-            for ln in lf.read().decode().split("\n"):
-                if ln.strip() != "":
-                    paths.append(ln.strip())
-            lf.close()
-        else:
-            paths.append(a)
     srcs: dict[str, str] = {}
     names: list[str] = []
     metas: list[dict[str, ?value]] = []
-    for path in paths:
-        rf = file.ReadFile(rfc, path)
-        text = rf.read().decode()
-        rf.close()
-        if path.endswith(".json"):
-            metas.append(std.json.decode(text))
-        else:
-            nm = module_name(text)
-            if nm == "":
-                nm = path
-            if nm not in srcs:
-                names.append(nm)
-            srcs[nm] = text
     failed: list[str] = []
     gone: set[str] = set()
-    while True:
-        live = [nm for nm in names if nm not in gone]
-        try:
-            root = yang.compile([srcs[nm] for nm in live])
-            w = Walk()
-            for c in root.children:
-                walk(w, c, "", False)
-            noid = len([p for p, o in w.paths.items() if o is not None and p not in w.in_notif])
-            print("compiled " + str(len(live)) + " modules: " + str(len(w.paths)) + " schema nodes, " + str(w.containers) +
-                  " containers, " + str(len(w.lists)) + " lists, " + str(w.leafs) + " leafs, " + str(len(w.notifs)) +
-                  " notifications, " + str(noid) + " nodes with smiv2:oid outside notifications, " + str(len(root.identities)) + " identities" +
-                  (", " + str(len(gone)) + " modules dropped" if len(gone) > 0 else ""))
-            for f in failed:
-                print(f)
-            rc = 1 if len(failed) > 0 else 0
-            if len(metas) > 0:
-                ms = [m for m in metas if jstr(m, "module") not in gone]
-                probs = check(w, ms)
-                print("mibmeta: " + str(len(ms)) + " modules checked, " + str(len(probs)) + " problems")
-                for p in probs:
-                    print("PROBLEM " + p)
-                if len(probs) > 0:
-                    rc = 1
-            env.exit(rc)
-            break
-        except Exception as e:
-            msg = str(e)
-            if not keep_going:
-                print("COMPILE ERROR: " + msg)
-                env.exit(1)
+
+    proc def __startup__():
+        for a in env.argv[1:]:
+            if a == "--meta":
+                continue
+            if a == "--keep-going":
+                keep_going = True
+                continue
+            if a.startswith("@"):
+                lf = file.ReadFile(rfc, a[1:])
+                for ln in lf.read().decode().split("\n"):
+                    if ln.strip() != "":
+                        paths.append(ln.strip())
+                lf.close()
+            else:
+                paths.append(a)
+        for path in paths:
+            rf = file.ReadFile(rfc, path)
+            text = rf.read().decode()
+            rf.close()
+            if path.endswith(".json"):
+                metas.append(std.json.decode(text))
+            else:
+                nm = module_name(text)
+                if nm == "":
+                    nm = path
+                if nm not in srcs:
+                    names.append(nm)
+                srcs[nm] = text
+        while True:
+            live = [nm for nm in names if nm not in gone]
+            try:
+                root = yang.compile([srcs[nm] for nm in live])
+                w = Walk()
+                for c in root.children:
+                    walk(w, c, "", False)
+                noid = len([p for p, o in w.paths.items() if o is not None and p not in w.in_notif])
+                print("compiled " + str(len(live)) + " modules: " + str(len(w.paths)) + " schema nodes, " + str(w.containers) +
+                      " containers, " + str(len(w.lists)) + " lists, " + str(w.leafs) + " leafs, " + str(len(w.notifs)) +
+                      " notifications, " + str(noid) + " nodes with smiv2:oid outside notifications, " + str(len(root.identities)) + " identities" +
+                      (", " + str(len(gone)) + " modules dropped" if len(gone) > 0 else ""))
+                for f in failed:
+                    print(f)
+                rc = 1 if len(failed) > 0 else 0
+                if len(metas) > 0:
+                    ms = [m for m in metas if jstr(m, "module") not in gone]
+                    probs = check(w, ms)
+                    print("mibmeta: " + str(len(ms)) + " modules checked, " + str(len(probs)) + " problems")
+                    for p in probs:
+                        print("PROBLEM " + p)
+                    if len(probs) > 0:
+                        rc = 1
+                env.exit(rc)
                 break
-            bad = culprit(msg, live, srcs)
-            if bad == "":
-                print("COMPILE ERROR (no culprit found): " + msg)
-                env.exit(1)
-                break
-            failed.append("FAILED " + bad + ": " + msg.replace("\n", " ")[:400])
-            gone.add(bad)
-            changed = True
-            while changed:
-                changed = False
-                for nm in live:
-                    if nm not in gone:
-                        for im in imports_of(srcs[nm]):
-                            if im in gone:
-                                gone.add(nm)
-                                failed.append("BLOCKED " + nm + ": imports " + im)
-                                changed = True
-                                break
+            except Exception as e:
+                msg = str(e)
+                if not keep_going:
+                    print("COMPILE ERROR: " + msg)
+                    env.exit(1)
+                    break
+                bad = culprit(msg, live, srcs)
+                if bad == "":
+                    print("COMPILE ERROR (no culprit found): " + msg)
+                    env.exit(1)
+                    break
+                failed.append("FAILED " + bad + ": " + msg.replace("\n", " ")[:400])
+                gone.add(bad)
+                changed = True
+                while changed:
+                    changed = False
+                    for nm in live:
+                        if nm not in gone:
+                            for im in imports_of(srcs[nm]):
+                                if im in gone:
+                                    gone.add(nm)
+                                    failed.append("BLOCKED " + nm + ": imports " + im)
+                                    changed = True
+                                    break

@@ -67,7 +67,7 @@ class Lcg(object):
         return b"".join([ber.BYTE_TABLE[self.below(256)] for i in range(n)])
 
 
-def pseudo_random(n: int, seed: int) -> bytes:
+pure def pseudo_random(n: int, seed: int) -> bytes:
     """Return n deterministic octets without short repeats (31-bit LCG with glibc's constants, high byte)"""
     t = ber.BYTE_TABLE
     parts: list[bytes] = []
@@ -134,4 +134,5 @@ actor ListenTcp(cap: net.TCPListenCap, address: str, first_port: int, count: int
             return
         on_ready(s, error)
 
-    transport.tcp_server_transport(cap, address, _port, _listening, log_handler, max_connections, idle_timeout)
+    proc def __startup__():
+        transport.tcp_server_transport(cap, address, _port, _listening, log_handler, max_connections, idle_timeout)

@@ -215,26 +215,30 @@ def _test_add_file_without_module() -> None:
 
 actor _test_index_golden_dir(t: testing.EnvT):
     """Index the golden directory from disk and check lookups, hashes and diagnostics."""
-    t.timeout(60.0)
     fc = file.FileCap(t.env.cap)
     mp = mib.source.MibPath([GOLDEN_DIR, "/nonexistent/mib/dir"])
     d = mib.diag.Diagnostics("")
-    nfiles = mib.source.index_path(mp, fc, d)
-    testing.assertTrue(nfiles >= 43)
-    testing.assertEqual(len(mp.files), nfiles)
-    testing.assertEqual(d.codes(), ["source.unreadable"])
-    e = mp.find("IF-MIB")
-    testing.assertEqual(e?.path, GOLDEN_DIR + "/IF-MIB")
-    # the content index hashes follow interop/mibs/index.py (golden.tsv)
-    testing.assertEqual(e?.sha256, "a41d2d0414bd6e1b3249257d0d035ea11554624c525b830f6910195b72b0c297")
-    testing.assertEqual(e?.last_updated, "200006140000Z")
     d2 = mib.diag.Diagnostics("")
-    s = mp.find("SNMPv2-SMI", d2)
-    testing.assertEqual(s?.builtin, True)
-    testing.assertEqual(d2.codes(), ["source.builtin-override"])
-    if e is not None:
-        data = mib.source.entry_bytes(fc, e)
-        testing.assertEqual(mib.source.sha256_hex(data), e.sha256)
-    if s is not None:
-        testing.assertEqual(mib.source.entry_bytes(fc, s), mib.source.base_module_bytes("SNMPv2-SMI"))
-    t.success()
+
+    proc def __startup__():
+        t.timeout(60.0)
+
+        nfiles = mib.source.index_path(mp, fc, d)
+        testing.assertTrue(nfiles >= 43)
+        testing.assertEqual(len(mp.files), nfiles)
+        testing.assertEqual(d.codes(), ["source.unreadable"])
+        e = mp.find("IF-MIB")
+        testing.assertEqual(e?.path, GOLDEN_DIR + "/IF-MIB")
+        # the content index hashes follow interop/mibs/index.py (golden.tsv)
+        testing.assertEqual(e?.sha256, "a41d2d0414bd6e1b3249257d0d035ea11554624c525b830f6910195b72b0c297")
+        testing.assertEqual(e?.last_updated, "200006140000Z")
+
+        s = mp.find("SNMPv2-SMI", d2)
+        testing.assertEqual(s?.builtin, True)
+        testing.assertEqual(d2.codes(), ["source.builtin-override"])
+        if e is not None:
+            data = mib.source.entry_bytes(fc, e)
+            testing.assertEqual(mib.source.sha256_hex(data), e.sha256)
+        if s is not None:
+            testing.assertEqual(mib.source.entry_bytes(fc, s), mib.source.base_module_bytes("SNMPv2-SMI"))
+        t.success()

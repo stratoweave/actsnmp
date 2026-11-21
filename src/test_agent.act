@@ -347,12 +347,15 @@ actor _exchange(report: proc(?Exception) -> None, ag: Agent, client: Transport, 
             done = True
             report(AssertionError("unexpected transport error: " + message))
 
-    client.set_receiver(received, failed)
-    for r in requests:
-        client.send(r)
-    if expect == 0:
-        after now QUIET: settled()
-    after now watchdog: settled()
+    proc def __startup__():
+        client.set_receiver(received, failed)
+        for r in requests:
+            client.send(r)
+        if expect == 0:
+            after now QUIET: settled()
+        after now watchdog: settled()
+
+
 
 proc def _client(mn: MemNet) -> Transport:
     return mn.client(MANAGER_ADDR, MANAGER_PORT, AGENT_ADDR, AGENT_PORT)
@@ -499,56 +502,75 @@ def _check_v2c_get(replies: list[Reply], stats: dict[str, int]) -> None:
 actor _test_v2c_get(t: testing.AsyncT):
     """GET: values, noSuchObject vs noSuchInstance, Counter64, the agent's snmpEngineID.0 and sysUpTime.0,
     request-ids, the community echoed"""
-    q = [eo("1.1.0"), eo("1.99.0"), eo("1.1.5"), eo("1.2.0"), o(ENGINE_ID_OID), eo("5.1.0"), o(SYS_UPTIME)]
-    _run(t, test_view(), config(), None,
-         [v2c(get_pdu(12345, [o(SYS_DESCR)] + q)), v2c(get_pdu(-5, [eo("1.1.0")])),
-          v2c(get_pdu(2147483647, [eo("1.1.0")]), "private")], 3, _check_v2c_get)
+    proc def __startup__():
+        q = [eo("1.1.0"), eo("1.99.0"), eo("1.1.5"), eo("1.2.0"), o(ENGINE_ID_OID), eo("5.1.0"), o(SYS_UPTIME)]
+
+        proc def check(replies: list[Reply], stats: dict[str, int]) -> None:
+            _check_v2c_get(replies, stats)
+
+        _run(t, test_view(), config(), None,
+             [v2c(get_pdu(12345, [o(SYS_DESCR)] + q)), v2c(get_pdu(-5, [eo("1.1.0")])),
+              v2c(get_pdu(2147483647, [eo("1.1.0")]), "private")], 3, check)
+
+
 
 actor _test_v2c_get_next(t: testing.AsyncT):
     """GETNEXT: the next variable of each varbind, endOfMibView with the requested name past the end"""
-    _run(t, test_view(), config(), None,
-         [v2c(next_pdu(1, [o(SYS_DESCR), o(SYS_NAME), eo("1.5.0"), eo("2.1.1"), o("0.0")])),
-          v2c(next_pdu(2, [o(ENGINE_ID_OID), o("2.999"), eo("4.3.0")]))], 2,
-         expect_pdus(message.SNMP_V2C, [
-             resp(1, [VarBind(o(SYS_OBJECT_ID), ObjectIdentifier(o(ENT))), VarBind(eo("1.1.0"), Integer(1)),
-                      VarBind(eo("2.1.1.1"), Integer(1)), VarBind(eo("2.1.1.1"), Integer(1)),
-                      VarBind(o(SYS_DESCR), OctetString(DESCR))]),
-             resp(2, [VarBind(o(ENGINE_ID_OID), EndOfMibView()), VarBind(o("2.999"), EndOfMibView()),
-                      VarBind(eo("5.1.0"), NoSuchObject())])]))
+
+    proc def __startup__():
+        _run(t, test_view(), config(), None,
+             [v2c(next_pdu(1, [o(SYS_DESCR), o(SYS_NAME), eo("1.5.0"), eo("2.1.1"), o("0.0")])),
+              v2c(next_pdu(2, [o(ENGINE_ID_OID), o("2.999"), eo("4.3.0")]))], 2,
+             expect_pdus(message.SNMP_V2C, [
+                 resp(1, [VarBind(o(SYS_OBJECT_ID), ObjectIdentifier(o(ENT))), VarBind(eo("1.1.0"), Integer(1)),
+                          VarBind(eo("2.1.1.1"), Integer(1)), VarBind(eo("2.1.1.1"), Integer(1)),
+                          VarBind(o(SYS_DESCR), OctetString(DESCR))]),
+                 resp(2, [VarBind(o(ENGINE_ID_OID), EndOfMibView()), VarBind(o("2.999"), EndOfMibView()),
+                          VarBind(eo("5.1.0"), NoSuchObject())])]))
+
+
 
 actor _test_v2c_get_bulk_layout(t: testing.AsyncT):
     """GETBULK: non-repeaters first, then the rows of the repeaters (RFC 3416 section 4.2.3)"""
-    _run(t, test_view(), config(), None,
-         [v2c(bulk_pdu(1, 1, 3, [o(SYS_DESCR), eo("2.1.1")])),
-          v2c(bulk_pdu(2, 0, 2, [eo("2.1.1"), eo("2.1.2")])),
-          v2c(bulk_pdu(3, 1, 2, [o("2.999"), eo("2.1.2")]))], 3,
-         expect_pdus(message.SNMP_V2C, [
-             resp(1, [VarBind(o(SYS_OBJECT_ID), ObjectIdentifier(o(ENT))), VarBind(eo("2.1.1.1"), Integer(1)),
-                      VarBind(eo("2.1.1.2"), Integer(2)), VarBind(eo("2.1.1.3"), Integer(3))]),
-             resp(2, [VarBind(eo("2.1.1.1"), Integer(1)), VarBind(eo("2.1.2.1"), OctetString(b"row-1")),
-                      VarBind(eo("2.1.1.2"), Integer(2)), VarBind(eo("2.1.2.2"), OctetString(b"row-2"))]),
-             # an endOfMibView among the non-repeaters does not end the rows
-             resp(3, [VarBind(o("2.999"), EndOfMibView()), VarBind(eo("2.1.2.1"), OctetString(b"row-1")),
-                      VarBind(eo("2.1.2.2"), OctetString(b"row-2"))])]))
+
+    proc def __startup__():
+        _run(t, test_view(), config(), None,
+             [v2c(bulk_pdu(1, 1, 3, [o(SYS_DESCR), eo("2.1.1")])),
+              v2c(bulk_pdu(2, 0, 2, [eo("2.1.1"), eo("2.1.2")])),
+              v2c(bulk_pdu(3, 1, 2, [o("2.999"), eo("2.1.2")]))], 3,
+             expect_pdus(message.SNMP_V2C, [
+                 resp(1, [VarBind(o(SYS_OBJECT_ID), ObjectIdentifier(o(ENT))), VarBind(eo("2.1.1.1"), Integer(1)),
+                          VarBind(eo("2.1.1.2"), Integer(2)), VarBind(eo("2.1.1.3"), Integer(3))]),
+                 resp(2, [VarBind(eo("2.1.1.1"), Integer(1)), VarBind(eo("2.1.2.1"), OctetString(b"row-1")),
+                          VarBind(eo("2.1.1.2"), Integer(2)), VarBind(eo("2.1.2.2"), OctetString(b"row-2"))]),
+                 # an endOfMibView among the non-repeaters does not end the rows
+                 resp(3, [VarBind(o("2.999"), EndOfMibView()), VarBind(eo("2.1.2.1"), OctetString(b"row-1")),
+                          VarBind(eo("2.1.2.2"), OctetString(b"row-2"))])]))
+
+
 
 actor _test_v2c_get_bulk_edges(t: testing.AsyncT):
     """GETBULK as snmpd: N clamped, negative fields as 0, M 0, the row with endOfMibView is the last"""
-    _run(t, test_view(), config(), None,
-         [v2c(bulk_pdu(1, 5, 3, [eo("1.1.0"), eo("1.3.0")])),
-          raw_bulk(message.SNMP_V2C, 2, -1, -5, [eo("1.1.0"), eo("1.3.0")]),
-          v2c(bulk_pdu(3, 1, 0, [eo("1.1.0"), eo("1.3.0")])),
-          v2c(bulk_pdu(4, 0, 3, [eo("5.1.0"), o("1.3.6.1.2.1.1")])),
-          v2c(bulk_pdu(5, 0, 3, [o("2.999")])),
-          raw_bulk(message.SNMP_V2C, 6, 0, 2147483647, [o(ENGINE_ID_OID)])], 6,
-         expect_pdus(message.SNMP_V2C, [
-             resp(1, [VarBind(eo("1.2.0"), Counter64(u64(18446744073709551615))),
-                      VarBind(eo("1.4.0"), Counter64(u64(5)))]),
-             resp(2, []),
-             resp(3, [VarBind(eo("1.2.0"), Counter64(u64(18446744073709551615)))]),
-             resp(4, [VarBind(o(ENGINE_ID_OID), OctetString(ENGINE_ID)), VarBind(o(SYS_DESCR), OctetString(DESCR)),
-                      VarBind(o(ENGINE_ID_OID), EndOfMibView()), VarBind(o(SYS_OBJECT_ID), ObjectIdentifier(o(ENT)))]),
-             resp(5, [VarBind(o("2.999"), EndOfMibView())]),
-             resp(6, [VarBind(o(ENGINE_ID_OID), EndOfMibView())])]))
+
+    proc def __startup__():
+        _run(t, test_view(), config(), None,
+             [v2c(bulk_pdu(1, 5, 3, [eo("1.1.0"), eo("1.3.0")])),
+              raw_bulk(message.SNMP_V2C, 2, -1, -5, [eo("1.1.0"), eo("1.3.0")]),
+              v2c(bulk_pdu(3, 1, 0, [eo("1.1.0"), eo("1.3.0")])),
+              v2c(bulk_pdu(4, 0, 3, [eo("5.1.0"), o("1.3.6.1.2.1.1")])),
+              v2c(bulk_pdu(5, 0, 3, [o("2.999")])),
+              raw_bulk(message.SNMP_V2C, 6, 0, 2147483647, [o(ENGINE_ID_OID)])], 6,
+             expect_pdus(message.SNMP_V2C, [
+                 resp(1, [VarBind(eo("1.2.0"), Counter64(u64(18446744073709551615))),
+                          VarBind(eo("1.4.0"), Counter64(u64(5)))]),
+                 resp(2, []),
+                 resp(3, [VarBind(eo("1.2.0"), Counter64(u64(18446744073709551615)))]),
+                 resp(4, [VarBind(o(ENGINE_ID_OID), OctetString(ENGINE_ID)), VarBind(o(SYS_DESCR), OctetString(DESCR)),
+                          VarBind(o(ENGINE_ID_OID), EndOfMibView()), VarBind(o(SYS_OBJECT_ID), ObjectIdentifier(o(ENT)))]),
+                 resp(5, [VarBind(o("2.999"), EndOfMibView())]),
+                 resp(6, [VarBind(o(ENGINE_ID_OID), EndOfMibView())])]))
+
+
 
 def _check_bulk_cap(replies: list[Reply], stats: dict[str, int]) -> None:
     testing.assertEqual(len(replies), 3)
@@ -565,10 +587,16 @@ def _check_bulk_cap(replies: list[Reply], stats: dict[str, int]) -> None:
 
 actor _test_v2c_get_bulk_cap(t: testing.AsyncT):
     """GETBULK repetitions are capped at max_bulk_varbinds // R rows (snmpd: 100 for R=1, 99 for R=3), non-repeaters not"""
-    _run(t, test_view(), config(max_bulk_varbinds=10), None,
-         [v2c(bulk_pdu(1, 0, 1000, [o(ENT)])),
-          v2c(bulk_pdu(2, 0, 1000, [eo("1"), eo("2"), eo("3")])),
-          v2c(bulk_pdu(3, 12, 5, [eo("1") for i in range(12)]))], 3, _check_bulk_cap)
+    proc def __startup__():
+        proc def check(replies: list[Reply], stats: dict[str, int]) -> None:
+            _check_bulk_cap(replies, stats)
+
+        _run(t, test_view(), config(max_bulk_varbinds=10), None,
+             [v2c(bulk_pdu(1, 0, 1000, [o(ENT)])),
+              v2c(bulk_pdu(2, 0, 1000, [eo("1"), eo("2"), eo("3")])),
+              v2c(bulk_pdu(3, 12, 5, [eo("1") for i in range(12)]))], 3, check)
+
+
 
 def _check_bulk_size(replies: list[Reply], stats: dict[str, int]) -> None:
     testing.assertEqual(len(replies), 1)
@@ -578,7 +606,13 @@ def _check_bulk_size(replies: list[Reply], stats: dict[str, int]) -> None:
 
 actor _test_v2c_get_bulk_shortened_to_size(t: testing.AsyncT):
     """A GETBULK response over max_msg_size is shortened from the end, not tooBig"""
-    _run(t, test_view(), config(max_msg_size=1000), None, [v2c(bulk_pdu(1, 0, 10, [eo("4")]))], 1, _check_bulk_size)
+    proc def __startup__():
+        proc def check(replies: list[Reply], stats: dict[str, int]) -> None:
+            _check_bulk_size(replies, stats)
+
+        _run(t, test_view(), config(max_msg_size=1000), None, [v2c(bulk_pdu(1, 0, 10, [eo("4")]))], 1, check)
+
+
 
 def _check_too_big(replies: list[Reply], stats: dict[str, int]) -> None:
     check_pdus(replies, message.SNMP_V2C, [resp(1, [], pdu.TOO_BIG), resp(2, [VarBind(eo("4.1.0"), big(1))])])
@@ -586,15 +620,25 @@ def _check_too_big(replies: list[Reply], stats: dict[str, int]) -> None:
 
 actor _test_v2c_too_big(t: testing.AsyncT):
     """SNMPv2c tooBig: error-index 0 and no varbinds (RFC 3416 section 4.2.1)"""
-    _run(t, test_view(), config(max_msg_size=1000), None,
-         [v2c(get_pdu(1, [eo("4.1.0"), eo("4.2.0"), eo("4.3.0")])), v2c(get_pdu(2, [eo("4.1.0")]))], 2,
-         _check_too_big)
+    proc def __startup__():
+        proc def check(replies: list[Reply], stats: dict[str, int]) -> None:
+            _check_too_big(replies, stats)
+
+        _run(t, test_view(), config(max_msg_size=1000), None,
+             [v2c(get_pdu(1, [eo("4.1.0"), eo("4.2.0"), eo("4.3.0")])), v2c(get_pdu(2, [eo("4.1.0")]))], 2,
+             check)
+
+
 
 actor _test_v1_too_big(t: testing.AsyncT):
     """SNMPv1 tooBig: error-index 0 and the request's varbinds (RFC 1157 section 4.1.2)"""
     q = [eo("4.1.0"), eo("4.2.0"), eo("4.3.0")]
-    _run(t, test_view(), config(max_msg_size=1000), None, [v1(get_pdu(1, q))], 1,
-         expect_pdus(message.SNMP_V1, [resp(1, vbs_of(q), pdu.TOO_BIG)]))
+
+    proc def __startup__():
+        _run(t, test_view(), config(max_msg_size=1000), None, [v1(get_pdu(1, q))], 1,
+             expect_pdus(message.SNMP_V1, [resp(1, vbs_of(q), pdu.TOO_BIG)]))
+
+
 
 def _check_too_big_dropped(replies: list[Reply], stats: dict[str, int]) -> None:
     testing.assertEqual(len(replies), 0)
@@ -602,35 +646,48 @@ def _check_too_big_dropped(replies: list[Reply], stats: dict[str, int]) -> None:
 
 actor _test_v1_too_big_dropped(t: testing.AsyncT):
     """When not even the SNMPv1 tooBig (which echoes the request) fits, nothing is sent"""
-    _run(t, test_view(), config(max_msg_size=484), None, [v1(get_pdu(1, [eo("4.1.0") for i in range(40)]))], 0,
-         _check_too_big_dropped)
+    proc def __startup__():
+        proc def check(replies: list[Reply], stats: dict[str, int]) -> None:
+            _check_too_big_dropped(replies, stats)
+
+        _run(t, test_view(), config(max_msg_size=484), None, [v1(get_pdu(1, [eo("4.1.0") for i in range(40)]))], 0,
+             check)
 
 
 # SNMPv1 ############################################################################################
 
+
 actor _test_v1_get(t: testing.AsyncT):
     """SNMPv1 GET: noSuchName for missing objects, exceptions stored as data and Counter64 (RFC 3584 4.2.2.1)"""
     ok = [VarBind(eo("1.1.0"), Integer(1)), VarBind(eo("1.3.0"), Counter32(7))]
-    _run(t, test_view(), config(), None,
-         [v1(get_pdu(1, [eo("1.1.0"), eo("1.3.0")])), v1(get_pdu(2, [eo("1.1.0"), eo("1.2.0")])),
-          v1(get_pdu(3, [eo("1.99.0")])), v1(get_pdu(4, [eo("1.1.0"), eo("1.3.0"), eo("5.1.0")]))], 4,
-         expect_pdus(message.SNMP_V1, [
-             resp(1, ok),
-             resp(2, vbs_of([eo("1.1.0"), eo("1.2.0")]), pdu.NO_SUCH_NAME, 2),
-             resp(3, vbs_of([eo("1.99.0")]), pdu.NO_SUCH_NAME, 1),
-             resp(4, vbs_of([eo("1.1.0"), eo("1.3.0"), eo("5.1.0")]), pdu.NO_SUCH_NAME, 3)]))
+
+    proc def __startup__():
+        _run(t, test_view(), config(), None,
+             [v1(get_pdu(1, [eo("1.1.0"), eo("1.3.0")])), v1(get_pdu(2, [eo("1.1.0"), eo("1.2.0")])),
+              v1(get_pdu(3, [eo("1.99.0")])), v1(get_pdu(4, [eo("1.1.0"), eo("1.3.0"), eo("5.1.0")]))], 4,
+             expect_pdus(message.SNMP_V1, [
+                 resp(1, ok),
+                 resp(2, vbs_of([eo("1.1.0"), eo("1.2.0")]), pdu.NO_SUCH_NAME, 2),
+                 resp(3, vbs_of([eo("1.99.0")]), pdu.NO_SUCH_NAME, 1),
+                 resp(4, vbs_of([eo("1.1.0"), eo("1.3.0"), eo("5.1.0")]), pdu.NO_SUCH_NAME, 3)]))
+
+
 
 actor _test_v1_get_next(t: testing.AsyncT):
     """SNMPv1 GETNEXT skips Counter64 objects; past the end (or onto an exception) it is noSuchName"""
-    _run(t, test_view(), config(), None,
-         [v1(next_pdu(1, [eo("1.1.0"), eo("1.3.0"), eo("3.5.0")])),
-          v1(next_pdu(2, [eo("1.1.0"), o(ENGINE_ID_OID)])),
-          v1(next_pdu(3, [eo("4.3.0")]))], 3,
-         expect_pdus(message.SNMP_V1, [
-             resp(1, [VarBind(eo("1.3.0"), Counter32(7)), VarBind(eo("1.5.0"), OctetString(b"after counter64")),
-                      VarBind(eo("4.1.0"), big(1))]),
-             resp(2, vbs_of([eo("1.1.0"), o(ENGINE_ID_OID)]), pdu.NO_SUCH_NAME, 2),
-             resp(3, vbs_of([eo("4.3.0")]), pdu.NO_SUCH_NAME, 1)]))
+
+    proc def __startup__():
+        _run(t, test_view(), config(), None,
+             [v1(next_pdu(1, [eo("1.1.0"), eo("1.3.0"), eo("3.5.0")])),
+              v1(next_pdu(2, [eo("1.1.0"), o(ENGINE_ID_OID)])),
+              v1(next_pdu(3, [eo("4.3.0")]))], 3,
+             expect_pdus(message.SNMP_V1, [
+                 resp(1, [VarBind(eo("1.3.0"), Counter32(7)), VarBind(eo("1.5.0"), OctetString(b"after counter64")),
+                          VarBind(eo("4.1.0"), big(1))]),
+                 resp(2, vbs_of([eo("1.1.0"), o(ENGINE_ID_OID)]), pdu.NO_SUCH_NAME, 2),
+                 resp(3, vbs_of([eo("4.3.0")]), pdu.NO_SUCH_NAME, 1)]))
+
+
 
 def _check_v1_bulk(replies: list[Reply], stats: dict[str, int]) -> None:
     check_pdus(replies, message.SNMP_V1, [
@@ -641,12 +698,17 @@ def _check_v1_bulk(replies: list[Reply], stats: dict[str, int]) -> None:
 
 actor _test_v1_get_bulk_answered_like_snmpd(t: testing.AsyncT):
     """A GETBULK in an SNMPv1 message is answered as snmpd does, with the SNMPv1 rules (and counted)"""
-    _run(t, test_view(), config(), None,
-         [raw_bulk(message.SNMP_V1, 1, 0, 3, [eo("1.1.0")]),
-          raw_bulk(message.SNMP_V1, 2, 1, 3, [eo("1.1.0"), eo("4.2.0")])], 2, _check_v1_bulk)
+    proc def __startup__():
+        proc def check(replies: list[Reply], stats: dict[str, int]) -> None:
+            _check_v1_bulk(replies, stats)
+
+        _run(t, test_view(), config(), None,
+             [raw_bulk(message.SNMP_V1, 1, 0, 3, [eo("1.1.0")]),
+              raw_bulk(message.SNMP_V1, 2, 1, 3, [eo("1.1.0"), eo("4.2.0")])], 2, check)
 
 
 # SET ###############################################################################################
+
 
 class _Boom(Value):
     """A value whose encode() raises ValueError instead of errors.EncodeError: a bug in a Value class"""
@@ -676,21 +738,32 @@ def _check_internal_error(replies: list[Reply], stats: dict[str, int]) -> None:
 actor _test_internal_error_contained(t: testing.AsyncT):
     """An unexpected exception while a datagram is handled (a bug, here a value whose encode() raises
     ValueError) is contained and counted as internal_errors, and the agent goes on serving"""
-    view = test_view()
-    view.set_value(eo("77.1.0"), _Boom())
-    _run(t, view, config(), None, [v2c(get_pdu(1, [eo("77.1.0")])), v2c(get_pdu(2, [eo("1.1.0")]))], 1,
-         _check_internal_error)
+    proc def __startup__():
+        view = test_view()
+
+        proc def check(replies: list[Reply], stats: dict[str, int]) -> None:
+            _check_internal_error(replies, stats)
+
+        view.set_value(eo("77.1.0"), _Boom())
+        _run(t, view, config(), None, [v2c(get_pdu(1, [eo("77.1.0")])), v2c(get_pdu(2, [eo("1.1.0")]))], 1,
+             check)
+
+
 
 actor _test_v2c_set(t: testing.AsyncT):
     """A SET of several variables is applied and echoed; GET shows the new values"""
     new = [VarBind(eo("3.1.0"), Integer(-99)), VarBind(eo("3.2.0"), OctetString(b"new")),
            VarBind(eo("3.3.0"), IpAddress(h("0a010203"))), VarBind(eo("3.5.0"), Integer(100)),
            VarBind(eo("3.6.0"), Counter64(u64(18446744073709551615)))]
-    _run(t, test_view(), config(), None,
-         [v2c(set_pdu(1, new), "private"), v2c(get_pdu(2, [vb.oid for vb in new])),
-          v2c(set_pdu(3, [VarBind(eo("3.2.0"), OctetString(b""))]), "private"), v2c(get_pdu(4, [eo("3.2.0")]))], 4,
-         expect_pdus(message.SNMP_V2C, [resp(1, new), resp(2, new), resp(3, [VarBind(eo("3.2.0"), OctetString(b""))]),
-                                        resp(4, [VarBind(eo("3.2.0"), OctetString(b""))])]))
+
+    proc def __startup__():
+        _run(t, test_view(), config(), None,
+             [v2c(set_pdu(1, new), "private"), v2c(get_pdu(2, [vb.oid for vb in new])),
+              v2c(set_pdu(3, [VarBind(eo("3.2.0"), OctetString(b""))]), "private"), v2c(get_pdu(4, [eo("3.2.0")]))], 4,
+             expect_pdus(message.SNMP_V2C, [resp(1, new), resp(2, new), resp(3, [VarBind(eo("3.2.0"), OctetString(b""))]),
+                                            resp(4, [VarBind(eo("3.2.0"), OctetString(b""))])]))
+
+
 
 def _set_error_cases() -> list[(VarBind, int)]:
     # (varbind, SNMPv2 error-status) for every status check_set() can give
@@ -732,13 +805,21 @@ def _set_error_replies(version: int) -> list[Pdu]:
 
 actor _test_v2c_set_errors(t: testing.AsyncT):
     """Every SET error status, with the index of the failing varbind and the request echoed"""
-    _run(t, test_view(), config(), None, _set_error_requests(message.SNMP_V2C), len(_set_error_cases()),
-         expect_pdus(message.SNMP_V2C, _set_error_replies(message.SNMP_V2C)))
+
+    proc def __startup__():
+        _run(t, test_view(), config(), None, _set_error_requests(message.SNMP_V2C), len(_set_error_cases()),
+             expect_pdus(message.SNMP_V2C, _set_error_replies(message.SNMP_V2C)))
+
+
 
 actor _test_v1_set_errors(t: testing.AsyncT):
     """SNMPv1 SET errors mapped with RFC 3584 section 4.4 (noSuchName, badValue)"""
-    _run(t, test_view(), config(), None, _set_error_requests(message.SNMP_V1), len(_set_error_cases()),
-         expect_pdus(message.SNMP_V1, _set_error_replies(message.SNMP_V1)))
+
+    proc def __startup__():
+        _run(t, test_view(), config(), None, _set_error_requests(message.SNMP_V1), len(_set_error_cases()),
+             expect_pdus(message.SNMP_V1, _set_error_replies(message.SNMP_V1)))
+
+
 
 actor _test_set_atomic_and_access(t: testing.AsyncT):
     """A failing SET changes nothing; a read-only community gets noAccess (SNMPv1: noSuchName);
@@ -746,11 +827,15 @@ actor _test_set_atomic_and_access(t: testing.AsyncT):
     good = VarBind(eo("3.1.0"), Integer(1))
     bad = VarBind(eo("3.5.0"), Integer(200))
     c64 = VarBind(eo("3.6.0"), UnknownValue(0x46, h("05")))       # Counter64 5, which encode_community refuses in v1
-    _run(t, test_view(), config(), None,
-         [v2c(set_pdu(1, [good, bad]), "private"), v2c(get_pdu(2, [eo("3.1.0")])),
-          v2c(set_pdu(3, [good])), v1(set_pdu(4, [good])),
-          v1(set_pdu(5, [good, c64]), "private"), v1(set_pdu(6, [good]), "private"), v1(get_pdu(7, [eo("3.1.0")]))], 7,
-         _check_atomic)
+
+    proc def __startup__():
+        _run(t, test_view(), config(), None,
+             [v2c(set_pdu(1, [good, bad]), "private"), v2c(get_pdu(2, [eo("3.1.0")])),
+              v2c(set_pdu(3, [good])), v1(set_pdu(4, [good])),
+              v1(set_pdu(5, [good, c64]), "private"), v1(set_pdu(6, [good]), "private"), v1(get_pdu(7, [eo("3.1.0")]))], 7,
+             _check_atomic)
+
+
 
 def _check_atomic(replies: list[Reply], stats: dict[str, int]) -> None:
     good = VarBind(eo("3.1.0"), Integer(1))
@@ -776,14 +861,20 @@ def _check_gen_err(replies: list[Reply], stats: dict[str, int]) -> None:
 
 actor _test_gen_err_for_unencodable_values(t: testing.AsyncT):
     """A value without a BER form in the view (an OID without arcs) gives genErr with its request index"""
-    view = test_view()
-    view.set_value(eo("6.1.0"), ObjectIdentifier(Oid([])))
-    _run(t, view, config(), None,
-         [v2c(get_pdu(1, [eo("1.1.0"), eo("6.1.0")])), v2c(next_pdu(2, [eo("5.1.0")])),
-          v2c(bulk_pdu(3, 1, 2, [eo("1.1.0"), eo("5.1.0")]))], 3, _check_gen_err)
+    proc def __startup__():
+        view = test_view()
+
+        proc def check(replies: list[Reply], stats: dict[str, int]) -> None:
+            _check_gen_err(replies, stats)
+
+        view.set_value(eo("6.1.0"), ObjectIdentifier(Oid([])))
+        _run(t, view, config(), None,
+             [v2c(get_pdu(1, [eo("1.1.0"), eo("6.1.0")])), v2c(next_pdu(2, [eo("5.1.0")])),
+              v2c(bulk_pdu(3, 1, 2, [eo("1.1.0"), eo("5.1.0")]))], 3, check)
 
 
 # What is dropped ####################################################################################
+
 
 def _check_drops(replies: list[Reply], stats: dict[str, int]) -> None:
     check_pdus(replies, message.SNMP_V2C, [resp(99, [VarBind(eo("1.1.0"), Integer(1))])])
@@ -792,21 +883,27 @@ def _check_drops(replies: list[Reply], stats: dict[str, int]) -> None:
 
 actor _test_drops(t: testing.AsyncT):
     """Garbage, unknown versions and communities, and PDUs an agent does not answer get no answer"""
-    g = get_pdu(1, [eo("1.1.0")])
-    vbs = [VarBind(eo("1.1.0"), Integer(1))]
-    trap = TrapV1Pdu(o(ENT), h("0a000001"), pdu.ENTERPRISE_SPECIFIC, 1, 0, vbs)
-    _run(t, test_view(), config(), None,
-         [b"\x00\x01\x02", h("3003020100"),
-          raw_community(2, "public", pdu.encode_pdu(g)),
-          v2c(g, "secret"),
-          v2c(Pdu(pdu.RESPONSE, 2, 0, 0, vbs)), v2c(Pdu(pdu.TRAP_V2, 3, 0, 0, vbs)),
-          v2c(Pdu(pdu.INFORM, 4, 0, 0, vbs)), v2c(Pdu(pdu.REPORT, 5, 0, 0, vbs)),
-          message.encode_community(CommunityMessage(message.SNMP_V1, b"public", None, trap)),
-          raw_community(message.SNMP_V1, "public", pdu.encode_pdu(Pdu(pdu.TRAP_V2, 6, 0, 0, vbs))),
-          v2c(get_pdu(99, [eo("1.1.0")]))], 1, _check_drops)
+    proc def __startup__():
+        g = get_pdu(1, [eo("1.1.0")])
+        vbs = [VarBind(eo("1.1.0"), Integer(1))]
+        trap = TrapV1Pdu(o(ENT), h("0a000001"), pdu.ENTERPRISE_SPECIFIC, 1, 0, vbs)
+
+        proc def check(replies: list[Reply], stats: dict[str, int]) -> None:
+            _check_drops(replies, stats)
+
+        _run(t, test_view(), config(), None,
+             [b"\x00\x01\x02", h("3003020100"),
+              raw_community(2, "public", pdu.encode_pdu(g)),
+              v2c(g, "secret"),
+              v2c(Pdu(pdu.RESPONSE, 2, 0, 0, vbs)), v2c(Pdu(pdu.TRAP_V2, 3, 0, 0, vbs)),
+              v2c(Pdu(pdu.INFORM, 4, 0, 0, vbs)), v2c(Pdu(pdu.REPORT, 5, 0, 0, vbs)),
+              message.encode_community(CommunityMessage(message.SNMP_V1, b"public", None, trap)),
+              raw_community(message.SNMP_V1, "public", pdu.encode_pdu(Pdu(pdu.TRAP_V2, 6, 0, 0, vbs))),
+              v2c(get_pdu(99, [eo("1.1.0")]))], 1, check)
 
 
 # SNMPv3 ############################################################################################
+
 
 def _check_discovery(replies: list[Reply], stats: dict[str, int]) -> None:
     testing.assertEqual(len(replies), 1)
@@ -816,7 +913,13 @@ def _check_discovery(replies: list[Reply], stats: dict[str, int]) -> None:
 
 actor _test_v3_discovery(t: testing.AsyncT):
     """net-snmp's discovery probe gets the unknownEngineIDs Report with our engine ID, boots and time"""
-    _run(t, test_view(), config(), None, [h(DISCOVERY_REQUEST)], 1, _check_discovery)
+    proc def __startup__():
+        proc def check(replies: list[Reply], stats: dict[str, int]) -> None:
+            _check_discovery(replies, stats)
+
+        _run(t, test_view(), config(), None, [h(DISCOVERY_REQUEST)], 1, check)
+
+
 
 def _check_refusals(replies: list[Reply], stats: dict[str, int]) -> None:
     testing.assertEqual(len(replies), 5)
@@ -840,22 +943,29 @@ def _bad_salt_request(keys: ?LocalizedUser) -> bytes:
 
 actor _test_v3_refusals(t: testing.AsyncT):
     """The Reports of the authoritative engine: unknown user, wrong digest, time window, level, decryption"""
-    g = get_pdu(1, [eo("1.1.0")])
-    sha = user_keys("sha")
-    wrong = fast_user("sha", usm.AUTH_SHA1, usm.PRIV_NONE, 77).localized(ENGINE_ID)
-    sha_aes = user_keys("sha_aes")
-    wrong_priv: ?LocalizedUser = None
-    if sha_aes is not None:
-        wrong_priv = LocalizedUser(b"sha_aes", usm.AUTH_SHA1, usm.PRIV_AES128, sha_aes.auth_key, b"\x07" * 16,
-                                   ENGINE_ID)
-    _run(t, test_view(), config(), None,
-         [v3(None, "nobody", 0, g, 11),
-          v3(wrong, "sha", usm.LEVEL_AUTH_NO_PRIV, get_pdu(2, [eo("1.1.0")]), 12),
-          v3(sha, "sha", usm.LEVEL_AUTH_NO_PRIV, get_pdu(3, [eo("1.1.0")]), 13, 1, 1000),
-          v3(sha_aes, "sha_aes", usm.LEVEL_AUTH_NO_PRIV, get_pdu(4, [eo("1.1.0")]), 14),
-          _bad_salt_request(sha_aes),
-          # a wrong privacy key decrypts to garbage: counted, dropped without a Report (as snmpd)
-          v3(wrong_priv, "sha_aes", usm.LEVEL_AUTH_PRIV, get_pdu(6, [eo("1.1.0")]), 16)], 5, _check_refusals)
+    proc def __startup__():
+        g = get_pdu(1, [eo("1.1.0")])
+        sha = user_keys("sha")
+        wrong = fast_user("sha", usm.AUTH_SHA1, usm.PRIV_NONE, 77).localized(ENGINE_ID)
+        sha_aes = user_keys("sha_aes")
+
+        proc def check(replies: list[Reply], stats: dict[str, int]) -> None:
+            _check_refusals(replies, stats)
+
+        wrong_priv: ?LocalizedUser = None
+        if sha_aes is not None:
+            wrong_priv = LocalizedUser(b"sha_aes", usm.AUTH_SHA1, usm.PRIV_AES128, sha_aes.auth_key, b"\x07" * 16,
+                                       ENGINE_ID)
+        _run(t, test_view(), config(), None,
+             [v3(None, "nobody", 0, g, 11),
+              v3(wrong, "sha", usm.LEVEL_AUTH_NO_PRIV, get_pdu(2, [eo("1.1.0")]), 12),
+              v3(sha, "sha", usm.LEVEL_AUTH_NO_PRIV, get_pdu(3, [eo("1.1.0")]), 13, 1, 1000),
+              v3(sha_aes, "sha_aes", usm.LEVEL_AUTH_NO_PRIV, get_pdu(4, [eo("1.1.0")]), 14),
+              _bad_salt_request(sha_aes),
+              # a wrong privacy key decrypts to garbage: counted, dropped without a Report (as snmpd)
+              v3(wrong_priv, "sha_aes", usm.LEVEL_AUTH_PRIV, get_pdu(6, [eo("1.1.0")]), 16)], 5, check)
+
+
 
 def _check_v3_levels(replies: list[Reply], stats: dict[str, int]) -> None:
     want = [VarBind(o(SYS_DESCR), OctetString(DESCR)), VarBind(eo("1.2.0"), Counter64(u64(18446744073709551615)))]
@@ -868,10 +978,17 @@ def _check_v3_levels(replies: list[Reply], stats: dict[str, int]) -> None:
 
 actor _test_v3_levels(t: testing.AsyncT):
     """Responses at the request's level, user and msgID, from our engine; each level and both cipher families"""
-    q = [o(SYS_DESCR), eo("1.2.0")]
-    _run(t, test_view(), config(), None,
-         [v3_user("noauth", get_pdu(31, q), 21), v3_user("sha", get_pdu(32, q), 22),
-          v3_user("sha_aes", get_pdu(33, q), 23), v3_user("md5_des", get_pdu(34, q), 24)], 4, _check_v3_levels)
+    proc def __startup__():
+        q = [o(SYS_DESCR), eo("1.2.0")]
+
+        proc def check(replies: list[Reply], stats: dict[str, int]) -> None:
+            _check_v3_levels(replies, stats)
+
+        _run(t, test_view(), config(), None,
+             [v3_user("noauth", get_pdu(31, q), 21), v3_user("sha", get_pdu(32, q), 22),
+              v3_user("sha_aes", get_pdu(33, q), 23), v3_user("md5_des", get_pdu(34, q), 24)], 4, check)
+
+
 
 def _check_v3_contexts(replies: list[Reply], stats: dict[str, int]) -> None:
     testing.assertEqual(len(replies), 2)
@@ -883,11 +1000,18 @@ def _check_v3_contexts(replies: list[Reply], stats: dict[str, int]) -> None:
 
 actor _test_v3_contexts(t: testing.AsyncT):
     """Only the default context: another context name is dropped, any contextEngineID is echoed (snmpd)"""
-    g = [eo("1.1.0")]
-    _run(t, test_view(), config(), None,
-         [v3_user("sha_aes", get_pdu(1, g), 41, context_name=b"foo"),
-          v3_user("sha_aes", get_pdu(2, g), 42, context_engine_id=h("8000000006")),
-          v3_user("noauth", get_pdu(3, g), 43)], 2, _check_v3_contexts)
+    proc def __startup__():
+        g = [eo("1.1.0")]
+
+        proc def check(replies: list[Reply], stats: dict[str, int]) -> None:
+            _check_v3_contexts(replies, stats)
+
+        _run(t, test_view(), config(), None,
+             [v3_user("sha_aes", get_pdu(1, g), 41, context_name=b"foo"),
+              v3_user("sha_aes", get_pdu(2, g), 42, context_engine_id=h("8000000006")),
+              v3_user("noauth", get_pdu(3, g), 43)], 2, check)
+
+
 
 def _check_v3_set(replies: list[Reply], stats: dict[str, int]) -> None:
     testing.assertEqual(len(replies), 3)
@@ -899,11 +1023,18 @@ def _check_v3_set(replies: list[Reply], stats: dict[str, int]) -> None:
 
 actor _test_v3_set_and_read_only_user(t: testing.AsyncT):
     """An SNMPv3 SET is applied; a read-only user gets noAccess"""
-    new = [VarBind(eo("3.1.0"), Integer(1234)), VarBind(eo("3.2.0"), OctetString(b"py\"set"))]
-    _run(t, test_view(), config(), None,
-         [v3_user("sha_aes", set_pdu(1, new), 51),
-          v3_user("ro_sha_aes", set_pdu(2, [VarBind(eo("3.1.0"), Integer(1))]), 52),
-          v3_user("noauth", get_pdu(3, [eo("3.1.0")]), 53)], 3, _check_v3_set)
+    proc def __startup__():
+        new = [VarBind(eo("3.1.0"), Integer(1234)), VarBind(eo("3.2.0"), OctetString(b"py\"set"))]
+
+        proc def check(replies: list[Reply], stats: dict[str, int]) -> None:
+            _check_v3_set(replies, stats)
+
+        _run(t, test_view(), config(), None,
+             [v3_user("sha_aes", set_pdu(1, new), 51),
+              v3_user("ro_sha_aes", set_pdu(2, [VarBind(eo("3.1.0"), Integer(1))]), 52),
+              v3_user("noauth", get_pdu(3, [eo("3.1.0")]), 53)], 3, check)
+
+
 
 def _check_v3_too_big(replies: list[Reply], stats: dict[str, int]) -> None:
     testing.assertEqual(len(replies), 2)
@@ -915,9 +1046,15 @@ def _check_v3_too_big(replies: list[Reply], stats: dict[str, int]) -> None:
 
 actor _test_v3_too_big(t: testing.AsyncT):
     """SNMPv3 size control uses the request's msgMaxSize: tooBig with no varbinds"""
-    _run(t, test_view(), config(), None,
-         [v3_user("sha_aes", get_pdu(1, [eo("4.1.0")]), 61, max_size=484),
-          v3_user("sha_aes", get_pdu(2, [eo("4.1.0")]), 62, max_size=1000)], 2, _check_v3_too_big)
+    proc def __startup__():
+        proc def check(replies: list[Reply], stats: dict[str, int]) -> None:
+            _check_v3_too_big(replies, stats)
+
+        _run(t, test_view(), config(), None,
+             [v3_user("sha_aes", get_pdu(1, [eo("4.1.0")]), 61, max_size=484),
+              v3_user("sha_aes", get_pdu(2, [eo("4.1.0")]), 62, max_size=1000)], 2, check)
+
+
 
 def _check_v3_bulk_size(replies: list[Reply], stats: dict[str, int]) -> None:
     testing.assertEqual(len(replies), 1)
@@ -928,8 +1065,14 @@ def _check_v3_bulk_size(replies: list[Reply], stats: dict[str, int]) -> None:
 
 actor _test_v3_get_bulk_shortened(t: testing.AsyncT):
     """An SNMPv3 GETBULK response is shortened to the request's msgMaxSize (DES padding included)"""
-    _run(t, test_view(), config(), None, [v3_user("md5_des", bulk_pdu(1, 0, 10, [eo("4")]), 71, max_size=1100)], 1,
-         _check_v3_bulk_size)
+    proc def __startup__():
+        proc def check(replies: list[Reply], stats: dict[str, int]) -> None:
+            _check_v3_bulk_size(replies, stats)
+
+        _run(t, test_view(), config(), None, [v3_user("md5_des", bulk_pdu(1, 0, 10, [eo("4")]), 71, max_size=1100)], 1,
+             check)
+
+
 
 PRIVS: list[int] = [usm.PRIV_DES, usm.PRIV_AES128, usm.PRIV_AES192, usm.PRIV_AES256, usm.PRIV_AES192C,
                     usm.PRIV_AES256C, usm.PRIV_3DES]
@@ -965,27 +1108,51 @@ proc def _combos(t: testing.AsyncT, auth: int) -> None:
 
 actor _test_v3_combos_md5(t: testing.AsyncT):
     """HMAC-MD5-96 with every privacy protocol"""
-    _combos(t, usm.AUTH_MD5)
+
+    proc def __startup__():
+        _combos(t, usm.AUTH_MD5)
+
+
 
 actor _test_v3_combos_sha(t: testing.AsyncT):
     """HMAC-SHA-96 with every privacy protocol"""
-    _combos(t, usm.AUTH_SHA1)
+
+    proc def __startup__():
+        _combos(t, usm.AUTH_SHA1)
+
+
 
 actor _test_v3_combos_sha224(t: testing.AsyncT):
     """HMAC-SHA-224 with every privacy protocol"""
-    _combos(t, usm.AUTH_SHA224)
+
+    proc def __startup__():
+        _combos(t, usm.AUTH_SHA224)
+
+
 
 actor _test_v3_combos_sha256(t: testing.AsyncT):
     """HMAC-SHA-256 with every privacy protocol"""
-    _combos(t, usm.AUTH_SHA256)
+
+    proc def __startup__():
+        _combos(t, usm.AUTH_SHA256)
+
+
 
 actor _test_v3_combos_sha384(t: testing.AsyncT):
     """HMAC-SHA-384 with every privacy protocol"""
-    _combos(t, usm.AUTH_SHA384)
+
+    proc def __startup__():
+        _combos(t, usm.AUTH_SHA384)
+
+
 
 actor _test_v3_combos_sha512(t: testing.AsyncT):
     """HMAC-SHA-512 with every privacy protocol"""
-    _combos(t, usm.AUTH_SHA512)
+
+    proc def __startup__():
+        _combos(t, usm.AUTH_SHA512)
+
+
 
 def _check_reboot(replies: list[Reply], stats: dict[str, int]) -> None:
     testing.assertEqual(len(replies), 4)
@@ -999,13 +1166,21 @@ def _check_reboot(replies: list[Reply], stats: dict[str, int]) -> None:
 
 actor _test_reboot(t: testing.AsyncT):
     """reboot() raises snmpEngineBoots: a request with the old boots gets notInTimeWindows"""
-    mn = MemNet()
-    ag = Agent(mn.server(AGENT_ADDR, AGENT_PORT), test_view(), config(), t.log_handler)
-    ag.reboot()
-    g = [eo("1.1.0")]
-    _exchange(_async_report(t), ag, _client(mn),
-              [h(DISCOVERY_REQUEST), v3_user("sha", get_pdu(12, g), 2, 1), v3_user("sha", get_pdu(13, g), 3, 2),
-               v2c(get_pdu(14, [o(ENGINE_ID_OID)]))], 4, _check_reboot)
+    proc def __startup__():
+        mn = MemNet()
+        g = [eo("1.1.0")]
+
+        proc def check(replies: list[Reply], stats: dict[str, int]) -> None:
+            _check_reboot(replies, stats)
+
+        ag = Agent(mn.server(AGENT_ADDR, AGENT_PORT), test_view(), config(), t.log_handler)
+        ag.reboot()
+
+        _exchange(_async_report(t), ag, _client(mn),
+                  [h(DISCOVERY_REQUEST), v3_user("sha", get_pdu(12, g), 2, 1), v3_user("sha", get_pdu(13, g), 3, 2),
+                   v2c(get_pdu(14, [o(ENGINE_ID_OID)]))], 4, check)
+
+
 
 def _check_set_value_and_view(replies: list[Reply], stats: dict[str, int]) -> None:
     testing.assertEqual(len(replies), 1)
@@ -1019,14 +1194,21 @@ def _check_set_value_and_view(replies: list[Reply], stats: dict[str, int]) -> No
 
 actor _test_set_value_and_view(t: testing.AsyncT):
     """set_view() replaces the variables and set_value() changes or adds one; the agent's own variables stay"""
-    mn = MemNet()
-    ag = Agent(mn.server(AGENT_ADDR, AGENT_PORT), test_view(), config(), t.log_handler)
-    ag.set_view(MibView([VarBind(eo("1.1.0"), Integer(1))]))
-    ag.set_value(eo("1.1.0"), Integer(99))
-    ag.set_value(eo("9.1.0"), Integer(9))
-    _exchange(_async_report(t), ag, _client(mn),
-              [v2c(get_pdu(1, [eo("1.1.0"), eo("9.1.0"), eo("1.2.0"), o(ENGINE_ID_OID), o(SYS_UPTIME)]))], 1,
-              _check_set_value_and_view)
+    proc def __startup__():
+        mn = MemNet()
+
+        proc def check(replies: list[Reply], stats: dict[str, int]) -> None:
+            _check_set_value_and_view(replies, stats)
+
+        ag = Agent(mn.server(AGENT_ADDR, AGENT_PORT), test_view(), config(), t.log_handler)
+        ag.set_view(MibView([VarBind(eo("1.1.0"), Integer(1))]))
+        ag.set_value(eo("1.1.0"), Integer(99))
+        ag.set_value(eo("9.1.0"), Integer(9))
+        _exchange(_async_report(t), ag, _client(mn),
+                  [v2c(get_pdu(1, [eo("1.1.0"), eo("9.1.0"), eo("1.2.0"), o(ENGINE_ID_OID), o(SYS_UPTIME)]))], 1,
+                  check)
+
+
 
 def _check_new_engine(replies: list[Reply], stats: dict[str, int]) -> None:
     testing.assertEqual(len(replies), 4)
@@ -1045,17 +1227,24 @@ def _check_new_engine(replies: list[Reply], stats: dict[str, int]) -> None:
 
 actor _test_reboot_with_new_engine_id(t: testing.AsyncT):
     """reboot(boots, engine_id): discovery gives the new engine; the old one is unknownEngineIDs"""
-    mn = MemNet()
-    ag = Agent(mn.server(AGENT_ADDR, AGENT_PORT), test_view(), config(), t.log_handler)
-    ag.reboot(9, OTHER_ENGINE_ID)
-    sha = user_keys("sha", OTHER_ENGINE_ID)
-    _exchange(_async_report(t), ag, _client(mn),
-              [h(DISCOVERY_REQUEST), v3_user("sha", get_pdu(12, [eo("1.1.0")]), 2),
-               v3(sha, "sha", usm.LEVEL_AUTH_NO_PRIV, get_pdu(13, [o(ENGINE_ID_OID)]), 3, 9, 0, OTHER_ENGINE_ID),
-               v2c(get_pdu(14, [o(ENGINE_ID_OID), o(SYS_UPTIME)]))], 4, _check_new_engine)
+    proc def __startup__():
+        mn = MemNet()
+        sha = user_keys("sha", OTHER_ENGINE_ID)
+
+        proc def check(replies: list[Reply], stats: dict[str, int]) -> None:
+            _check_new_engine(replies, stats)
+
+        ag = Agent(mn.server(AGENT_ADDR, AGENT_PORT), test_view(), config(), t.log_handler)
+        ag.reboot(9, OTHER_ENGINE_ID)
+
+        _exchange(_async_report(t), ag, _client(mn),
+                  [h(DISCOVERY_REQUEST), v3_user("sha", get_pdu(12, [eo("1.1.0")]), 2),
+                   v3(sha, "sha", usm.LEVEL_AUTH_NO_PRIV, get_pdu(13, [o(ENGINE_ID_OID)]), 3, 9, 0, OTHER_ENGINE_ID),
+                   v2c(get_pdu(14, [o(ENGINE_ID_OID), o(SYS_UPTIME)]))], 4, check)
 
 
 # Faults ############################################################################################
+
 
 def _check_drop_first_n(replies: list[Reply], stats: dict[str, int]) -> None:
     check_pdus(replies, message.SNMP_V2C, [resp(3, [VarBind(eo("3.1.0"), Integer(2))])])
@@ -1063,10 +1252,16 @@ def _check_drop_first_n(replies: list[Reply], stats: dict[str, int]) -> None:
 
 actor _test_fault_drop_first_n(t: testing.AsyncT):
     """drop_first_n loses the answers, not the requests: the SETs were applied"""
-    _run(t, test_view(), config(), Faults(drop_first_n=2),
-         [v2c(set_pdu(1, [VarBind(eo("3.1.0"), Integer(1))]), "private"),
-          v2c(set_pdu(2, [VarBind(eo("3.1.0"), Integer(2))]), "private"), v2c(get_pdu(3, [eo("3.1.0")]))], 1,
-         _check_drop_first_n)
+    proc def __startup__():
+        proc def check(replies: list[Reply], stats: dict[str, int]) -> None:
+            _check_drop_first_n(replies, stats)
+
+        _run(t, test_view(), config(), Faults(drop_first_n=2),
+             [v2c(set_pdu(1, [VarBind(eo("3.1.0"), Integer(1))]), "private"),
+              v2c(set_pdu(2, [VarBind(eo("3.1.0"), Integer(2))]), "private"), v2c(get_pdu(3, [eo("3.1.0")]))], 1,
+             check)
+
+
 
 def _check_wrong_request_id(replies: list[Reply], stats: dict[str, int]) -> None:
     vb = [VarBind(eo("1.1.0"), Integer(1))]
@@ -1081,9 +1276,15 @@ def _check_wrong_request_id(replies: list[Reply], stats: dict[str, int]) -> None
 
 actor _test_fault_wrong_request_id(t: testing.AsyncT):
     """wrong_request_id sends a copy with another request-id before each Response (v2c and v3)"""
-    _run(t, test_view(), config(), Faults(wrong_request_id=True),
-         [v2c(get_pdu(7, [eo("1.1.0")])), v3_user("sha_aes", get_pdu(-8, [eo("1.1.0")]), 81)], 4,
-         _check_wrong_request_id)
+    proc def __startup__():
+        proc def check(replies: list[Reply], stats: dict[str, int]) -> None:
+            _check_wrong_request_id(replies, stats)
+
+        _run(t, test_view(), config(), Faults(wrong_request_id=True),
+             [v2c(get_pdu(7, [eo("1.1.0")])), v3_user("sha_aes", get_pdu(-8, [eo("1.1.0")]), 81)], 4,
+             check)
+
+
 
 def _check_wrong_community_version(replies: list[Reply], stats: dict[str, int]) -> None:
     testing.assertEqual(len(replies), 2)
@@ -1097,8 +1298,14 @@ def _check_wrong_community_version(replies: list[Reply], stats: dict[str, int]) 
 
 actor _test_fault_wrong_community_and_version(t: testing.AsyncT):
     """wrong_community and wrong_version change the answer's community and version"""
-    _run(t, test_view(), config(), Faults(wrong_community=True, wrong_version=True),
-         [v2c(get_pdu(1, [eo("1.2.0")])), v1(get_pdu(2, [eo("1.1.0")]))], 2, _check_wrong_community_version)
+    proc def __startup__():
+        proc def check(replies: list[Reply], stats: dict[str, int]) -> None:
+            _check_wrong_community_version(replies, stats)
+
+        _run(t, test_view(), config(), Faults(wrong_community=True, wrong_version=True),
+             [v2c(get_pdu(1, [eo("1.2.0")])), v1(get_pdu(2, [eo("1.1.0")]))], 2, check)
+
+
 
 def _check_trailing(replies: list[Reply], stats: dict[str, int]) -> None:
     testing.assertEqual(len(replies), 2)
@@ -1114,15 +1321,25 @@ def _check_trailing(replies: list[Reply], stats: dict[str, int]) -> None:
 
 actor _test_fault_trailing_bytes(t: testing.AsyncT):
     """trailing_bytes are appended to every datagram"""
-    _run(t, test_view(), config(), Faults(trailing_bytes=b"\xde\xad"),
-         [v2c(get_pdu(1, [eo("1.1.0")])), h(DISCOVERY_REQUEST)], 2, _check_trailing)
+    proc def __startup__():
+        proc def check(replies: list[Reply], stats: dict[str, int]) -> None:
+            _check_trailing(replies, stats)
+
+        _run(t, test_view(), config(), Faults(trailing_bytes=b"\xde\xad"),
+             [v2c(get_pdu(1, [eo("1.1.0")])), h(DISCOVERY_REQUEST)], 2, check)
+
+
 
 actor _test_fault_non_increasing_at(t: testing.AsyncT):
     """non_increasing_at: GETNEXT and GETBULK steps landing there answer with the requested OID"""
-    _run(t, test_view(), config(), Faults(non_increasing_at=eo("2.1.1.2")),
-         [v2c(next_pdu(1, [eo("2.1.1.1")])), v2c(bulk_pdu(2, 0, 3, [eo("2.1.1")])), v2c(get_pdu(3, [eo("2.1.1.2")])),
-          v1(next_pdu(4, [eo("2.1.1.1")]))], 4,
-         _check_non_increasing)
+
+    proc def __startup__():
+        _run(t, test_view(), config(), Faults(non_increasing_at=eo("2.1.1.2")),
+             [v2c(next_pdu(1, [eo("2.1.1.1")])), v2c(bulk_pdu(2, 0, 3, [eo("2.1.1")])), v2c(get_pdu(3, [eo("2.1.1.2")])),
+              v1(next_pdu(4, [eo("2.1.1.1")]))], 4,
+             _check_non_increasing)
+
+
 
 def _check_non_increasing(replies: list[Reply], stats: dict[str, int]) -> None:
     two = Integer(2)
@@ -1144,30 +1361,48 @@ def _check_too_big_over(replies: list[Reply], stats: dict[str, int]) -> None:
 
 actor _test_fault_too_big_over(t: testing.AsyncT):
     """too_big_over turns longer answers into tooBig, GETBULK included"""
-    _run(t, test_view(), config(), Faults(too_big_over=300),
-         [v2c(get_pdu(1, [eo("4.1.0")])), v2c(bulk_pdu(2, 0, 2, [eo("1")])), v2c(bulk_pdu(3, 0, 2, [eo("4")])),
-          v1(get_pdu(4, [eo("4.1.0")]))], 4, _check_too_big_over)
+    proc def __startup__():
+        proc def check(replies: list[Reply], stats: dict[str, int]) -> None:
+            _check_too_big_over(replies, stats)
+
+        _run(t, test_view(), config(), Faults(too_big_over=300),
+             [v2c(get_pdu(1, [eo("4.1.0")])), v2c(bulk_pdu(2, 0, 2, [eo("1")])), v2c(bulk_pdu(3, 0, 2, [eo("4")])),
+              v1(get_pdu(4, [eo("4.1.0")]))], 4, check)
+
+
 
 actor _test_fault_truncate_bulk(t: testing.AsyncT):
     """truncate_bulk cuts GETBULK responses anywhere, mid-row included; GETNEXT is not affected"""
-    _run(t, test_view(), config(), Faults(truncate_bulk=3),
-         [v2c(bulk_pdu(1, 0, 5, [eo("2.1.1"), eo("2.1.2")])), v2c(next_pdu(2, [eo("2.1.1"), eo("2.1.2")]))], 2,
-         expect_pdus(message.SNMP_V2C, [
-             resp(1, [VarBind(eo("2.1.1.1"), Integer(1)), VarBind(eo("2.1.2.1"), OctetString(b"row-1")),
-                      VarBind(eo("2.1.1.2"), Integer(2))]),
-             resp(2, [VarBind(eo("2.1.1.1"), Integer(1)), VarBind(eo("2.1.2.1"), OctetString(b"row-1"))])]))
+
+    proc def __startup__():
+        _run(t, test_view(), config(), Faults(truncate_bulk=3),
+             [v2c(bulk_pdu(1, 0, 5, [eo("2.1.1"), eo("2.1.2")])), v2c(next_pdu(2, [eo("2.1.1"), eo("2.1.2")]))], 2,
+             expect_pdus(message.SNMP_V2C, [
+                 resp(1, [VarBind(eo("2.1.1.1"), Integer(1)), VarBind(eo("2.1.2.1"), OctetString(b"row-1")),
+                          VarBind(eo("2.1.1.2"), Integer(2))]),
+                 resp(2, [VarBind(eo("2.1.1.1"), Integer(1)), VarBind(eo("2.1.2.1"), OctetString(b"row-1"))])]))
+
+
 
 actor _test_fault_truncate_bulk_empty(t: testing.AsyncT):
     """truncate_bulk 0: an empty GETBULK response with noError"""
-    _run(t, test_view(), config(), Faults(truncate_bulk=0), [v2c(bulk_pdu(1, 1, 5, [eo("1"), eo("2.1.1")]))], 1,
-         expect_pdus(message.SNMP_V2C, [resp(1, [])]))
+
+    proc def __startup__():
+        _run(t, test_view(), config(), Faults(truncate_bulk=0), [v2c(bulk_pdu(1, 1, 5, [eo("1"), eo("2.1.1")]))], 1,
+             expect_pdus(message.SNMP_V2C, [resp(1, [])]))
+
+
 
 actor _test_fault_error_at(t: testing.AsyncT):
     """error_at answers any request naming that OID with error_status and its index, as given (also SNMPv1)"""
-    _run(t, test_view(), config(), Faults(error_at=eo("1.3.0"), error_status=pdu.RESOURCE_UNAVAILABLE),
-         [v2c(get_pdu(1, [eo("1.1.0"), eo("1.3.0")])), v2c(next_pdu(2, [eo("1.3.0")])), v2c(get_pdu(3, [eo("1.1.0")])),
-          v1(get_pdu(4, [eo("1.3.0")])), v2c(set_pdu(5, [VarBind(eo("1.3.0"), Integer(1))]), "private")], 5,
-         _check_error_at)
+
+    proc def __startup__():
+        _run(t, test_view(), config(), Faults(error_at=eo("1.3.0"), error_status=pdu.RESOURCE_UNAVAILABLE),
+             [v2c(get_pdu(1, [eo("1.1.0"), eo("1.3.0")])), v2c(next_pdu(2, [eo("1.3.0")])), v2c(get_pdu(3, [eo("1.1.0")])),
+              v1(get_pdu(4, [eo("1.3.0")])), v2c(set_pdu(5, [VarBind(eo("1.3.0"), Integer(1))]), "private")], 5,
+             _check_error_at)
+
+
 
 def _check_error_at(replies: list[Reply], stats: dict[str, int]) -> None:
     testing.assertEqual(len(replies), 5)
@@ -1190,10 +1425,17 @@ def _check_nitw_once(replies: list[Reply], stats: dict[str, int]) -> None:
 
 actor _test_fault_report_not_in_time_window_once(t: testing.AsyncT):
     """The first authenticated request gets a notInTimeWindows Report; then the agent answers normally"""
-    g = [eo("1.1.0")]
-    _run(t, test_view(), config(), Faults(report_not_in_time_window_once=True),
-         [v3_user("noauth", get_pdu(1, g), 91), v3_user("sha_aes", get_pdu(2, g), 92),
-          v3_user("sha_aes", get_pdu(3, g), 93), v3_user("sha", get_pdu(4, g), 94)], 4, _check_nitw_once)
+    proc def __startup__():
+        g = [eo("1.1.0")]
+
+        proc def check(replies: list[Reply], stats: dict[str, int]) -> None:
+            _check_nitw_once(replies, stats)
+
+        _run(t, test_view(), config(), Faults(report_not_in_time_window_once=True),
+             [v3_user("noauth", get_pdu(1, g), 91), v3_user("sha_aes", get_pdu(2, g), 92),
+              v3_user("sha_aes", get_pdu(3, g), 93), v3_user("sha", get_pdu(4, g), 94)], 4, check)
+
+
 
 def _check_other_port(replies: list[Reply], stats: dict[str, int]) -> None:
     testing.assertEqual(len(replies), 2)
@@ -1204,12 +1446,19 @@ def _check_other_port(replies: list[Reply], stats: dict[str, int]) -> None:
 
 actor _test_fault_respond_from_other_port(t: testing.AsyncT):
     """respond_from_other_port: answers come from other_port"""
-    mn = MemNet()
-    other = mn.server(AGENT_ADDR, OTHER_PORT)
-    ag = Agent(mn.server(AGENT_ADDR, AGENT_PORT), test_view(), config(), t.log_handler,
-               Faults(respond_from_other_port=True, other_port=other))
-    _exchange(_async_report(t), ag, _client(mn), [v2c(get_pdu(1, [eo("1.1.0")])), h(DISCOVERY_REQUEST)], 2,
-              _check_other_port)
+    proc def __startup__():
+        mn = MemNet()
+
+        proc def check(replies: list[Reply], stats: dict[str, int]) -> None:
+            _check_other_port(replies, stats)
+
+        other = mn.server(AGENT_ADDR, OTHER_PORT)
+        ag = Agent(mn.server(AGENT_ADDR, AGENT_PORT), test_view(), config(), t.log_handler,
+                   Faults(respond_from_other_port=True, other_port=other))
+        _exchange(_async_report(t), ag, _client(mn), [v2c(get_pdu(1, [eo("1.1.0")])), h(DISCOVERY_REQUEST)], 2,
+                  check)
+
+
 
 def _check_set_faults(replies: list[Reply], stats: dict[str, int]) -> None:
     testing.assertEqual(len(replies), 2)
@@ -1219,11 +1468,18 @@ def _check_set_faults(replies: list[Reply], stats: dict[str, int]) -> None:
 
 actor _test_set_faults(t: testing.AsyncT):
     """set_faults() replaces the faults of a running agent"""
-    mn = MemNet()
-    ag = Agent(mn.server(AGENT_ADDR, AGENT_PORT), test_view(), config(), t.log_handler, Faults(drop_first_n=5))
-    ag.set_faults(Faults(wrong_community=True))
-    _exchange(_async_report(t), ag, _client(mn), [v2c(get_pdu(1, [eo("1.1.0")])), v2c(get_pdu(2, [eo("1.1.0")]))], 2,
-              _check_set_faults)
+    proc def __startup__():
+        mn = MemNet()
+
+        proc def check(replies: list[Reply], stats: dict[str, int]) -> None:
+            _check_set_faults(replies, stats)
+
+        ag = Agent(mn.server(AGENT_ADDR, AGENT_PORT), test_view(), config(), t.log_handler, Faults(drop_first_n=5))
+        ag.set_faults(Faults(wrong_community=True))
+        _exchange(_async_report(t), ag, _client(mn), [v2c(get_pdu(1, [eo("1.1.0")])), v2c(get_pdu(2, [eo("1.1.0")]))], 2,
+                  check)
+
+
 
 def _check_v3_unanswered(replies: list[Reply], stats: dict[str, int]) -> None:
     testing.assertEqual(len(replies), 2)
@@ -1233,12 +1489,19 @@ def _check_v3_unanswered(replies: list[Reply], stats: dict[str, int]) -> None:
 
 actor _test_v3_unanswered_pdus(t: testing.AsyncT):
     """SNMPv3 PDUs an agent does not handle: InformRequest gets snmpUnknownPDUHandlers, the others nothing"""
-    vbs = [VarBind(eo("1.1.0"), Integer(1))]
-    _run(t, test_view(), config(), None,
-         [v3_user("noauth", Pdu(pdu.INFORM, 1, 0, 0, vbs), 101), v3_user("noauth", Pdu(pdu.TRAP_V2, 2, 0, 0, vbs), 102),
-          v3_user("noauth", Pdu(pdu.RESPONSE, 3, 0, 0, vbs), 103),
-          v3_user("noauth", Pdu(pdu.REPORT, 4, 0, 0, vbs), 104),
-          v3_user("noauth", get_pdu(5, [eo("1.1.0")]), 105)], 2, _check_v3_unanswered)
+    proc def __startup__():
+        vbs = [VarBind(eo("1.1.0"), Integer(1))]
+
+        proc def check(replies: list[Reply], stats: dict[str, int]) -> None:
+            _check_v3_unanswered(replies, stats)
+
+        _run(t, test_view(), config(), None,
+             [v3_user("noauth", Pdu(pdu.INFORM, 1, 0, 0, vbs), 101), v3_user("noauth", Pdu(pdu.TRAP_V2, 2, 0, 0, vbs), 102),
+              v3_user("noauth", Pdu(pdu.RESPONSE, 3, 0, 0, vbs), 103),
+              v3_user("noauth", Pdu(pdu.REPORT, 4, 0, 0, vbs), 104),
+              v3_user("noauth", get_pdu(5, [eo("1.1.0")]), 105)], 2, check)
+
+
 
 def _check_retransmissions(replies: list[Reply], stats: dict[str, int]) -> None:
     vb = [VarBind(eo("3.1.0"), Integer(5))]
@@ -1247,36 +1510,47 @@ def _check_retransmissions(replies: list[Reply], stats: dict[str, int]) -> None:
 
 actor _test_retransmissions_answered(t: testing.AsyncT):
     """The agent is stateless: a retransmitted request (same request-id) is answered again, a SET applied again"""
-    s = v2c(set_pdu(1, [VarBind(eo("3.1.0"), Integer(5))]), "private")
-    g = v2c(get_pdu(2, [eo("3.1.0")]))
-    _run(t, test_view(), config(), None, [s, s, g, g], 4, _check_retransmissions)
+    proc def __startup__():
+        s = v2c(set_pdu(1, [VarBind(eo("3.1.0"), Integer(5))]), "private")
+        g = v2c(get_pdu(2, [eo("3.1.0")]))
+
+        proc def check(replies: list[Reply], stats: dict[str, int]) -> None:
+            _check_retransmissions(replies, stats)
+
+        _run(t, test_view(), config(), None, [s, s, g, g], 4, check)
+
+
 
 actor _test_close(t: testing.AsyncT):
     """After close() the agent answers nothing (the client may see ICMP-like refusals)"""
     mn = MemNet()
-    ag = Agent(mn.server(AGENT_ADDR, AGENT_PORT), test_view(), config(), t.log_handler)
-    ag.close()
-    ag.close()
-    client = _client(mn)
     var replies = 0
 
-    def settled() -> None:
-        st = ag.stats()
-        client.close()
-        if replies == 0 and st["received"] == 0:
-            t.success()
-        else:
-            t.failure(AssertionError("a closed agent answered: %d replies, %d received" % (replies, st["received"])))
+    proc def __startup__():
+        def received(data: bytes, address: str, port: int) -> None:
+            replies += 1
 
-    def received(data: bytes, address: str, port: int) -> None:
-        replies += 1
+        def failed(message: str, fatal: bool) -> None:
+            pass
 
-    def failed(message: str, fatal: bool) -> None:
-        pass
+        ag = Agent(mn.server(AGENT_ADDR, AGENT_PORT), test_view(), config(), t.log_handler)
+        ag.close()
+        ag.close()
+        client = _client(mn)
 
-    client.set_receiver(received, failed)
-    client.send(v2c(get_pdu(1, [eo("1.1.0")])))
-    after now QUIET: settled()
+        def settled() -> None:
+            st = ag.stats()
+            client.close()
+            if replies == 0 and st["received"] == 0:
+                t.success()
+            else:
+                t.failure(AssertionError("a closed agent answered: %d replies, %d received" % (replies, st["received"])))
+
+        client.set_receiver(received, failed)
+        client.send(v2c(get_pdu(1, [eo("1.1.0")])))
+        after now QUIET: settled()
+
+
 
 def _check_stats_keys(replies: list[Reply], stats: dict[str, int]) -> None:
     testing.assertEqual(list(stats.keys()), STATS + COUNTERS)
@@ -1285,10 +1559,15 @@ def _check_stats_keys(replies: list[Reply], stats: dict[str, int]) -> None:
 
 actor _test_stats_keys(t: testing.AsyncT):
     """stats(): the agent's counters, then the engine's"""
-    _run(t, test_view(), config(), None, [], 0, _check_stats_keys)
+    proc def __startup__():
+        proc def check(replies: list[Reply], stats: dict[str, int]) -> None:
+            _check_stats_keys(replies, stats)
+
+        _run(t, test_view(), config(), None, [], 0, check)
 
 
 # The lab dataset (env tests) ########################################################################
+
 
 WALK_GETNEXT = 0
 WALK_V1 = 1
@@ -1302,111 +1581,134 @@ actor _walk(t: testing.EnvT, mode: int, expected_file: str):
     GETBULK, 25 repetitions) or WALK_V3_BULK (GETBULK, 40 repetitions,
     u_sha256_aes of users.tsv, as interop/tools/selftest.py walks).
     """
-    t.timeout(120.0)
     base = Oid.parse(LAB_BASE)
-    view = load_snmprec(read_text(t, LAB_SNMPREC))
-    rules_text = read_text(t, LAB_RULES)
-    expected = [line for line in read_text(t, expected_file).split("\n") if line != ""]
     var keys: ?LocalizedUser = None
-    if mode == WALK_V3_BULK:
-        cfg = lab_config(read_text(t, LAB_USERS), rules_text)
-        for u in cfg.users:
-            if u.user == "u_sha256_aes":
-                keys = u.localized(DEFAULT_ENGINE_ID)
-    else:
-        cfg = AgentConfig({"public": False}, [], DEFAULT_ENGINE_ID, 1, load_write_rules(rules_text))
     mn = MemNet()
-    ag = Agent(mn.server(AGENT_ADDR, AGENT_PORT), view, cfg, None)
-    client = _client(mn)
     var got: list[str] = []
     var cur = base
     var rid = 0
     var done = False
     var after_base: ?VarBind = None
 
-    def check() -> None:
-        testing.assertEqual(len(got), len(expected), "number of varbinds")
-        for i in range(len(expected)):
-            testing.assertEqual(got[i], expected[i], "line %d" % (i + 1))
-        nxt = after_base
-        if nxt is not None:
-            testing.assertEqual(nxt, VarBind(Oid.parse(ENGINE_ID_OID), OctetString(DEFAULT_ENGINE_ID)),
-                                "the agent's snmpEngineID.0 follows the dataset")
-        else:
-            testing.error("the walk did not leave the dataset")
+    proc def __startup__():
+        def request() -> bytes:
+            rid += 1
+            q = [cur]
+            if mode == WALK_GETNEXT:
+                return v2c(next_pdu(rid, q))
+            if mode == WALK_V1:
+                return v1(next_pdu(rid, q))
+            if mode == WALK_BULK:
+                return v2c(bulk_pdu(rid, 0, 25, q))
+            return v3(keys, "u_sha256_aes", usm.LEVEL_AUTH_PRIV, bulk_pdu(rid, 0, 40, q), rid, 1, 0, DEFAULT_ENGINE_ID,
+                      None, b"", 65507, u64(rid))
 
-    def finish(error: ?Exception) -> None:
-        if done:
-            return
-        done = True
-        ag.close()
-        client.close()
-        if error is not None:
-            t.failure(error)
-            return
-        try:
-            check()
-            t.success()
-        except AssertionError as e:
-            t.failure(e)
+        def varbinds_of(data: bytes) -> list[VarBind]:
+            if mode == WALK_V3_BULK:
+                return usm.unprotect(data, v3_of(Reply(data, "", 0)), keys).pdu.varbinds
+            p = response_of(Reply(data, "", 0), message.SNMP_V1 if mode == WALK_V1 else message.SNMP_V2C)
+            testing.assertEqual((p.request_id, p.error_status), (rid, 0), "response")
+            return p.varbinds
 
-    def request() -> bytes:
-        rid += 1
-        q = [cur]
-        if mode == WALK_GETNEXT:
-            return v2c(next_pdu(rid, q))
-        if mode == WALK_V1:
-            return v1(next_pdu(rid, q))
-        if mode == WALK_BULK:
-            return v2c(bulk_pdu(rid, 0, 25, q))
-        return v3(keys, "u_sha256_aes", usm.LEVEL_AUTH_PRIV, bulk_pdu(rid, 0, 40, q), rid, 1, 0, DEFAULT_ENGINE_ID,
-                  None, b"", 65507, u64(rid))
+        t.timeout(120.0)
 
-    def varbinds_of(data: bytes) -> list[VarBind]:
+        view = load_snmprec(read_text(t, LAB_SNMPREC))
+        rules_text = read_text(t, LAB_RULES)
+        expected = [line for line in read_text(t, expected_file).split("\n") if line != ""]
+
+        def check() -> None:
+            testing.assertEqual(len(got), len(expected), "number of varbinds")
+            for i in range(len(expected)):
+                testing.assertEqual(got[i], expected[i], "line %d" % (i + 1))
+            nxt = after_base
+            if nxt is not None:
+                testing.assertEqual(nxt, VarBind(Oid.parse(ENGINE_ID_OID), OctetString(DEFAULT_ENGINE_ID)),
+                                    "the agent's snmpEngineID.0 follows the dataset")
+            else:
+                testing.error("the walk did not leave the dataset")
+
         if mode == WALK_V3_BULK:
-            return usm.unprotect(data, v3_of(Reply(data, "", 0)), keys).pdu.varbinds
-        p = response_of(Reply(data, "", 0), message.SNMP_V1 if mode == WALK_V1 else message.SNMP_V2C)
-        testing.assertEqual((p.request_id, p.error_status), (rid, 0), "response")
-        return p.varbinds
+            cfg = lab_config(read_text(t, LAB_USERS), rules_text)
+            for u in cfg.users:
+                if u.user == "u_sha256_aes":
+                    keys = u.localized(DEFAULT_ENGINE_ID)
+        else:
+            cfg = AgentConfig({"public": False}, [], DEFAULT_ENGINE_ID, 1, load_write_rules(rules_text))
 
-    def received(data: bytes, address: str, port: int) -> None:
-        if done:
-            return
-        try:
-            vbs = varbinds_of(data)
-            testing.assertTrue(len(vbs) > 0, "an empty response")
-            for vb in vbs:
-                if not vb.oid.startswith(base) or values.is_exception(vb.value):
-                    after_base = vb
-                    finish(None)
-                    return
-                got.append(canon_varbind(vb))
-                cur = vb.oid
-            client.send(request())
-        except Exception as e:
-            finish(e)
+        ag = Agent(mn.server(AGENT_ADDR, AGENT_PORT), view, cfg, None)
+        client = _client(mn)
 
-    def failed(message: str, fatal: bool) -> None:
-        finish(AssertionError("transport error: " + message))
+        def finish(error: ?Exception) -> None:
+            if done:
+                return
+            done = True
+            ag.close()
+            client.close()
+            if error is not None:
+                t.failure(error)
+                return
+            try:
+                check()
+                t.success()
+            except AssertionError as e:
+                t.failure(e)
 
-    client.set_receiver(received, failed)
-    client.send(request())
+        def received(data: bytes, address: str, port: int) -> None:
+            if done:
+                return
+            try:
+                vbs = varbinds_of(data)
+                testing.assertTrue(len(vbs) > 0, "an empty response")
+                for vb in vbs:
+                    if not vb.oid.startswith(base) or values.is_exception(vb.value):
+                        after_base = vb
+                        finish(None)
+                        return
+                    got.append(canon_varbind(vb))
+                    cur = vb.oid
+                client.send(request())
+            except Exception as e:
+                finish(e)
+
+        def failed(message: str, fatal: bool) -> None:
+            finish(AssertionError("transport error: " + message))
+
+        client.set_receiver(received, failed)
+        client.send(request())
+
+
 
 actor _test_lab_walk_getnext(t: testing.EnvT):
     """The lab dataset walked with SNMPv2c GETNEXT equals expected/canon/dataset.txt (fmt.canon_varbind)"""
-    _walk(t, WALK_GETNEXT, LAB_CANON)
+
+    proc def __startup__():
+        _walk(t, WALK_GETNEXT, LAB_CANON)
+
+
 
 actor _test_lab_walk_v1(t: testing.EnvT):
     """The SNMPv1 walk skips the Counter64 objects: expected/canon/dataset-v1.txt"""
-    _walk(t, WALK_V1, LAB_CANON_V1)
+
+    proc def __startup__():
+        _walk(t, WALK_V1, LAB_CANON_V1)
+
+
 
 actor _test_lab_walk_bulk(t: testing.EnvT):
     """The lab dataset walked with SNMPv2c GETBULK equals expected/canon/dataset.txt"""
-    _walk(t, WALK_BULK, LAB_CANON)
+
+    proc def __startup__():
+        _walk(t, WALK_BULK, LAB_CANON)
+
+
 
 actor _test_lab_walk_v3_bulk(t: testing.EnvT):
     """An authPriv GETBULK walk with a user of users.tsv equals expected/canon/dataset.txt"""
-    _walk(t, WALK_V3_BULK, LAB_CANON)
+
+    proc def __startup__():
+        _walk(t, WALK_V3_BULK, LAB_CANON)
+
+
 
 def _check_lab_users(users: list[Usm], keys: list[?LocalizedUser]) -> proc(list[Reply], dict[str, int]) -> None:
     def check(replies: list[Reply], stats: dict[str, int]) -> None:
@@ -1421,26 +1723,29 @@ def _check_lab_users(users: list[Usm], keys: list[?LocalizedUser]) -> proc(list[
 
 actor _test_lab_users(t: testing.EnvT):
     """lab_config() of the committed users.tsv: every lab user (all auth/priv combinations) reads the probe OID"""
-    t.timeout(120.0)
-    cfg = lab_config(read_text(t, LAB_USERS), read_text(t, LAB_RULES))
-    names = [u.user for u in cfg.users]
-    ok = len(cfg.users) == 50 and cfg.read_only_users == ["u_ro_sha_aes"] and "u_sha512_3des" in names
-    if not ok:
-        t.failure(AssertionError("users.tsv: %d users, read-only " % len(cfg.users) + repr(cfg.read_only_users)))
-    else:
-        keys: list[?LocalizedUser] = [u.localized(DEFAULT_ENGINE_ID) if u.level() != 0 else None for u in cfg.users]
-        reqs: list[bytes] = []
-        for i in range(len(cfg.users)):
-            u = cfg.users[i]
-            reqs.append(v3(keys[i], u.user, u.level(), get_pdu(1000 + i, [Oid.parse(LAB_PROBE)]), 1 + i, 1, 0,
-                           DEFAULT_ENGINE_ID, None, b"", 65507, u64(i + 1)))
-        view = load_snmprec(read_text(t, LAB_SNMPREC))
-        mn = MemNet()
-        ag = Agent(mn.server(AGENT_ADDR, AGENT_PORT), view, cfg, t.log_handler)
-        _exchange(_env_report(t), ag, _client(mn), reqs, len(reqs), _check_lab_users(cfg.users, keys), 100.0)
+
+    proc def __startup__():
+        t.timeout(120.0)
+        cfg = lab_config(read_text(t, LAB_USERS), read_text(t, LAB_RULES))
+        names = [u.user for u in cfg.users]
+        ok = len(cfg.users) == 50 and cfg.read_only_users == ["u_ro_sha_aes"] and "u_sha512_3des" in names
+        if not ok:
+            t.failure(AssertionError("users.tsv: %d users, read-only " % len(cfg.users) + repr(cfg.read_only_users)))
+        else:
+            keys: list[?LocalizedUser] = [u.localized(DEFAULT_ENGINE_ID) if u.level() != 0 else None for u in cfg.users]
+            reqs: list[bytes] = []
+            for i in range(len(cfg.users)):
+                u = cfg.users[i]
+                reqs.append(v3(keys[i], u.user, u.level(), get_pdu(1000 + i, [Oid.parse(LAB_PROBE)]), 1 + i, 1, 0,
+                               DEFAULT_ENGINE_ID, None, b"", 65507, u64(i + 1)))
+            view = load_snmprec(read_text(t, LAB_SNMPREC))
+            mn = MemNet()
+            ag = Agent(mn.server(AGENT_ADDR, AGENT_PORT), view, cfg, t.log_handler)
+            _exchange(_env_report(t), ag, _client(mn), reqs, len(reqs), _check_lab_users(cfg.users, keys), 100.0)
 
 
 # GETBULK caps #####################################################################################
+
 
 def _view300() -> MibView:
     return MibView([VarBind(Oid([1, 3, 6, 1, 4, 1, 99999, 1, i, 0]), Integer(i)) for i in range(1, 301)])
@@ -1452,8 +1757,6 @@ def _bulk300(n: int, m: int, oids: list[Oid]) -> bytes:
 actor _test_getbulk_non_repeaters_not_capped(t: testing.AsyncT):
     """snmpd caps only the repetitions (maxGetbulkResponses / R); the non-repeaters come on top"""
     mn = MemNet()
-    ag = Agent(mn.server("10.0.0.1", 161), _view300(), AgentConfig({"public": False}), None)
-    c = mn.client("10.0.0.2", 40000, "10.0.0.1", 161)
     var got: list[int] = []
     var done = False
 
@@ -1480,8 +1783,14 @@ actor _test_getbulk_non_repeaters_not_capped(t: testing.AsyncT):
     def failed(msg: str, fatal: bool) -> None:
         pass
 
-    c.set_receiver(received, failed)
     base = [1, 3, 6, 1, 4, 1, 99999, 1]
-    c.send(_bulk300(10, 1000, [Oid(base + [i, 0]) for i in range(1, 11)] + [Oid(base)]))
-    c.send(_bulk300(150, 0, [Oid(base + [i, 0]) for i in range(1, 151)]))
-    after 2.0: fin()
+
+    proc def __startup__():
+        ag = Agent(mn.server("10.0.0.1", 161), _view300(), AgentConfig({"public": False}), None)
+        c = mn.client("10.0.0.2", 40000, "10.0.0.1", 161)
+
+        c.set_receiver(received, failed)
+
+        c.send(_bulk300(10, 1000, [Oid(base + [i, 0]) for i in range(1, 11)] + [Oid(base)]))
+        c.send(_bulk300(150, 0, [Oid(base + [i, 0]) for i in range(1, 151)]))
+        after 2.0: fin()
