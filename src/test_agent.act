@@ -1526,29 +1526,29 @@ actor _test_close(t: testing.AsyncT):
     mn = MemNet()
     var replies = 0
 
-    def settled(ag: Agent, client: Transport) -> None:
-        st = ag.stats()
-        client.close()
-        if replies == 0 and st["received"] == 0:
-            t.success()
-        else:
-            t.failure(AssertionError("a closed agent answered: %d replies, %d received" % (replies, st["received"])))
-
-    def received(data: bytes, address: str, port: int) -> None:
-        replies += 1
-
-    def failed(message: str, fatal: bool) -> None:
-        pass
-
     proc def __startup__():
+        def received(data: bytes, address: str, port: int) -> None:
+            replies += 1
+
+        def failed(message: str, fatal: bool) -> None:
+            pass
+
         ag = Agent(mn.server(AGENT_ADDR, AGENT_PORT), test_view(), config(), t.log_handler)
         ag.close()
         ag.close()
         client = _client(mn)
 
+        def settled() -> None:
+            st = ag.stats()
+            client.close()
+            if replies == 0 and st["received"] == 0:
+                t.success()
+            else:
+                t.failure(AssertionError("a closed agent answered: %d replies, %d received" % (replies, st["received"])))
+
         client.set_receiver(received, failed)
         client.send(v2c(get_pdu(1, [eo("1.1.0")])))
-        after now QUIET: settled(ag, client)
+        after now QUIET: settled()
 
 
 
@@ -1590,77 +1590,42 @@ actor _walk(t: testing.EnvT, mode: int, expected_file: str):
     var done = False
     var after_base: ?VarBind = None
 
-    def check(expected: list[str]) -> None:
-        testing.assertEqual(len(got), len(expected), "number of varbinds")
-        for i in range(len(expected)):
-            testing.assertEqual(got[i], expected[i], "line %d" % (i + 1))
-        nxt = after_base
-        if nxt is not None:
-            testing.assertEqual(nxt, VarBind(Oid.parse(ENGINE_ID_OID), OctetString(DEFAULT_ENGINE_ID)),
-                                "the agent's snmpEngineID.0 follows the dataset")
-        else:
-            testing.error("the walk did not leave the dataset")
-
-    def finish(ag: Agent, client: Transport, expected: list[str], error: ?Exception) -> None:
-        if done:
-            return
-        done = True
-        ag.close()
-        client.close()
-        if error is not None:
-            t.failure(error)
-            return
-        try:
-            check(expected)
-            t.success()
-        except AssertionError as e:
-            t.failure(e)
-
-    def request() -> bytes:
-        rid += 1
-        q = [cur]
-        if mode == WALK_GETNEXT:
-            return v2c(next_pdu(rid, q))
-        if mode == WALK_V1:
-            return v1(next_pdu(rid, q))
-        if mode == WALK_BULK:
-            return v2c(bulk_pdu(rid, 0, 25, q))
-        return v3(keys, "u_sha256_aes", usm.LEVEL_AUTH_PRIV, bulk_pdu(rid, 0, 40, q), rid, 1, 0, DEFAULT_ENGINE_ID,
-                  None, b"", 65507, u64(rid))
-
-    def varbinds_of(data: bytes) -> list[VarBind]:
-        if mode == WALK_V3_BULK:
-            return usm.unprotect(data, v3_of(Reply(data, "", 0)), keys).pdu.varbinds
-        p = response_of(Reply(data, "", 0), message.SNMP_V1 if mode == WALK_V1 else message.SNMP_V2C)
-        testing.assertEqual((p.request_id, p.error_status), (rid, 0), "response")
-        return p.varbinds
-
-    def received(ag: Agent, client: Transport, expected: list[str], data: bytes, address: str, port: int) -> None:
-        if done:
-            return
-        try:
-            vbs = varbinds_of(data)
-            testing.assertTrue(len(vbs) > 0, "an empty response")
-            for vb in vbs:
-                if not vb.oid.startswith(base) or values.is_exception(vb.value):
-                    after_base = vb
-                    finish(ag, client, expected, None)
-                    return
-                got.append(canon_varbind(vb))
-                cur = vb.oid
-            client.send(request())
-        except Exception as e:
-            finish(ag, client, expected, e)
-
-    def failed(ag: Agent, client: Transport, expected: list[str], message: str, fatal: bool) -> None:
-        finish(ag, client, expected, AssertionError("transport error: " + message))
-
     proc def __startup__():
+        def request() -> bytes:
+            rid += 1
+            q = [cur]
+            if mode == WALK_GETNEXT:
+                return v2c(next_pdu(rid, q))
+            if mode == WALK_V1:
+                return v1(next_pdu(rid, q))
+            if mode == WALK_BULK:
+                return v2c(bulk_pdu(rid, 0, 25, q))
+            return v3(keys, "u_sha256_aes", usm.LEVEL_AUTH_PRIV, bulk_pdu(rid, 0, 40, q), rid, 1, 0, DEFAULT_ENGINE_ID,
+                      None, b"", 65507, u64(rid))
+
+        def varbinds_of(data: bytes) -> list[VarBind]:
+            if mode == WALK_V3_BULK:
+                return usm.unprotect(data, v3_of(Reply(data, "", 0)), keys).pdu.varbinds
+            p = response_of(Reply(data, "", 0), message.SNMP_V1 if mode == WALK_V1 else message.SNMP_V2C)
+            testing.assertEqual((p.request_id, p.error_status), (rid, 0), "response")
+            return p.varbinds
+
         t.timeout(120.0)
 
         view = load_snmprec(read_text(t, LAB_SNMPREC))
         rules_text = read_text(t, LAB_RULES)
         expected = [line for line in read_text(t, expected_file).split("\n") if line != ""]
+
+        def check() -> None:
+            testing.assertEqual(len(got), len(expected), "number of varbinds")
+            for i in range(len(expected)):
+                testing.assertEqual(got[i], expected[i], "line %d" % (i + 1))
+            nxt = after_base
+            if nxt is not None:
+                testing.assertEqual(nxt, VarBind(Oid.parse(ENGINE_ID_OID), OctetString(DEFAULT_ENGINE_ID)),
+                                    "the agent's snmpEngineID.0 follows the dataset")
+            else:
+                testing.error("the walk did not leave the dataset")
 
         if mode == WALK_V3_BULK:
             cfg = lab_config(read_text(t, LAB_USERS), rules_text)
@@ -1673,7 +1638,42 @@ actor _walk(t: testing.EnvT, mode: int, expected_file: str):
         ag = Agent(mn.server(AGENT_ADDR, AGENT_PORT), view, cfg, None)
         client = _client(mn)
 
-        client.set_receiver((lambda data, address, port: received(ag, client, expected, data, address, port)), (lambda message, fatal: failed(ag, client, expected, message, fatal)))
+        def finish(error: ?Exception) -> None:
+            if done:
+                return
+            done = True
+            ag.close()
+            client.close()
+            if error is not None:
+                t.failure(error)
+                return
+            try:
+                check()
+                t.success()
+            except AssertionError as e:
+                t.failure(e)
+
+        def received(data: bytes, address: str, port: int) -> None:
+            if done:
+                return
+            try:
+                vbs = varbinds_of(data)
+                testing.assertTrue(len(vbs) > 0, "an empty response")
+                for vb in vbs:
+                    if not vb.oid.startswith(base) or values.is_exception(vb.value):
+                        after_base = vb
+                        finish(None)
+                        return
+                    got.append(canon_varbind(vb))
+                    cur = vb.oid
+                client.send(request())
+            except Exception as e:
+                finish(e)
+
+        def failed(message: str, fatal: bool) -> None:
+            finish(AssertionError("transport error: " + message))
+
+        client.set_receiver(received, failed)
         client.send(request())
 
 

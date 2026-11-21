@@ -484,32 +484,32 @@ actor _test_v3_discover(t: testing.AsyncT):
     mn = MemNet()
     var info: ?EngineInfo = None
 
-    def got(c: Client, cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
-        s = c.stats()
-        def check() -> None:
-            testing.assertEqual(vbs_of(Outcome(r, err), "get"), [VarBind(SYS_DESCR, OctetString(DESCR))])
-            i = info
-            if i is not None:
-                testing.assertEqual((i.engine_id, i.boots), (h(AGENT_ENGINE), AGENT_BOOTS))
-            else:
-                raise AssertionError("no EngineInfo")
-            testing.assertEqual(s.reports, 1, "one discovery Report: " + str(s))
-        report(t, outcome(check))
-
-    def discovered(c: Client, cl: Client, i: ?EngineInfo, err: ?errors.SnmpError) -> None:
-        if err is not None:
-            t.failure(AssertionError("discovery failed: " + str(err)))
-            return
-        info = i
-        c.get((lambda cl, r, err: got(c, cl, r, err)), [SYS_DESCR])
-
     proc def __startup__():
         t.timeout(30.0)
 
         agent = Agent(mn.server(AGENT, 161), make_view(), agent_config([u]), t.log_handler)
         c = _client(mn, u, 40001, OPTS, t.log_handler)
 
-        c.discover((lambda cl, i, err: discovered(c, cl, i, err)))
+        def got(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+            s = c.stats()
+            def check() -> None:
+                testing.assertEqual(vbs_of(Outcome(r, err), "get"), [VarBind(SYS_DESCR, OctetString(DESCR))])
+                i = info
+                if i is not None:
+                    testing.assertEqual((i.engine_id, i.boots), (h(AGENT_ENGINE), AGENT_BOOTS))
+                else:
+                    raise AssertionError("no EngineInfo")
+                testing.assertEqual(s.reports, 1, "one discovery Report: " + str(s))
+            report(t, outcome(check))
+
+        def discovered(cl: Client, i: ?EngineInfo, err: ?errors.SnmpError) -> None:
+            if err is not None:
+                t.failure(AssertionError("discovery failed: " + str(err)))
+                return
+            info = i
+            c.get(got, [SYS_DESCR])
+
+        c.discover(discovered)
 
 
 # Faults seen through the real Client ##############################################################
@@ -982,7 +982,12 @@ actor _test_v3_agent_reboot(t: testing.AsyncT):
                 return True
             return False
 
-        def got_third(c: Client, cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+        t.timeout(30.0)
+
+        agent = Agent(mn.server(AGENT, 161), make_view(), agent_config([u]), t.log_handler)
+        c = _client(mn, u, 40001, OPTS, t.log_handler)
+
+        def got_third(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
             if fail("after the engine ID change", r, err):
                 return
             info = c.engine_info()
@@ -997,7 +1002,7 @@ actor _test_v3_agent_reboot(t: testing.AsyncT):
                 testing.assertEqual((s.reports, s.timeouts), (4, 0), str(s))
             report(t, outcome(check))
 
-        def got_second(agent: Agent, c: Client, cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+        def got_second(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
             if fail("after the reboot", r, err):
                 return
             boots = -1
@@ -1008,20 +1013,15 @@ actor _test_v3_agent_reboot(t: testing.AsyncT):
                 t.failure(AssertionError("boots not learned after the reboot: %d" % boots))
                 return
             agent.reboot(1, new_engine)
-            c.get((lambda cl, r, err: got_third(c, cl, r, err)), [SYS_DESCR])
+            c.get(got_third, [SYS_DESCR])
 
-        def got_first(agent: Agent, c: Client, cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+        def got_first(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
             if fail("first get", r, err):
                 return
             agent.reboot()
-            c.get((lambda cl, r, err: got_second(agent, c, cl, r, err)), [SYS_DESCR])
+            c.get(got_second, [SYS_DESCR])
 
-        t.timeout(30.0)
-
-        agent = Agent(mn.server(AGENT, 161), make_view(), agent_config([u]), t.log_handler)
-        c = _client(mn, u, 40001, OPTS, t.log_handler)
-
-        c.get((lambda cl, r, err: got_first(agent, c, cl, r, err)), [SYS_DESCR])
+        c.get(got_first, [SYS_DESCR])
 
 
 
@@ -1034,7 +1034,12 @@ actor _test_v3_agent_restart_boots_lost(t: testing.AsyncT):
         u = _sha_aes()
         mn = MemNet()
 
-        def reported(c: Client, label: str, outs: list[Outcome]) -> None:
+        t.timeout(30.0)
+
+        agent = Agent(mn.server(AGENT, 161), make_view(), agent_config([u]), t.log_handler)
+        c = _client(mn, u, 40001, OPTS.with_(max_in_flight=2), t.log_handler)
+
+        def reported(label: str, outs: list[Outcome]) -> None:
             info = c.engine_info()
             s = c.stats()
             def run() -> None:
@@ -1053,20 +1058,15 @@ actor _test_v3_agent_restart_boots_lost(t: testing.AsyncT):
                 testing.assertEqual((s.reports, s.timeouts, s.drops_auth, s.retries), (3, 0, 0, 0), str(s))
             report(t, outcome(run))
 
-        def got_first(agent: Agent, c: Client, col: Collector, cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+        col = Collector("restart", reported)
+
+        def got_first(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
             col.completed(cl, r, err)
             agent.reboot(1)
             c.get(col.completed, [SYS_DESCR])
             c.get(col.completed, [e([1, 1, 0])])
 
-        t.timeout(30.0)
-
-        agent = Agent(mn.server(AGENT, 161), make_view(), agent_config([u]), t.log_handler)
-        c = _client(mn, u, 40001, OPTS.with_(max_in_flight=2), t.log_handler)
-
-        col = Collector("restart", (lambda label, outs: reported(c, label, outs)))
-
-        c.get((lambda cl, r, err: got_first(agent, c, col, cl, r, err)), [SYS_DESCR])
+        c.get(got_first, [SYS_DESCR])
         col.expect(3)
 
 
@@ -1096,7 +1096,12 @@ actor _test_inform_retransmission_dedup(t: testing.AsyncT):
         def received(r: NotificationReceiver, n: Notification) -> None:
             got.append(n)
 
-        def acked(rcv: NotificationReceiver, cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+        t.timeout(30.0)
+
+        rcv = NotificationReceiver(mn.server(RECEIVER, 162), ReceiverConfig(["public"], [], [], h(RECEIVER_ENGINE), 1, 60.0),
+                                   received, t.log_handler)
+
+        def acked(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
             st = rcv.stats()
             def check() -> None:
                 resp = ok(Outcome(r, err), "inform")
@@ -1105,14 +1110,10 @@ actor _test_inform_retransmission_dedup(t: testing.AsyncT):
                 testing.assertEqual((st["delivered"], st["duplicates"], st["acked"]), (1, 1, 2), str(st))
             report(t, outcome(check))
 
-        t.timeout(30.0)
-
-        rcv = NotificationReceiver(mn.server(RECEIVER, 162), ReceiverConfig(["public"], [], [], h(RECEIVER_ENGINE), 1, 60.0),
-                                   received, t.log_handler)
         c = Client(None, RECEIVER, Community("public"), t.log_handler, port=162, opts=Options(timeout=0.2, retries=2),
                    transport=mn.client(MANAGER, 42001, RECEIVER, 162))
 
-        c.inform((lambda cl, r, err: acked(rcv, cl, r, err)), notify.TRAP_LINK_DOWN, [VarBind(e([1, 1, 0]), Integer(3))], 500)
+        c.inform(acked, notify.TRAP_LINK_DOWN, [VarBind(e([1, 1, 0]), Integer(3))], 500)
 
 
 
@@ -1253,30 +1254,30 @@ actor _ResyncStaleTimer(t: testing.AsyncT, delay: float, retries: int):
     mn = MemNet()
     var started = 0.0
 
-    def got_second(c: Client, cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
-        waited = float(time.monotonic_ns()) / 1e9 - started
-        s = c.stats()
-        def check() -> None:
-            resp = ok(Outcome(r, err), "after the reboot (answers %.2f s late, retries %d, callback after %.3f s)"
-                      % (delay, retries, waited))
-            testing.assertEqual(resp.attempts, 2, "the request and its resynchronisation resend")
-            testing.assertEqual(s.retries, 0, "no retransmission: " + str(s))
-        report(t, outcome(check))
-
-    def got_first(agent: Agent, c: Client, cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
-        if err is not None:
-            t.failure(AssertionError("first get: " + str(err)))
-            return
-        agent.reboot()
-        mn.set_faults(NetFaults(delay=delay, to_address=MANAGER))
-        started = float(time.monotonic_ns()) / 1e9
-        c.get((lambda cl, r, err: got_second(c, cl, r, err)), [SYS_DESCR])
-
     proc def __startup__():
         agent = Agent(mn.server(AGENT, 161), make_view(), agent_config([u]), t.log_handler)
         c = _client(mn, u, 40001, Options(timeout=0.25, retries=retries), t.log_handler)
 
-        c.get((lambda cl, r, err: got_first(agent, c, cl, r, err)), [SYS_DESCR])
+        def got_second(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+            waited = float(time.monotonic_ns()) / 1e9 - started
+            s = c.stats()
+            def check() -> None:
+                resp = ok(Outcome(r, err), "after the reboot (answers %.2f s late, retries %d, callback after %.3f s)"
+                          % (delay, retries, waited))
+                testing.assertEqual(resp.attempts, 2, "the request and its resynchronisation resend")
+                testing.assertEqual(s.retries, 0, "no retransmission: " + str(s))
+            report(t, outcome(check))
+
+        def got_first(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+            if err is not None:
+                t.failure(AssertionError("first get: " + str(err)))
+                return
+            agent.reboot()
+            mn.set_faults(NetFaults(delay=delay, to_address=MANAGER))
+            started = float(time.monotonic_ns()) / 1e9
+            c.get(got_second, [SYS_DESCR])
+
+        c.get(got_first, [SYS_DESCR])
 
 # The resend goes out when the Report arrives, delay after the request, and its answer comes delay later:
 # after the first attempt's timeout (0.25 s) when delay is 0.15 s, but within the resend's own timeout
@@ -1326,7 +1327,15 @@ actor _test_resync_then_silence(t: testing.AsyncT):
         u = _sha_aes()
         mn = MemNet()
 
-        def got(c: Client, cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
+        t.timeout(30.0)
+
+        srv = mn.server(AGENT, 161)
+        # datagrams the agent sends: the discovery Report, the notInTimeWindows Report, then nothing
+        agent = Agent(_gated(_Gate(srv, 2), srv), make_view(), agent_config([u]), t.log_handler,
+                      Faults(report_not_in_time_window_once=True))
+        c = _client(mn, u, 40001, Options(timeout=0.2, retries=2), t.log_handler)
+
+        def got(cl: Client, r: ?Response, err: ?errors.SnmpError) -> None:
             s = c.stats()
             sends = [d.dst_port for d in mn.history() if d.src_port == 40001]
             def check() -> None:
@@ -1340,12 +1349,4 @@ actor _test_resync_then_silence(t: testing.AsyncT):
                 testing.assertEqual(len(sends), 5, "probe and four attempts")
             report(t, outcome(check))
 
-        t.timeout(30.0)
-
-        srv = mn.server(AGENT, 161)
-        # datagrams the agent sends: the discovery Report, the notInTimeWindows Report, then nothing
-        agent = Agent(_gated(_Gate(srv, 2), srv), make_view(), agent_config([u]), t.log_handler,
-                      Faults(report_not_in_time_window_once=True))
-        c = _client(mn, u, 40001, Options(timeout=0.2, retries=2), t.log_handler)
-
-        c.get((lambda cl, r, err: got(c, cl, r, err)), [SYS_DESCR])
+        c.get(got, [SYS_DESCR])

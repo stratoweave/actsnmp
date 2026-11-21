@@ -445,7 +445,11 @@ actor _test_walk_disorder_scripted(t: testing.AsyncT):
             if len(results) == 5:
                 after now QUIET: report(t, outcome(check))
 
-        def received(server: transport.ServerTransport, data: bytes, address: str, port: int) -> None:
+        t.timeout(30.0)
+
+        server = mn.server(AGENT, 161)
+
+        def received(data: bytes, address: str, port: int) -> None:
             c, m = message.decode(data)
             if c is not None:
                 p = c.pdu
@@ -472,11 +476,7 @@ actor _test_walk_disorder_scripted(t: testing.AsyncT):
                     server.send_to(message.encode_community(message.CommunityMessage(c.version, c.community, resp)),
                                    address, port)
 
-        t.timeout(30.0)
-
-        server = mn.server(AGENT, 161)
-
-        server.set_receiver((lambda data, address, port: received(server, data, address, port)))
+        server.set_receiver(received)
         c2 = client(mn, v2c(), 40001, OPTS.with_(use_bulk=False))
         c2.walk(Sink("checked", got).walked, root)
         c2.walk(Sink("unchecked", got).walked, root, OPTS.with_(use_bulk=False, check_increasing=False))
@@ -535,38 +535,27 @@ actor _test_walk_adaptive_too_big(t: testing.AsyncT):
     var reps: dict[str, list[int]] = {}
     var calls = 0
 
-    def sent_reps(port: int) -> list[int]:
-        return bulk_reps(requests_sent([d.data for d in mn.history() if d.src_port == port]))
-
-    def check() -> None:
-        testing.assertEqual(calls, 4, "callbacks")
-        testing.assertEqual(ok(results["first"], "first"), want)
-        testing.assertEqual(ok(results["second"], "second"), want)
-        testing.assertEqual(ok(results["plain"], "plain"), want)
-        testing.assertEqual(ok(results["plain again"], "plain again"), want)
-        # 25 rows of 70 octets do not fit 1200, 12 do: the second walk starts at 12. The first walk's
-        # last five GETBULKs were clean at 12; three more in the second walk make BULK_REGROW_AFTER (8), so
-        # its fourth tries 24, which is tooBig again and answered at 12
-        first = reps["first"]
-        testing.assertEqual(first, [25, 12, 12, 12, 12, 12, 12], "tooBig halves: " + str(first))
-        rest = sent_reps(40001)[len(first):]
-        testing.assertEqual(rest, [12, 12, 12, 24, 12, 12, 12],
-                            "the second walk uses the learned value, then tries 24: " + str(rest))
-        p = sent_reps(40002)
-        testing.assertEqual(p[:3], [25, 12, 25], "adaptive_bulk=False: every request starts at 25: " + str(p))
-
-    def got(c: Client, plain: Client, label: str, g: Got) -> None:
-        results[label] = g
-        calls += 1
-        if label == "first":
-            reps["first"] = sent_reps(40001)
-            c.walk(Sink("second", (lambda label, g: got(c, plain, label, g))).walked, b([5]))
-        elif label == "plain":
-            plain.walk(Sink("plain again", (lambda label, g: got(c, plain, label, g))).walked, b([5]), OPTS.with_(adaptive_bulk=False))
-        if calls == 4:
-            after now QUIET: report(t, outcome(check))
-
     proc def __startup__():
+        def sent_reps(port: int) -> list[int]:
+            return bulk_reps(requests_sent([d.data for d in mn.history() if d.src_port == port]))
+
+        def check() -> None:
+            testing.assertEqual(calls, 4, "callbacks")
+            testing.assertEqual(ok(results["first"], "first"), want)
+            testing.assertEqual(ok(results["second"], "second"), want)
+            testing.assertEqual(ok(results["plain"], "plain"), want)
+            testing.assertEqual(ok(results["plain again"], "plain again"), want)
+            # 25 rows of 70 octets do not fit 1200, 12 do: the second walk starts at 12. The first walk's
+            # last five GETBULKs were clean at 12; three more in the second walk make BULK_REGROW_AFTER (8), so
+            # its fourth tries 24, which is tooBig again and answered at 12
+            first = reps["first"]
+            testing.assertEqual(first, [25, 12, 12, 12, 12, 12, 12], "tooBig halves: " + str(first))
+            rest = sent_reps(40001)[len(first):]
+            testing.assertEqual(rest, [12, 12, 12, 24, 12, 12, 12],
+                                "the second walk uses the learned value, then tries 24: " + str(rest))
+            p = sent_reps(40002)
+            testing.assertEqual(p[:3], [25, 12, 25], "adaptive_bulk=False: every request starts at 25: " + str(p))
+
         t.timeout(30.0)
 
         agent = Agent(mn.server(AGENT, 161), small_view(), config(), None, Faults(too_big_over=1200))
@@ -574,8 +563,19 @@ actor _test_walk_adaptive_too_big(t: testing.AsyncT):
         c = client(mn, v2c(), 40001)
         plain = client(mn, v2c(), 40002)
 
-        c.walk(Sink("first", (lambda label, g: got(c, plain, label, g))).walked, b([5]))
-        plain.walk(Sink("plain", (lambda label, g: got(c, plain, label, g))).walked, b([5]), OPTS.with_(adaptive_bulk=False))
+        def got(label: str, g: Got) -> None:
+            results[label] = g
+            calls += 1
+            if label == "first":
+                reps["first"] = sent_reps(40001)
+                c.walk(Sink("second", got).walked, b([5]))
+            elif label == "plain":
+                plain.walk(Sink("plain again", got).walked, b([5]), OPTS.with_(adaptive_bulk=False))
+            if calls == 4:
+                after now QUIET: report(t, outcome(check))
+
+        c.walk(Sink("first", got).walked, b([5]))
+        plain.walk(Sink("plain", got).walked, b([5]), OPTS.with_(adaptive_bulk=False))
 
 
 
@@ -587,43 +587,43 @@ actor _test_walk_adaptive_timeout(t: testing.AsyncT):
     var results: dict[str, Got] = {}
     var calls = 0
 
-    def sent_reps(port: int) -> list[int]:
-        return bulk_reps(requests_sent([d.data for d in mn.history() if d.src_port == port]))
-
-    def check(c: Client) -> None:
-        testing.assertEqual(calls, 3, "callbacks")
-        testing.assertEqual(ok(results["first"], "first"), want)
-        testing.assertEqual(ok(results["second"], "second"), want)
-        testing.assertEqual(ok(results["fixed"], "fixed"), want)
-        r = sent_reps(40001)
-        # first walk: 25 (answer lost), 12 (retry), 12, 12, 12, 12 (60 = 12 * 5), 12 (the end); second walk:
-        # 12, 12, 12, then 24 (eight clean responses at 12: regrown, client.BULK_REGROW_AFTER), 24 (the end)
-        testing.assertEqual(r, [25, 12, 12, 12, 12, 12, 12, 12, 12, 12, 24, 24],
-                            "the retry is halved, the value kept, then regrown: " + str(r))
-        f = sent_reps(40002)
-        testing.assertEqual(f[:2], [25, 25], "adaptive_bulk=False retries unchanged: " + str(f))
-        testing.assertEqual(c.stats().retries, 1)
-
-    def got(c: Client, label: str, g: Got) -> None:
-        results[label] = g
-        calls += 1
-        if label == "first":
-            c.walk(Sink("second", (lambda label, g: got(c, label, g))).walked, b([5]))
-            fixed = client(mn, v2c(), 40002, opts.with_(adaptive_bulk=False))
-            mn.set_faults(NetFaults(drop_first_n=1, to_address=MANAGER, to_port=40002))
-            fixed.walk(Sink("fixed", (lambda label, g: got(c, label, g))).walked, b([5]))
-        if calls == 3:
-            after now QUIET: report(t, outcome((lambda: check(c))))
-
     proc def __startup__():
+        def sent_reps(port: int) -> list[int]:
+            return bulk_reps(requests_sent([d.data for d in mn.history() if d.src_port == port]))
+
         t.timeout(30.0)
 
         agent = Agent(mn.server(AGENT, 161), small_view(), config(), None)
 
         c = client(mn, v2c(), 40001, opts)
 
+        def check() -> None:
+            testing.assertEqual(calls, 3, "callbacks")
+            testing.assertEqual(ok(results["first"], "first"), want)
+            testing.assertEqual(ok(results["second"], "second"), want)
+            testing.assertEqual(ok(results["fixed"], "fixed"), want)
+            r = sent_reps(40001)
+            # first walk: 25 (answer lost), 12 (retry), 12, 12, 12, 12 (60 = 12 * 5), 12 (the end); second walk:
+            # 12, 12, 12, then 24 (eight clean responses at 12: regrown, client.BULK_REGROW_AFTER), 24 (the end)
+            testing.assertEqual(r, [25, 12, 12, 12, 12, 12, 12, 12, 12, 12, 24, 24],
+                                "the retry is halved, the value kept, then regrown: " + str(r))
+            f = sent_reps(40002)
+            testing.assertEqual(f[:2], [25, 25], "adaptive_bulk=False retries unchanged: " + str(f))
+            testing.assertEqual(c.stats().retries, 1)
+
+        def got(label: str, g: Got) -> None:
+            results[label] = g
+            calls += 1
+            if label == "first":
+                c.walk(Sink("second", got).walked, b([5]))
+                fixed = client(mn, v2c(), 40002, opts.with_(adaptive_bulk=False))
+                mn.set_faults(NetFaults(drop_first_n=1, to_address=MANAGER, to_port=40002))
+                fixed.walk(Sink("fixed", got).walked, b([5]))
+            if calls == 3:
+                after now QUIET: report(t, outcome(check))
+
         mn.set_faults(NetFaults(drop_first_n=1, to_address=MANAGER, to_port=40001))
-        c.walk(Sink("first", (lambda label, g: got(c, label, g))).walked, b([5]))
+        c.walk(Sink("first", got).walked, b([5]))
 
 
 
@@ -636,29 +636,29 @@ actor _test_walk_adaptive_timeout_v3(t: testing.AsyncT):
         want = [VarBind(b([5, n, 0]), big(n)) for n in range(1, 61)]
         walks: list[Got] = []
 
-        def check(c: Client) -> None:
-            testing.assertEqual(len(walks), 1, "one callback")
-            testing.assertEqual(ok(walks[0], "v3 walk"), want)
-            r = bulk_reps(requests_sent([d.data for d in mn.history() if d.src_port == 40001]))
-            testing.assertEqual(r[:3], [25, 12, 12], "the retry is halved: " + str(r))
-            testing.assertEqual(c.stats().retries, 1)
-
-        def walked(c: Client, cl: Client, vbs: list[VarBind], e: ?errors.SnmpError) -> None:
-            walks.append(Got(vbs, None, len(vbs), [], e))
-            after now QUIET: report(t, outcome((lambda: check(c))))
-
-        def discovered(c: Client, cl: Client, info: ?EngineInfo, e: ?errors.SnmpError) -> None:
-            # the next datagram to the Client, the answer to the walk's first GETBULK, is lost
-            mn.set_faults(NetFaults(drop_first_n=1, to_address=MANAGER, to_port=40001))
-            c.walk((lambda cl, vbs, e: walked(c, cl, vbs, e)), b([5]))
-
         t.timeout(30.0)
 
         agent = Agent(mn.server(AGENT, 161), small_view(), AgentConfig({}, [noauth]), None)
 
         c = client(mn, noauth, 40001, Options(timeout=0.3, retries=2))
 
-        c.discover((lambda cl, info, e: discovered(c, cl, info, e)))
+        def check() -> None:
+            testing.assertEqual(len(walks), 1, "one callback")
+            testing.assertEqual(ok(walks[0], "v3 walk"), want)
+            r = bulk_reps(requests_sent([d.data for d in mn.history() if d.src_port == 40001]))
+            testing.assertEqual(r[:3], [25, 12, 12], "the retry is halved: " + str(r))
+            testing.assertEqual(c.stats().retries, 1)
+
+        def walked(cl: Client, vbs: list[VarBind], e: ?errors.SnmpError) -> None:
+            walks.append(Got(vbs, None, len(vbs), [], e))
+            after now QUIET: report(t, outcome(check))
+
+        def discovered(cl: Client, info: ?EngineInfo, e: ?errors.SnmpError) -> None:
+            # the next datagram to the Client, the answer to the walk's first GETBULK, is lost
+            mn.set_faults(NetFaults(drop_first_n=1, to_address=MANAGER, to_port=40001))
+            c.walk(walked, b([5]))
+
+        c.discover(discovered)
 
 
 
@@ -692,21 +692,21 @@ actor _test_walk_adaptive_regrow(t: testing.AsyncT):
             testing.assertEqual(r, [25, 12] + [12 for _ in range(8)] + [24 for _ in range(8)] + [25 for _ in range(7)],
                                 "max-repetitions sent: " + str(r))
 
-        def got(agent: Agent, c: Client, label: str, g: Got) -> None:
-            results[label] = g
-            if label == "learn":
-                agent.set_faults(None)
-                c.walk(Sink("regrow", (lambda label, g: got(agent, c, label, g))).walked, b([6]))
-            else:
-                after now QUIET: report(t, outcome(check))
-
         t.timeout(30.0)
 
         agent = Agent(mn.server(AGENT, 161), MibView(small_view().varbinds() + extra), config(), None,
                       Faults(too_big_over=1200))
         c = client(mn, v2c(), 40001)
 
-        c.walk(Sink("learn", (lambda label, g: got(agent, c, label, g))).walked, b([5]))
+        def got(label: str, g: Got) -> None:
+            results[label] = g
+            if label == "learn":
+                agent.set_faults(None)
+                c.walk(Sink("regrow", got).walked, b([6]))
+            else:
+                after now QUIET: report(t, outcome(check))
+
+        c.walk(Sink("learn", got).walked, b([5]))
 
 
 
@@ -751,32 +751,33 @@ actor _test_walk_retries_mid_walk(t: testing.AsyncT):
     var delivered: list[VarBind] = []
     var done: list[Got] = []
 
-    def check(c: Client) -> None:
-        testing.assertEqual(len(done), 1, "on_done once")
-        g = done[0]
-        testing.assertEqual(ok(g, "walk"), scalars(), "nothing lost")
-        testing.assertEqual(g.count, 23)
-        testing.assertEqual(c.stats().retries, 2, "one retry per dropped answer")
-
-    def got_batch(agent: Agent, cl: Client, vbs: list[VarBind]) -> None:
-        batches += 1
-        delivered.extend(vbs)
-        if batches == 3:
-            agent.set_faults(Faults(drop_first_n=2))
-
-    def stream_ended(c: Client, cl: Client, count: int, e: ?errors.SnmpError) -> None:
-        done.append(Got(delivered, None, count, [], e))
-        after now QUIET: report(t, outcome((lambda: check(c))))
-
     proc def __startup__():
         t.timeout(30.0)
 
         agent = Agent(mn.server(AGENT, 161), small_view(), config(), None)
+
+        def got_batch(cl: Client, vbs: list[VarBind]) -> None:
+            batches += 1
+            delivered.extend(vbs)
+            if batches == 3:
+                agent.set_faults(Faults(drop_first_n=2))
+
         # every request waits 10 ms on its way to the agent, so the walk is still running when the faults are set
         mn.set_faults(NetFaults(delay=0.01, to_address=AGENT))
         c = client(mn, v2c(), 40001, Options(timeout=0.2, retries=3, use_bulk=False))
 
-        c.walk_stream((lambda cl, vbs: got_batch(agent, cl, vbs)), (lambda cl, count, e: stream_ended(c, cl, count, e)), b([1]))
+        def check() -> None:
+            testing.assertEqual(len(done), 1, "on_done once")
+            g = done[0]
+            testing.assertEqual(ok(g, "walk"), scalars(), "nothing lost")
+            testing.assertEqual(g.count, 23)
+            testing.assertEqual(c.stats().retries, 2, "one retry per dropped answer")
+
+        def stream_ended(cl: Client, count: int, e: ?errors.SnmpError) -> None:
+            done.append(Got(delivered, None, count, [], e))
+            after now QUIET: report(t, outcome(check))
+
+        c.walk_stream(got_batch, stream_ended, b([1]))
 
 
 
@@ -834,42 +835,6 @@ actor _test_walk_cancel(t: testing.AsyncT):
     var batches = 0
     var delivered: list[VarBind] = []
 
-    def check(c: Client) -> None:
-        testing.assertEqual(ok(results["unaffected"][0], "unaffected"), scalars(),
-                            "cancel() of a walk's internal request handle does nothing")
-        for label in ["immediate", "stream", "table"]:
-            testing.assertEqual(len(results[label]), 1, label + ": exactly one callback")
-            testing.assertTrue(is_cancelled(failed_with(results[label][0], label)), label)
-        testing.assertEqual(results["immediate"][0].vbs, [], "cancelled before any answer")
-        s = results["stream"][0]
-        testing.assertEqual(s.count, len(s.vbs), "on_done counts what the batches delivered")
-        testing.assertTrue(s.count >= 2 and s.count < 23, "cancelled mid-walk: %d" % s.count)
-        testing.assertEqual(s.vbs, scalars()[:s.count], "the delivered prefix")
-        tb = results["table"][0].table
-        testing.assertTrue(tb is not None, "a cancelled table still has its (partial) rows")
-        testing.assertEqual(ok(results["after"][0], "after"), scalars(), "the Client keeps working")
-        st = c.stats()
-        testing.assertEqual((st.queued, st.in_flight), (0, 0), "nothing left over: " + str(st))
-
-    def got(c: Client, label: str, g: Got) -> None:
-        if label not in results:
-            results[label] = []
-        results[label].append(g)
-        if label == "stream":
-            c.walk(Sink("after", (lambda label, g: got(c, label, g))).walked, b([1]))
-        if label == "after":
-            after now QUIET: report(t, outcome((lambda: check(c))))
-
-    def got_batch(c: Client, cl: Client, vbs: list[VarBind]) -> None:
-        batches += 1
-        delivered.extend(vbs)
-        if batches == 2:
-            c.cancel(hs)
-            c.cancel(hs)
-
-    def stream_ended(c: Client, cl: Client, count: int, e: ?errors.SnmpError) -> None:
-        got(c, "stream", Got(delivered, None, count, [], e))
-
     proc def __startup__():
         t.timeout(30.0)
 
@@ -878,14 +843,50 @@ actor _test_walk_cancel(t: testing.AsyncT):
         mn.set_faults(NetFaults(delay=0.02, to_address=AGENT))
         c = client(mn, v2c(), 40001, OPTS.with_(use_bulk=False))
 
-        hu = c.walk(Sink("unaffected", (lambda label, g: got(c, label, g))).walked, b([1]))
+        def check() -> None:
+            testing.assertEqual(ok(results["unaffected"][0], "unaffected"), scalars(),
+                                "cancel() of a walk's internal request handle does nothing")
+            for label in ["immediate", "stream", "table"]:
+                testing.assertEqual(len(results[label]), 1, label + ": exactly one callback")
+                testing.assertTrue(is_cancelled(failed_with(results[label][0], label)), label)
+            testing.assertEqual(results["immediate"][0].vbs, [], "cancelled before any answer")
+            s = results["stream"][0]
+            testing.assertEqual(s.count, len(s.vbs), "on_done counts what the batches delivered")
+            testing.assertTrue(s.count >= 2 and s.count < 23, "cancelled mid-walk: %d" % s.count)
+            testing.assertEqual(s.vbs, scalars()[:s.count], "the delivered prefix")
+            tb = results["table"][0].table
+            testing.assertTrue(tb is not None, "a cancelled table still has its (partial) rows")
+            testing.assertEqual(ok(results["after"][0], "after"), scalars(), "the Client keeps working")
+            st = c.stats()
+            testing.assertEqual((st.queued, st.in_flight), (0, 0), "nothing left over: " + str(st))
+
+        def got(label: str, g: Got) -> None:
+            if label not in results:
+                results[label] = []
+            results[label].append(g)
+            if label == "stream":
+                c.walk(Sink("after", got).walked, b([1]))
+            if label == "after":
+                after now QUIET: report(t, outcome(check))
+
+        def got_batch(cl: Client, vbs: list[VarBind]) -> None:
+            batches += 1
+            delivered.extend(vbs)
+            if batches == 2:
+                c.cancel(hs)
+                c.cancel(hs)
+
+        def stream_ended(cl: Client, count: int, e: ?errors.SnmpError) -> None:
+            got("stream", Got(delivered, None, count, [], e))
+
+        hu = c.walk(Sink("unaffected", got).walked, b([1]))
         c.cancel(hu + 1)
-        h1 = c.walk(Sink("immediate", (lambda label, g: got(c, label, g))).walked, b([1]))
+        h1 = c.walk(Sink("immediate", got).walked, b([1]))
         c.cancel(h1)
         c.cancel(h1)
-        ht = c.get_table(Sink("table", (lambda label, g: got(c, label, g))).got_table, [b([2, 1, 1]), b([2, 1, 3])])
+        ht = c.get_table(Sink("table", got).got_table, [b([2, 1, 1]), b([2, 1, 3])])
         c.cancel(ht)
-        hs = c.walk_stream((lambda cl, vbs: got_batch(c, cl, vbs)), (lambda cl, count, e: stream_ended(c, cl, count, e)), b([1]))
+        hs = c.walk_stream(got_batch, stream_ended, b([1]))
 
 
 
@@ -895,31 +896,24 @@ actor _test_walk_close(t: testing.AsyncT):
     var results: dict[str, list[Got]] = {}
     var closed = False
 
-    def check() -> None:
-        for label in ["a", "b", "table", "stream", "late", "late table"]:
-            testing.assertEqual(len(results[label]), 1, label + ": exactly one callback")
-            e = failed_with(results[label][0], label)
-            testing.assertTrue(is_cancelled(e), label + ": " + str(e))
-            testing.assertEqual(e.error_message, "client closed", label)
-
-    def got(label: str, g: Got) -> None:
-        if label not in results:
-            results[label] = []
-        results[label].append(g)
-        if len(results) == 6:
-            after now QUIET: report(t, outcome(check))
-
-    def got_batch(c: Client, cl: Client, vbs: list[VarBind]) -> None:
-        if not closed:
-            closed = True
-            c.close()
-            c.walk(Sink("late", got).walked, b([1]))
-            c.get_table(Sink("late table", got).got_table, [b([2, 1, 1])])
-
-    def stream_ended(cl: Client, count: int, e: ?errors.SnmpError) -> None:
-        got("stream", Got([], None, count, [], e))
-
     proc def __startup__():
+        def check() -> None:
+            for label in ["a", "b", "table", "stream", "late", "late table"]:
+                testing.assertEqual(len(results[label]), 1, label + ": exactly one callback")
+                e = failed_with(results[label][0], label)
+                testing.assertTrue(is_cancelled(e), label + ": " + str(e))
+                testing.assertEqual(e.error_message, "client closed", label)
+
+        def got(label: str, g: Got) -> None:
+            if label not in results:
+                results[label] = []
+            results[label].append(g)
+            if len(results) == 6:
+                after now QUIET: report(t, outcome(check))
+
+        def stream_ended(cl: Client, count: int, e: ?errors.SnmpError) -> None:
+            got("stream", Got([], None, count, [], e))
+
         t.timeout(30.0)
 
         agent = Agent(mn.server(AGENT, 161), small_view(), config(), None)
@@ -927,10 +921,17 @@ actor _test_walk_close(t: testing.AsyncT):
         mn.set_faults(NetFaults(delay=0.01, to_address=AGENT))
         c = client(mn, v2c(), 40001, OPTS.with_(use_bulk=False, max_in_flight=2))
 
+        def got_batch(cl: Client, vbs: list[VarBind]) -> None:
+            if not closed:
+                closed = True
+                c.close()
+                c.walk(Sink("late", got).walked, b([1]))
+                c.get_table(Sink("late table", got).got_table, [b([2, 1, 1])])
+
         c.walk(Sink("a", got).walked, b([1]))
         c.walk(Sink("b", got).walked, b([5]))
         c.get_table(Sink("table", got).got_table, [b([2, 1, 1]), b([2, 1, 3])])
-        c.walk_stream((lambda cl, vbs: got_batch(c, cl, vbs)), stream_ended, b([1]))
+        c.walk_stream(got_batch, stream_ended, b([1]))
 
 
 
@@ -1047,15 +1048,6 @@ actor _test_table_cancel_sends_once(t: testing.AsyncT):
         mn = MemNet(NetFaults(delay=0.3, to_address=MANAGER))
         got: list[Got] = []
 
-        def check(c: Client) -> None:
-            testing.assertEqual(len(got), 1, "one callback")
-            e = got[0].e
-            testing.assertTrue(e is not None and is_cancelled(e), describe(got[0]))
-            sent = requests_sent([d.data for d in mn.history() if d.src_port == 40001])
-            testing.assertEqual(len(sent), 1, "requests on the wire: %d" % len(sent))
-            s = c.stats()
-            testing.assertEqual((s.queued, s.in_flight), (0, 0), str(s))
-
         def got_table(cl: Client, tb: ?Table, e: ?errors.SnmpError) -> None:
             got.append(Got([], tb, 0, [], e))
 
@@ -1064,9 +1056,18 @@ actor _test_table_cancel_sends_once(t: testing.AsyncT):
         agent = Agent(mn.server(AGENT, 161), small_view(), config(), None)
         c = client(mn, v2c(), 40001, OPTS.with_(max_oids_per_request=1, max_in_flight=1))
 
+        def check() -> None:
+            testing.assertEqual(len(got), 1, "one callback")
+            e = got[0].e
+            testing.assertTrue(e is not None and is_cancelled(e), describe(got[0]))
+            sent = requests_sent([d.data for d in mn.history() if d.src_port == 40001])
+            testing.assertEqual(len(sent), 1, "requests on the wire: %d" % len(sent))
+            s = c.stats()
+            testing.assertEqual((s.queued, s.in_flight), (0, 0), str(s))
+
         h = c.get_table(got_table, [b([2, 1, 1]), b([2, 1, 2]), b([2, 1, 3])])
         c.cancel(h)
-        after now 0.6: report(t, outcome((lambda: check(c))))
+        after now 0.6: report(t, outcome(check))
 
 
 
@@ -1116,22 +1117,22 @@ actor _test_walk_adaptive_slow_agent(t: testing.AsyncT):
             r = bulk_reps(requests_sent([d.data for d in mn.history() if d.src_port == 40001]))
             testing.assertEqual(r, [25, 12, 25, 12, 25, 12, 25, 12, 25, 12, 25, 12], "max-repetitions sent: " + str(r))
 
-        def walked(c: Client, cl: Client, vbs: list[VarBind], e: ?errors.SnmpError) -> None:
-            if e is not None:
-                t.failure(AssertionError("walk %d: %s" % (len(rows) + 1, str(e))))
-                return
-            rows.append(len(vbs))
-            if len(rows) < 6:
-                c.walk((lambda cl, vbs, e: walked(c, cl, vbs, e)), b([8, 1, len(rows) + 1]))
-            else:
-                after now QUIET: report(t, outcome(check))
-
         t.timeout(60.0)
 
         agent = Agent(mn.server(AGENT, 161), slow_view(), config(), None)
         c = client(mn, v2c(), 40001, Options(timeout=0.2, retries=3, max_repetitions=25))
 
-        c.walk((lambda cl, vbs, e: walked(c, cl, vbs, e)), b([8, 1, 1]))
+        def walked(cl: Client, vbs: list[VarBind], e: ?errors.SnmpError) -> None:
+            if e is not None:
+                t.failure(AssertionError("walk %d: %s" % (len(rows) + 1, str(e))))
+                return
+            rows.append(len(vbs))
+            if len(rows) < 6:
+                c.walk(walked, b([8, 1, len(rows) + 1]))
+            else:
+                after now QUIET: report(t, outcome(check))
+
+        c.walk(walked, b([8, 1, 1]))
 
 
 # Tables that share an index, narrowed tables, truncation ############################################
@@ -1254,19 +1255,19 @@ actor _test_lab_walks_v2c(t: testing.EnvT):
     proc def __startup__():
         mn = MemNet()
 
-        def gathered(expected: str, r: dict[str, Got], calls: int) -> None:
+        t.timeout(120.0)
+        snmprec = read_text(t, SNMPREC)
+        expected = read_text(t, CANON_DATASET)
+
+        def gathered(r: dict[str, Got], calls: int) -> None:
             def check() -> None:
                 check_lab(r, calls, 3, expected, ["getnext", "bulk", "stream"])
                 testing.assertEqual(r["stream"].count, 6038)
             report_env(t, outcome(check))
 
-        t.timeout(120.0)
-        snmprec = read_text(t, SNMPREC)
-        expected = read_text(t, CANON_DATASET)
-
         agent = lab_agent(mn, snmprec)
 
-        g = Gather(3, (lambda r, calls: gathered(expected, r, calls)))
+        g = Gather(3, gathered)
         c = client(mn, v2c(), 40001)
         c.walk(Sink("getnext", g.got).walked, BASE, OPTS.with_(use_bulk=False))
         c.walk(Sink("bulk", g.got).walked, BASE)
@@ -1280,18 +1281,18 @@ actor _test_lab_walks_v1(t: testing.EnvT):
     proc def __startup__():
         mn = MemNet()
 
-        def gathered(expected: str, r: dict[str, Got], calls: int) -> None:
-            def check() -> None:
-                check_lab(r, calls, 1, expected, ["v1"])
-            report_env(t, outcome(check))
-
         t.timeout(120.0)
         snmprec = read_text(t, SNMPREC)
         expected = read_text(t, CANON_DATASET_V1)
 
+        def gathered(r: dict[str, Got], calls: int) -> None:
+            def check() -> None:
+                check_lab(r, calls, 1, expected, ["v1"])
+            report_env(t, outcome(check))
+
         agent = lab_agent(mn, snmprec)
 
-        g = Gather(1, (lambda r, calls: gathered(expected, r, calls)))
+        g = Gather(1, gathered)
         client(mn, v1(), 40001).walk(Sink("v1", g.got).walked, BASE)
 
 
@@ -1301,18 +1302,18 @@ actor _test_lab_walks_v3(t: testing.EnvT):
     proc def __startup__():
         mn = MemNet()
 
-        def gathered(expected: str, r: dict[str, Got], calls: int) -> None:
-            def check() -> None:
-                check_lab(r, calls, 2, expected, ["getnext", "bulk"])
-            report_env(t, outcome(check))
-
         t.timeout(120.0)
         snmprec = read_text(t, SNMPREC)
         expected = read_text(t, CANON_DATASET)
 
+        def gathered(r: dict[str, Got], calls: int) -> None:
+            def check() -> None:
+                check_lab(r, calls, 2, expected, ["getnext", "bulk"])
+            report_env(t, outcome(check))
+
         agent = lab_agent(mn, snmprec)
 
-        g = Gather(2, (lambda r, calls: gathered(expected, r, calls)))
+        g = Gather(2, gathered)
         c = client(mn, shaaes(), 40001)
         c.walk(Sink("getnext", g.got).walked, BASE, OPTS.with_(use_bulk=False))
         c.walk(Sink("bulk", g.got).walked, BASE)
@@ -1328,7 +1329,14 @@ actor _test_lab_tables(t: testing.EnvT):
         mn = MemNet()
         mn2 = MemNet()
 
-        def verify(bigtable: str, strtable: str, table: str, v1_table: str, r: dict[str, Got], calls: int) -> None:
+        t.timeout(120.0)
+        snmprec = read_text(t, SNMPREC)
+        table = read_text(t, CANON_TABLE)
+        strtable = read_text(t, CANON_STRTABLE)
+        bigtable = read_text(t, CANON_BIGTABLE)
+        v1_table = under(read_text(t, CANON_DATASET_V1), b([10]).dotted() + ".")
+
+        def verify(r: dict[str, Got], calls: int) -> None:
             testing.assertEqual(calls, 7, "callbacks (exactly once per table)")
             for label in ["table", "table getnext", "table cut mid-row", "table in groups"]:
                 tb = table_of(r[label], label)
@@ -1343,23 +1351,16 @@ actor _test_lab_tables(t: testing.EnvT):
             assert_same_lines(canon(table_varbinds(table_of(r["bigtable"], "bigtable"))), bigtable, "bigtable")
             assert_same_lines(canon(table_varbinds(table_of(r["v1 table"], "v1 table"))), v1_table, "v1 table")
 
-        def gathered(bigtable: str, strtable: str, table: str, v1_table: str, r: dict[str, Got], calls: int) -> None:
+        def gathered(r: dict[str, Got], calls: int) -> None:
             def check() -> None:
-                verify(bigtable, strtable, table, v1_table, r, calls)
+                verify(r, calls)
             report_env(t, outcome(check))
-
-        t.timeout(120.0)
-        snmprec = read_text(t, SNMPREC)
-        table = read_text(t, CANON_TABLE)
-        strtable = read_text(t, CANON_STRTABLE)
-        bigtable = read_text(t, CANON_BIGTABLE)
-        v1_table = under(read_text(t, CANON_DATASET_V1), b([10]).dotted() + ".")
 
         agent = lab_agent(mn, snmprec)
 
         cut = lab_agent(mn2, snmprec, Faults(truncate_bulk=10))
 
-        g = Gather(7, (lambda r, calls: gathered(bigtable, strtable, table, v1_table, r, calls)))
+        g = Gather(7, gathered)
         c = client(mn, v2c(), 40001)
         c.get_table(Sink("table", g.got).got_table, lab_columns(10, 7))
         c.get_table(Sink("table getnext", g.got).got_table, lab_columns(10, 7), OPTS.with_(use_bulk=False))
@@ -1382,32 +1383,32 @@ actor _test_lab_bulk_walk_time(t: testing.EnvT):
     var started = 0.0
     var times: list[float] = []
 
-    def ms() -> float:
-        return float(time.monotonic_ns()) / 1000000.0
-
-    def walked_m100(expected: str, cl: Client, vbs: list[VarBind], e: ?errors.SnmpError) -> None:
-        times.append(ms() - started)
-        def check() -> None:
-            assert_same_lines(canon(ok(Got(vbs, None, 0, [], e), "M=100")), expected, "M=100")
-        log.info("GETBULK walk of the lab dataset", {"varbinds": len(vbs), "ms_m25": times[0], "ms_m100": times[1]})
-        report_env(t, outcome(check))
-
-    def walked_m25(c: Client, expected: str, cl: Client, vbs: list[VarBind], e: ?errors.SnmpError) -> None:
-        times.append(ms() - started)
-        if e is not None or len(vbs) != 6038:
-            report_env(t, AssertionError("M=25: " + describe(Got(vbs, None, 0, [], e))))
-            return
-        started = ms()
-        c.walk((lambda cl, vbs, e: walked_m100(expected, cl, vbs, e)), BASE, OPTS.with_(max_repetitions=100))
-
     proc def __startup__():
+        def ms() -> float:
+            return float(time.monotonic_ns()) / 1000000.0
+
         t.timeout(120.0)
         snmprec = read_text(t, SNMPREC)
         expected = read_text(t, CANON_DATASET)
+
+        def walked_m100(cl: Client, vbs: list[VarBind], e: ?errors.SnmpError) -> None:
+            times.append(ms() - started)
+            def check() -> None:
+                assert_same_lines(canon(ok(Got(vbs, None, 0, [], e), "M=100")), expected, "M=100")
+            log.info("GETBULK walk of the lab dataset", {"varbinds": len(vbs), "ms_m25": times[0], "ms_m100": times[1]})
+            report_env(t, outcome(check))
 
         agent = Agent(mn.server(AGENT, 161), load_snmprec(snmprec), AgentConfig({"public": False}, max_bulk_varbinds=100),
                       None)
         c = client(mn, v2c(), 40001)
 
+        def walked_m25(cl: Client, vbs: list[VarBind], e: ?errors.SnmpError) -> None:
+            times.append(ms() - started)
+            if e is not None or len(vbs) != 6038:
+                report_env(t, AssertionError("M=25: " + describe(Got(vbs, None, 0, [], e))))
+                return
+            started = ms()
+            c.walk(walked_m100, BASE, OPTS.with_(max_repetitions=100))
+
         started = ms()
-        c.walk((lambda cl, vbs, e: walked_m25(c, expected, cl, vbs, e)), BASE)
+        c.walk(walked_m25, BASE)

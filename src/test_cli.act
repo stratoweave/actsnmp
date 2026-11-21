@@ -968,7 +968,12 @@ actor LabWalk(t: testing.EnvT, args: list[str], expected_file: str, sort_lines: 
         mn = MemNet()
         o = cliopts.parse(["actsnmp", "agent"])
 
-        def walked(expected: str, r: Result) -> None:
+        config = actsnmp.agent_config(o, read_text(t, cliopts.LAB_WRITE_RULES), read_text(t, cliopts.LAB_USERS))
+        view = mibview.load_snmprec(read_text(t, cliopts.LAB_SNMPREC))
+        expected_text = read_text(t, expected_file)
+        expected = sorted_lines(expected_text) if sort_lines else expected_text
+
+        def walked(r: Result) -> None:
             out = sorted_lines(r.out) if sort_lines else r.out
             if r.code == 0 and r.err == "" and out == expected:
                 t.success()
@@ -982,13 +987,9 @@ actor LabWalk(t: testing.EnvT, args: list[str], expected_file: str, sort_lines: 
                                          % (r.code, r.err, n + 1, got[n] if n < len(got) else "<end>",
                                             want[n] if n < len(want) else "<end>")))
 
-        config = actsnmp.agent_config(o, read_text(t, cliopts.LAB_WRITE_RULES), read_text(t, cliopts.LAB_USERS))
-        view = mibview.load_snmprec(read_text(t, cliopts.LAB_SNMPREC))
-        expected_text = read_text(t, expected_file)
-        expected = sorted_lines(expected_text) if sort_lines else expected_text
         ag = Agent(mn.server(AGENT, 161), view, config, None)
 
-        run_cli(mn, 45000, args, (lambda r: walked(expected, r)), tree)
+        run_cli(mn, 45000, args, walked, tree)
 
 
 

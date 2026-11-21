@@ -1464,22 +1464,6 @@ def matrix_users(text: str, blocks: list[list[str]]) -> str:
 actor _test_lab_matrix(t: testing.EnvT):
     """The 86 notifications of interop/expected/notify/matrix.txt, sent to the receiver, print exactly that file"""
 
-    def finished(blocks: list[list[str]], cfg: ReceiverConfig, informs: int, matrix: str, b: Bench) -> None:
-        def check() -> None:
-            testing.assertEqual(len(blocks), 86, "blocks in " + MATRIX)
-            testing.assertEqual(len(cfg.users), 15, "users in the matrix")
-            ns = b.notifications()
-            testing.assertEqual(len(ns), len(blocks))
-            for i in range(len(blocks)):
-                testing.assertEqual(fmt.canon_notification(ns[i]), "\n".join(blocks[i]), "block %d" % (i + 1),
-                                    print_diff=False)
-            testing.assertEqual("\n".join([fmt.canon_notification(n) for n in ns]) + "\n", matrix, MATRIX,
-                                print_vals=False, print_diff=False)
-            testing.assertEqual(len(b.replies()), informs)
-            check_stats(b.stats(), {"received": len(blocks), "delivered": len(blocks), "acked": informs,
-                                    "trap_keys_derived": 2 * 14})
-        report_env(t, outcome(check))
-
     proc def __startup__():
         t.timeout(180.0)
         matrix = read_text(t, MATRIX)
@@ -1491,9 +1475,25 @@ actor _test_lab_matrix(t: testing.EnvT):
         datagrams = [block_datagram(blocks[i], i, view, keys) for i in range(len(blocks))]
         informs = len([b for b in blocks if " INFORM " in b[0]])
 
+        def finished(b: Bench) -> None:
+            def check() -> None:
+                testing.assertEqual(len(blocks), 86, "blocks in " + MATRIX)
+                testing.assertEqual(len(cfg.users), 15, "users in the matrix")
+                ns = b.notifications()
+                testing.assertEqual(len(ns), len(blocks))
+                for i in range(len(blocks)):
+                    testing.assertEqual(fmt.canon_notification(ns[i]), "\n".join(blocks[i]), "block %d" % (i + 1),
+                                        print_diff=False)
+                testing.assertEqual("\n".join([fmt.canon_notification(n) for n in ns]) + "\n", matrix, MATRIX,
+                                    print_vals=False, print_diff=False)
+                testing.assertEqual(len(b.replies()), informs)
+                check_stats(b.stats(), {"received": len(blocks), "delivered": len(blocks), "acked": informs,
+                                        "trap_keys_derived": 2 * 14})
+            report_env(t, outcome(check))
+
         network = MemNet()
 
-        b = Bench(network, network.server(PEER, PEER_PORT), network.server(RCV, RCV_PORT), cfg, t.log_handler, (lambda b: finished(blocks, cfg, informs, matrix, b)))
+        b = Bench(network, network.server(PEER, PEER_PORT), network.server(RCV, RCV_PORT), cfg, t.log_handler, finished)
         for d in datagrams:
             b.send(d)
         b.finish()
@@ -1544,7 +1544,11 @@ actor _test_no_community_v3_only(t: testing.AsyncT):
         def peer_received(data: bytes, address: str, port: int) -> None:
             replies.append(data)
 
-        def settled(rcv: NotificationReceiver) -> None:
+        peer = net0.server(PEER, PEER_PORT)
+
+        rcv = NotificationReceiver(net0.server(RCV, RCV_PORT), cfg, received, t.log_handler)
+
+        def settled() -> None:
             st = rcv.stats()
             def check() -> None:
                 testing.assertEqual([n.version for n in got], [message.SNMP_V3])
@@ -1552,16 +1556,13 @@ actor _test_no_community_v3_only(t: testing.AsyncT):
                 testing.assertEqual((st["dropped_community"], st["delivered"], st["received"]), (3, 1, 4))
             report(t, outcome(check))
 
-        peer = net0.server(PEER, PEER_PORT)
-
-        rcv = NotificationReceiver(net0.server(RCV, RCV_PORT), cfg, received, t.log_handler)
         peer.set_receiver(peer_received)
         net0.send(v2c_message(b"public", v2_pdu(pdu.TRAP_V2, 1, 1)), PEER, PEER_PORT, RCV, RCV_PORT)
         net0.send(v1_message(b"public", v1_example()), PEER, PEER_PORT, RCV, RCV_PORT)
         net0.send(v2c_message(b"public", v2_pdu(pdu.INFORM, 2, 2)), PEER, PEER_PORT, RCV, RCV_PORT)
         net0.send(v3_trap(u, keys_for(u, a), a, 1, 10, v2_pdu(pdu.TRAP_V2, 3, 3)), PEER, PEER_PORT, RCV, RCV_PORT)
 
-        after now NOTHING_WAIT: settled(rcv)
+        after now NOTHING_WAIT: settled()
 
 
 
@@ -1605,14 +1606,6 @@ actor _test_reset_engine(t: testing.AsyncT):
             mn.send(v3_trap(device, kd, a, boots, etime, v2_pdu(pdu.TRAP_V2, rid, 1), u64(rid)), PEER, PEER_PORT,
                     RCV, RCV_PORT)
 
-        def settled(n: int, rcv: NotificationReceiver, st: dict[str, int]) -> None:
-            st2 = rcv.stats()
-            def check() -> None:
-                testing.assertEqual(st["dropped_time_window"], 1)
-                testing.assertEqual(n, 1, "one time record dropped")
-                testing.assertEqual(got, [1, 3, 4])
-            report(t, outcome(check))
-
         rcv = NotificationReceiver(mn.server(RCV, RCV_PORT), config([device]), received, t.log_handler)
 
         send(1, 100000, 1)
@@ -1621,10 +1614,19 @@ actor _test_reset_engine(t: testing.AsyncT):
         while st["received"] < 2:     # the MemNet delivers asynchronously
             st = rcv.stats()
         n = rcv.reset_engine(a)
+
+        def settled() -> None:
+            st2 = rcv.stats()
+            def check() -> None:
+                testing.assertEqual(st["dropped_time_window"], 1)
+                testing.assertEqual(n, 1, "one time record dropped")
+                testing.assertEqual(got, [1, 3, 4])
+            report(t, outcome(check))
+
         send(1, 4, 3)                 # accepted: the clock is learned again
         send(1, 5, 4)
 
-        after now NOTHING_WAIT: settled(n, rcv, st)
+        after now NOTHING_WAIT: settled()
 
 
 

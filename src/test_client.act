@@ -238,7 +238,16 @@ actor _test_get_v2c(t: testing.AsyncT):
         oids = _oids(3)
         seen: list[CommunityMessage] = []
 
-        def check(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        p = mem_pair(mn)
+
+        def received(data: bytes, address: str, port: int) -> None:
+            req = _cm(data)
+            seen.append(req)
+            p.server.send_to(_reply(req, _answer(_pdu(req).varbinds)), address, port)
+
+        c = Client(None, AGENT, Community("public"), t.log_handler, opts=SLOW, transport=p.client)
+
+        def check(r: ?Response, e: ?errors.SnmpError) -> None:
             resp = _ok(r, e)
             testing.assertEqual(resp.varbinds, _answer([VarBind(o) for o in oids]))
             testing.assertEqual((resp.pdu_type, resp.error_status, resp.error_index, resp.attempts), (pdu.RESPONSE, 0, 0, 1))
@@ -255,19 +264,11 @@ actor _test_get_v2c(t: testing.AsyncT):
             testing.assertEqual((s.requests, s.responses, s.retries, s.timeouts), (1, 1, 0, 0))
             testing.assertTrue(c.engine_info() is None, "no engine for v2c")
 
-        def received(p: (client: Transport, server: ServerTransport), data: bytes, address: str, port: int) -> None:
-            req = _cm(data)
-            seen.append(req)
-            p.server.send_to(_reply(req, _answer(_pdu(req).varbinds)), address, port)
+        def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            _finish(t, lambda: check(r, e))
 
-        def got(c: Client, cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-            _finish(t, lambda: check(c, r, e))
-
-        p = mem_pair(mn)
-        c = Client(None, AGENT, Community("public"), t.log_handler, opts=SLOW, transport=p.client)
-
-        p.server.set_receiver((lambda data, address, port: received(p, data, address, port)))
-        c.get((lambda cl, r, e: got(c, cl, r, e)), oids)
+        p.server.set_receiver(received)
+        c.get(got, oids)
 
 
 
@@ -277,16 +278,6 @@ actor _test_get_next_and_bulk_v2c(t: testing.AsyncT):
         mn = MemNet()
         seen: list[Pdu] = []
         responses: list[Response] = []
-
-        def received(p: (client: Transport, server: ServerTransport), data: bytes, address: str, port: int) -> None:
-            req = _cm(data)
-            q = _pdu(req)
-            seen.append(q)
-            if q.pdu_type == pdu.GETBULK:
-                vbs = [VarBind(Oid([1, 3, 6, 1, 4, 1, 99, 1, i]), Integer(i)) for i in range(q.max_repetitions())]
-                p.server.send_to(_reply(req, vbs), address, port)
-            else:
-                p.server.send_to(_reply(req, _answer_next(q.varbinds)), address, port)
 
         def check() -> None:
             testing.assertEqual([q.pdu_type for q in seen], [pdu.GETNEXT, pdu.GETBULK, pdu.GETBULK])
@@ -302,9 +293,20 @@ actor _test_get_next_and_bulk_v2c(t: testing.AsyncT):
                 _finish(t, check)
 
         p = mem_pair(mn)
+
+        def received(data: bytes, address: str, port: int) -> None:
+            req = _cm(data)
+            q = _pdu(req)
+            seen.append(q)
+            if q.pdu_type == pdu.GETBULK:
+                vbs = [VarBind(Oid([1, 3, 6, 1, 4, 1, 99, 1, i]), Integer(i)) for i in range(q.max_repetitions())]
+                p.server.send_to(_reply(req, vbs), address, port)
+            else:
+                p.server.send_to(_reply(req, _answer_next(q.varbinds)), address, port)
+
         c = Client(None, AGENT, Community("public"), t.log_handler, opts=SLOW.with_(max_repetitions=4), transport=p.client)
 
-        p.server.set_receiver((lambda data, address, port: received(p, data, address, port)))
+        p.server.set_receiver(received)
         c.get_next(got, _oids(2))
         c.get_bulk(got, _oids(1))
         c.get_bulk(got, _oids(2), 1, 9)
@@ -318,11 +320,6 @@ actor _test_set_v2c(t: testing.AsyncT):
         vbs = [VarBind(Oid.parse("1.3.6.1.2.1.1.5.0"), OctetString(b"name")), VarBind(Oid.parse("1.3.6.1.2.1.1.6.0"), Integer(3))]
         seen: list[Pdu] = []
 
-        def received(p: (client: Transport, server: ServerTransport), data: bytes, address: str, port: int) -> None:
-            req = _cm(data)
-            seen.append(_pdu(req))
-            p.server.send_to(_reply(req, _pdu(req).varbinds), address, port)
-
         def check(r: ?Response, e: ?errors.SnmpError) -> None:
             resp = _ok(r, e)
             testing.assertEqual(resp.varbinds, vbs)
@@ -332,9 +329,15 @@ actor _test_set_v2c(t: testing.AsyncT):
             _finish(t, lambda: check(r, e))
 
         p = mem_pair(mn)
+
+        def received(data: bytes, address: str, port: int) -> None:
+            req = _cm(data)
+            seen.append(_pdu(req))
+            p.server.send_to(_reply(req, _pdu(req).varbinds), address, port)
+
         c = Client(None, AGENT, Community("private"), t.log_handler, opts=SLOW, transport=p.client)
 
-        p.server.set_receiver((lambda data, address, port: received(p, data, address, port)))
+        p.server.set_receiver(received)
         c.set(written, vbs)
 
 
@@ -344,10 +347,6 @@ actor _test_error_status_keeps_response(t: testing.AsyncT):
     proc def __startup__():
         mn = MemNet()
         oids = _oids(3)
-
-        def received(p: (client: Transport, server: ServerTransport), data: bytes, address: str, port: int) -> None:
-            req = _cm(data)
-            p.server.send_to(_reply(req, _pdu(req).varbinds, pdu.GEN_ERR, 2), address, port)
 
         def check(r: ?Response, e: ?errors.SnmpError) -> None:
             testing.assertTrue(r is None, "the Response travels in the error")
@@ -370,9 +369,14 @@ actor _test_error_status_keeps_response(t: testing.AsyncT):
             _finish(t, lambda: check(r, e))
 
         p = mem_pair(mn)
+
+        def received(data: bytes, address: str, port: int) -> None:
+            req = _cm(data)
+            p.server.send_to(_reply(req, _pdu(req).varbinds, pdu.GEN_ERR, 2), address, port)
+
         c = Client(None, AGENT, Community("public"), t.log_handler, opts=SLOW, transport=p.client)
 
-        p.server.set_receiver((lambda data, address, port: received(p, data, address, port)))
+        p.server.set_receiver(received)
         c.get(got, oids)
 
 
@@ -387,44 +391,44 @@ actor _test_retries_backoff_fresh_ids(t: testing.AsyncT):
     var at: list[float] = []
     var start = _now()
 
-    def received(data: bytes, address: str, port: int) -> None:
-        ids.append(_pdu(_cm(data)).request_id)
-        at.append(_now())
-
-    def check(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-        end = _now()
-        err = _failed(r, e)
-        testing.assertEqual(len(ids), 4)
-        testing.assertEqual(len(set(ids)), 4, "a fresh request-id per attempt")
-        gaps = [at[i + 1] - at[i] for i in range(3)]
-        want = [0.1, 0.2, 0.3]
-        for i in range(3):
-            testing.assertTrue(gaps[i] >= want[i] - 0.01 and gaps[i] < want[i] + 0.25, "gap %d: %f" % (i, gaps[i]))
-        last = end - at[3]
-        testing.assertTrue(last >= 0.29 and last < 0.55, "final wait %f" % last)
-        if isinstance(err, errors.TimeoutError):
-            testing.assertEqual(err.attempts, 4)
-            testing.assertTrue(err.elapsed >= 0.89 and err.elapsed < 1.6, "elapsed %f" % err.elapsed)
-            testing.assertTrue(err.transient)
-            testing.assertTrue(err.hint is None, "nothing arrived, nothing to hint")
-        else:
-            testing.error("not a TimeoutError: " + str(err))
-        s = c.stats()
-        testing.assertEqual((s.retries, s.timeouts, s.responses), (3, 1, 0))
-
-    def got(c: Client, cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-        _finish(t, lambda: check(c, r, e))
-
     proc def __startup__():
+        def received(data: bytes, address: str, port: int) -> None:
+            ids.append(_pdu(_cm(data)).request_id)
+            at.append(_now())
+
         t.timeout(10.0)
 
         p = mem_pair(mn)
 
         c = Client(None, AGENT, Community("public"), t.log_handler, opts=o, transport=p.client)
 
+        def check(r: ?Response, e: ?errors.SnmpError) -> None:
+            end = _now()
+            err = _failed(r, e)
+            testing.assertEqual(len(ids), 4)
+            testing.assertEqual(len(set(ids)), 4, "a fresh request-id per attempt")
+            gaps = [at[i + 1] - at[i] for i in range(3)]
+            want = [0.1, 0.2, 0.3]
+            for i in range(3):
+                testing.assertTrue(gaps[i] >= want[i] - 0.01 and gaps[i] < want[i] + 0.25, "gap %d: %f" % (i, gaps[i]))
+            last = end - at[3]
+            testing.assertTrue(last >= 0.29 and last < 0.55, "final wait %f" % last)
+            if isinstance(err, errors.TimeoutError):
+                testing.assertEqual(err.attempts, 4)
+                testing.assertTrue(err.elapsed >= 0.89 and err.elapsed < 1.6, "elapsed %f" % err.elapsed)
+                testing.assertTrue(err.transient)
+                testing.assertTrue(err.hint is None, "nothing arrived, nothing to hint")
+            else:
+                testing.error("not a TimeoutError: " + str(err))
+            s = c.stats()
+            testing.assertEqual((s.retries, s.timeouts, s.responses), (3, 1, 0))
+
+        def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            _finish(t, lambda: check(r, e))
+
         p.server.set_receiver(received)
         start = _now()
-        c.get((lambda cl, r, e: got(c, cl, r, e)), _oids(1))
+        c.get(got, _oids(1))
 
 
 
@@ -434,26 +438,27 @@ actor _test_retry_then_answer(t: testing.AsyncT):
         mn = MemNet()
         ids: list[int] = []
 
-        def received(p: (client: Transport, server: ServerTransport), data: bytes, address: str, port: int) -> None:
+        p = mem_pair(mn)
+
+        def received(data: bytes, address: str, port: int) -> None:
             req = _cm(data)
             ids.append(_pdu(req).request_id)
             if len(ids) == 3:
                 p.server.send_to(_reply(req, _answer(_pdu(req).varbinds)), address, port)
 
-        def check(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        c = Client(None, AGENT, Community("public"), t.log_handler, opts=Options(timeout=0.05, retries=5), transport=p.client)
+
+        def check(r: ?Response, e: ?errors.SnmpError) -> None:
             resp = _ok(r, e)
             testing.assertEqual(resp.attempts, 3)
             testing.assertEqual(resp.request_id, ids[2])
             testing.assertEqual(c.stats().retries, 2)
 
-        def got(c: Client, cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-            _finish(t, lambda: check(c, r, e))
+        def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            _finish(t, lambda: check(r, e))
 
-        p = mem_pair(mn)
-        c = Client(None, AGENT, Community("public"), t.log_handler, opts=Options(timeout=0.05, retries=5), transport=p.client)
-
-        p.server.set_receiver((lambda data, address, port: received(p, data, address, port)))
-        c.get((lambda cl, r, e: got(c, cl, r, e)), _oids(1))
+        p.server.set_receiver(received)
+        c.get(got, _oids(1))
 
 
 
@@ -464,44 +469,45 @@ actor _test_late_reply_to_earlier_attempt(t: testing.AsyncT):
     var ids: list[int] = []
     var done_count = 0
 
-    def received(p: (client: Transport, server: ServerTransport), data: bytes, address: str, port: int) -> None:
-        req = _cm(data)
-        ids.append(_pdu(req).request_id)
-        f = first
-        if f is not None:
-            if len(ids) == 2:
-                p.server.send_to(_reply(f, _answer(_pdu(f).varbinds)), address, port)
-            p.server.send_to(_reply(req, _answer(_pdu(req).varbinds)), address, port)
-        else:
-            first = req
-
-    def check(r: ?Response, e: ?errors.SnmpError) -> None:
-        resp = _ok(r, e)
-        testing.assertEqual(resp.request_id, ids[0], "the answer to attempt 1 was accepted")
-        testing.assertEqual(resp.attempts, 2)
-
-    def got_barrier(c: Client, cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-        def check2() -> None:
-            _ok(r, e)
-            testing.assertEqual(done_count, 1)
-            testing.assertEqual(c.stats().drops_unknown_id, 1, "the second answer is dropped")
-        _finish(t, check2)
-
-    def got(c: Client, cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-        done_count += 1
-        try:
-            check(r, e)
-        except Exception as ex:
-            t.failure(ex)
-            return
-        c.get((lambda cl, r, e: got_barrier(c, cl, r, e)), _oids(1))
-
     proc def __startup__():
+        def check(r: ?Response, e: ?errors.SnmpError) -> None:
+            resp = _ok(r, e)
+            testing.assertEqual(resp.request_id, ids[0], "the answer to attempt 1 was accepted")
+            testing.assertEqual(resp.attempts, 2)
+
         p = mem_pair(mn)
+
+        def received(data: bytes, address: str, port: int) -> None:
+            req = _cm(data)
+            ids.append(_pdu(req).request_id)
+            f = first
+            if f is not None:
+                if len(ids) == 2:
+                    p.server.send_to(_reply(f, _answer(_pdu(f).varbinds)), address, port)
+                p.server.send_to(_reply(req, _answer(_pdu(req).varbinds)), address, port)
+            else:
+                first = req
+
         c = Client(None, AGENT, Community("public"), t.log_handler, opts=Options(timeout=0.05, retries=3), transport=p.client)
 
-        p.server.set_receiver((lambda data, address, port: received(p, data, address, port)))
-        c.get((lambda cl, r, e: got(c, cl, r, e)), _oids(1))
+        def got_barrier(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            def check2() -> None:
+                _ok(r, e)
+                testing.assertEqual(done_count, 1)
+                testing.assertEqual(c.stats().drops_unknown_id, 1, "the second answer is dropped")
+            _finish(t, check2)
+
+        def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            done_count += 1
+            try:
+                check(r, e)
+            except Exception as ex:
+                t.failure(ex)
+                return
+            c.get(got_barrier, _oids(1))
+
+        p.server.set_receiver(received)
+        c.get(got, _oids(1))
 
 
 
@@ -510,29 +516,30 @@ actor _test_duplicate_response_ignored(t: testing.AsyncT):
     mn = MemNet(NetFaults(duplicate=True, to_address=MANAGER))
     var calls = 0
 
-    def received(p: (client: Transport, server: ServerTransport), data: bytes, address: str, port: int) -> None:
-        req = _cm(data)
-        p.server.send_to(_reply(req, _answer(_pdu(req).varbinds)), address, port)
-
-    def verify(c: Client) -> None:
-        testing.assertEqual(calls, 2, "one callback per request")
-        s = c.stats()
-        testing.assertEqual((s.responses, s.drops_unknown_id), (2, 2))
-
-    def got(c: Client, cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-        calls += 1
-        _ok(r, e)
-        if calls == 1:
-            c.get((lambda cl, r, e: got(c, cl, r, e)), _oids(1))
-        else:
-            after now QUIET: _finish(t, (lambda: verify(c)))
-
     proc def __startup__():
         p = mem_pair(mn)
+
+        def received(data: bytes, address: str, port: int) -> None:
+            req = _cm(data)
+            p.server.send_to(_reply(req, _answer(_pdu(req).varbinds)), address, port)
+
         c = Client(None, AGENT, Community("public"), t.log_handler, opts=SLOW, transport=p.client)
 
-        p.server.set_receiver((lambda data, address, port: received(p, data, address, port)))
-        c.get((lambda cl, r, e: got(c, cl, r, e)), _oids(2))
+        def verify() -> None:
+            testing.assertEqual(calls, 2, "one callback per request")
+            s = c.stats()
+            testing.assertEqual((s.responses, s.drops_unknown_id), (2, 2))
+
+        def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            calls += 1
+            _ok(r, e)
+            if calls == 1:
+                c.get(got, _oids(1))
+            else:
+                after now QUIET: _finish(t, verify)
+
+        p.server.set_receiver(received)
+        c.get(got, _oids(2))
 
 
 
@@ -541,24 +548,25 @@ actor _test_wrong_id_dropped(t: testing.AsyncT):
     proc def __startup__():
         mn = MemNet()
 
-        def received(p: (client: Transport, server: ServerTransport), data: bytes, address: str, port: int) -> None:
+        p = mem_pair(mn)
+
+        def received(data: bytes, address: str, port: int) -> None:
             req = _cm(data)
             rid = _pdu(req).request_id
             p.server.send_to(_reply(req, _answer(_pdu(req).varbinds), request_id=rid ^ 0x5a5a), address, port)
             p.server.send_to(_reply(req, _answer(_pdu(req).varbinds)), address, port)
 
-        def check(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        c = Client(None, AGENT, Community("public"), t.log_handler, opts=SLOW, transport=p.client)
+
+        def check(r: ?Response, e: ?errors.SnmpError) -> None:
             _ok(r, e)
             testing.assertEqual(c.stats().drops_unknown_id, 1)
 
-        def got(c: Client, cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-            _finish(t, lambda: check(c, r, e))
+        def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            _finish(t, lambda: check(r, e))
 
-        p = mem_pair(mn)
-        c = Client(None, AGENT, Community("public"), t.log_handler, opts=SLOW, transport=p.client)
-
-        p.server.set_receiver((lambda data, address, port: received(p, data, address, port)))
-        c.get((lambda cl, r, e: got(c, cl, r, e)), _oids(1))
+        p.server.set_receiver(received)
+        c.get(got, _oids(1))
 
 
 
@@ -567,25 +575,26 @@ actor _test_spoofed_source_dropped(t: testing.AsyncT):
     proc def __startup__():
         mn = MemNet(NetFaults(spoof_source=True, to_address=MANAGER))
 
-        def received(p: (client: Transport, server: ServerTransport), data: bytes, address: str, port: int) -> None:
+        p = mem_pair(mn)
+
+        def received(data: bytes, address: str, port: int) -> None:
             req = _cm(data)
             answer = _reply(req, _answer(_pdu(req).varbinds))
             mn.send(answer, "10.9.9.9", 161, address, port)       # same id, another address
             p.server.send_to(answer, address, port)                # forged copy from port 162 first, then genuine
 
-        def check(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        c = Client(None, AGENT, Community("public"), t.log_handler, opts=SLOW, transport=p.client)
+
+        def check(r: ?Response, e: ?errors.SnmpError) -> None:
             _ok(r, e)
             # the injected datagram from 10.9.9.9 gets a forged copy (port 162) too
             testing.assertEqual(c.stats().drops_source, 3)
 
-        def got(c: Client, cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-            _finish(t, lambda: check(c, r, e))
+        def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            _finish(t, lambda: check(r, e))
 
-        p = mem_pair(mn)
-        c = Client(None, AGENT, Community("public"), t.log_handler, opts=SLOW, transport=p.client)
-
-        p.server.set_receiver((lambda data, address, port: received(p, data, address, port)))
-        c.get((lambda cl, r, e: got(c, cl, r, e)), _oids(1))
+        p.server.set_receiver(received)
+        c.get(got, _oids(1))
 
 
 
@@ -594,7 +603,9 @@ actor _test_corrupt_datagrams_dropped(t: testing.AsyncT):
     proc def __startup__():
         mn = MemNet()
 
-        def received(p: (client: Transport, server: ServerTransport), data: bytes, address: str, port: int) -> None:
+        p = mem_pair(mn)
+
+        def received(data: bytes, address: str, port: int) -> None:
             req = _cm(data)
             answer = _reply(req, _answer(_pdu(req).varbinds))
             p.server.send_to(b"\x30\x03\x02\x01", address, port)
@@ -603,18 +614,17 @@ actor _test_corrupt_datagrams_dropped(t: testing.AsyncT):
             p.server.send_to(b"", address, port)
             p.server.send_to(answer, address, port)
 
-        def check(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        c = Client(None, AGENT, Community("public"), t.log_handler, opts=SLOW, transport=p.client)
+
+        def check(r: ?Response, e: ?errors.SnmpError) -> None:
             _ok(r, e)
             testing.assertEqual(c.stats().drops_decode, 4)
 
-        def got(c: Client, cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-            _finish(t, lambda: check(c, r, e))
+        def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            _finish(t, lambda: check(r, e))
 
-        p = mem_pair(mn)
-        c = Client(None, AGENT, Community("public"), t.log_handler, opts=SLOW, transport=p.client)
-
-        p.server.set_receiver((lambda data, address, port: received(p, data, address, port)))
-        c.get((lambda cl, r, e: got(c, cl, r, e)), _oids(1))
+        p.server.set_receiver(received)
+        c.get(got, _oids(1))
 
 
 
@@ -623,7 +633,9 @@ actor _test_wrong_version_and_pdu_type_dropped(t: testing.AsyncT):
     proc def __startup__():
         mn = MemNet()
 
-        def received(p: (client: Transport, server: ServerTransport), data: bytes, address: str, port: int) -> None:
+        p = mem_pair(mn)
+
+        def received(data: bytes, address: str, port: int) -> None:
             req = _cm(data)
             vbs = _answer(_pdu(req).varbinds)
             p.server.send_to(_reply(req, vbs, version=message.SNMP_V1), address, port)
@@ -633,19 +645,18 @@ actor _test_wrong_version_and_pdu_type_dropped(t: testing.AsyncT):
             p.server.send_to(message.encode_community(CommunityMessage(message.SNMP_V1, b"public", None, trap)), address, port)
             p.server.send_to(_reply(req, vbs), address, port)
 
-        def check(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        c = Client(None, AGENT, Community("public"), t.log_handler, opts=SLOW, transport=p.client)
+
+        def check(r: ?Response, e: ?errors.SnmpError) -> None:
             _ok(r, e)
             s = c.stats()
             testing.assertEqual((s.drops_version, s.drops_pdu), (2, 2))
 
-        def got(c: Client, cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-            _finish(t, lambda: check(c, r, e))
+        def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            _finish(t, lambda: check(r, e))
 
-        p = mem_pair(mn)
-        c = Client(None, AGENT, Community("public"), t.log_handler, opts=SLOW, transport=p.client)
-
-        p.server.set_receiver((lambda data, address, port: received(p, data, address, port)))
-        c.get((lambda cl, r, e: got(c, cl, r, e)), _oids(1))
+        p.server.set_receiver(received)
+        c.get(got, _oids(1))
 
 
 
@@ -654,35 +665,36 @@ actor _test_community_check_option(t: testing.AsyncT):
     mn = MemNet()
     var phase = 0
 
-    def received(p: (client: Transport, server: ServerTransport), data: bytes, address: str, port: int) -> None:
-        req = _cm(data)
-        vbs = _answer(_pdu(req).varbinds)
-        p.server.send_to(_reply(req, vbs, community=b"other"), address, port)
-        if phase == 1:
-            p.server.send_to(_reply(req, vbs), address, port)
-
-    def got_checked(c: Client, cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-        def verify() -> None:
-            _ok(r, e)
-            testing.assertEqual(c.stats().drops_auth, 1, "the other community was dropped")
-        _finish(t, verify)
-
-    def got_unchecked(c: Client, cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-        try:
-            _ok(r, e)
-            testing.assertEqual(c.stats().drops_auth, 0)
-        except Exception as ex:
-            t.failure(ex)
-            return
-        phase = 1
-        c.get((lambda cl, r, e: got_checked(c, cl, r, e)), _oids(1), SLOW.with_(check_community=True))
-
     proc def __startup__():
         p = mem_pair(mn)
+
+        def received(data: bytes, address: str, port: int) -> None:
+            req = _cm(data)
+            vbs = _answer(_pdu(req).varbinds)
+            p.server.send_to(_reply(req, vbs, community=b"other"), address, port)
+            if phase == 1:
+                p.server.send_to(_reply(req, vbs), address, port)
+
         c = Client(None, AGENT, Community("public"), t.log_handler, opts=SLOW, transport=p.client)
 
-        p.server.set_receiver((lambda data, address, port: received(p, data, address, port)))
-        c.get((lambda cl, r, e: got_unchecked(c, cl, r, e)), _oids(1))
+        def got_checked(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            def verify() -> None:
+                _ok(r, e)
+                testing.assertEqual(c.stats().drops_auth, 1, "the other community was dropped")
+            _finish(t, verify)
+
+        def got_unchecked(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            try:
+                _ok(r, e)
+                testing.assertEqual(c.stats().drops_auth, 0)
+            except Exception as ex:
+                t.failure(ex)
+                return
+            phase = 1
+            c.get(got_checked, _oids(1), SLOW.with_(check_community=True))
+
+        p.server.set_receiver(received)
+        c.get(got_unchecked, _oids(1))
 
 
 
@@ -690,11 +702,6 @@ actor _test_timeout_hint_drops(t: testing.AsyncT):
     """Every answer fails the community check: the TimeoutError says so"""
     proc def __startup__():
         mn = MemNet()
-
-        def received(p: (client: Transport, server: ServerTransport), data: bytes, address: str, port: int) -> None:
-            req = _cm(data)
-            p.server.send_to(_reply(req, _answer(_pdu(req).varbinds), community=b"wrong"), address, port)
-            p.server.send_to(b"junk", address, port)
 
         def check(r: ?Response, e: ?errors.SnmpError) -> None:
             err = _failed(r, e)
@@ -708,10 +715,16 @@ actor _test_timeout_hint_drops(t: testing.AsyncT):
             _finish(t, lambda: check(r, e))
 
         p = mem_pair(mn)
+
+        def received(data: bytes, address: str, port: int) -> None:
+            req = _cm(data)
+            p.server.send_to(_reply(req, _answer(_pdu(req).varbinds), community=b"wrong"), address, port)
+            p.server.send_to(b"junk", address, port)
+
         c = Client(None, AGENT, Community("public"), t.log_handler, opts=Options(timeout=0.05, retries=1, check_community=True),
                    transport=p.client)
 
-        p.server.set_receiver((lambda data, address, port: received(p, data, address, port)))
+        p.server.set_receiver(received)
         c.get(got, _oids(1))
 
 
@@ -721,7 +734,10 @@ actor _test_icmp_unreachable_hint(t: testing.AsyncT):
     proc def __startup__():
         mn = MemNet()
 
-        def check(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        tr = mn.client(MANAGER, 40000, AGENT, 161)
+        c = Client(None, AGENT, Community("public"), t.log_handler, opts=Options(timeout=0.05, retries=1), transport=tr)
+
+        def check(r: ?Response, e: ?errors.SnmpError) -> None:
             err = _failed(r, e)
             if isinstance(err, errors.TimeoutError):
                 testing.assertEqual(err.hint, "ICMP port unreachable")
@@ -730,13 +746,10 @@ actor _test_icmp_unreachable_hint(t: testing.AsyncT):
                 testing.error("not a TimeoutError: " + str(err))
             testing.assertEqual(c.stats().unreachable, 2)
 
-        def got(c: Client, cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-            _finish(t, lambda: check(c, r, e))
+        def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            _finish(t, lambda: check(r, e))
 
-        tr = mn.client(MANAGER, 40000, AGENT, 161)
-        c = Client(None, AGENT, Community("public"), t.log_handler, opts=Options(timeout=0.05, retries=1), transport=tr)
-
-        c.get((lambda cl, r, e: got(c, cl, r, e)), _oids(1))
+        c.get(got, _oids(1))
 
 
 
@@ -775,50 +788,51 @@ actor _test_shape_checks(t: testing.AsyncT):
     var step = 0
     var results: list[str] = []
 
-    def received(p: (client: Transport, server: ServerTransport), data: bytes, address: str, port: int) -> None:
-        req = _cm(data)
-        vbs = _pdu(req).varbinds
-        if step == 0 or step == 1:      # GET answered with another OID (strict, then lenient)
-            p.server.send_to(_reply(req, [VarBind(Oid.parse("1.3.6.1.9.9"), Integer(1))] + _answer(vbs[1:])), address, port)
-        elif step == 2:                 # GET answered with one varbind too few
-            p.server.send_to(_reply(req, _answer(vbs[1:])), address, port)
-        elif step == 3:                 # GETNEXT answered with one varbind too many
-            p.server.send_to(_reply(req, _answer_next(vbs) + _answer_next(vbs[:1])), address, port)
-        elif step == 4:                 # GETBULK N=1, M=2, R=1: at most 3 varbinds
-            p.server.send_to(_reply(req, _answer_next(vbs + vbs)), address, port)
-        else:                           # GETNEXT with other OIDs is fine
-            p.server.send_to(_reply(req, _answer_next(vbs)), address, port)
-
-    def outcome(r: ?Response, e: ?errors.SnmpError) -> str:
-        if e is not None:
-            return "invalid" if isinstance(e, errors.InvalidResponseError) else "error: " + str(e)
-        return "ok"
-
-    def check() -> None:
-        testing.assertEqual(results, ["invalid", "ok", "invalid", "invalid", "invalid", "ok"])
-
-    def got(c: Client, cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-        results.append(outcome(r, e))
-        step += 1
-        if step == 1:
-            c.get((lambda cl, r, e: got(c, cl, r, e)), _oids(2), SLOW.with_(strict_response_oids=False))
-        elif step == 2:
-            c.get((lambda cl, r, e: got(c, cl, r, e)), _oids(2))
-        elif step == 3:
-            c.get_next((lambda cl, r, e: got(c, cl, r, e)), _oids(2))
-        elif step == 4:
-            c.get_bulk((lambda cl, r, e: got(c, cl, r, e)), _oids(2), 1, 2)
-        elif step == 5:
-            c.get_next((lambda cl, r, e: got(c, cl, r, e)), _oids(2))
-        else:
-            _finish(t, check)
-
     proc def __startup__():
+        def outcome(r: ?Response, e: ?errors.SnmpError) -> str:
+            if e is not None:
+                return "invalid" if isinstance(e, errors.InvalidResponseError) else "error: " + str(e)
+            return "ok"
+
+        def check() -> None:
+            testing.assertEqual(results, ["invalid", "ok", "invalid", "invalid", "invalid", "ok"])
+
         p = mem_pair(mn)
+
+        def received(data: bytes, address: str, port: int) -> None:
+            req = _cm(data)
+            vbs = _pdu(req).varbinds
+            if step == 0 or step == 1:      # GET answered with another OID (strict, then lenient)
+                p.server.send_to(_reply(req, [VarBind(Oid.parse("1.3.6.1.9.9"), Integer(1))] + _answer(vbs[1:])), address, port)
+            elif step == 2:                 # GET answered with one varbind too few
+                p.server.send_to(_reply(req, _answer(vbs[1:])), address, port)
+            elif step == 3:                 # GETNEXT answered with one varbind too many
+                p.server.send_to(_reply(req, _answer_next(vbs) + _answer_next(vbs[:1])), address, port)
+            elif step == 4:                 # GETBULK N=1, M=2, R=1: at most 3 varbinds
+                p.server.send_to(_reply(req, _answer_next(vbs + vbs)), address, port)
+            else:                           # GETNEXT with other OIDs is fine
+                p.server.send_to(_reply(req, _answer_next(vbs)), address, port)
+
         c = Client(None, AGENT, Community("public"), t.log_handler, opts=SLOW, transport=p.client)
 
-        p.server.set_receiver((lambda data, address, port: received(p, data, address, port)))
-        c.get((lambda cl, r, e: got(c, cl, r, e)), _oids(2))
+        def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            results.append(outcome(r, e))
+            step += 1
+            if step == 1:
+                c.get(got, _oids(2), SLOW.with_(strict_response_oids=False))
+            elif step == 2:
+                c.get(got, _oids(2))
+            elif step == 3:
+                c.get_next(got, _oids(2))
+            elif step == 4:
+                c.get_bulk(got, _oids(2), 1, 2)
+            elif step == 5:
+                c.get_next(got, _oids(2))
+            else:
+                _finish(t, check)
+
+        p.server.set_receiver(received)
+        c.get(got, _oids(2))
 
 
 # tooBig and splitting ###############################################################################
@@ -831,15 +845,6 @@ actor _test_too_big_split(t: testing.AsyncT):
         oids = _oids(5)
         sizes: list[int] = []
 
-        def received(p: (client: Transport, server: ServerTransport), data: bytes, address: str, port: int) -> None:
-            req = _cm(data)
-            vbs = _pdu(req).varbinds
-            sizes.append(len(vbs))
-            if len(vbs) > 1:
-                p.server.send_to(_reply(req, [], pdu.TOO_BIG, 0), address, port)
-            else:
-                p.server.send_to(_reply(req, _answer(vbs)), address, port)
-
         def check(r: ?Response, e: ?errors.SnmpError) -> None:
             resp = _ok(r, e)
             testing.assertEqual(resp.varbinds, _answer([VarBind(o) for o in oids]))
@@ -850,9 +855,19 @@ actor _test_too_big_split(t: testing.AsyncT):
             _finish(t, lambda: check(r, e))
 
         p = mem_pair(mn)
+
+        def received(data: bytes, address: str, port: int) -> None:
+            req = _cm(data)
+            vbs = _pdu(req).varbinds
+            sizes.append(len(vbs))
+            if len(vbs) > 1:
+                p.server.send_to(_reply(req, [], pdu.TOO_BIG, 0), address, port)
+            else:
+                p.server.send_to(_reply(req, _answer(vbs)), address, port)
+
         c = Client(None, AGENT, Community("public"), t.log_handler, opts=SLOW, transport=p.client)
 
-        p.server.set_receiver((lambda data, address, port: received(p, data, address, port)))
+        p.server.set_receiver(received)
         c.get(got, oids)
 
 
@@ -863,11 +878,6 @@ actor _test_too_big_single_and_set(t: testing.AsyncT):
         mn = MemNet()
         sizes: list[int] = []
         statuses: list[int] = []
-
-        def received(p: (client: Transport, server: ServerTransport), data: bytes, address: str, port: int) -> None:
-            req = _cm(data)
-            sizes.append(len(_pdu(req).varbinds))
-            p.server.send_to(_reply(req, [], pdu.TOO_BIG, 0), address, port)
 
         def status_of(r: ?Response, e: ?errors.SnmpError) -> int:
             if isinstance(e, errors.ErrorStatusError):
@@ -884,15 +894,21 @@ actor _test_too_big_single_and_set(t: testing.AsyncT):
             statuses.append(status_of(r, e))
             _finish(t, check)
 
-        def got(c: Client, cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        p = mem_pair(mn)
+
+        def received(data: bytes, address: str, port: int) -> None:
+            req = _cm(data)
+            sizes.append(len(_pdu(req).varbinds))
+            p.server.send_to(_reply(req, [], pdu.TOO_BIG, 0), address, port)
+
+        c = Client(None, AGENT, Community("public"), t.log_handler, opts=SLOW, transport=p.client)
+
+        def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
             statuses.append(status_of(r, e))
             c.set(written, [VarBind(o, Integer(1)) for o in _oids(40)])
 
-        p = mem_pair(mn)
-        c = Client(None, AGENT, Community("public"), t.log_handler, opts=SLOW, transport=p.client)
-
-        p.server.set_receiver((lambda data, address, port: received(p, data, address, port)))
-        c.get((lambda cl, r, e: got(c, cl, r, e)), _oids(1))
+        p.server.set_receiver(received)
+        c.get(got, _oids(1))
 
 
 
@@ -903,52 +919,53 @@ actor _test_max_oids_per_request(t: testing.AsyncT):
     var sizes: list[int] = []
     var fail_part = False
 
-    def received(p: (client: Transport, server: ServerTransport), data: bytes, address: str, port: int) -> None:
-        req = _cm(data)
-        vbs = _pdu(req).varbinds
-        sizes.append(len(vbs))
-        if fail_part and vbs[0].oid == oids[2]:
-            p.server.send_to(_reply(req, vbs, pdu.GEN_ERR, 2), address, port)
-        else:
-            p.server.send_to(_reply(req, _answer(vbs)), address, port)
-
-    def check_error(r: ?Response, e: ?errors.SnmpError) -> None:
-        err = _failed(r, e)
-        if isinstance(err, errors.ErrorStatusError):
-            testing.assertEqual((err.status, err.index), (pdu.GEN_ERR, 4), "index of the caller's 4th varbind")
-            testing.assertEqual(err.oid, oids[3].arcs)
-            resp = error_response(err)
-            if resp is not None:
-                testing.assertEqual(len(resp.varbinds), 5)
-                testing.assertEqual(resp.varbinds[0], VarBind(oids[0], _val(oids[0])))
-                testing.assertEqual(resp.error_index, 4)
-            else:
-                testing.error("no Response")
-        else:
-            testing.error("not an ErrorStatusError: " + str(err))
-        testing.assertEqual(sizes, [2, 2, 1, 2, 2])
-
-    def got_error(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-        _finish(t, lambda: check_error(r, e))
-
-    def got(c: Client, cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-        try:
-            resp = _ok(r, e)
-            testing.assertEqual(resp.varbinds, _answer([VarBind(o) for o in oids]))
-            testing.assertEqual(sizes, [2, 2, 1])
-            testing.assertEqual(resp.attempts, 3)
-        except Exception as ex:
-            t.failure(ex)
-            return
-        fail_part = True
-        c.get(got_error, oids)
-
     proc def __startup__():
+        def check_error(r: ?Response, e: ?errors.SnmpError) -> None:
+            err = _failed(r, e)
+            if isinstance(err, errors.ErrorStatusError):
+                testing.assertEqual((err.status, err.index), (pdu.GEN_ERR, 4), "index of the caller's 4th varbind")
+                testing.assertEqual(err.oid, oids[3].arcs)
+                resp = error_response(err)
+                if resp is not None:
+                    testing.assertEqual(len(resp.varbinds), 5)
+                    testing.assertEqual(resp.varbinds[0], VarBind(oids[0], _val(oids[0])))
+                    testing.assertEqual(resp.error_index, 4)
+                else:
+                    testing.error("no Response")
+            else:
+                testing.error("not an ErrorStatusError: " + str(err))
+            testing.assertEqual(sizes, [2, 2, 1, 2, 2])
+
+        def got_error(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            _finish(t, lambda: check_error(r, e))
+
         p = mem_pair(mn)
+
+        def received(data: bytes, address: str, port: int) -> None:
+            req = _cm(data)
+            vbs = _pdu(req).varbinds
+            sizes.append(len(vbs))
+            if fail_part and vbs[0].oid == oids[2]:
+                p.server.send_to(_reply(req, vbs, pdu.GEN_ERR, 2), address, port)
+            else:
+                p.server.send_to(_reply(req, _answer(vbs)), address, port)
+
         c = Client(None, AGENT, Community("public"), t.log_handler, opts=SLOW.with_(max_oids_per_request=2), transport=p.client)
 
-        p.server.set_receiver((lambda data, address, port: received(p, data, address, port)))
-        c.get((lambda cl, r, e: got(c, cl, r, e)), oids)
+        def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            try:
+                resp = _ok(r, e)
+                testing.assertEqual(resp.varbinds, _answer([VarBind(o) for o in oids]))
+                testing.assertEqual(sizes, [2, 2, 1])
+                testing.assertEqual(resp.attempts, 3)
+            except Exception as ex:
+                t.failure(ex)
+                return
+            fail_part = True
+            c.get(got_error, oids)
+
+        p.server.set_receiver(received)
+        c.get(got, oids)
 
 
 
@@ -957,15 +974,6 @@ actor _test_bulk_too_big_halves(t: testing.AsyncT):
     proc def __startup__():
         mn = MemNet()
         reps: list[int] = []
-
-        def received(p: (client: Transport, server: ServerTransport), data: bytes, address: str, port: int) -> None:
-            req = _cm(data)
-            q = _pdu(req)
-            reps.append(q.max_repetitions())
-            if q.max_repetitions() > 2:
-                p.server.send_to(_reply(req, [], pdu.TOO_BIG, 0), address, port)
-            else:
-                p.server.send_to(_reply(req, _answer_next(q.varbinds + q.varbinds)), address, port)
 
         def check(r: ?Response, e: ?errors.SnmpError) -> None:
             resp = _ok(r, e)
@@ -976,9 +984,19 @@ actor _test_bulk_too_big_halves(t: testing.AsyncT):
             _finish(t, lambda: check(r, e))
 
         p = mem_pair(mn)
+
+        def received(data: bytes, address: str, port: int) -> None:
+            req = _cm(data)
+            q = _pdu(req)
+            reps.append(q.max_repetitions())
+            if q.max_repetitions() > 2:
+                p.server.send_to(_reply(req, [], pdu.TOO_BIG, 0), address, port)
+            else:
+                p.server.send_to(_reply(req, _answer_next(q.varbinds + q.varbinds)), address, port)
+
         c = Client(None, AGENT, Community("public"), t.log_handler, opts=SLOW, transport=p.client)
 
-        p.server.set_receiver((lambda data, address, port: received(p, data, address, port)))
+        p.server.set_receiver(received)
         c.get_bulk(got, _oids(1), 0, 9)
 
 
@@ -994,14 +1012,6 @@ actor _test_too_big_no_split(t: testing.AsyncT):
         sizes: list[int] = []
         reps: list[int] = []
         statuses: list[(int, int)] = []
-
-        def received(p: (client: Transport, server: ServerTransport), data: bytes, address: str, port: int) -> None:
-            req = _cm(data)
-            q = _pdu(req)
-            sizes.append(len(q.varbinds))
-            if q.pdu_type == pdu.GETBULK:
-                reps.append(q.max_repetitions())
-            p.server.send_to(_reply(req, [], pdu.TOO_BIG, 0), address, port)
 
         def status_of(e: ?errors.SnmpError) -> (int, int):
             if isinstance(e, errors.ErrorStatusError):
@@ -1019,16 +1029,24 @@ actor _test_too_big_no_split(t: testing.AsyncT):
             statuses.append(status_of(e))
             _finish(t, check)
 
-        def got(c: Client, cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-            statuses.append(status_of(e))
-            c.get_bulk(got_bulk, _oids(1), 0, 9)
-
         p = mem_pair(mn)
+
+        def received(data: bytes, address: str, port: int) -> None:
+            req = _cm(data)
+            q = _pdu(req)
+            sizes.append(len(q.varbinds))
+            if q.pdu_type == pdu.GETBULK:
+                reps.append(q.max_repetitions())
+            p.server.send_to(_reply(req, [], pdu.TOO_BIG, 0), address, port)
 
         c = Client(None, AGENT, Community("public"), t.log_handler, opts=opts, transport=p.client)
 
-        p.server.set_receiver((lambda data, address, port: received(p, data, address, port)))
-        c.get((lambda cl, r, e: got(c, cl, r, e)), _oids(5))
+        def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            statuses.append(status_of(e))
+            c.get_bulk(got_bulk, _oids(1), 0, 9)
+
+        p.server.set_receiver(received)
+        c.get(got, _oids(5))
 
 
 # SNMPv1 normalisation ##############################################################################
@@ -1039,11 +1057,6 @@ actor _test_v1_bulk_as_getnext(t: testing.AsyncT):
     proc def __startup__():
         mn = MemNet()
         seen: list[CommunityMessage] = []
-
-        def received(p: (client: Transport, server: ServerTransport), data: bytes, address: str, port: int) -> None:
-            req = _cm(data)
-            seen.append(req)
-            p.server.send_to(_reply(req, _answer_next(_pdu(req).varbinds)), address, port)
 
         def check(r: ?Response, e: ?errors.SnmpError) -> None:
             resp = _ok(r, e)
@@ -1056,9 +1069,15 @@ actor _test_v1_bulk_as_getnext(t: testing.AsyncT):
             _finish(t, lambda: check(r, e))
 
         p = mem_pair(mn)
+
+        def received(data: bytes, address: str, port: int) -> None:
+            req = _cm(data)
+            seen.append(req)
+            p.server.send_to(_reply(req, _answer_next(_pdu(req).varbinds)), address, port)
+
         c = Client(None, AGENT, Community("public", message.SNMP_V1), t.log_handler, opts=SLOW, transport=p.client)
 
-        p.server.set_receiver((lambda data, address, port: received(p, data, address, port)))
+        p.server.set_receiver(received)
         c.get_bulk(got, _oids(2), 0, 10)
 
 
@@ -1071,16 +1090,6 @@ actor _test_v1_get_no_such_name_fixed(t: testing.AsyncT):
         missing = [oids[1], oids[3]]
         sizes: list[int] = []
 
-        def received(p: (client: Transport, server: ServerTransport), data: bytes, address: str, port: int) -> None:
-            req = _cm(data)
-            vbs = _pdu(req).varbinds
-            sizes.append(len(vbs))
-            for i in range(len(vbs)):
-                if vbs[i].oid in missing:
-                    p.server.send_to(_reply(req, vbs, pdu.NO_SUCH_NAME, i + 1), address, port)
-                    return
-            p.server.send_to(_reply(req, _answer(vbs)), address, port)
-
         def check_unfixed(r: ?Response, e: ?errors.SnmpError) -> None:
             err = _failed(r, e)
             if isinstance(err, errors.ErrorStatusError):
@@ -1092,7 +1101,21 @@ actor _test_v1_get_no_such_name_fixed(t: testing.AsyncT):
         def got_unfixed(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
             _finish(t, lambda: check_unfixed(r, e))
 
-        def got(c: Client, cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        p = mem_pair(mn)
+
+        def received(data: bytes, address: str, port: int) -> None:
+            req = _cm(data)
+            vbs = _pdu(req).varbinds
+            sizes.append(len(vbs))
+            for i in range(len(vbs)):
+                if vbs[i].oid in missing:
+                    p.server.send_to(_reply(req, vbs, pdu.NO_SUCH_NAME, i + 1), address, port)
+                    return
+            p.server.send_to(_reply(req, _answer(vbs)), address, port)
+
+        c = Client(None, AGENT, Community("public", message.SNMP_V1), t.log_handler, opts=SLOW, transport=p.client)
+
+        def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
             try:
                 resp = _ok(r, e)
                 testing.assertEqual(resp.varbinds, [VarBind(oids[0], _val(oids[0])), VarBind(oids[1], NoSuchObject()),
@@ -1104,11 +1127,8 @@ actor _test_v1_get_no_such_name_fixed(t: testing.AsyncT):
                 return
             c.get(got_unfixed, oids, SLOW.with_(v1_fix_errors=False))
 
-        p = mem_pair(mn)
-        c = Client(None, AGENT, Community("public", message.SNMP_V1), t.log_handler, opts=SLOW, transport=p.client)
-
-        p.server.set_receiver((lambda data, address, port: received(p, data, address, port)))
-        c.get((lambda cl, r, e: got(c, cl, r, e)), oids)
+        p.server.set_receiver(received)
+        c.get(got, oids)
 
 
 
@@ -1121,7 +1141,15 @@ actor _test_v1_getnext_no_such_name_end(t: testing.AsyncT):
         sizes: list[int] = []
         responses: list[Response] = []
 
-        def received(p: (client: Transport, server: ServerTransport), data: bytes, address: str, port: int) -> None:
+        def check() -> None:
+            testing.assertEqual(responses[0].varbinds, [VarBind(_successor(first), _val(_successor(first))),
+                                                  VarBind(last, EndOfMibView())])
+            testing.assertEqual(responses[1].varbinds, [VarBind(last, EndOfMibView())])
+            testing.assertEqual(sizes, [2, 1, 1])
+
+        p = mem_pair(mn)
+
+        def received(data: bytes, address: str, port: int) -> None:
             req = _cm(data)
             vbs = _pdu(req).varbinds
             sizes.append(len(vbs))
@@ -1131,24 +1159,17 @@ actor _test_v1_getnext_no_such_name_end(t: testing.AsyncT):
                     return
             p.server.send_to(_reply(req, _answer_next(vbs)), address, port)
 
-        def check() -> None:
-            testing.assertEqual(responses[0].varbinds, [VarBind(_successor(first), _val(_successor(first))),
-                                                  VarBind(last, EndOfMibView())])
-            testing.assertEqual(responses[1].varbinds, [VarBind(last, EndOfMibView())])
-            testing.assertEqual(sizes, [2, 1, 1])
+        c = Client(None, AGENT, Community("public", message.SNMP_V1), t.log_handler, opts=SLOW, transport=p.client)
 
-        def got(c: Client, cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
             responses.append(_ok(r, e))
             if len(responses) == 1:
-                c.get_next((lambda cl, r, e: got(c, cl, r, e)), [last])
+                c.get_next(got, [last])
             else:
                 _finish(t, check)
 
-        p = mem_pair(mn)
-        c = Client(None, AGENT, Community("public", message.SNMP_V1), t.log_handler, opts=SLOW, transport=p.client)
-
-        p.server.set_receiver((lambda data, address, port: received(p, data, address, port)))
-        c.get_next((lambda cl, r, e: got(c, cl, r, e)), [first, last])
+        p.server.set_receiver(received)
+        c.get_next(got, [first, last])
 
 
 # Cancel, close, queueing, invalid arguments, transport failures #######################################
@@ -1161,61 +1182,62 @@ actor _test_cancel_exactly_once(t: testing.AsyncT):
     var log: list[str] = []
     var h1 = 0
 
-    def received(data: bytes, address: str, port: int) -> None:
-        held.append(_cm(data))
-
-    def outcome(name: str, r: ?Response, e: ?errors.SnmpError) -> str:
-        if isinstance(e, errors.CancelledError):
-            return name + ":cancelled"
-        if e is not None:
-            return name + ":error " + str(e)
-        return name + ":ok"
-
-    def verify(c: Client) -> None:
-        testing.assertEqual(log, ["second:cancelled", "first:cancelled", "third:ok"])
-        testing.assertEqual(len(held), 2, "the queued second request was never sent")
-        testing.assertEqual(c.stats().drops_unknown_id, 1, "the late answer to the first")
-
-    def got_third(c: Client, cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-        log.append(outcome("third", r, e))
-        after now QUIET: _finish(t, (lambda: verify(c)))
-
-    def answer_third(p: (client: Transport, server: ServerTransport)) -> None:
-        if len(held) == 2:
-            req = held[1]
-            p.server.send_to(_reply(req, _answer(_pdu(req).varbinds)), MANAGER, 40000)
-        else:
-            after now 0.01: answer_third(p)
-
-    def got_first(c: Client, p: (client: Transport, server: ServerTransport), cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-        log.append(outcome("first", r, e))
-        req = held[0]
-        p.server.send_to(_reply(req, _answer(_pdu(req).varbinds)), MANAGER, 40000)      # too late
-        c.cancel(h1)                                                                    # no second callback
-        c.get((lambda cl, r, e: got_third(c, cl, r, e)), _oids(1))
-        answer_third(p)
-
-    def got_second(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-        log.append(outcome("second", r, e))
-
-    def cancel_first(c: Client) -> None:
-        # once the first request is out
-        if len(held) == 1:
-            c.cancel(h1)
-            c.cancel(h1)
-            c.cancel(9999)
-        else:
-            after now 0.01: cancel_first(c)
-
     proc def __startup__():
+        def received(data: bytes, address: str, port: int) -> None:
+            held.append(_cm(data))
+
+        def outcome(name: str, r: ?Response, e: ?errors.SnmpError) -> str:
+            if isinstance(e, errors.CancelledError):
+                return name + ":cancelled"
+            if e is not None:
+                return name + ":error " + str(e)
+            return name + ":ok"
+
+        def got_second(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            log.append(outcome("second", r, e))
+
         p = mem_pair(mn)
+
+        def answer_third() -> None:
+            if len(held) == 2:
+                req = held[1]
+                p.server.send_to(_reply(req, _answer(_pdu(req).varbinds)), MANAGER, 40000)
+            else:
+                after now 0.01: answer_third()
+
         c = Client(None, AGENT, Community("public"), t.log_handler, opts=SLOW, transport=p.client)
 
+        def verify() -> None:
+            testing.assertEqual(log, ["second:cancelled", "first:cancelled", "third:ok"])
+            testing.assertEqual(len(held), 2, "the queued second request was never sent")
+            testing.assertEqual(c.stats().drops_unknown_id, 1, "the late answer to the first")
+
+        def got_third(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            log.append(outcome("third", r, e))
+            after now QUIET: _finish(t, verify)
+
+        def got_first(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            log.append(outcome("first", r, e))
+            req = held[0]
+            p.server.send_to(_reply(req, _answer(_pdu(req).varbinds)), MANAGER, 40000)      # too late
+            c.cancel(h1)                                                                    # no second callback
+            c.get(got_third, _oids(1))
+            answer_third()
+
+        def cancel_first() -> None:
+            # once the first request is out
+            if len(held) == 1:
+                c.cancel(h1)
+                c.cancel(h1)
+                c.cancel(9999)
+            else:
+                after now 0.01: cancel_first()
+
         p.server.set_receiver(received)
-        h1 = c.get((lambda cl, r, e: got_first(c, p, cl, r, e)), _oids(1))
+        h1 = c.get(got_first, _oids(1))
         h2 = c.get(got_second, _oids(2))
         c.cancel(h2)
-        cancel_first(c)
+        cancel_first()
 
 
 
@@ -1225,52 +1247,52 @@ actor _test_close_exactly_once(t: testing.AsyncT):
     var log: list[str] = []
     var sent = 0
 
-    def received(data: bytes, address: str, port: int) -> None:
-        sent += 1
-
-    def name_of(e: ?errors.SnmpError) -> str:
-        if isinstance(e, errors.CancelledError):
-            return "cancelled"
-        if isinstance(e, errors.EncodeError):
-            return "encode"
-        return "other"
-
-    def verify() -> None:
-        testing.assertEqual(sorted(log), ["a:cancelled", "after-get:cancelled", "after-trap:cancelled", "b:cancelled",
-                                          "c:cancelled"])
-        testing.assertEqual(sent, 2, "max_in_flight 2: the third stayed queued")
-
-    def got_a(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-        log.append("a:" + name_of(e))
-
-    def got_b(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-        log.append("b:" + name_of(e))
-
-    def got_c(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-        log.append("c:" + name_of(e))
-
-    def got_after_close(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-        log.append("after-get:" + name_of(e))
-
-    def trap_sent(cl: Client, e: ?errors.SnmpError) -> None:
-        log.append("after-trap:" + name_of(e))
-
-    def close_due(c: Client) -> None:
-        c.close()
-        c.close()
-        c.get(got_after_close, _oids(1))
-        c.trap(trap_sent, TRAP_OID, [])
-        after now QUIET: _finish(t, verify)
-
     proc def __startup__():
+        def received(data: bytes, address: str, port: int) -> None:
+            sent += 1
+
+        def name_of(e: ?errors.SnmpError) -> str:
+            if isinstance(e, errors.CancelledError):
+                return "cancelled"
+            if isinstance(e, errors.EncodeError):
+                return "encode"
+            return "other"
+
+        def verify() -> None:
+            testing.assertEqual(sorted(log), ["a:cancelled", "after-get:cancelled", "after-trap:cancelled", "b:cancelled",
+                                              "c:cancelled"])
+            testing.assertEqual(sent, 2, "max_in_flight 2: the third stayed queued")
+
+        def got_a(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            log.append("a:" + name_of(e))
+
+        def got_b(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            log.append("b:" + name_of(e))
+
+        def got_c(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            log.append("c:" + name_of(e))
+
+        def got_after_close(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            log.append("after-get:" + name_of(e))
+
+        def trap_sent(cl: Client, e: ?errors.SnmpError) -> None:
+            log.append("after-trap:" + name_of(e))
+
         p = mem_pair(mn)
         c = Client(None, AGENT, Community("public"), t.log_handler, opts=SLOW.with_(max_in_flight=2), transport=p.client)
+
+        def close_due() -> None:
+            c.close()
+            c.close()
+            c.get(got_after_close, _oids(1))
+            c.trap(trap_sent, TRAP_OID, [])
+            after now QUIET: _finish(t, verify)
 
         p.server.set_receiver(received)
         c.get(got_a, _oids(1))
         c.get(got_b, _oids(1))
         c.get(got_c, _oids(1))
-        after now 0.05: close_due(c)
+        after now 0.05: close_due()
 
 
 
@@ -1283,32 +1305,33 @@ actor _test_queueing_max_in_flight(t: testing.AsyncT):
     var order: list[Oid] = []
     var done_order: list[Oid] = []
 
-    def received(p: (client: Transport, server: ServerTransport), data: bytes, address: str, port: int) -> None:
-        req = _cm(data)
-        order.append(_pdu(req).varbinds[0].oid)
-        held.append((req, address, port))
-        if len(held) > outstanding_max:
-            outstanding_max = len(held)
-        if len(held) == 2 or len(order) == 5:
-            for entry in held:
-                p.server.send_to(_reply(entry.0, _answer(_pdu(entry.0).varbinds)), entry.1, entry.2)
-            held = []
-
-    def check() -> None:
-        testing.assertEqual(order, oids)
-        testing.assertEqual(done_order, oids)
-        testing.assertEqual(outstanding_max, 2)
-
-    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-        done_order.append(_ok(r, e).varbinds[0].oid)
-        if len(done_order) == 5:
-            _finish(t, check)
-
     proc def __startup__():
+        def check() -> None:
+            testing.assertEqual(order, oids)
+            testing.assertEqual(done_order, oids)
+            testing.assertEqual(outstanding_max, 2)
+
+        def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            done_order.append(_ok(r, e).varbinds[0].oid)
+            if len(done_order) == 5:
+                _finish(t, check)
+
         p = mem_pair(mn)
+
+        def received(data: bytes, address: str, port: int) -> None:
+            req = _cm(data)
+            order.append(_pdu(req).varbinds[0].oid)
+            held.append((req, address, port))
+            if len(held) > outstanding_max:
+                outstanding_max = len(held)
+            if len(held) == 2 or len(order) == 5:
+                for entry in held:
+                    p.server.send_to(_reply(entry.0, _answer(_pdu(entry.0).varbinds)), entry.1, entry.2)
+                held = []
+
         c = Client(None, AGENT, Community("public"), t.log_handler, opts=SLOW.with_(max_in_flight=2), transport=p.client)
 
-        p.server.set_receiver((lambda data, address, port: received(p, data, address, port)))
+        p.server.set_receiver(received)
         for o in oids:
             c.get(got, [o])
 
@@ -1319,26 +1342,27 @@ actor _test_queueing_one_at_a_time(t: testing.AsyncT):
     mn = MemNet()
     var count = 0
 
-    def received(p: (client: Transport, server: ServerTransport), data: bytes, address: str, port: int) -> None:
-        req = _cm(data)
-        p.server.send_to(_reply(req, _answer(_pdu(req).varbinds)), address, port)
-
-    def check() -> None:
-        hist = mn.history()
-        directions = ["req" if d.dst_address == AGENT else "resp" for d in hist]
-        testing.assertEqual(directions, ["req", "resp", "req", "resp", "req", "resp"])
-
-    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-        _ok(r, e)
-        count += 1
-        if count == 3:
-            _finish(t, check)
-
     proc def __startup__():
+        def check() -> None:
+            hist = mn.history()
+            directions = ["req" if d.dst_address == AGENT else "resp" for d in hist]
+            testing.assertEqual(directions, ["req", "resp", "req", "resp", "req", "resp"])
+
+        def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            _ok(r, e)
+            count += 1
+            if count == 3:
+                _finish(t, check)
+
         p = mem_pair(mn)
+
+        def received(data: bytes, address: str, port: int) -> None:
+            req = _cm(data)
+            p.server.send_to(_reply(req, _answer(_pdu(req).varbinds)), address, port)
+
         c = Client(None, AGENT, Community("public"), t.log_handler, opts=SLOW, transport=p.client)
 
-        p.server.set_receiver((lambda data, address, port: received(p, data, address, port)))
+        p.server.set_receiver(received)
         for o in _oids(3):
             c.get(got, [o])
 
@@ -1533,31 +1557,32 @@ actor _test_logs_never_show_the_community(t: testing.AsyncT):
     mn = MemNet()
     var count = 0
 
-    def received(p: (client: Transport, server: ServerTransport), data: bytes, address: str, port: int) -> None:
-        req = _cm(data)
-        p.server.send_to(_reply(req, [], pdu.TOO_BIG, 0), address, port)
-        p.server.send_to(_reply(req, _answer(_pdu(req).varbinds)), address, port)
-
-    def check() -> None:
-        texts = col.all()
-        testing.assertTrue(len(texts) > 3, "something was logged")
-        joined = "\n".join(texts)
-        testing.assertFalse("s3cr3t" in joined, joined)
-        testing.assertFalse(b"s3cr3t-community".hex() in joined)
-
-    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-        count += 1
-        if count == 2:
-            after now QUIET: _finish(t, check)
-
     proc def __startup__():
+        def check() -> None:
+            texts = col.all()
+            testing.assertTrue(len(texts) > 3, "something was logged")
+            joined = "\n".join(texts)
+            testing.assertFalse("s3cr3t" in joined, joined)
+            testing.assertFalse(b"s3cr3t-community".hex() in joined)
+
+        def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            count += 1
+            if count == 2:
+                after now QUIET: _finish(t, check)
+
         handler.add_sink(_CaptureSink(col))
         handler.set_output_level(logging.ALL)
 
         p = mem_pair(mn)
+
+        def received(data: bytes, address: str, port: int) -> None:
+            req = _cm(data)
+            p.server.send_to(_reply(req, [], pdu.TOO_BIG, 0), address, port)
+            p.server.send_to(_reply(req, _answer(_pdu(req).varbinds)), address, port)
+
         c = Client(None, AGENT, Community("s3cr3t-community"), handler, opts=SLOW, transport=p.client)
 
-        p.server.set_receiver((lambda data, address, port: received(p, data, address, port)))
+        p.server.set_receiver(received)
         c.get(got, _oids(2))
         c.get(got, _oids(1))
 
@@ -1764,7 +1789,11 @@ actor _test_v3_discovery_hint_two_round_trips(t: testing.AsyncT):
         mn = MemNet()
         oids = _oids(2)
 
-        def check(agent: _V3Agent, c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        p = mem_pair(mn)
+        agent = _V3Agent(p.server, _users(), _engine_id())
+        c = Client(None, AGENT, _shaaes(), t.log_handler, opts=SLOW, transport=p.client)
+
+        def check(r: ?Response, e: ?errors.SnmpError) -> None:
             resp = _ok(r, e)
             testing.assertEqual(resp.varbinds, _answer([VarBind(o) for o in oids]))
             testing.assertEqual(agent.seen(), ["probe", "ok"])
@@ -1780,14 +1809,10 @@ actor _test_v3_discovery_hint_two_round_trips(t: testing.AsyncT):
             s = c.stats()
             testing.assertEqual((s.reports, s.responses, s.drops_auth), (1, 1, 0))
 
-        def got(agent: _V3Agent, c: Client, cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-            _finish(t, lambda: check(agent, c, r, e))
+        def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            _finish(t, lambda: check(r, e))
 
-        p = mem_pair(mn)
-        agent = _V3Agent(p.server, _users(), _engine_id())
-        c = Client(None, AGENT, _shaaes(), t.log_handler, opts=SLOW, transport=p.client)
-
-        c.get((lambda cl, r, e: got(agent, c, cl, r, e)), oids)
+        c.get(got, oids)
 
 
 
@@ -1828,7 +1853,12 @@ actor _test_v3_time_sync_fallback(t: testing.AsyncT):
     proc def __startup__():
         mn = MemNet()
 
-        def check(agent: _V3Agent, c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        p = mem_pair(mn)
+        agent = _V3Agent(p.server, _users(), _engine_id())
+        agent.set_forged_discovery(0, 0)
+        c = Client(None, AGENT, _shaaes(), t.log_handler, opts=SLOW, transport=p.client)
+
+        def check(r: ?Response, e: ?errors.SnmpError) -> None:
             resp = _ok(r, e)
             testing.assertEqual(agent.seen(), ["probe", usm.USM_STATS_NOT_IN_TIME_WINDOWS, "ok"])
             testing.assertEqual(resp.attempts, 2)
@@ -1839,15 +1869,10 @@ actor _test_v3_time_sync_fallback(t: testing.AsyncT):
             else:
                 testing.error("no engine info")
 
-        def got(agent: _V3Agent, c: Client, cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-            _finish(t, lambda: check(agent, c, r, e))
+        def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            _finish(t, lambda: check(r, e))
 
-        p = mem_pair(mn)
-        agent = _V3Agent(p.server, _users(), _engine_id())
-        agent.set_forged_discovery(0, 0)
-        c = Client(None, AGENT, _shaaes(), t.log_handler, opts=SLOW, transport=p.client)
-
-        c.get((lambda cl, r, e: got(agent, c, cl, r, e)), _oids(1))
+        c.get(got, _oids(1))
 
 
 
@@ -1856,7 +1881,11 @@ actor _test_v3_resync_after_reboot(t: testing.AsyncT):
     proc def __startup__():
         mn = MemNet()
 
-        def check(agent: _V3Agent, c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        p = mem_pair(mn)
+        agent = _V3Agent(p.server, _users(), _engine_id())
+        c = Client(None, AGENT, _shaaes(), t.log_handler, opts=SLOW, transport=p.client)
+
+        def check(r: ?Response, e: ?errors.SnmpError) -> None:
             _ok(r, e)
             testing.assertEqual(agent.seen(), ["probe", "ok", usm.USM_STATS_NOT_IN_TIME_WINDOWS, "ok"])
             info = c.engine_info()
@@ -1865,23 +1894,19 @@ actor _test_v3_resync_after_reboot(t: testing.AsyncT):
             else:
                 testing.error("no engine info")
 
-        def got_second(agent: _V3Agent, c: Client, cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-            _finish(t, lambda: check(agent, c, r, e))
+        def got_second(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            _finish(t, lambda: check(r, e))
 
-        def got_first(agent: _V3Agent, c: Client, cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        def got_first(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
             try:
                 _ok(r, e)
             except Exception as ex:
                 t.failure(ex)
                 return
             agent.reboot(2)
-            c.get((lambda cl, r, e: got_second(agent, c, cl, r, e)), _oids(1))
+            c.get(got_second, _oids(1))
 
-        p = mem_pair(mn)
-        agent = _V3Agent(p.server, _users(), _engine_id())
-        c = Client(None, AGENT, _shaaes(), t.log_handler, opts=SLOW, transport=p.client)
-
-        c.get((lambda cl, r, e: got_first(agent, c, cl, r, e)), _oids(1))
+        c.get(got_first, _oids(1))
 
 
 
@@ -1890,7 +1915,12 @@ actor _test_v3_resync_budget(t: testing.AsyncT):
     proc def __startup__():
         mn = MemNet()
 
-        def check(agent: _V3Agent, c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        p = mem_pair(mn)
+        agent = _V3Agent(p.server, _users(), _engine_id())
+        agent.set_mode(ALWAYS_TIME_WINDOW)
+        c = Client(None, AGENT, _shaaes(), t.log_handler, opts=SLOW, transport=p.client)
+
+        def check(r: ?Response, e: ?errors.SnmpError) -> None:
             err = _failed(r, e)
             if isinstance(err, errors.ReportError):
                 testing.assertEqual(err.name, usm.USM_STATS_NOT_IN_TIME_WINDOWS)
@@ -1903,15 +1933,10 @@ actor _test_v3_resync_budget(t: testing.AsyncT):
             testing.assertEqual(agent.seen(), ["probe", usm.USM_STATS_NOT_IN_TIME_WINDOWS, usm.USM_STATS_NOT_IN_TIME_WINDOWS])
             testing.assertTrue(c.engine_info() is None, "engine state reset")
 
-        def got(agent: _V3Agent, c: Client, cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-            _finish(t, lambda: check(agent, c, r, e))
+        def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            _finish(t, lambda: check(r, e))
 
-        p = mem_pair(mn)
-        agent = _V3Agent(p.server, _users(), _engine_id())
-        agent.set_mode(ALWAYS_TIME_WINDOW)
-        c = Client(None, AGENT, _shaaes(), t.log_handler, opts=SLOW, transport=p.client)
-
-        c.get((lambda cl, r, e: got(agent, c, cl, r, e)), _oids(1))
+        c.get(got, _oids(1))
 
 
 
@@ -1920,7 +1945,11 @@ actor _test_v3_rediscovery_on_engine_change(t: testing.AsyncT):
     proc def __startup__():
         mn = MemNet()
 
-        def check(agent: _V3Agent, c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        p = mem_pair(mn)
+        agent = _V3Agent(p.server, _users(), _engine_id())
+        c = Client(None, AGENT, _shaaes(), t.log_handler, opts=SLOW, transport=p.client)
+
+        def check(r: ?Response, e: ?errors.SnmpError) -> None:
             resp = _ok(r, e)
             testing.assertEqual(agent.seen(), ["probe", "ok", usm.USM_STATS_UNKNOWN_ENGINE_IDS, "probe", "ok"])
             testing.assertEqual(resp.context_engine_id, h(ENGINE2_HEX))
@@ -1930,23 +1959,19 @@ actor _test_v3_rediscovery_on_engine_change(t: testing.AsyncT):
             else:
                 testing.error("no engine info")
 
-        def got_second(agent: _V3Agent, c: Client, cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-            _finish(t, lambda: check(agent, c, r, e))
+        def got_second(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            _finish(t, lambda: check(r, e))
 
-        def got_first(agent: _V3Agent, c: Client, cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        def got_first(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
             try:
                 _ok(r, e)
             except Exception as ex:
                 t.failure(ex)
                 return
             agent.change_engine(h(ENGINE2_HEX))
-            c.get((lambda cl, r, e: got_second(agent, c, cl, r, e)), _oids(1))
+            c.get(got_second, _oids(1))
 
-        p = mem_pair(mn)
-        agent = _V3Agent(p.server, _users(), _engine_id())
-        c = Client(None, AGENT, _shaaes(), t.log_handler, opts=SLOW, transport=p.client)
-
-        c.get((lambda cl, r, e: got_first(agent, c, cl, r, e)), _oids(1))
+        c.get(got_first, _oids(1))
 
 
 
@@ -1965,42 +1990,42 @@ actor _test_v3_report_kinds(t: testing.AsyncT):
 
     var transient: list[bool] = []
 
-    def check() -> None:
-        testing.assertEqual(names, [usm.USM_STATS_UNKNOWN_USER_NAMES, usm.USM_STATS_WRONG_DIGESTS,
-                                    usm.USM_STATS_UNSUPPORTED_SEC_LEVELS, usm.USM_STATS_DECRYPTION_ERRORS,
-                                    "unknown report"])
-        testing.assertEqual(transient, [False, False, False, False, False], "configuration problems are permanent")
-        testing.assertEqual(arcs[0], usm.report_oid(usm.USM_STATS_UNKNOWN_USER_NAMES).arcs)
-        testing.assertEqual(arcs[4], [1, 3, 6, 1, 4, 1, 99, 99, 0])
-
-    def got(agent: _V3Agent, cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-        if isinstance(e, errors.ReportError):
-            names.append(e.name)
-            arcs.append(e.oid)
-            transient.append(e.transient)
-        else:
-            names.append("not a ReportError: " + _describe(e))
-            arcs.append([])
-        n += 1
-        if n == len(clients):
-            _finish(t, check)
-        else:
-            next_client(agent)
-
-    def next_client(agent: _V3Agent) -> None:
-        if n == 3:
-            agent.set_mode(CRAFTED_REPORT)
-        if n == 4:
-            agent.set_report(Oid.parse("1.3.6.1.4.1.99.99.0"))
-        tr = mn.client(MANAGER, 41000 + n, AGENT, 161)
-        cl = Client(None, AGENT, clients[n], t.log_handler, opts=SLOW, transport=tr)
-        cl.get((lambda cl, r, e: got(agent, cl, r, e)), _oids(1))
-
     proc def __startup__():
+        def check() -> None:
+            testing.assertEqual(names, [usm.USM_STATS_UNKNOWN_USER_NAMES, usm.USM_STATS_WRONG_DIGESTS,
+                                        usm.USM_STATS_UNSUPPORTED_SEC_LEVELS, usm.USM_STATS_DECRYPTION_ERRORS,
+                                        "unknown report"])
+            testing.assertEqual(transient, [False, False, False, False, False], "configuration problems are permanent")
+            testing.assertEqual(arcs[0], usm.report_oid(usm.USM_STATS_UNKNOWN_USER_NAMES).arcs)
+            testing.assertEqual(arcs[4], [1, 3, 6, 1, 4, 1, 99, 99, 0])
+
         p = mem_pair(mn)
         agent = _V3Agent(p.server, _users(), _engine_id())
 
-        next_client(agent)
+        def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            if isinstance(e, errors.ReportError):
+                names.append(e.name)
+                arcs.append(e.oid)
+                transient.append(e.transient)
+            else:
+                names.append("not a ReportError: " + _describe(e))
+                arcs.append([])
+            n += 1
+            if n == len(clients):
+                _finish(t, check)
+            else:
+                next_client()
+
+        def next_client() -> None:
+            if n == 3:
+                agent.set_mode(CRAFTED_REPORT)
+            if n == 4:
+                agent.set_report(Oid.parse("1.3.6.1.4.1.99.99.0"))
+            tr = mn.client(MANAGER, 41000 + n, AGENT, 161)
+            cl = Client(None, AGENT, clients[n], t.log_handler, opts=SLOW, transport=tr)
+            cl.get(got, _oids(1))
+
+        next_client()
 
 
 
@@ -2010,14 +2035,19 @@ actor _test_v3_forged_response_dropped(t: testing.AsyncT):
     proc def __startup__():
         mn = MemNet()
 
-        def check3(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        p = mem_pair(mn)
+        agent = _V3Agent(p.server, _users(), _engine_id())
+        agent.set_mode(FORGED_FIRST)
+        c = Client(None, AGENT, _shaaes(), t.log_handler, opts=SLOW, transport=p.client)
+
+        def check3(r: ?Response, e: ?errors.SnmpError) -> None:
             _ok(r, e)
             testing.assertEqual(c.stats().drops_auth, 3)
 
-        def got_third(c: Client, cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-            _finish(t, lambda: check3(c, r, e))
+        def got_third(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            _finish(t, lambda: check3(r, e))
 
-        def got_second(agent: _V3Agent, c: Client, cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        def got_second(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
             try:
                 _ok(r, e)
                 testing.assertEqual(c.stats().drops_auth, 2)
@@ -2025,9 +2055,9 @@ actor _test_v3_forged_response_dropped(t: testing.AsyncT):
                 t.failure(ex)
                 return
             agent.set_mode(OTHER_ENGINE_FIRST)
-            c.get((lambda cl, r, e: got_third(c, cl, r, e)), _oids(1))
+            c.get(got_third, _oids(1))
 
-        def got_first(agent: _V3Agent, c: Client, cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        def got_first(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
             try:
                 _ok(r, e)
                 testing.assertEqual(c.stats().drops_auth, 1)
@@ -2035,14 +2065,9 @@ actor _test_v3_forged_response_dropped(t: testing.AsyncT):
                 t.failure(ex)
                 return
             agent.set_mode(UNAUTH_FIRST)
-            c.get((lambda cl, r, e: got_second(agent, c, cl, r, e)), _oids(1))
+            c.get(got_second, _oids(1))
 
-        p = mem_pair(mn)
-        agent = _V3Agent(p.server, _users(), _engine_id())
-        agent.set_mode(FORGED_FIRST)
-        c = Client(None, AGENT, _shaaes(), t.log_handler, opts=SLOW, transport=p.client)
-
-        c.get((lambda cl, r, e: got_first(agent, c, cl, r, e)), _oids(1))
+        c.get(got_first, _oids(1))
 
 
 
@@ -2051,35 +2076,36 @@ actor _test_v3_reset_after_timeouts(t: testing.AsyncT):
     mn = MemNet()
     var step = 0
 
-    def check(agent: _V3Agent, r: ?Response, e: ?errors.SnmpError) -> None:
-        _ok(r, e)
-        testing.assertEqual(agent.seen(), ["probe", "ok", "silent", "silent", "probe", "ok"])
-
-    def got(agent: _V3Agent, c: Client, cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-        step += 1
-        if step == 1:
-            agent.set_mode(SILENT)
-            c.get((lambda cl, r, e: got(agent, c, cl, r, e)), _oids(1), FAST)
-        elif step == 2:
-            if c.engine_info() is None:
-                t.failure(AssertionError("reset after one timeout"))
-                return
-            c.get((lambda cl, r, e: got(agent, c, cl, r, e)), _oids(1), FAST)
-        elif step == 3:
-            if c.engine_info() is not None:
-                t.failure(AssertionError("no reset after two timeouts"))
-                return
-            agent.set_mode(NORMAL)
-            c.get((lambda cl, r, e: got(agent, c, cl, r, e)), _oids(1))
-        else:
-            _finish(t, lambda: check(agent, r, e))
-
     proc def __startup__():
         p = mem_pair(mn)
         agent = _V3Agent(p.server, _users(), _engine_id())
+
+        def check(r: ?Response, e: ?errors.SnmpError) -> None:
+            _ok(r, e)
+            testing.assertEqual(agent.seen(), ["probe", "ok", "silent", "silent", "probe", "ok"])
+
         c = Client(None, AGENT, _shaaes(), t.log_handler, opts=SLOW, transport=p.client)
 
-        c.get((lambda cl, r, e: got(agent, c, cl, r, e)), _oids(1))
+        def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            step += 1
+            if step == 1:
+                agent.set_mode(SILENT)
+                c.get(got, _oids(1), FAST)
+            elif step == 2:
+                if c.engine_info() is None:
+                    t.failure(AssertionError("reset after one timeout"))
+                    return
+                c.get(got, _oids(1), FAST)
+            elif step == 3:
+                if c.engine_info() is not None:
+                    t.failure(AssertionError("no reset after two timeouts"))
+                    return
+                agent.set_mode(NORMAL)
+                c.get(got, _oids(1))
+            else:
+                _finish(t, lambda: check(r, e))
+
+        c.get(got, _oids(1))
 
 
 
@@ -2089,54 +2115,55 @@ actor _test_v3_discovery_failures(t: testing.AsyncT):
     var n = 0
     var log: list[str] = []
 
-    def name_of(e: ?errors.SnmpError) -> str:
-        if isinstance(e, errors.TimeoutError):
-            return "timeout" if e.hint == "SNMPv3 engine discovery" else "timeout, hint " + str(e.hint)
-        if isinstance(e, errors.InvalidResponseError):
-            return "invalid"
-        if e is not None:
-            return "other: " + str(e)
-        return "ok"
-
-    def check() -> None:
-        testing.assertEqual(log, ["timeout", "timeout", "invalid", "invalid"])
-
-    def note(agent: _V3Agent, text: str) -> None:
-        log.append(text)
-        n += 1
-        if n == 4:
-            _finish(t, check)
-        else:
-            next_case(agent)
-
-    def got(agent: _V3Agent, cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-        note(agent, name_of(e))
-
-    def discovered(agent: _V3Agent, cl: Client, info: ?EngineInfo, e: ?errors.SnmpError) -> None:
-        note(agent, name_of(e))
-
-    def next_case(agent: _V3Agent) -> None:
-        tr = mn.client(MANAGER, 41000 + n, AGENT, 161)
-        # the silent agent's cases time out after FAST's 50 ms; the agent answers the others, which wait for
-        # that answer as long as SLOW allows
-        cl = Client(None, AGENT, _shaaes(), t.log_handler, opts=FAST if n < 2 else SLOW, transport=tr)
-        if n == 0:
-            cl.get((lambda cl, r, e: got(agent, cl, r, e)), _oids(1))
-        elif n == 1:
-            cl.discover((lambda cl, info, e: discovered(agent, cl, info, e)))
-        elif n == 2:
-            agent.set_mode(PROBE_RESPONSE)
-            cl.get((lambda cl, r, e: got(agent, cl, r, e)), _oids(1))
-        else:
-            agent.set_mode(SHORT_ENGINE_ID)
-            cl.get((lambda cl, r, e: got(agent, cl, r, e)), _oids(1))
-
     proc def __startup__():
+        def name_of(e: ?errors.SnmpError) -> str:
+            if isinstance(e, errors.TimeoutError):
+                return "timeout" if e.hint == "SNMPv3 engine discovery" else "timeout, hint " + str(e.hint)
+            if isinstance(e, errors.InvalidResponseError):
+                return "invalid"
+            if e is not None:
+                return "other: " + str(e)
+            return "ok"
+
+        def check() -> None:
+            testing.assertEqual(log, ["timeout", "timeout", "invalid", "invalid"])
+
         p = mem_pair(mn)
         agent = _V3Agent(p.server, _users(), _engine_id())
+
+        def note(text: str) -> None:
+            log.append(text)
+            n += 1
+            if n == 4:
+                _finish(t, check)
+            else:
+                next_case()
+
+        def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            note(name_of(e))
+
+        def discovered(cl: Client, info: ?EngineInfo, e: ?errors.SnmpError) -> None:
+            note(name_of(e))
+
+        def next_case() -> None:
+            tr = mn.client(MANAGER, 41000 + n, AGENT, 161)
+            # the silent agent's cases time out after FAST's 50 ms; the agent answers the others, which wait for
+            # that answer as long as SLOW allows
+            cl = Client(None, AGENT, _shaaes(), t.log_handler, opts=FAST if n < 2 else SLOW, transport=tr)
+            if n == 0:
+                cl.get(got, _oids(1))
+            elif n == 1:
+                cl.discover(discovered)
+            elif n == 2:
+                agent.set_mode(PROBE_RESPONSE)
+                cl.get(got, _oids(1))
+            else:
+                agent.set_mode(SHORT_ENGINE_ID)
+                cl.get(got, _oids(1))
+
         agent.set_mode(SILENT)
 
-        next_case(agent)
+        next_case()
 
 
 
@@ -2146,7 +2173,10 @@ actor _test_v3_discover(t: testing.AsyncT):
         mn = MemNet()
         infos: list[EngineInfo] = []
 
-        def check(agent: _V3Agent, r: ?Response, e: ?errors.SnmpError) -> None:
+        p = mem_pair(mn)
+        agent = _V3Agent(p.server, _users(), _engine_id())
+
+        def check(r: ?Response, e: ?errors.SnmpError) -> None:
             _ok(r, e)
             testing.assertEqual(len(infos), 2, "both discover() callbacks, one probe")
             testing.assertEqual(infos[0].engine_id, _engine_id())
@@ -2154,21 +2184,19 @@ actor _test_v3_discover(t: testing.AsyncT):
             testing.assertTrue(infos[0].time >= 1000 and infos[0].time < 1010)
             testing.assertEqual(agent.seen(), ["probe", "ok"])
 
-        def got(agent: _V3Agent, cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-            _finish(t, lambda: check(agent, r, e))
+        def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            _finish(t, lambda: check(r, e))
 
-        def discovered(agent: _V3Agent, c: Client, cl: Client, info: ?EngineInfo, e: ?errors.SnmpError) -> None:
+        c = Client(None, AGENT, _shaaes(), t.log_handler, opts=SLOW, transport=p.client)
+
+        def discovered(cl: Client, info: ?EngineInfo, e: ?errors.SnmpError) -> None:
             if info is not None:
                 infos.append(info)
             if len(infos) == 2:
-                c.get((lambda cl, r, e: got(agent, cl, r, e)), _oids(1))
+                c.get(got, _oids(1))
 
-        p = mem_pair(mn)
-        agent = _V3Agent(p.server, _users(), _engine_id())
-        c = Client(None, AGENT, _shaaes(), t.log_handler, opts=SLOW, transport=p.client)
-
-        c.discover((lambda cl, info, e: discovered(agent, c, cl, info, e)))
-        c.discover((lambda cl, info, e: discovered(agent, c, cl, info, e)))
+        c.discover(discovered)
+        c.discover(discovered)
 
 
 
@@ -2178,19 +2206,19 @@ actor _test_v3_seeded_engine(t: testing.AsyncT):
         mn = MemNet()
         seed = EngineInfo(_engine_id(), 1, 1000, _now())
 
-        def check(agent: _V3Agent, r: ?Response, e: ?errors.SnmpError) -> None:
-            _ok(r, e)
-            testing.assertEqual(agent.seen(), ["ok"])
-
-        def got(agent: _V3Agent, cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-            _finish(t, lambda: check(agent, r, e))
-
         p = mem_pair(mn)
         agent = _V3Agent(p.server, _users(), _engine_id())
 
+        def check(r: ?Response, e: ?errors.SnmpError) -> None:
+            _ok(r, e)
+            testing.assertEqual(agent.seen(), ["ok"])
+
+        def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            _finish(t, lambda: check(r, e))
+
         c = Client(None, AGENT, _shaaes(), t.log_handler, opts=SLOW, transport=p.client, engine=seed)
 
-        c.get((lambda cl, r, e: got(agent, cl, r, e)), _oids(1))
+        c.get(got, _oids(1))
 
 
 
@@ -2199,22 +2227,23 @@ actor _test_v3_concurrent_requests_share_discovery(t: testing.AsyncT):
     mn = MemNet()
     var count = 0
 
-    def check(agent: _V3Agent) -> None:
-        testing.assertEqual(agent.seen(), ["probe", "ok", "ok", "ok"])
-
-    def got(agent: _V3Agent, cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-        _ok(r, e)
-        count += 1
-        if count == 3:
-            _finish(t, (lambda: check(agent)))
-
     proc def __startup__():
         p = mem_pair(mn)
         agent = _V3Agent(p.server, _users(), _engine_id())
+
+        def check() -> None:
+            testing.assertEqual(agent.seen(), ["probe", "ok", "ok", "ok"])
+
+        def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            _ok(r, e)
+            count += 1
+            if count == 3:
+                _finish(t, check)
+
         c = Client(None, AGENT, _shaaes(), t.log_handler, opts=SLOW.with_(max_in_flight=3), transport=p.client)
 
         for o in _oids(3):
-            c.get((lambda cl, r, e: got(agent, cl, r, e)), [o])
+            c.get(got, [o])
 
 
 
@@ -2227,16 +2256,6 @@ actor _test_v3_wire_format(t: testing.AsyncT):
         keys = _shaaes().localized(_engine_id())
         msgs: list[V3Message] = []
         scoped: list[ScopedPdu] = []
-
-        def received(p: (client: Transport, server: ServerTransport), data: bytes, address: str, port: int) -> None:
-            m = _v3(data)
-            msgs.append(m)
-            if m.usm.engine_id == b"":
-                r = eng.incoming(data, m, _now()).report
-                if r is not None:
-                    p.server.send_to(r, address, port)
-            else:
-                scoped.append(usm.unprotect(data, m, keys))     # never answered: retries
 
         def check(r: ?Response, e: ?errors.SnmpError) -> None:
             _failed(r, e)
@@ -2270,9 +2289,19 @@ actor _test_v3_wire_format(t: testing.AsyncT):
 
         p = mem_pair(mn)
 
+        def received(data: bytes, address: str, port: int) -> None:
+            m = _v3(data)
+            msgs.append(m)
+            if m.usm.engine_id == b"":
+                r = eng.incoming(data, m, _now()).report
+                if r is not None:
+                    p.server.send_to(r, address, port)
+            else:
+                scoped.append(usm.unprotect(data, m, keys))     # never answered: retries
+
         c = Client(None, AGENT, _shaaes(), t.log_handler, opts=Options(timeout=0.05, retries=2), transport=p.client)
 
-        p.server.set_receiver((lambda data, address, port: received(p, data, address, port)))
+        p.server.set_receiver(received)
         c.get(got, _oids(1))
 
 
@@ -2314,7 +2343,10 @@ actor _test_trap_v2c(t: testing.AsyncT):
             cm = _cm(data)
             got.append(notify.notification_from_v2c(_pdu(cm), cm.community, address, port))
 
-        def check(c: Client) -> None:
+        p = mem_pair(mn, server_port=162)
+        c = Client(None, AGENT, Community("public"), t.log_handler, port=162, opts=SLOW, transport=p.client)
+
+        def check() -> None:
             testing.assertEqual(errs, ["ok", "ok"])
             testing.assertEqual(len(got), 2)
             n = got[0]
@@ -2324,17 +2356,14 @@ actor _test_trap_v2c(t: testing.AsyncT):
             testing.assertTrue(got[1].uptime >= 0 and got[1].uptime < 300, "uptime since the Client started: %d" % got[1].uptime)
             testing.assertEqual(c.stats().requests, 0, "traps are not requests")
 
-        def trap_sent(c: Client, cl: Client, e: ?errors.SnmpError) -> None:
+        def trap_sent(cl: Client, e: ?errors.SnmpError) -> None:
             errs.append(_describe(e))
             if len(errs) == 2:
-                after now QUIET: _finish(t, (lambda: check(c)))
-
-        p = mem_pair(mn, server_port=162)
-        c = Client(None, AGENT, Community("public"), t.log_handler, port=162, opts=SLOW, transport=p.client)
+                after now QUIET: _finish(t, check)
 
         p.server.set_receiver(received)
-        c.trap((lambda cl, e: trap_sent(c, cl, e)), TRAP_OID, payload, 12345)
-        c.trap((lambda cl, e: trap_sent(c, cl, e)), TRAP_OID, payload)
+        c.trap(trap_sent, TRAP_OID, payload, 12345)
+        c.trap(trap_sent, TRAP_OID, payload)
 
 
 
@@ -2429,14 +2458,6 @@ actor _test_inform_v2c(t: testing.AsyncT):
         payload = [VarBind(Oid.parse("1.3.6.1.4.1.8072.2.3.2.1"), Integer(42))]
         seen: list[Pdu] = []
 
-        def received(p: (client: Transport, server: ServerTransport), data: bytes, address: str, port: int) -> None:
-            cm = _cm(data)
-            q = _pdu(cm)
-            seen.append(q)
-            if len(seen) > 1:
-                resp = notify.inform_response(q)
-                p.server.send_to(message.encode_community(CommunityMessage(cm.version, cm.community, resp)), address, port)
-
         def check(r: ?Response, e: ?errors.SnmpError) -> None:
             resp = _ok(r, e)
             testing.assertEqual(resp.attempts, 2)
@@ -2449,10 +2470,19 @@ actor _test_inform_v2c(t: testing.AsyncT):
             _finish(t, lambda: check(r, e))
 
         p = mem_pair(mn, server_port=162)
+
+        def received(data: bytes, address: str, port: int) -> None:
+            cm = _cm(data)
+            q = _pdu(cm)
+            seen.append(q)
+            if len(seen) > 1:
+                resp = notify.inform_response(q)
+                p.server.send_to(message.encode_community(CommunityMessage(cm.version, cm.community, resp)), address, port)
+
         c = Client(None, AGENT, Community("public"), t.log_handler, port=162, opts=Options(timeout=0.05, retries=2),
                    transport=p.client)
 
-        p.server.set_receiver((lambda data, address, port: received(p, data, address, port)))
+        p.server.set_receiver(received)
         c.inform(acked, TRAP_OID, payload, 500)
 
 
@@ -2463,19 +2493,20 @@ actor _test_inform_v3(t: testing.AsyncT):
         mn = MemNet()
         payload = [VarBind(Oid.parse("1.3.6.1.4.1.8072.2.3.2.1"), Integer(42))]
 
-        def check(rcv: _V3Agent, r: ?Response, e: ?errors.SnmpError) -> None:
+        p = mem_pair(mn, server_port=162)
+        rcv = _V3Agent(p.server, _users(), _engine_id(), [pdu.INFORM])
+
+        def check(r: ?Response, e: ?errors.SnmpError) -> None:
             resp = _ok(r, e)
             testing.assertEqual(rcv.seen(), ["probe", "ok"])
             testing.assertEqual(resp.varbinds, notify.build_trap_v2(77, TRAP_OID, payload))
 
-        def acked(rcv: _V3Agent, cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-            _finish(t, lambda: check(rcv, r, e))
+        def acked(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            _finish(t, lambda: check(r, e))
 
-        p = mem_pair(mn, server_port=162)
-        rcv = _V3Agent(p.server, _users(), _engine_id(), [pdu.INFORM])
         c = Client(None, AGENT, _shaaes(), t.log_handler, port=162, opts=SLOW, transport=p.client)
 
-        c.inform((lambda cl, r, e: acked(rcv, cl, r, e)), TRAP_OID, payload, 77)
+        c.inform(acked, TRAP_OID, payload, 77)
 
 
 
@@ -2484,10 +2515,6 @@ actor _test_inform_wrong_echo(t: testing.AsyncT):
     proc def __startup__():
         mn = MemNet()
 
-        def received(p: (client: Transport, server: ServerTransport), data: bytes, address: str, port: int) -> None:
-            cm = _cm(data)
-            p.server.send_to(_reply(cm, _answer(_pdu(cm).varbinds[1:])), address, port)
-
         def check(r: ?Response, e: ?errors.SnmpError) -> None:
             testing.assertTrue(isinstance(_failed(r, e), errors.InvalidResponseError))
 
@@ -2495,9 +2522,14 @@ actor _test_inform_wrong_echo(t: testing.AsyncT):
             _finish(t, lambda: check(r, e))
 
         p = mem_pair(mn, server_port=162)
+
+        def received(data: bytes, address: str, port: int) -> None:
+            cm = _cm(data)
+            p.server.send_to(_reply(cm, _answer(_pdu(cm).varbinds[1:])), address, port)
+
         c = Client(None, AGENT, Community("public"), t.log_handler, port=162, opts=SLOW, transport=p.client)
 
-        p.server.set_receiver((lambda data, address, port: received(p, data, address, port)))
+        p.server.set_receiver(received)
         c.inform(acked, TRAP_OID, [])
 
 
@@ -2507,7 +2539,10 @@ actor _test_v3_unknown_engine_twice(t: testing.AsyncT):
     proc def __startup__():
         mn = MemNet()
 
-        def check(agent: _V3Agent, r: ?Response, e: ?errors.SnmpError) -> None:
+        p = mem_pair(mn)
+        agent = _V3Agent(p.server, _users(), _engine_id())
+
+        def check(r: ?Response, e: ?errors.SnmpError) -> None:
             err = _failed(r, e)
             if isinstance(err, errors.ReportError):
                 testing.assertEqual(err.name, usm.USM_STATS_UNKNOWN_ENGINE_IDS)
@@ -2517,15 +2552,13 @@ actor _test_v3_unknown_engine_twice(t: testing.AsyncT):
             u = usm.USM_STATS_UNKNOWN_ENGINE_IDS
             testing.assertEqual(agent.seen(), ["probe", u, "probe", u])
 
-        def got(agent: _V3Agent, cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-            _finish(t, lambda: check(agent, r, e))
+        def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            _finish(t, lambda: check(r, e))
 
-        p = mem_pair(mn)
-        agent = _V3Agent(p.server, _users(), _engine_id())
         agent.set_mode(ALWAYS_UNKNOWN_ENGINE)
         c = Client(None, AGENT, _shaaes(), t.log_handler, opts=SLOW, transport=p.client)
 
-        c.get((lambda cl, r, e: got(agent, cl, r, e)), _oids(1))
+        c.get(got, _oids(1))
 
 
 
@@ -2534,7 +2567,12 @@ actor _test_v3_forged_discovery_cannot_lock_out(t: testing.AsyncT):
     proc def __startup__():
         mn = MemNet()
 
-        def check(agent: _V3Agent, c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        p = mem_pair(mn)
+        agent = _V3Agent(p.server, _users(), _engine_id())
+        agent.set_forged_discovery(2000000000, 5)
+        c = Client(None, AGENT, _shaaes(), t.log_handler, opts=SLOW, transport=p.client)
+
+        def check(r: ?Response, e: ?errors.SnmpError) -> None:
             _ok(r, e)
             testing.assertEqual(agent.seen(), ["probe", usm.USM_STATS_NOT_IN_TIME_WINDOWS, "ok"])
             info = c.engine_info()
@@ -2543,15 +2581,10 @@ actor _test_v3_forged_discovery_cannot_lock_out(t: testing.AsyncT):
             else:
                 testing.error("no engine info")
 
-        def got(agent: _V3Agent, c: Client, cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-            _finish(t, lambda: check(agent, c, r, e))
+        def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            _finish(t, lambda: check(r, e))
 
-        p = mem_pair(mn)
-        agent = _V3Agent(p.server, _users(), _engine_id())
-        agent.set_forged_discovery(2000000000, 5)
-        c = Client(None, AGENT, _shaaes(), t.log_handler, opts=SLOW, transport=p.client)
-
-        c.get((lambda cl, r, e: got(agent, c, cl, r, e)), _oids(1))
+        c.get(got, _oids(1))
 
 
 
@@ -2562,7 +2595,12 @@ actor _test_v3_boots_went_down_resyncs(t: testing.AsyncT):
     proc def __startup__():
         mn = MemNet()
 
-        def check(agent: _V3Agent, c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        p = mem_pair(mn)
+        agent = _V3Agent(p.server, _users(), _engine_id())
+        agent.reboot(5)
+        c = Client(None, AGENT, _shaaes(), t.log_handler, opts=SLOW, transport=p.client)
+
+        def check(r: ?Response, e: ?errors.SnmpError) -> None:
             resp = _ok(r, e)
             testing.assertEqual(resp.varbinds, _answer([VarBind(o) for o in _oids(1)]))
             testing.assertEqual(resp.attempts, 2, "the request and its resend after the resynchronisation")
@@ -2576,24 +2614,19 @@ actor _test_v3_boots_went_down_resyncs(t: testing.AsyncT):
             s = c.stats()
             testing.assertEqual((s.reports, s.responses, s.timeouts, s.drops_auth), (2, 2, 0, 0), str(s))
 
-        def got_second(agent: _V3Agent, c: Client, cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-            _finish(t, lambda: check(agent, c, r, e))
+        def got_second(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            _finish(t, lambda: check(r, e))
 
-        def got_first(agent: _V3Agent, c: Client, cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        def got_first(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
             try:
                 _ok(r, e)
             except Exception as ex:
                 t.failure(ex)
                 return
             agent.reboot(1)
-            c.get((lambda cl, r, e: got_second(agent, c, cl, r, e)), _oids(1))
+            c.get(got_second, _oids(1))
 
-        p = mem_pair(mn)
-        agent = _V3Agent(p.server, _users(), _engine_id())
-        agent.reboot(5)
-        c = Client(None, AGENT, _shaaes(), t.log_handler, opts=SLOW, transport=p.client)
-
-        c.get((lambda cl, r, e: got_first(agent, c, cl, r, e)), _oids(1))
+        c.get(got_first, _oids(1))
 
 
 
@@ -2604,7 +2637,11 @@ actor _test_v3_time_went_back_resyncs(t: testing.AsyncT):
     proc def __startup__():
         mn = MemNet()
 
-        def check(agent: _V3Agent, c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        p = mem_pair(mn)
+        agent = _V3Agent(p.server, _users(), _engine_id())
+        c = Client(None, AGENT, _shaaes(), t.log_handler, opts=SLOW, transport=p.client)
+
+        def check(r: ?Response, e: ?errors.SnmpError) -> None:
             resp = _ok(r, e)
             testing.assertEqual(resp.attempts, 2)
             testing.assertEqual(agent.seen(), ["probe", "ok", usm.USM_STATS_NOT_IN_TIME_WINDOWS, "ok"])
@@ -2617,10 +2654,10 @@ actor _test_v3_time_went_back_resyncs(t: testing.AsyncT):
             s = c.stats()
             testing.assertEqual((s.timeouts, s.drops_auth), (0, 0), str(s))
 
-        def got_second(agent: _V3Agent, c: Client, cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-            _finish(t, lambda: check(agent, c, r, e))
+        def got_second(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            _finish(t, lambda: check(r, e))
 
-        def got_first(agent: _V3Agent, c: Client, cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        def got_first(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
             try:
                 _ok(r, e)
                 info = c.engine_info()
@@ -2630,13 +2667,9 @@ actor _test_v3_time_went_back_resyncs(t: testing.AsyncT):
                 t.failure(ex)
                 return
             agent.reboot(1)
-            c.get((lambda cl, r, e: got_second(agent, c, cl, r, e)), _oids(1))
+            c.get(got_second, _oids(1))
 
-        p = mem_pair(mn)
-        agent = _V3Agent(p.server, _users(), _engine_id())
-        c = Client(None, AGENT, _shaaes(), t.log_handler, opts=SLOW, transport=p.client)
-
-        c.get((lambda cl, r, e: got_first(agent, c, cl, r, e)), _oids(1))
+        c.get(got_first, _oids(1))
 
 
 
@@ -2647,46 +2680,47 @@ actor _test_v3_clock_back_once_per_request(t: testing.AsyncT):
     mn = MemNet()
     var step = 0
 
-    def check_timeout(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-        err = _failed(r, e)
-        if isinstance(err, errors.TimeoutError):
-            testing.assertEqual(err.hint, "1 datagram failed authentication (1 outside the time window)")
-        else:
-            testing.error("not a TimeoutError: " + str(err))
-        testing.assertTrue(c.engine_info() is None, "reset after the time-window failure")
-
-    def check_last(agent: _V3Agent, r: ?Response, e: ?errors.SnmpError) -> None:
-        _ok(r, e)
-        n = usm.USM_STATS_NOT_IN_TIME_WINDOWS
-        testing.assertEqual(agent.seen(), ["probe", "ok", n, n, "probe", "ok"])
-
-    def got(agent: _V3Agent, c: Client, cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-        step += 1
-        if step == 1:
-            try:
-                _ok(r, e)
-            except Exception as ex:
-                t.failure(ex)
-                return
-            agent.set_mode(CLOCK_BACK)
-            c.get((lambda cl, r, e: got(agent, c, cl, r, e)), _oids(1), FAST.with_(timeout=0.1))
-        elif step == 2:
-            try:
-                check_timeout(c, r, e)
-            except Exception as ex:
-                t.failure(ex)
-                return
-            agent.set_mode(NORMAL)
-            c.get((lambda cl, r, e: got(agent, c, cl, r, e)), _oids(1))
-        else:
-            _finish(t, lambda: check_last(agent, r, e))
-
     proc def __startup__():
         p = mem_pair(mn)
         agent = _V3Agent(p.server, _users(), _engine_id())
+
+        def check_last(r: ?Response, e: ?errors.SnmpError) -> None:
+            _ok(r, e)
+            n = usm.USM_STATS_NOT_IN_TIME_WINDOWS
+            testing.assertEqual(agent.seen(), ["probe", "ok", n, n, "probe", "ok"])
+
         c = Client(None, AGENT, _shaaes(), t.log_handler, opts=SLOW, transport=p.client)
 
-        c.get((lambda cl, r, e: got(agent, c, cl, r, e)), _oids(1))
+        def check_timeout(r: ?Response, e: ?errors.SnmpError) -> None:
+            err = _failed(r, e)
+            if isinstance(err, errors.TimeoutError):
+                testing.assertEqual(err.hint, "1 datagram failed authentication (1 outside the time window)")
+            else:
+                testing.error("not a TimeoutError: " + str(err))
+            testing.assertTrue(c.engine_info() is None, "reset after the time-window failure")
+
+        def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            step += 1
+            if step == 1:
+                try:
+                    _ok(r, e)
+                except Exception as ex:
+                    t.failure(ex)
+                    return
+                agent.set_mode(CLOCK_BACK)
+                c.get(got, _oids(1), FAST.with_(timeout=0.1))
+            elif step == 2:
+                try:
+                    check_timeout(r, e)
+                except Exception as ex:
+                    t.failure(ex)
+                    return
+                agent.set_mode(NORMAL)
+                c.get(got, _oids(1))
+            else:
+                _finish(t, lambda: check_last(r, e))
+
+        c.get(got, _oids(1))
 
 
 
@@ -2697,7 +2731,11 @@ actor _test_v3_duplicated_time_window_report(t: testing.AsyncT):
         mn = MemNet(NetFaults(duplicate=True, to_address=MANAGER))
         outcomes: list[str] = []
 
-        def check(agent: _V3Agent, c: Client) -> None:
+        p = mem_pair(mn)
+        agent = _V3Agent(p.server, _users(), _engine_id())
+        c = Client(None, AGENT, _shaaes(), t.log_handler, opts=SLOW, transport=p.client)
+
+        def check() -> None:
             testing.assertEqual(outcomes, ["ok", "ok"], "exactly one callback per request")
             testing.assertEqual(agent.seen(), ["probe", "ok", usm.USM_STATS_NOT_IN_TIME_WINDOWS, "ok"])
             info = c.engine_info()
@@ -2710,20 +2748,16 @@ actor _test_v3_duplicated_time_window_report(t: testing.AsyncT):
             # Report and of both Responses have unknown msgIDs by then
             testing.assertEqual((s.reports, s.drops_unknown_id, s.timeouts, s.drops_auth), (3, 3, 0, 0), str(s))
 
-        def got_second(agent: _V3Agent, c: Client, cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        def got_second(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
             outcomes.append(_describe(e))
-            after now QUIET: _finish(t, (lambda: check(agent, c)))
+            after now QUIET: _finish(t, check)
 
-        def got_first(agent: _V3Agent, c: Client, cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        def got_first(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
             outcomes.append(_describe(e))
             agent.reboot(2)
-            c.get((lambda cl, r, e: got_second(agent, c, cl, r, e)), _oids(1))
+            c.get(got_second, _oids(1))
 
-        p = mem_pair(mn)
-        agent = _V3Agent(p.server, _users(), _engine_id())
-        c = Client(None, AGENT, _shaaes(), t.log_handler, opts=SLOW, transport=p.client)
-
-        c.get((lambda cl, r, e: got_first(agent, c, cl, r, e)), _oids(1))
+        c.get(got_first, _oids(1))
 
 
 
@@ -2735,7 +2769,13 @@ actor _test_v3_stale_engine_user_report_rediscovers(t: testing.AsyncT):
         mn = MemNet()
         seed = EngineInfo(h(ENGINE2_HEX), 1, 1000, _now())
 
-        def check(agent: _V3Agent, c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+        p = mem_pair(mn)
+        agent = _V3Agent(p.server, _users(), _engine_id())
+        agent.set_mode(STALE_ENGINE_USER)
+
+        c = Client(None, AGENT, _shaaes(), t.log_handler, opts=SLOW, transport=p.client, engine=seed)
+
+        def check(r: ?Response, e: ?errors.SnmpError) -> None:
             resp = _ok(r, e)
             testing.assertEqual(resp.attempts, 2)
             testing.assertEqual(resp.context_engine_id, _engine_id())
@@ -2748,16 +2788,10 @@ actor _test_v3_stale_engine_user_report_rediscovers(t: testing.AsyncT):
             s = c.stats()
             testing.assertEqual((s.reports, s.timeouts, s.drops_auth), (2, 0, 0), str(s))
 
-        def got(agent: _V3Agent, c: Client, cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-            _finish(t, lambda: check(agent, c, r, e))
+        def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            _finish(t, lambda: check(r, e))
 
-        p = mem_pair(mn)
-        agent = _V3Agent(p.server, _users(), _engine_id())
-        agent.set_mode(STALE_ENGINE_USER)
-
-        c = Client(None, AGENT, _shaaes(), t.log_handler, opts=SLOW, transport=p.client, engine=seed)
-
-        c.get((lambda cl, r, e: got(agent, c, cl, r, e)), _oids(1))
+        c.get(got, _oids(1))
 
 
 
@@ -2768,27 +2802,27 @@ actor _test_v3_other_engine_report_bounded(t: testing.AsyncT):
         mn = MemNet()
         outcomes: list[str] = []
 
-        def check(agent: _V3Agent, c: Client) -> None:
-            testing.assertEqual(len(outcomes), 1, "exactly one callback")
-            testing.assertEqual(outcomes[0], "ReportError " + usm.USM_STATS_UNKNOWN_USER_NAMES + " transient")
-            testing.assertEqual(agent.seen(), ["probe", "other engine", "probe", "other engine"])
-            s = c.stats()
-            testing.assertEqual((s.reports, s.timeouts), (4, 0), str(s))
-
-        def got(agent: _V3Agent, c: Client, cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-            if isinstance(e, errors.ReportError):
-                outcomes.append("ReportError " + e.name + (" transient" if e.transient else " permanent"))
-            else:
-                outcomes.append("not a ReportError: " + _describe(e))
-            after now QUIET: _finish(t, (lambda: check(agent, c)))
-
         p = mem_pair(mn)
         agent = _V3Agent(p.server, _users(), _engine_id())
         agent.set_mode(OTHER_ENGINE_REPORT)
         agent.set_report(usm.report_oid(usm.USM_STATS_UNKNOWN_USER_NAMES))
         c = Client(None, AGENT, _shaaes(), t.log_handler, opts=SLOW, transport=p.client)
 
-        c.get((lambda cl, r, e: got(agent, c, cl, r, e)), _oids(1))
+        def check() -> None:
+            testing.assertEqual(len(outcomes), 1, "exactly one callback")
+            testing.assertEqual(outcomes[0], "ReportError " + usm.USM_STATS_UNKNOWN_USER_NAMES + " transient")
+            testing.assertEqual(agent.seen(), ["probe", "other engine", "probe", "other engine"])
+            s = c.stats()
+            testing.assertEqual((s.reports, s.timeouts), (4, 0), str(s))
+
+        def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            if isinstance(e, errors.ReportError):
+                outcomes.append("ReportError " + e.name + (" transient" if e.transient else " permanent"))
+            else:
+                outcomes.append("not a ReportError: " + _describe(e))
+            after now QUIET: _finish(t, check)
+
+        c.get(got, _oids(1))
 
 
 
@@ -2798,38 +2832,39 @@ actor _test_v3_late_reply_and_wrong_request_id(t: testing.AsyncT):
     mn = MemNet()
     var step = 0
 
-    def check_late(agent: _V3Agent, r: ?Response, e: ?errors.SnmpError) -> None:
-        resp = _ok(r, e)
-        testing.assertEqual(resp.attempts, 2)
-        testing.assertEqual(agent.seen(), ["probe", "ok", "held", "ok", "ok"])
-
-    def check_wrong(c: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-        _ok(r, e)
-        s = c.stats()
-        testing.assertEqual((s.drops_pdu, s.drops_unknown_id), (1, 1))
-
-    def got(agent: _V3Agent, c: Client, cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-        step += 1
-        if step == 1:
-            agent.set_mode(HOLD_FIRST)
-            c.get((lambda cl, r, e: got(agent, c, cl, r, e)), _oids(1))
-        elif step == 2:
-            try:
-                check_late(agent, r, e)
-            except Exception as ex:
-                t.failure(ex)
-                return
-            agent.set_mode(WRONG_RID_FIRST)
-            c.get((lambda cl, r, e: got(agent, c, cl, r, e)), _oids(1))
-        else:
-            _finish(t, lambda: check_wrong(c, r, e))
-
     proc def __startup__():
         p = mem_pair(mn)
         agent = _V3Agent(p.server, _users(), _engine_id())
+
+        def check_late(r: ?Response, e: ?errors.SnmpError) -> None:
+            resp = _ok(r, e)
+            testing.assertEqual(resp.attempts, 2)
+            testing.assertEqual(agent.seen(), ["probe", "ok", "held", "ok", "ok"])
+
         c = Client(None, AGENT, _shaaes(), t.log_handler, opts=Options(timeout=0.1, retries=2), transport=p.client)
 
-        c.get((lambda cl, r, e: got(agent, c, cl, r, e)), _oids(1))
+        def check_wrong(r: ?Response, e: ?errors.SnmpError) -> None:
+            _ok(r, e)
+            s = c.stats()
+            testing.assertEqual((s.drops_pdu, s.drops_unknown_id), (1, 1))
+
+        def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            step += 1
+            if step == 1:
+                agent.set_mode(HOLD_FIRST)
+                c.get(got, _oids(1))
+            elif step == 2:
+                try:
+                    check_late(r, e)
+                except Exception as ex:
+                    t.failure(ex)
+                    return
+                agent.set_mode(WRONG_RID_FIRST)
+                c.get(got, _oids(1))
+            else:
+                _finish(t, lambda: check_wrong(r, e))
+
+        c.get(got, _oids(1))
 
 
 
@@ -2844,10 +2879,6 @@ actor _test_v3_cancel_and_close_while_discovering(t: testing.AsyncT):
                 return "cancelled"
             return _describe(e)
 
-        def check(agent: _V3Agent) -> None:
-            testing.assertEqual(log, ["get:cancelled", "get2:cancelled", "discover:cancelled"])
-            testing.assertEqual(agent.seen(), ["probe"])
-
         def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
             log.append("get:" + name_of(e))
 
@@ -2857,20 +2888,25 @@ actor _test_v3_cancel_and_close_while_discovering(t: testing.AsyncT):
         def discovered(cl: Client, info: ?EngineInfo, e: ?errors.SnmpError) -> None:
             log.append("discover:" + name_of(e))
 
-        def close_due(agent: _V3Agent, c: Client) -> None:
-            c.close()
-            after now QUIET: _finish(t, (lambda: check(agent)))
-
         p = mem_pair(mn)
         agent = _V3Agent(p.server, _users(), _engine_id())
+
+        def check() -> None:
+            testing.assertEqual(log, ["get:cancelled", "get2:cancelled", "discover:cancelled"])
+            testing.assertEqual(agent.seen(), ["probe"])
+
         agent.set_mode(SILENT)
         c = Client(None, AGENT, _shaaes(), t.log_handler, opts=SLOW, transport=p.client)
+
+        def close_due() -> None:
+            c.close()
+            after now QUIET: _finish(t, check)
 
         h1 = c.get(got, _oids(1))
         c.discover(discovered)
         c.get(got_second, _oids(1))
         c.cancel(h1)
-        after now 0.05: close_due(agent, c)
+        after now 0.05: close_due()
 
 
 # UDP loopback ######################################################################################
@@ -2957,36 +2993,36 @@ actor _test_rv_encrypted_report(t: testing.AsyncT):
     salt = SaltCounter(u64(77))
     var started = _now()
 
-    def received(p: (client: Transport, server: ServerTransport), data: bytes, address: str, port: int) -> None:
-        cm, m = message.decode(data)
-        if m is not None:
-            hdr = V3Message(m.msg_id, 65507, message.FLAG_AUTH | message.FLAG_PRIV,
-                            UsmSecurityParameters(eid, 1, 1000, b"shaaes"))
-            rep = Pdu(pdu.REPORT, 0, 0, 0, [VarBind(usm.report_oid(usm.SNMP_UNKNOWN_CONTEXTS), Counter32(1))])
-            p.server.send_to(usm.protect(hdr, message.encode_scoped(ScopedPdu(eid, b"", rep)), keys, salt.next()),
-                             address, port)
-
-    def check(e: ?errors.SnmpError, elapsed: float, s: str) -> None:
-        if not isinstance(e, errors.ReportError):
-            raise AssertionError("expected ReportError(snmpUnknownContexts), got " + _describe(e)
-                                 + " after %.3f s; " % elapsed + s)
-
-    def got(c: Client, cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-        elapsed = _now() - started
-        s = str(c.stats())
-        _finish(t, lambda: check(e, elapsed, s))
-
     proc def __startup__():
         t.timeout(10.0)
 
         p = mem_pair(mn)
 
+        def received(data: bytes, address: str, port: int) -> None:
+            cm, m = message.decode(data)
+            if m is not None:
+                hdr = V3Message(m.msg_id, 65507, message.FLAG_AUTH | message.FLAG_PRIV,
+                                UsmSecurityParameters(eid, 1, 1000, b"shaaes"))
+                rep = Pdu(pdu.REPORT, 0, 0, 0, [VarBind(usm.report_oid(usm.SNMP_UNKNOWN_CONTEXTS), Counter32(1))])
+                p.server.send_to(usm.protect(hdr, message.encode_scoped(ScopedPdu(eid, b"", rep)), keys, salt.next()),
+                                 address, port)
+
         c = Client(None, AGENT, u, t.log_handler, opts=Options(timeout=0.3, retries=0), transport=p.client,
                    engine=EngineInfo(eid, 1, 1000, _now()))
 
-        p.server.set_receiver((lambda data, address, port: received(p, data, address, port)))
+        def check(e: ?errors.SnmpError, elapsed: float, s: str) -> None:
+            if not isinstance(e, errors.ReportError):
+                raise AssertionError("expected ReportError(snmpUnknownContexts), got " + _describe(e)
+                                     + " after %.3f s; " % elapsed + s)
+
+        def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            elapsed = _now() - started
+            s = str(c.stats())
+            _finish(t, lambda: check(e, elapsed, s))
+
+        p.server.set_receiver(received)
         started = _now()
-        c.get((lambda cl, r, e: got(c, cl, r, e)), _oids(1))
+        c.get(got, _oids(1))
 
 
 # Fatal transport error with a long queue: no recursion, no quadratic work ##########################
@@ -3115,19 +3151,16 @@ actor _test_rv_trap_v3_after_restart(t: testing.AsyncT):
         def received(r: NotificationReceiver, n: Notification) -> None:
             delivered.append(n)
 
-        def check(rcv: NotificationReceiver) -> None:
-            s = rcv.stats()
-            testing.assertEqual(len(delivered), 2, "delivered %d; receiver stats %s" % (len(delivered), str(s)))
-
-        def trap_sent(rcv: NotificationReceiver, cl: Client, e: ?errors.SnmpError) -> None:
-            after now 0.3: _finish(t, (lambda: check(rcv)))
-
-        def trap_due(c: Client, rcv: NotificationReceiver) -> None:
-            c.trap((lambda cl, e: trap_sent(rcv, cl, e)), TRAP_OID, [])
-
         t.timeout(10.0)
 
         rcv = NotificationReceiver(mn.server("10.0.0.9", 162), cfg, received, t.log_handler)
+
+        def check() -> None:
+            s = rcv.stats()
+            testing.assertEqual(len(delivered), 2, "delivered %d; receiver stats %s" % (len(delivered), str(s)))
+
+        def trap_sent(cl: Client, e: ?errors.SnmpError) -> None:
+            after now 0.3: _finish(t, check)
 
         mn.send(usm.protect(hdr, message.encode_scoped(ScopedPdu(eid, b"", old)), keys, u64(0)), MANAGER, 40000,
                 "10.0.0.9", 162)
@@ -3135,7 +3168,10 @@ actor _test_rv_trap_v3_after_restart(t: testing.AsyncT):
         c = Client(None, "10.0.0.9", u, t.log_handler, port=162, transport=c_transport,
                    local_engine_id=eid, local_engine_boots=2)
 
-        after now 0.1: trap_due(c, rcv)
+        def trap_due() -> None:
+            c.trap(trap_sent, TRAP_OID, [])
+
+        after now 0.1: trap_due()
 
 
 # SNMPv3 tooBig split, fatal error during discovery ##################################################
@@ -3191,18 +3227,19 @@ actor _test_rv_v3_too_big_split(t: testing.AsyncT):
                 testing.assertEqual([vb.value for vb in r.varbinds], [OctetString(o.dotted().encode()) for o in oids])
             testing.assertEqual(sizes, [3, 1, 2, 1, 1])
 
-        def got(agent: _TooBigV3Agent, cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-            sizes = agent.seen()
-            _finish(t, lambda: check(r, e, sizes))
-
         t.timeout(10.0)
 
         p = mem_pair(mn)
 
         agent = _TooBigV3Agent(p.server, _shaaes(), eid)
+
+        def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            sizes = agent.seen()
+            _finish(t, lambda: check(r, e, sizes))
+
         c = Client(None, AGENT, _shaaes(), t.log_handler, opts=Options(timeout=2.0, retries=0), transport=p.client)
 
-        c.get((lambda cl, r, e: got(agent, cl, r, e)), oids)
+        c.get(got, oids)
 
 
 
@@ -3242,33 +3279,34 @@ actor _test_rv_error_index_outside_part(t: testing.AsyncT):
     mn = MemNet()
     var parts = 0
 
-    def received(p: (client: Transport, server: ServerTransport), data: bytes, address: str, port: int) -> None:
-        cm = _cm(data)
-        parts += 1
-        if parts == 2:
-            p.server.send_to(_reply(cm, _pdu(cm).varbinds, pdu.GEN_ERR, 7), address, port)
-        else:
-            p.server.send_to(_reply(cm, _answer(_pdu(cm).varbinds)), address, port)
-
-    def check(e: ?errors.SnmpError) -> None:
-        if isinstance(e, errors.ErrorStatusError):
-            testing.assertEqual((e.status, e.index), (pdu.GEN_ERR, 0))
-            testing.assertTrue(e.oid is None, "no OID blamed")
-            r = error_response(e)
-            if r is not None:
-                testing.assertEqual(r.error_index, 0)
-        else:
-            raise AssertionError("expected ErrorStatusError, got " + _describe(e))
-
-    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-        _finish(t, lambda: check(e))
-
     proc def __startup__():
+        def check(e: ?errors.SnmpError) -> None:
+            if isinstance(e, errors.ErrorStatusError):
+                testing.assertEqual((e.status, e.index), (pdu.GEN_ERR, 0))
+                testing.assertTrue(e.oid is None, "no OID blamed")
+                r = error_response(e)
+                if r is not None:
+                    testing.assertEqual(r.error_index, 0)
+            else:
+                raise AssertionError("expected ErrorStatusError, got " + _describe(e))
+
+        def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            _finish(t, lambda: check(e))
+
         p = mem_pair(mn)
+
+        def received(data: bytes, address: str, port: int) -> None:
+            cm = _cm(data)
+            parts += 1
+            if parts == 2:
+                p.server.send_to(_reply(cm, _pdu(cm).varbinds, pdu.GEN_ERR, 7), address, port)
+            else:
+                p.server.send_to(_reply(cm, _answer(_pdu(cm).varbinds)), address, port)
+
         c = Client(None, AGENT, Community("public"), t.log_handler, opts=Options(timeout=2.0, retries=0,
                    max_oids_per_request=2), transport=p.client)
 
-        p.server.set_receiver((lambda data, address, port: received(p, data, address, port)))
+        p.server.set_receiver(received)
         c.get(got, _oids(5))
 
 
@@ -3390,37 +3428,37 @@ actor _test_v3_many_discovery_waiters(t: testing.AsyncT):
     var wrong = 0
     var t0 = 0.0
 
-    def received(data: bytes, address: str, port: int) -> None:
-        pass
-
-    def got_first(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-        pass
-
-    def check(elapsed: float) -> None:
-        testing.assertEqual(wrong, 0, "callbacks that were not a TimeoutError")
-        testing.assertTrue(elapsed < 8.0, "the last of 20000 callbacks came %.2f s after the first request" % elapsed)
-
-    def got(c: Client, cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-        if not isinstance(e, errors.TimeoutError):
-            wrong += 1
-        n += 1
-        if n == 20000:
-            elapsed = _now() - t0
-            c.close()
-            _finish(t, lambda: check(elapsed))
-
     proc def __startup__():
+        def received(data: bytes, address: str, port: int) -> None:
+            pass
+
+        def got_first(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            pass
+
+        def check(elapsed: float) -> None:
+            testing.assertEqual(wrong, 0, "callbacks that were not a TimeoutError")
+            testing.assertTrue(elapsed < 8.0, "the last of 20000 callbacks came %.2f s after the first request" % elapsed)
+
         t.timeout(120.0)
 
         p = mem_pair(mn)
         c = Client(None, AGENT, _shaaes(), None, opts=Options(timeout=0.5, retries=0, max_in_flight=30000),
                    transport=p.client)
 
+        def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            if not isinstance(e, errors.TimeoutError):
+                wrong += 1
+            n += 1
+            if n == 20000:
+                elapsed = _now() - t0
+                c.close()
+                _finish(t, lambda: check(elapsed))
+
         p.server.set_receiver(received)
         t0 = _now()
         c.get(got_first, _oids(1), Options(timeout=30.0, retries=0))
         for i in range(20000):
-            c.get((lambda cl, r, e: got(c, cl, r, e)), _oids(1))
+            c.get(got, _oids(1))
 
 
 
@@ -3432,36 +3470,36 @@ actor _test_v3_late_joiner_keeps_budget(t: testing.AsyncT):
     var a_waited = 0.0
     var t0 = 0.0
 
-    def received(data: bytes, address: str, port: int) -> None:
-        pass
-
-    def got_a(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-        a_waited = _now() - t0
-
-    def check(e: ?errors.SnmpError, waited: float) -> None:
-        testing.assertTrue(isinstance(e, errors.TimeoutError), _describe(e))
-        testing.assertTrue(waited >= 3.9, "B (budget 4 s) failed after %.2f s: " % waited + _describe(e))
-        testing.assertTrue(a_waited >= 0.95 and a_waited < 1.5, "A (budget 1 s) failed after %.2f s" % a_waited)
-
-    def got_b(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-        waited = _now() - t_b
-        _finish(t, lambda: check(e, waited))
-
-    def request_b_due(c: Client) -> None:
-        t_b = _now()
-        c.get(got_b, _oids(1), Options(timeout=2.0, retries=1))
-
     proc def __startup__():
+        def received(data: bytes, address: str, port: int) -> None:
+            pass
+
+        def got_a(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            a_waited = _now() - t0
+
+        def check(e: ?errors.SnmpError, waited: float) -> None:
+            testing.assertTrue(isinstance(e, errors.TimeoutError), _describe(e))
+            testing.assertTrue(waited >= 3.9, "B (budget 4 s) failed after %.2f s: " % waited + _describe(e))
+            testing.assertTrue(a_waited >= 0.95 and a_waited < 1.5, "A (budget 1 s) failed after %.2f s" % a_waited)
+
+        def got_b(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            waited = _now() - t_b
+            _finish(t, lambda: check(e, waited))
+
         t.timeout(30.0)
 
         p = mem_pair(mn)
         c = Client(None, AGENT, _shaaes(), None, opts=Options(timeout=1.0, retries=0, max_in_flight=4),
                    transport=p.client)
 
+        def request_b_due() -> None:
+            t_b = _now()
+            c.get(got_b, _oids(1), Options(timeout=2.0, retries=1))
+
         p.server.set_receiver(received)
         t0 = _now()
         c.get(got_a, _oids(1))
-        after now 0.8: request_b_due(c)
+        after now 0.8: request_b_due()
 
 
 
@@ -3524,28 +3562,16 @@ actor _test_id16_exhaustion(t: testing.AsyncT):
     var full: list[str] = []
     var others = 0
 
-    def received(data: bytes, address: str, port: int) -> None:
-        pass
-
-    def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-        if isinstance(e, errors.QueueFullError):
-            full.append(e.error_message)
-        else:
-            others += 1
-
-    def check(s: Stats, texts: list[str], n_others: int) -> None:
-        testing.assertEqual(len(texts), 1, "one request without an id")
-        testing.assertTrue(texts[0].startswith("no free request-id"), texts[0])
-        testing.assertEqual(n_others, 0, "no other callback yet")
-        testing.assertEqual((s.in_flight, s.queued), (32767, 0), str(s))
-
-    def settled(c: Client, s: Stats) -> None:
-        texts = full
-        n_others = others
-        c.close()
-        _finish(t, lambda: check(s, texts, n_others))
-
     proc def __startup__():
+        def received(data: bytes, address: str, port: int) -> None:
+            pass
+
+        def got(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            if isinstance(e, errors.QueueFullError):
+                full.append(e.error_message)
+            else:
+                others += 1
+
         t.timeout(120.0)
 
         p = mem_pair(mn)
@@ -3559,7 +3585,19 @@ actor _test_id16_exhaustion(t: testing.AsyncT):
         # a synchronous call: it returns only once every get() above has been handled
         s = c.stats()
 
-        after now QUIET: settled(c, s)
+        def check(texts: list[str], n_others: int) -> None:
+            testing.assertEqual(len(texts), 1, "one request without an id")
+            testing.assertTrue(texts[0].startswith("no free request-id"), texts[0])
+            testing.assertEqual(n_others, 0, "no other callback yet")
+            testing.assertEqual((s.in_flight, s.queued), (32767, 0), str(s))
+
+        def settled() -> None:
+            texts = full
+            n_others = others
+            c.close()
+            _finish(t, lambda: check(texts, n_others))
+
+        after now QUIET: settled()
 
 
 
@@ -3582,14 +3620,6 @@ actor _test_v3_context_per_request(t: testing.AsyncT):
             if len(got) == 4:
                 _finish(t, check)
 
-        def got_default(c: Client, cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-            one(r, e)
-            c.get((lambda cl, r, e: got_vlan_10(c, cl, r, e)), _oids(1), SLOW.with_(context_name=b"vlan-10"))
-
-        def got_vlan_10(c: Client, cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
-            one(r, e)
-            c.get(got_vlan_20, _oids(1), Options(timeout=2.0, retries=0, context_name=b"vlan-20"))
-
         def got_vlan_20(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
             one(r, e)
             c2 = Client(None, AGENT, u.with_context("vrf-blue"), t.log_handler, opts=SLOW,
@@ -3604,7 +3634,15 @@ actor _test_v3_context_per_request(t: testing.AsyncT):
 
         c = Client(None, AGENT, u, t.log_handler, opts=SLOW, transport=p.client)
 
-        c.get((lambda cl, r, e: got_default(c, cl, r, e)), _oids(1))
+        def got_default(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            one(r, e)
+            c.get(got_vlan_10, _oids(1), SLOW.with_(context_name=b"vlan-10"))
+
+        def got_vlan_10(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
+            one(r, e)
+            c.get(got_vlan_20, _oids(1), Options(timeout=2.0, retries=0, context_name=b"vlan-20"))
+
+        c.get(got_default, _oids(1))
 
 
 
