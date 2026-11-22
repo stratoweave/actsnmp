@@ -55,19 +55,12 @@ class MibView(object):
 
     def __init__(self, entries: list[VarBind]):
         """Build a view from varbinds in any order; of two entries with the same OID the last wins"""
-        vals: dict[Oid, Value] = {}
-        for vb in entries:
-            vals[vb.oid] = vb.value
-        self._values = vals
-        self._oids = sorted(list(vals.keys()))
+        self._values = {vb.oid: vb.value for vb in entries}
+        self._oids = sorted(list(self._values.keys()))
         # _vals[i] is the value of _oids[i]: get_next() need not hash the OID it found
-        self._vals = [vals[o] for o in self._oids]
+        self._vals = [self._values[o] for o in self._oids]
         self._objects = {_object_of(o) for o in self._oids}
-        top = -1
-        for ob in self._objects:
-            if len(ob.arcs) > top:
-                top = len(ob.arcs)
-        self._max_object = top
+        self._max_object = max([len(ob.arcs) for ob in self._objects], -1)
 
     def _after(self, oid: Oid) -> int:
         # The index of the first OID of the view that is greater than oid (binary search)

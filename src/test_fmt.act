@@ -684,46 +684,60 @@ def check_matrix_blocks(snmprec: str, matrix: str) -> None:
 
 actor _test_lab_dataset_canon(t: testing.EnvT):
     """canon_varbind of every dataset record equals expected/canon/dataset.txt"""
-    t.timeout(60.0)
-    try:
-        check_canon_dataset(read_text(t, SNMPREC), read_text(t, CANON_DATASET))
-        t.success()
-    except AssertionError as e:
-        t.failure(e)
-    except Exception as e:
-        t.error(e)
+
+    proc def __startup__():
+        t.timeout(60.0)
+        try:
+            check_canon_dataset(read_text(t, SNMPREC), read_text(t, CANON_DATASET))
+            t.success()
+        except AssertionError as e:
+            t.failure(e)
+        except Exception as e:
+            t.error(e)
+
+
 
 actor _test_lab_dataset_netsnmp(t: testing.EnvT):
     """netsnmp_varbind of every dataset record equals net-snmp's snmpbulkwalk -On output"""
-    t.timeout(60.0)
-    try:
-        check_netsnmp_dataset(read_text(t, SNMPREC), read_text(t, NETSNMP_DATASET), OutputOptions(),
-                              NETSNMP_DATASET)
-        t.success()
-    except AssertionError as e:
-        t.failure(e)
-    except Exception as e:
-        t.error(e)
+
+    proc def __startup__():
+        t.timeout(60.0)
+        try:
+            check_netsnmp_dataset(read_text(t, SNMPREC), read_text(t, NETSNMP_DATASET), OutputOptions(),
+                                  NETSNMP_DATASET)
+            t.success()
+        except AssertionError as e:
+            t.failure(e)
+        except Exception as e:
+            t.error(e)
+
+
 
 actor _test_lab_dataset_netsnmp_hex(t: testing.EnvT):
     """the same with -Ox --hexOutputLength=0"""
-    t.timeout(60.0)
-    try:
-        check_netsnmp_dataset(read_text(t, SNMPREC), read_text(t, NETSNMP_DATASET_HEX),
-                              OutputOptions(hex_line_length=0).with_flags("x"), NETSNMP_DATASET_HEX)
-        t.success()
-    except AssertionError as e:
-        t.failure(e)
-    except Exception as e:
-        t.error(e)
+
+    proc def __startup__():
+        t.timeout(60.0)
+        try:
+            check_netsnmp_dataset(read_text(t, SNMPREC), read_text(t, NETSNMP_DATASET_HEX),
+                                  OutputOptions(hex_line_length=0).with_flags("x"), NETSNMP_DATASET_HEX)
+            t.success()
+        except AssertionError as e:
+            t.failure(e)
+        except Exception as e:
+            t.error(e)
+
+
 
 actor _test_lab_notify_matrix(t: testing.EnvT):
     """canon_notification of hand-built notifications matches blocks of expected/notify/matrix.txt"""
-    t.timeout(60.0)
-    try:
-        check_matrix_blocks(read_text(t, SNMPREC), read_text(t, NOTIFY_MATRIX))
-        t.success()
-    except AssertionError as e:
-        t.failure(e)
-    except Exception as e:
-        t.error(e)
+
+    proc def __startup__():
+        t.timeout(60.0)
+        try:
+            check_matrix_blocks(read_text(t, SNMPREC), read_text(t, NOTIFY_MATRIX))
+            t.success()
+        except AssertionError as e:
+            t.failure(e)
+        except Exception as e:
+            t.error(e)

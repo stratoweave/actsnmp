@@ -274,7 +274,7 @@ def counters(names: list[str], n: int) -> dict[str, int]:
 
 # The test bench ###################################################################################
 
-actor Bench(network: MemNet, cfg: ReceiverConfig, log_handler: ?logging.Handler, on_done: action(Bench) -> None):
+actor Bench(network: MemNet, peer: ServerTransport, receiver_transport: ServerTransport, cfg: ReceiverConfig, log_handler: ?logging.Handler, on_done: action(Bench) -> None):
     """A NotificationReceiver on network at RCV:RCV_PORT and a peer endpoint at PEER:PEER_PORT
 
     send() injects a datagram from any source. finish() sends the sentinel
@@ -297,9 +297,7 @@ actor Bench(network: MemNet, cfg: ReceiverConfig, log_handler: ?logging.Handler,
         else:
             _replies.append(data)
 
-    _peer = network.server(PEER, PEER_PORT)
-    _receiver = NotificationReceiver(network.server(RCV, RCV_PORT), cfg, _received, log_handler)
-    _peer.set_receiver(_peer_received)
+    _receiver = NotificationReceiver(receiver_transport, cfg, _received, log_handler)
 
     def send(data: bytes, src_address: str=PEER, src_port: int=PEER_PORT) -> None:
         network.send(data, src_address, src_port, RCV, RCV_PORT)
@@ -324,8 +322,14 @@ actor Bench(network: MemNet, cfg: ReceiverConfig, log_handler: ?logging.Handler,
         _receiver.close()
         _receiver.close()
 
+    proc def __startup__():
+        # Wait until the receiver startup has queued its callback registration.
+        await async _receiver.stats()
+        peer.set_receiver(_peer_received)
+
 
 # Configuration ####################################################################################
+
 
 def _test_config() -> None:
     c = ReceiverConfig(["public", "private"], [keyed("u_noauth")], [sender_a()], our_engine(), 1, 30.0)
@@ -479,195 +483,222 @@ def v1_example() -> TrapV1Pdu:
 
 actor _test_v1_traps(t: testing.AsyncT):
     """SNMPv1 Trap-PDUs are delivered in SNMPv2 form (RFC 3584 3.1); nothing is sent back"""
-    traps = ([v1_example()]
-             + [TrapV1Pdu(o("1.3.6.1.4.1.8072.9999.3"), h("0a000001"), g, 0, g * 100, v1_payload(g)) for g in range(6)]
-             + [TrapV1Pdu(o("1.3.6.1.4.1.8072.9999.3"), h("00000000"), 6, 2147483647, 4294967295, [])])
+    proc def __startup__():
+        traps = ([v1_example()]
+                 + [TrapV1Pdu(o("1.3.6.1.4.1.8072.9999.3"), h("0a000001"), g, 0, g * 100, v1_payload(g)) for g in range(6)]
+                 + [TrapV1Pdu(o("1.3.6.1.4.1.8072.9999.3"), h("00000000"), 6, 2147483647, 4294967295, [])])
 
-    def finished(b: Bench) -> None:
-        def check() -> None:
-            ns = b.notifications()
-            testing.assertEqual(len(ns), len(traps))
-            testing.assertEqual(fmt.canon_notification(ns[0]), lines([
-                "NOTIFICATION v1 TRAP community=\"public\" enterprise=.1.3.6.1.4.1.8072.9999 agent=192.0.2.1 generic=6 specific=42 uptime=12345 trapoid=.1.3.6.1.4.1.8072.9999.0.42",
-                ".1.3.6.1.4.1.8072.9999.1.1.1.0 = INTEGER: 0",
-                "END"]))
-            for i in range(len(traps)):
-                n = ns[i]
-                testing.assertEqual(n, notify.notification_from_v1(traps[i], b"public", "198.51.100.%d" % i, 1000 + i))
-                testing.assertEqual((n.version, n.pdu_type, n.request_id, n.problem), (message.SNMP_V1, pdu.TRAP_V1, 0, ""))
-            testing.assertEqual(ns[3].trap_oid, notify.TRAP_LINK_DOWN)
-            testing.assertEqual(ns[7].trap_oid, o("1.3.6.1.4.1.8072.9999.3.0.2147483647"))
-            # RFC 3584 extras: agent-addr, community, enterprise (no snmpTrapAddress.0 for 0.0.0.0)
-            testing.assertEqual([x.oid for x in ns[1].varbinds[-3:]],
-                                [notify.SNMP_TRAP_ADDRESS_0, notify.SNMP_TRAP_COMMUNITY_0, notify.SNMP_TRAP_ENTERPRISE_0])
-            testing.assertEqual([x.oid for x in ns[7].varbinds],
-                                [notify.SNMP_TRAP_COMMUNITY_0, notify.SNMP_TRAP_ENTERPRISE_0])
-            testing.assertEqual(b.replies(), [])
-            check_stats(b.stats(), {"received": len(traps), "delivered": len(traps)})
-        report(t, outcome(check))
+        def finished(b: Bench) -> None:
+            def check() -> None:
+                ns = b.notifications()
+                testing.assertEqual(len(ns), len(traps))
+                testing.assertEqual(fmt.canon_notification(ns[0]), lines([
+                    "NOTIFICATION v1 TRAP community=\"public\" enterprise=.1.3.6.1.4.1.8072.9999 agent=192.0.2.1 generic=6 specific=42 uptime=12345 trapoid=.1.3.6.1.4.1.8072.9999.0.42",
+                    ".1.3.6.1.4.1.8072.9999.1.1.1.0 = INTEGER: 0",
+                    "END"]))
+                for i in range(len(traps)):
+                    n = ns[i]
+                    testing.assertEqual(n, notify.notification_from_v1(traps[i], b"public", "198.51.100.%d" % i, 1000 + i))
+                    testing.assertEqual((n.version, n.pdu_type, n.request_id, n.problem), (message.SNMP_V1, pdu.TRAP_V1, 0, ""))
+                testing.assertEqual(ns[3].trap_oid, notify.TRAP_LINK_DOWN)
+                testing.assertEqual(ns[7].trap_oid, o("1.3.6.1.4.1.8072.9999.3.0.2147483647"))
+                # RFC 3584 extras: agent-addr, community, enterprise (no snmpTrapAddress.0 for 0.0.0.0)
+                testing.assertEqual([x.oid for x in ns[1].varbinds[-3:]],
+                                    [notify.SNMP_TRAP_ADDRESS_0, notify.SNMP_TRAP_COMMUNITY_0, notify.SNMP_TRAP_ENTERPRISE_0])
+                testing.assertEqual([x.oid for x in ns[7].varbinds],
+                                    [notify.SNMP_TRAP_COMMUNITY_0, notify.SNMP_TRAP_ENTERPRISE_0])
+                testing.assertEqual(b.replies(), [])
+                check_stats(b.stats(), {"received": len(traps), "delivered": len(traps)})
+            report(t, outcome(check))
 
-    b = Bench(MemNet(), config(), t.log_handler, finished)
-    for i in range(len(traps)):
-        b.send(v1_message(b"public", traps[i]), "198.51.100.%d" % i, 1000 + i)
-    b.finish()
+        network = MemNet()
+        b = Bench(network, network.server(PEER, PEER_PORT), network.server(RCV, RCV_PORT), config(), t.log_handler, finished)
+        for i in range(len(traps)):
+            b.send(v1_message(b"public", traps[i]), "198.51.100.%d" % i, 1000 + i)
+        b.finish()
+
+
 
 actor _test_v2c_traps_and_informs(t: testing.AsyncT):
     """SNMPv2c traps are delivered; informs are delivered and acknowledged with their request-id and varbinds"""
-    cold = Pdu(pdu.TRAP_V2, 1, 0, 0, notify.build_trap_v2(0, notify.TRAP_COLD_START, []))
-    trap = v2_pdu(pdu.TRAP_V2, 2, 20)
-    inform = v2_pdu(pdu.INFORM, 3, 23)
-    empty = Pdu(pdu.INFORM, -5, 0, 0, notify.build_trap_v2(1, trap_oid(24), []))
+    proc def __startup__():
+        cold = Pdu(pdu.TRAP_V2, 1, 0, 0, notify.build_trap_v2(0, notify.TRAP_COLD_START, []))
+        trap = v2_pdu(pdu.TRAP_V2, 2, 20)
+        inform = v2_pdu(pdu.INFORM, 3, 23)
+        empty = Pdu(pdu.INFORM, -5, 0, 0, notify.build_trap_v2(1, trap_oid(24), []))
 
-    def finished(b: Bench) -> None:
-        def check() -> None:
-            ns = b.notifications()
-            testing.assertEqual(len(ns), 4)
-            testing.assertEqual(fmt.canon_notification(ns[0]), lines([
-                "NOTIFICATION v2c TRAP2 community=\"public\" uptime=0 trapoid=.1.3.6.1.6.3.1.1.5.1", "END"]))
-            testing.assertEqual(ns[1], notify.notification_from_v2c(trap, b"public", PEER, PEER_PORT))
-            testing.assertEqual(ns[2], notify.notification_from_v2c(inform, b"public", PEER, PEER_PORT))
-            testing.assertEqual((ns[2].pdu_type, ns[2].request_id, ns[2].uptime, ns[2].trap_oid, ns[2].varbinds),
-                                (pdu.INFORM, 3, 1023, trap_oid(23), payload(23)))
-            testing.assertEqual(fmt.canon_notification(ns[3]), lines([
-                "NOTIFICATION v2c INFORM community=\"public\" uptime=1 trapoid=.1.3.6.1.4.1.8072.9999.3.0.24", "END"]))
-            rs = b.replies()
-            testing.assertEqual(len(rs), 2)
-            check_v2c_ack(rs[0], b"public", inform)
-            check_v2c_ack(rs[1], b"public", empty)
-            check_stats(b.stats(), {"received": 4, "delivered": 4, "acked": 2})
-        report(t, outcome(check))
+        def finished(b: Bench) -> None:
+            def check() -> None:
+                ns = b.notifications()
+                testing.assertEqual(len(ns), 4)
+                testing.assertEqual(fmt.canon_notification(ns[0]), lines([
+                    "NOTIFICATION v2c TRAP2 community=\"public\" uptime=0 trapoid=.1.3.6.1.6.3.1.1.5.1", "END"]))
+                testing.assertEqual(ns[1], notify.notification_from_v2c(trap, b"public", PEER, PEER_PORT))
+                testing.assertEqual(ns[2], notify.notification_from_v2c(inform, b"public", PEER, PEER_PORT))
+                testing.assertEqual((ns[2].pdu_type, ns[2].request_id, ns[2].uptime, ns[2].trap_oid, ns[2].varbinds),
+                                    (pdu.INFORM, 3, 1023, trap_oid(23), payload(23)))
+                testing.assertEqual(fmt.canon_notification(ns[3]), lines([
+                    "NOTIFICATION v2c INFORM community=\"public\" uptime=1 trapoid=.1.3.6.1.4.1.8072.9999.3.0.24", "END"]))
+                rs = b.replies()
+                testing.assertEqual(len(rs), 2)
+                check_v2c_ack(rs[0], b"public", inform)
+                check_v2c_ack(rs[1], b"public", empty)
+                check_stats(b.stats(), {"received": 4, "delivered": 4, "acked": 2})
+            report(t, outcome(check))
 
-    b = Bench(MemNet(), config(), t.log_handler, finished)
-    for p in [cold, trap, inform, empty]:
-        b.send(v2c_message(b"public", p))
-    b.finish()
+        network = MemNet()
+        b = Bench(network, network.server(PEER, PEER_PORT), network.server(RCV, RCV_PORT), config(), t.log_handler, finished)
+        for p in [cold, trap, inform, empty]:
+            b.send(v2c_message(b"public", p))
+        b.finish()
+
+
 
 actor _test_v2c_inform_not_encodable(t: testing.AsyncT):
     """An inform whose varbinds cannot be encoded again is delivered and answered with genErr"""
     # an INTEGER of 2^32: it decodes (as net-snmp does), but Integer.encode() refuses it
-    datagram = v2c_message(b"public", Pdu(pdu.INFORM, 9, 0, 0, notify.build_trap_v2(5, notify.TRAP_COLD_START, [
-        vb("1.3.6.1.4.1.8072.1", raw_value(0x02, "01 00 00 00 00"))])))
+    proc def __startup__():
+        datagram = v2c_message(b"public", Pdu(pdu.INFORM, 9, 0, 0, notify.build_trap_v2(5, notify.TRAP_COLD_START, [
+            vb("1.3.6.1.4.1.8072.1", raw_value(0x02, "01 00 00 00 00"))])))
 
-    def finished(b: Bench) -> None:
-        def check() -> None:
-            ns = b.notifications()
-            testing.assertEqual(len(ns), 1)
-            testing.assertEqual(ns[0].varbinds, [vb("1.3.6.1.4.1.8072.1", Integer(4294967296))])
-            rs = b.replies()
-            testing.assertEqual(len(rs), 1)
-            testing.assertEqual(decode_community(rs[0]).pdu, Pdu(pdu.RESPONSE, 9, pdu.GEN_ERR, 0, []))
-            check_stats(b.stats(), {"received": 1, "delivered": 1, "acked": 1})
-        report(t, outcome(check))
+        def finished(b: Bench) -> None:
+            def check() -> None:
+                ns = b.notifications()
+                testing.assertEqual(len(ns), 1)
+                testing.assertEqual(ns[0].varbinds, [vb("1.3.6.1.4.1.8072.1", Integer(4294967296))])
+                rs = b.replies()
+                testing.assertEqual(len(rs), 1)
+                testing.assertEqual(decode_community(rs[0]).pdu, Pdu(pdu.RESPONSE, 9, pdu.GEN_ERR, 0, []))
+                check_stats(b.stats(), {"received": 1, "delivered": 1, "acked": 1})
+            report(t, outcome(check))
 
-    b = Bench(MemNet(), config(), t.log_handler, finished)
-    b.send(datagram)
-    b.finish()
+        network = MemNet()
+        b = Bench(network, network.server(PEER, PEER_PORT), network.server(RCV, RCV_PORT), config(), t.log_handler, finished)
+        b.send(datagram)
+        b.finish()
+
+
 
 actor _test_communities(t: testing.AsyncT):
     """Only the configured communities are accepted; others are dropped without an answer"""
-    def finished(b: Bench) -> None:
-        def check() -> None:
-            ns = b.notifications()
-            testing.assertEqual([(n.version, n.community) for n in ns],
-                                [(message.SNMP_V1, b"private"), (message.SNMP_V2C, b"public"),
-                                 (message.SNMP_V2C, b"private")])
-            testing.assertEqual(len(b.replies()), 1, "only the accepted inform is acknowledged")
-            check_stats(b.stats(), {"received": 8, "delivered": 3, "acked": 1, "dropped_community": 5})
-        report(t, outcome(check))
+    proc def __startup__():
+        def finished(b: Bench) -> None:
+            def check() -> None:
+                ns = b.notifications()
+                testing.assertEqual([(n.version, n.community) for n in ns],
+                                    [(message.SNMP_V1, b"private"), (message.SNMP_V2C, b"public"),
+                                     (message.SNMP_V2C, b"private")])
+                testing.assertEqual(len(b.replies()), 1, "only the accepted inform is acknowledged")
+                check_stats(b.stats(), {"received": 8, "delivered": 3, "acked": 1, "dropped_community": 5})
+            report(t, outcome(check))
 
-    b = Bench(MemNet(), config(communities=["public", "private"]), t.log_handler, finished)
-    b.send(v1_message(b"private", v1_example()))
-    b.send(v1_message(b"secret", v1_example()))
-    b.send(v2c_message(b"public", v2_pdu(pdu.TRAP_V2, 1, 1)))
-    b.send(v2c_message(b"PUBLIC", v2_pdu(pdu.TRAP_V2, 2, 2)))
-    b.send(v2c_message(b"", v2_pdu(pdu.TRAP_V2, 3, 3)))
-    b.send(v2c_message(b"publi", v2_pdu(pdu.TRAP_V2, 4, 4)))
-    b.send(v2c_message(b"secret", v2_pdu(pdu.INFORM, 5, 5)))
-    b.send(v2c_message(b"private", v2_pdu(pdu.INFORM, 6, 6)))
-    b.finish()
+        network = MemNet()
+        b = Bench(network, network.server(PEER, PEER_PORT), network.server(RCV, RCV_PORT), config(communities=["public", "private"]), t.log_handler, finished)
+        b.send(v1_message(b"private", v1_example()))
+        b.send(v1_message(b"secret", v1_example()))
+        b.send(v2c_message(b"public", v2_pdu(pdu.TRAP_V2, 1, 1)))
+        b.send(v2c_message(b"PUBLIC", v2_pdu(pdu.TRAP_V2, 2, 2)))
+        b.send(v2c_message(b"", v2_pdu(pdu.TRAP_V2, 3, 3)))
+        b.send(v2c_message(b"publi", v2_pdu(pdu.TRAP_V2, 4, 4)))
+        b.send(v2c_message(b"secret", v2_pdu(pdu.INFORM, 5, 5)))
+        b.send(v2c_message(b"private", v2_pdu(pdu.INFORM, 6, 6)))
+        b.finish()
+
+
 
 actor _test_any_community(t: testing.AsyncT):
     """The community "*" accepts any community"""
-    def finished(b: Bench) -> None:
-        def check() -> None:
-            testing.assertEqual([n.community for n in b.notifications()], [b"", b"anything", b"\x00\xff"])
-            check_stats(b.stats(), {"received": 3, "delivered": 3})
-        report(t, outcome(check))
+    proc def __startup__():
+        def finished(b: Bench) -> None:
+            def check() -> None:
+                testing.assertEqual([n.community for n in b.notifications()], [b"", b"anything", b"\x00\xff"])
+                check_stats(b.stats(), {"received": 3, "delivered": 3})
+            report(t, outcome(check))
 
-    b = Bench(MemNet(), config(communities=["*"]), t.log_handler, finished)
-    b.send(v2c_message(b"", v2_pdu(pdu.TRAP_V2, 1, 1)))
-    b.send(v1_message(b"anything", v1_example()))
-    b.send(v2c_message(b"\x00\xff", v2_pdu(pdu.TRAP_V2, 2, 2)))
-    b.finish()
+        network = MemNet()
+        b = Bench(network, network.server(PEER, PEER_PORT), network.server(RCV, RCV_PORT), config(communities=["*"]), t.log_handler, finished)
+        b.send(v2c_message(b"", v2_pdu(pdu.TRAP_V2, 1, 1)))
+        b.send(v1_message(b"anything", v1_example()))
+        b.send(v2c_message(b"\x00\xff", v2_pdu(pdu.TRAP_V2, 2, 2)))
+        b.finish()
+
+
 
 actor _test_wrong_pdu_for_version(t: testing.AsyncT):
     """PDUs that are not notifications of the message's version are dropped without an answer"""
-    v2_trap = v2c_message(b"public", v2_pdu(pdu.TRAP_V2, 1, 1))
-    v2_inform = v2c_message(b"public", v2_pdu(pdu.INFORM, 2, 2))
-    get = Pdu(pdu.GET, 3, 0, 0, [VarBind(o("1.3.6.1.2.1.1.1.0"))])
-    datagrams = [
-        with_version(v2_trap, message.SNMP_V1),                                 # SNMPv2-Trap in SNMPv1
-        with_version(v2_inform, message.SNMP_V1),                               # InformRequest in SNMPv1
-        with_version(v1_message(b"public", v1_example()), message.SNMP_V2C),    # Trap-PDU in SNMPv2c
-        message.encode_community(CommunityMessage(message.SNMP_V1, b"public", get)),
-        v2c_message(b"public", get),
-        v2c_message(b"public", Pdu(pdu.GETNEXT, 4, 0, 0, [VarBind(o("1.3.6.1"))])),
-        v2c_message(b"public", Pdu(pdu.GETBULK, 5, 0, 10, [VarBind(o("1.3.6.1"))])),
-        v2c_message(b"public", Pdu(pdu.SET, 6, 0, 0, [vb("1.3.6.1.2.1.1.5.0", OctetString(b"x"))])),
-        v2c_message(b"public", Pdu(pdu.RESPONSE, 7, 0, 0, [])),
-        v2c_message(b"public", Pdu(pdu.REPORT, 8, 0, 0, []))]
+    proc def __startup__():
+        v2_trap = v2c_message(b"public", v2_pdu(pdu.TRAP_V2, 1, 1))
+        v2_inform = v2c_message(b"public", v2_pdu(pdu.INFORM, 2, 2))
+        get = Pdu(pdu.GET, 3, 0, 0, [VarBind(o("1.3.6.1.2.1.1.1.0"))])
+        datagrams = [
+            with_version(v2_trap, message.SNMP_V1),                                 # SNMPv2-Trap in SNMPv1
+            with_version(v2_inform, message.SNMP_V1),                               # InformRequest in SNMPv1
+            with_version(v1_message(b"public", v1_example()), message.SNMP_V2C),    # Trap-PDU in SNMPv2c
+            message.encode_community(CommunityMessage(message.SNMP_V1, b"public", get)),
+            v2c_message(b"public", get),
+            v2c_message(b"public", Pdu(pdu.GETNEXT, 4, 0, 0, [VarBind(o("1.3.6.1"))])),
+            v2c_message(b"public", Pdu(pdu.GETBULK, 5, 0, 10, [VarBind(o("1.3.6.1"))])),
+            v2c_message(b"public", Pdu(pdu.SET, 6, 0, 0, [vb("1.3.6.1.2.1.1.5.0", OctetString(b"x"))])),
+            v2c_message(b"public", Pdu(pdu.RESPONSE, 7, 0, 0, [])),
+            v2c_message(b"public", Pdu(pdu.REPORT, 8, 0, 0, []))]
 
-    def finished(b: Bench) -> None:
-        def check() -> None:
-            testing.assertEqual(b.notifications(), [])
-            testing.assertEqual(b.replies(), [])
-            check_stats(b.stats(), {"received": len(datagrams), "dropped_pdu": len(datagrams)})
-        report(t, outcome(check))
+        def finished(b: Bench) -> None:
+            def check() -> None:
+                testing.assertEqual(b.notifications(), [])
+                testing.assertEqual(b.replies(), [])
+                check_stats(b.stats(), {"received": len(datagrams), "dropped_pdu": len(datagrams)})
+            report(t, outcome(check))
 
-    b = Bench(MemNet(), config(), t.log_handler, finished)
-    for d in datagrams:
-        b.send(d)
-    b.finish()
+        network = MemNet()
+        b = Bench(network, network.server(PEER, PEER_PORT), network.server(RCV, RCV_PORT), config(), t.log_handler, finished)
+        for d in datagrams:
+            b.send(d)
+        b.finish()
+
+
 
 actor _test_malformed(t: testing.AsyncT):
     """Undecodable datagrams are dropped; malformed notification content is delivered with a problem"""
-    good = v2c_message(b"public", v2_pdu(pdu.TRAP_V2, 1, 1))
-    v3 = v3_message(None, b"u_noauth", 0, sender_a(), 1, 0, v2_pdu(pdu.TRAP_V2, 2, 2))
-    undecodable = [b"", b"\x00", b"\x30", b"\x30\x00", b"hello world", good[:len(good) - 1], good[:20],
-                   with_version(good, 2), with_version(good, 4), h("30 84 ff ff ff ff 02 01 01"),
-                   h("30 80 02 01 01 04 00 a7 00 00 00"), v3 + b"\x00", v3[:len(v3) - 3],
-                   with_pdu_tag(good, 0xa9), with_pdu_tag(good, 0x30), with_pdu_tag(good, 0x9f),
-                   pseudo_random(300, 5)]
-    # leading varbinds that are not sysUpTime.0 and snmpTrapOID.0
-    odd = Pdu(pdu.TRAP_V2, 3, 0, 0, [vb("1.3.6.1.4.1.8072.9999.1.1.1.0", Integer(5))])
-    # a varbind value with invalid content: a Counter32 above 2^32-1
-    bad_value = v2c_message(b"public", Pdu(pdu.TRAP_V2, 4, 0, 0, notify.build_trap_v2(5, notify.TRAP_COLD_START, [
-        vb("1.3.6.1.4.1.8072.1", raw_value(0x41, "01 00 00 00 00"))])))
+    proc def __startup__():
+        good = v2c_message(b"public", v2_pdu(pdu.TRAP_V2, 1, 1))
+        v3 = v3_message(None, b"u_noauth", 0, sender_a(), 1, 0, v2_pdu(pdu.TRAP_V2, 2, 2))
+        undecodable = [b"", b"\x00", b"\x30", b"\x30\x00", b"hello world", good[:len(good) - 1], good[:20],
+                       with_version(good, 2), with_version(good, 4), h("30 84 ff ff ff ff 02 01 01"),
+                       h("30 80 02 01 01 04 00 a7 00 00 00"), v3 + b"\x00", v3[:len(v3) - 3],
+                       with_pdu_tag(good, 0xa9), with_pdu_tag(good, 0x30), with_pdu_tag(good, 0x9f),
+                       pseudo_random(300, 5)]
+        # leading varbinds that are not sysUpTime.0 and snmpTrapOID.0
+        odd = Pdu(pdu.TRAP_V2, 3, 0, 0, [vb("1.3.6.1.4.1.8072.9999.1.1.1.0", Integer(5))])
+        # a varbind value with invalid content: a Counter32 above 2^32-1
+        bad_value = v2c_message(b"public", Pdu(pdu.TRAP_V2, 4, 0, 0, notify.build_trap_v2(5, notify.TRAP_COLD_START, [
+            vb("1.3.6.1.4.1.8072.1", raw_value(0x41, "01 00 00 00 00"))])))
 
-    def finished(b: Bench) -> None:
-        def check() -> None:
-            ns = b.notifications()
-            testing.assertEqual(len(ns), 2)
-            testing.assertEqual(ns[0].problem, "first variable binding is .1.3.6.1.4.1.8072.9999.1.1.1.0, not sysUpTime.0")
-            testing.assertEqual(fmt.canon_notification(ns[0]), lines([
-                "NOTIFICATION v2c TRAP2 community=\"public\" uptime=? trapoid=?",
-                ".1.3.6.1.4.1.8072.9999.1.1.1.0 = INTEGER: 5", "END"]))
-            v = ns[1].varbinds[0].value
-            testing.assertTrue(isinstance(v, values.MalformedValue), "malformed value delivered: " + repr(v))
-            testing.assertEqual(ns[1].problem, "")
-            check_stats(b.stats(), {"received": len(undecodable) + 2, "delivered": 2,
-                                    "dropped_decode": len(undecodable)})
-        report(t, outcome(check))
+        def finished(b: Bench) -> None:
+            def check() -> None:
+                ns = b.notifications()
+                testing.assertEqual(len(ns), 2)
+                testing.assertEqual(ns[0].problem, "first variable binding is .1.3.6.1.4.1.8072.9999.1.1.1.0, not sysUpTime.0")
+                testing.assertEqual(fmt.canon_notification(ns[0]), lines([
+                    "NOTIFICATION v2c TRAP2 community=\"public\" uptime=? trapoid=?",
+                    ".1.3.6.1.4.1.8072.9999.1.1.1.0 = INTEGER: 5", "END"]))
+                v = ns[1].varbinds[0].value
+                testing.assertTrue(isinstance(v, values.MalformedValue), "malformed value delivered: " + repr(v))
+                testing.assertEqual(ns[1].problem, "")
+                check_stats(b.stats(), {"received": len(undecodable) + 2, "delivered": 2,
+                                        "dropped_decode": len(undecodable)})
+            report(t, outcome(check))
 
-    b = Bench(MemNet(), config(), t.log_handler, finished)
-    for d in undecodable:
-        b.send(d)
-    b.send(v2c_message(b"public", odd))
-    b.send(bad_value)
-    b.finish()
+        network = MemNet()
+        b = Bench(network, network.server(PEER, PEER_PORT), network.server(RCV, RCV_PORT), config(), t.log_handler, finished)
+        for d in undecodable:
+            b.send(d)
+        b.send(v2c_message(b"public", odd))
+        b.send(bad_value)
+        b.finish()
 
 
 # SNMPv3 traps #####################################################################################
+
 
 def lab_users(auth_name: str) -> list[Usm]:
     """u_<auth> and u_<auth>_<priv> for every privacy protocol, with deterministic keys"""
@@ -676,7 +707,7 @@ def lab_users(auth_name: str) -> list[Usm]:
         users.append(keyed("u_" + auth_name + "_" + pname))
     return users
 
-def v3_traps_round(auth_name: str, with_noauth: bool) -> (list[Usm], list[bytes], list[Notification]):
+pure def v3_traps_round(auth_name: str, with_noauth: bool) -> (list[Usm], list[bytes], list[Notification]):
     """Every user of lab_users(auth_name) (and u_noauth) sends a trap from sender A and from sender B
 
     Returns the users, the datagrams and the notifications they must give.
@@ -702,145 +733,185 @@ def v3_traps_round(auth_name: str, with_noauth: bool) -> (list[Usm], list[bytes]
 
 actor _v3_traps_test(t: testing.AsyncT, auth_name: str, with_noauth: bool):
     """Shared body of the _test_v3_traps_* tests"""
-    t.timeout(60.0)
-    r = v3_traps_round(auth_name, with_noauth)
-    users = r.0
-    datagrams = r.1
-    want = r.2
+    proc def __startup__():
+        r = v3_traps_round(auth_name, with_noauth)
+        users = r.0
+        datagrams = r.1
+        want = r.2
 
-    def finished(b: Bench) -> None:
-        def check() -> None:
-            ns = b.notifications()
-            testing.assertEqual(len(ns), len(want))
-            for i in range(len(want)):
-                testing.assertEqual(ns[i], want[i], "notification %d" % i)
-                testing.assertEqual((ns[i].version, ns[i].pdu_type, ns[i].problem), (message.SNMP_V3, pdu.TRAP_V2, ""))
-            testing.assertEqual(b.replies(), [], "traps are never answered")
-            auth_users = len([u for u in users if u.level() != usm.LEVEL_NO_AUTH_NO_PRIV])
-            check_stats(b.stats(), {"received": len(want), "delivered": len(want),
-                                    "trap_keys_derived": 2 * auth_users})
-        report(t, outcome(check))
+        def finished(b: Bench) -> None:
+            def check() -> None:
+                ns = b.notifications()
+                testing.assertEqual(len(ns), len(want))
+                for i in range(len(want)):
+                    testing.assertEqual(ns[i], want[i], "notification %d" % i)
+                    testing.assertEqual((ns[i].version, ns[i].pdu_type, ns[i].problem), (message.SNMP_V3, pdu.TRAP_V2, ""))
+                testing.assertEqual(b.replies(), [], "traps are never answered")
+                auth_users = len([u for u in users if u.level() != usm.LEVEL_NO_AUTH_NO_PRIV])
+                check_stats(b.stats(), {"received": len(want), "delivered": len(want),
+                                        "trap_keys_derived": 2 * auth_users})
+            report(t, outcome(check))
 
-    b = Bench(MemNet(), config(users), t.log_handler, finished)
-    for d in datagrams:
-        b.send(d)
-    b.finish()
+        t.timeout(60.0)
+
+        network = MemNet()
+
+        b = Bench(network, network.server(PEER, PEER_PORT), network.server(RCV, RCV_PORT), config(users), t.log_handler, finished)
+        for d in datagrams:
+            b.send(d)
+        b.finish()
+
+
 
 actor _test_v3_traps_md5(t: testing.AsyncT):
     """SNMPv3 traps of u_noauth and every MD5 user (all privacy protocols) from two sender engines"""
-    _v3_traps_test(t, "md5", True)
+
+    proc def __startup__():
+        _v3_traps_test(t, "md5", True)
+
+
 
 actor _test_v3_traps_sha(t: testing.AsyncT):
     """The same for the SHA users"""
-    _v3_traps_test(t, "sha", False)
+
+    proc def __startup__():
+        _v3_traps_test(t, "sha", False)
+
+
 
 actor _test_v3_traps_sha224(t: testing.AsyncT):
     """The same for the SHA-224 users"""
-    _v3_traps_test(t, "sha224", False)
+
+    proc def __startup__():
+        _v3_traps_test(t, "sha224", False)
+
+
 
 actor _test_v3_traps_sha256(t: testing.AsyncT):
     """The same for the SHA-256 users"""
-    _v3_traps_test(t, "sha256", False)
+
+    proc def __startup__():
+        _v3_traps_test(t, "sha256", False)
+
+
 
 actor _test_v3_traps_sha384(t: testing.AsyncT):
     """The same for the SHA-384 users"""
-    _v3_traps_test(t, "sha384", False)
+
+    proc def __startup__():
+        _v3_traps_test(t, "sha384", False)
+
+
 
 actor _test_v3_traps_sha512(t: testing.AsyncT):
     """The same for the SHA-512 users"""
-    _v3_traps_test(t, "sha512", False)
+
+    proc def __startup__():
+        _v3_traps_test(t, "sha512", False)
+
+
 
 actor _test_v3_trap_canon(t: testing.AsyncT):
     """Received SNMPv3 traps print as canonical NOTIFICATION blocks"""
-    users = [keyed("u_noauth"), keyed("u_sha_aes"), keyed("u_md5")]
-    vbs = [vb("1.3.6.1.4.1.8072.9999.1.1.2.0", Integer(1)), vb("1.3.6.1.4.1.8072.9999.1.2.1.0", OctetString(b"Hello, SNMP!"))]
-    datagrams = [v3_trap(users[0], None, sender_a(), 1, 5, Pdu(pdu.TRAP_V2, 1, 0, 0, notify.build_trap_v2(3000000, trap_oid(27), vbs))),
-                 v3_trap(users[1], keys_for(users[1], sender_b()), sender_b(), 1, 0,
-                         Pdu(pdu.TRAP_V2, 2, 0, 0, notify.build_trap_v2(3000008, trap_oid(35), vbs))),
-                 v3_trap(users[2], keys_for(users[2], sender_a()), sender_a(), 1, 9,
-                         Pdu(pdu.TRAP_V2, 3, 0, 0, notify.build_trap_v2(42, notify.TRAP_LINK_UP, [])), u64(1), b"ctx \"1\"")]
+    proc def __startup__():
+        users = [keyed("u_noauth"), keyed("u_sha_aes"), keyed("u_md5")]
+        vbs = [vb("1.3.6.1.4.1.8072.9999.1.1.2.0", Integer(1)), vb("1.3.6.1.4.1.8072.9999.1.2.1.0", OctetString(b"Hello, SNMP!"))]
+        datagrams = [v3_trap(users[0], None, sender_a(), 1, 5, Pdu(pdu.TRAP_V2, 1, 0, 0, notify.build_trap_v2(3000000, trap_oid(27), vbs))),
+                     v3_trap(users[1], keys_for(users[1], sender_b()), sender_b(), 1, 0,
+                             Pdu(pdu.TRAP_V2, 2, 0, 0, notify.build_trap_v2(3000008, trap_oid(35), vbs))),
+                     v3_trap(users[2], keys_for(users[2], sender_a()), sender_a(), 1, 9,
+                             Pdu(pdu.TRAP_V2, 3, 0, 0, notify.build_trap_v2(42, notify.TRAP_LINK_UP, [])), u64(1), b"ctx \"1\"")]
 
-    def finished(b: Bench) -> None:
-        def check() -> None:
-            got = [fmt.canon_notification(n) for n in b.notifications()]
-            testing.assertEqual(got, [
-                lines(["NOTIFICATION v3 TRAP2 user=\"u_noauth\" level=noAuthNoPriv context=\"\" uptime=3000000 trapoid=.1.3.6.1.4.1.8072.9999.3.0.27",
-                       ".1.3.6.1.4.1.8072.9999.1.1.2.0 = INTEGER: 1",
-                       ".1.3.6.1.4.1.8072.9999.1.2.1.0 = STRING: \"Hello, SNMP!\"",
-                       "END"]),
-                lines(["NOTIFICATION v3 TRAP2 user=\"u_sha_aes\" level=authPriv context=\"\" uptime=3000008 trapoid=.1.3.6.1.4.1.8072.9999.3.0.35",
-                       ".1.3.6.1.4.1.8072.9999.1.1.2.0 = INTEGER: 1",
-                       ".1.3.6.1.4.1.8072.9999.1.2.1.0 = STRING: \"Hello, SNMP!\"",
-                       "END"]),
-                lines(["NOTIFICATION v3 TRAP2 user=\"u_md5\" level=authNoPriv context=\"ctx \\\"1\\\"\" uptime=42 trapoid=.1.3.6.1.6.3.1.1.5.4",
-                       "END"])])
-        report(t, outcome(check))
+        def finished(b: Bench) -> None:
+            def check() -> None:
+                got = [fmt.canon_notification(n) for n in b.notifications()]
+                testing.assertEqual(got, [
+                    lines(["NOTIFICATION v3 TRAP2 user=\"u_noauth\" level=noAuthNoPriv context=\"\" uptime=3000000 trapoid=.1.3.6.1.4.1.8072.9999.3.0.27",
+                           ".1.3.6.1.4.1.8072.9999.1.1.2.0 = INTEGER: 1",
+                           ".1.3.6.1.4.1.8072.9999.1.2.1.0 = STRING: \"Hello, SNMP!\"",
+                           "END"]),
+                    lines(["NOTIFICATION v3 TRAP2 user=\"u_sha_aes\" level=authPriv context=\"\" uptime=3000008 trapoid=.1.3.6.1.4.1.8072.9999.3.0.35",
+                           ".1.3.6.1.4.1.8072.9999.1.1.2.0 = INTEGER: 1",
+                           ".1.3.6.1.4.1.8072.9999.1.2.1.0 = STRING: \"Hello, SNMP!\"",
+                           "END"]),
+                    lines(["NOTIFICATION v3 TRAP2 user=\"u_md5\" level=authNoPriv context=\"ctx \\\"1\\\"\" uptime=42 trapoid=.1.3.6.1.6.3.1.1.5.4",
+                           "END"])])
+            report(t, outcome(check))
 
-    b = Bench(MemNet(), config(users), t.log_handler, finished)
-    for d in datagrams:
-        b.send(d)
-    b.finish()
+        network = MemNet()
+        b = Bench(network, network.server(PEER, PEER_PORT), network.server(RCV, RCV_PORT), config(users), t.log_handler, finished)
+        for d in datagrams:
+            b.send(d)
+        b.finish()
+
+
 
 actor _test_v3_trap_refusals(t: testing.AsyncT):
     """Each way an SNMPv3 trap fails is dropped and counted; nothing is answered, no keys are derived for forgeries"""
-    t.timeout(30.0)
-    noauth = keyed("u_noauth")
-    sha = keyed("u_sha")
-    sha_aes = keyed("u_sha_aes")
-    md5_aes256c = keyed("u_md5_aes256c")
-    a = sender_a()
-    p = v2_pdu(pdu.TRAP_V2, 1, 1)
-    sha_aes_keys = sha_aes.localized(a)
-    datagrams = [
-        # unknown user, at authNoPriv and at noAuthNoPriv
-        v3_trap(nobody(), None, a, 1, 0, p),
-        v3_message(LocalizedUser(b"u_other", usm.AUTH_SHA1, usm.PRIV_NONE, b"o" * 20, b"", a), b"u_other",
-                   usm.LEVEL_AUTH_NO_PRIV, a, 1, 0, p),
-        # levels other than the user's: lower, lower, higher
-        v3_message(sha_aes_keys, b"u_sha_aes", usm.LEVEL_AUTH_NO_PRIV, a, 1, 0, p),
-        v3_message(None, b"u_sha", usm.LEVEL_NO_AUTH_NO_PRIV, a, 1, 0, p),
-        v3_message(LocalizedUser(b"u_noauth", usm.AUTH_SHA1, usm.PRIV_NONE, b"k" * 20, b"", a), b"u_noauth",
-                   usm.LEVEL_AUTH_NO_PRIV, a, 1, 0, p),
-        # wrong digests: other keys, also for a user whose privacy key needs the Reeder extension
-        v3_trap(sha, keys_for(keyed("u_sha", 1), a), a, 1, 0, p),
-        v3_trap(md5_aes256c, keys_for(keyed("u_md5_aes256c", 1), a), a, 1, 0, p),
-        v3_trap(md5_aes256c, keys_for(keyed("u_md5_aes256c", 2), sender_b()), sender_b(), 1, 0, p),
-        # right authentication key, wrong privacy key: decryption error
-        v3_trap(sha_aes, keys_for(with_priv_key(sha_aes, 99), a), a, 1, 0, p),
-        # sender engine IDs outside 5..32 octets
-        v3_trap(noauth, None, b"\x80\x00\x00\x01", 1, 0, p),
-        v3_trap(noauth, None, b"\x80" * 33, 1, 0, p),
-        v3_trap(noauth, None, b"", 1, 0, Pdu(pdu.TRAP_V2, 9, 0, 0, [])),
-        # privFlag without authFlag; a security model other than USM
-        message.encode_v3(V3Message(5, 65507, message.FLAG_PRIV, UsmSecurityParameters(a, 1, 0, b"u_sha_aes")),
-                          pseudo_random(48, 3)).msg,
-        message.encode_v3(V3Message(6, 65507, 0, UsmSecurityParameters(a, 1, 0, b"u_noauth"), None, None, 99),
-                          message.encode_scoped(ScopedPdu(a, b"", p))).msg,
-        # plaintext PDUs other than SNMPv2-Trap from a sender engine, and an SNMPv2-Trap to our engine ID
-        v3_trap(noauth, None, a, 1, 0, Pdu(pdu.RESPONSE, 10, 0, 0, [])),
-        v3_trap(noauth, None, a, 1, 0, Pdu(pdu.REPORT, 11, 0, 0, [])),
-        v3_trap(noauth, None, our_engine(), 1, 0, p)]
+    proc def __startup__():
+        noauth = keyed("u_noauth")
+        sha = keyed("u_sha")
+        sha_aes = keyed("u_sha_aes")
+        md5_aes256c = keyed("u_md5_aes256c")
+        a = sender_a()
+        p = v2_pdu(pdu.TRAP_V2, 1, 1)
+        sha_aes_keys = sha_aes.localized(a)
+        datagrams = [
+            # unknown user, at authNoPriv and at noAuthNoPriv
+            v3_trap(nobody(), None, a, 1, 0, p),
+            v3_message(LocalizedUser(b"u_other", usm.AUTH_SHA1, usm.PRIV_NONE, b"o" * 20, b"", a), b"u_other",
+                       usm.LEVEL_AUTH_NO_PRIV, a, 1, 0, p),
+            # levels other than the user's: lower, lower, higher
+            v3_message(sha_aes_keys, b"u_sha_aes", usm.LEVEL_AUTH_NO_PRIV, a, 1, 0, p),
+            v3_message(None, b"u_sha", usm.LEVEL_NO_AUTH_NO_PRIV, a, 1, 0, p),
+            v3_message(LocalizedUser(b"u_noauth", usm.AUTH_SHA1, usm.PRIV_NONE, b"k" * 20, b"", a), b"u_noauth",
+                       usm.LEVEL_AUTH_NO_PRIV, a, 1, 0, p),
+            # wrong digests: other keys, also for a user whose privacy key needs the Reeder extension
+            v3_trap(sha, keys_for(keyed("u_sha", 1), a), a, 1, 0, p),
+            v3_trap(md5_aes256c, keys_for(keyed("u_md5_aes256c", 1), a), a, 1, 0, p),
+            v3_trap(md5_aes256c, keys_for(keyed("u_md5_aes256c", 2), sender_b()), sender_b(), 1, 0, p),
+            # right authentication key, wrong privacy key: decryption error
+            v3_trap(sha_aes, keys_for(with_priv_key(sha_aes, 99), a), a, 1, 0, p),
+            # sender engine IDs outside 5..32 octets
+            v3_trap(noauth, None, b"\x80\x00\x00\x01", 1, 0, p),
+            v3_trap(noauth, None, b"\x80" * 33, 1, 0, p),
+            v3_trap(noauth, None, b"", 1, 0, Pdu(pdu.TRAP_V2, 9, 0, 0, [])),
+            # privFlag without authFlag; a security model other than USM
+            message.encode_v3(V3Message(5, 65507, message.FLAG_PRIV, UsmSecurityParameters(a, 1, 0, b"u_sha_aes")),
+                              pseudo_random(48, 3)).msg,
+            message.encode_v3(V3Message(6, 65507, 0, UsmSecurityParameters(a, 1, 0, b"u_noauth"), None, None, 99),
+                              message.encode_scoped(ScopedPdu(a, b"", p))).msg,
+            # plaintext PDUs other than SNMPv2-Trap from a sender engine, and an SNMPv2-Trap to our engine ID
+            v3_trap(noauth, None, a, 1, 0, Pdu(pdu.RESPONSE, 10, 0, 0, [])),
+            v3_trap(noauth, None, a, 1, 0, Pdu(pdu.REPORT, 11, 0, 0, [])),
+            v3_trap(noauth, None, our_engine(), 1, 0, p)]
 
-    def finished(b: Bench) -> None:
-        def check() -> None:
-            testing.assertEqual(b.notifications(), [])
-            testing.assertEqual(b.replies(), [], "nothing is answered")
-            check_stats(b.stats(), {"received": len(datagrams), "dropped_user": 2, "dropped_level": 3,
-                                    "dropped_auth": 3, "dropped_decrypt": 1, "dropped_engine_id": 3,
-                                    "dropped_invalid": 2, "dropped_pdu": 3,
-                                    "usmStatsUnknownUserNames": 2, "usmStatsUnsupportedSecLevels": 3,
-                                    "usmStatsWrongDigests": 3, "usmStatsDecryptionErrors": 1,
-                                    "usmStatsUnknownEngineIDs": 3, "snmpInvalidMsgs": 1,
-                                    "snmpUnknownSecurityModels": 1, "snmpUnknownPDUHandlers": 3,
-                                    "trap_keys_derived": 1})
-        report(t, outcome(check))
+        def finished(b: Bench) -> None:
+            def check() -> None:
+                testing.assertEqual(b.notifications(), [])
+                testing.assertEqual(b.replies(), [], "nothing is answered")
+                check_stats(b.stats(), {"received": len(datagrams), "dropped_user": 2, "dropped_level": 3,
+                                        "dropped_auth": 3, "dropped_decrypt": 1, "dropped_engine_id": 3,
+                                        "dropped_invalid": 2, "dropped_pdu": 3,
+                                        "usmStatsUnknownUserNames": 2, "usmStatsUnsupportedSecLevels": 3,
+                                        "usmStatsWrongDigests": 3, "usmStatsDecryptionErrors": 1,
+                                        "usmStatsUnknownEngineIDs": 3, "snmpInvalidMsgs": 1,
+                                        "snmpUnknownSecurityModels": 1, "snmpUnknownPDUHandlers": 3,
+                                        "trap_keys_derived": 1})
+            report(t, outcome(check))
 
-    b = Bench(MemNet(), config([noauth, sha, sha_aes, md5_aes256c]), t.log_handler, finished)
-    for d in datagrams:
-        b.send(d)
-    b.finish()
+        t.timeout(30.0)
 
-def time_window_steps(sha: Usm, sha_aes: Usm, noauth: Usm) -> list[(bytes, bool)]:
+        network = MemNet()
+
+        b = Bench(network, network.server(PEER, PEER_PORT), network.server(RCV, RCV_PORT), config([noauth, sha, sha_aes, md5_aes256c]), t.log_handler, finished)
+        for d in datagrams:
+            b.send(d)
+        b.finish()
+
+
+
+pure def time_window_steps(sha: Usm, sha_aes: Usm, noauth: Usm) -> list[(bytes, bool)]:
     """SNMPv3 traps and whether the receiver accepts them; trap k has request-id k"""
     ka = sha.localized(sender_a())
     kpa = sha_aes.localized(sender_a())
@@ -874,71 +945,82 @@ def time_window_steps(sha: Usm, sha_aes: Usm, noauth: Usm) -> list[(bytes, bool)
 
 actor _test_v3_trap_time_window(t: testing.AsyncT):
     """Each sender engine's clock is learned from its first authenticated trap; older ones are dropped (RFC 3414 3.2 7b)"""
-    sha = keyed("u_sha")
-    sha_aes = keyed("u_sha_aes")
-    noauth = keyed("u_noauth")
-    steps = time_window_steps(sha, sha_aes, noauth)
-    accepted = [i + 1 for i in range(len(steps)) if steps[i].1]
+    proc def __startup__():
+        sha = keyed("u_sha")
+        sha_aes = keyed("u_sha_aes")
+        noauth = keyed("u_noauth")
+        steps = time_window_steps(sha, sha_aes, noauth)
+        accepted = [i + 1 for i in range(len(steps)) if steps[i].1]
 
-    def finished(b: Bench) -> None:
-        def check() -> None:
-            testing.assertEqual([n.request_id for n in b.notifications()], accepted)
-            n = len(steps) - len(accepted)
-            check_stats(b.stats(), {"received": len(steps), "delivered": len(accepted), "dropped_time_window": n,
-                                    "usmStatsNotInTimeWindows": n, "trap_keys_derived": 4})
-        report(t, outcome(check))
+        def finished(b: Bench) -> None:
+            def check() -> None:
+                testing.assertEqual([n.request_id for n in b.notifications()], accepted)
+                n = len(steps) - len(accepted)
+                check_stats(b.stats(), {"received": len(steps), "delivered": len(accepted), "dropped_time_window": n,
+                                        "usmStatsNotInTimeWindows": n, "trap_keys_derived": 4})
+            report(t, outcome(check))
 
-    b = Bench(MemNet(), config([sha, sha_aes, noauth]), t.log_handler, finished)
-    for d in steps:
-        b.send(d.0)
-    b.finish()
+        network = MemNet()
+        b = Bench(network, network.server(PEER, PEER_PORT), network.server(RCV, RCV_PORT), config([sha, sha_aes, noauth]), t.log_handler, finished)
+        for d in steps:
+            b.send(d.0)
+        b.finish()
+
+
 
 actor _test_v3_trap_engines(t: testing.AsyncT):
     """With trap_engines set, SNMPv3 traps from other sender engines are dropped before any key work"""
-    sha = keyed("u_sha")
-    noauth = keyed("u_noauth")
+    proc def __startup__():
+        sha = keyed("u_sha")
+        noauth = keyed("u_noauth")
 
-    def finished(b: Bench) -> None:
-        def check() -> None:
-            testing.assertEqual([(n.engine_id, n.request_id) for n in b.notifications()], [(sender_a(), 1), (sender_a(), 3)])
-            check_stats(b.stats(), {"received": 4, "delivered": 2, "dropped_engine_id": 2,
-                                    "usmStatsUnknownEngineIDs": 2, "trap_keys_derived": 1})
-        report(t, outcome(check))
+        def finished(b: Bench) -> None:
+            def check() -> None:
+                testing.assertEqual([(n.engine_id, n.request_id) for n in b.notifications()], [(sender_a(), 1), (sender_a(), 3)])
+                check_stats(b.stats(), {"received": 4, "delivered": 2, "dropped_engine_id": 2,
+                                        "usmStatsUnknownEngineIDs": 2, "trap_keys_derived": 1})
+            report(t, outcome(check))
 
-    b = Bench(MemNet(), config([sha, noauth], trap_engines=[sender_a()]), t.log_handler, finished)
-    b.send(v3_trap(sha, sha.localized(sender_a()), sender_a(), 1, 0, v2_pdu(pdu.TRAP_V2, 1, 1)))
-    b.send(v3_trap(sha, sha.localized(sender_b()), sender_b(), 1, 0, v2_pdu(pdu.TRAP_V2, 2, 2)))
-    b.send(v3_trap(noauth, None, sender_a(), 1, 0, v2_pdu(pdu.TRAP_V2, 3, 3)))
-    b.send(v3_trap(noauth, None, sender_b(), 1, 0, v2_pdu(pdu.TRAP_V2, 4, 4)))
-    b.finish()
+        network = MemNet()
+        b = Bench(network, network.server(PEER, PEER_PORT), network.server(RCV, RCV_PORT), config([sha, noauth], trap_engines=[sender_a()]), t.log_handler, finished)
+        b.send(v3_trap(sha, sha.localized(sender_a()), sender_a(), 1, 0, v2_pdu(pdu.TRAP_V2, 1, 1)))
+        b.send(v3_trap(sha, sha.localized(sender_b()), sender_b(), 1, 0, v2_pdu(pdu.TRAP_V2, 2, 2)))
+        b.send(v3_trap(noauth, None, sender_a(), 1, 0, v2_pdu(pdu.TRAP_V2, 3, 3)))
+        b.send(v3_trap(noauth, None, sender_b(), 1, 0, v2_pdu(pdu.TRAP_V2, 4, 4)))
+        b.finish()
+
 
 
 actor _test_v3_trap_users_per_engine(t: testing.AsyncT):
     """Two devices whose trap user has the same name and different keys (a fleet's "u_sha" with one password
     per device): TrapUser entries per sender engine deliver both, and a third engine falls back to the
     name-only user of users; each engine's traps are checked with its own keys"""
-    dev_a = keyed("u_sha", 1)
-    dev_b = keyed("u_sha", 2)
-    shared = keyed("u_sha")
+    proc def __startup__():
+        dev_a = keyed("u_sha", 1)
+        dev_b = keyed("u_sha", 2)
+        shared = keyed("u_sha")
+        cfg = ReceiverConfig(["public"], [shared], [], our_engine(), BOOTS, 0.0,
+                             [TrapUser(sender_a(), dev_a), TrapUser(sender_b(), dev_b)])
 
-    def finished(b: Bench) -> None:
-        def check() -> None:
-            got = [(n.engine_id, n.request_id) for n in b.notifications()]
-            testing.assertEqual(got, [(sender_a(), 1), (sender_b(), 2), (sender_c(), 3)])
-            check_stats(b.stats(), {"received": 5, "delivered": 3, "dropped_auth": 2, "usmStatsWrongDigests": 2,
-                                    "trap_keys_derived": 3})
-        report(t, outcome(check))
+        def finished(b: Bench) -> None:
+            def check() -> None:
+                got = [(n.engine_id, n.request_id) for n in b.notifications()]
+                testing.assertEqual(got, [(sender_a(), 1), (sender_b(), 2), (sender_c(), 3)])
+                check_stats(b.stats(), {"received": 5, "delivered": 3, "dropped_auth": 2, "usmStatsWrongDigests": 2,
+                                        "trap_keys_derived": 3})
+            report(t, outcome(check))
 
-    cfg = ReceiverConfig(["public"], [shared], [], our_engine(), BOOTS, 0.0,
-                         [TrapUser(sender_a(), dev_a), TrapUser(sender_b(), dev_b)])
-    b = Bench(MemNet(), cfg, t.log_handler, finished)
-    b.send(v3_trap(dev_a, dev_a.localized(sender_a()), sender_a(), 1, 0, v2_pdu(pdu.TRAP_V2, 1, 1)))
-    b.send(v3_trap(dev_b, dev_b.localized(sender_b()), sender_b(), 1, 0, v2_pdu(pdu.TRAP_V2, 2, 2)))
-    b.send(v3_trap(shared, shared.localized(sender_c()), sender_c(), 1, 0, v2_pdu(pdu.TRAP_V2, 3, 3)))
-    # device B's keys for device A's engine, and the shared user's for B: wrong digests
-    b.send(v3_trap(dev_b, dev_b.localized(sender_a()), sender_a(), 1, 0, v2_pdu(pdu.TRAP_V2, 4, 4)))
-    b.send(v3_trap(shared, shared.localized(sender_b()), sender_b(), 1, 0, v2_pdu(pdu.TRAP_V2, 5, 5)))
-    b.finish()
+        network = MemNet()
+        b = Bench(network, network.server(PEER, PEER_PORT), network.server(RCV, RCV_PORT), cfg, t.log_handler, finished)
+        b.send(v3_trap(dev_a, dev_a.localized(sender_a()), sender_a(), 1, 0, v2_pdu(pdu.TRAP_V2, 1, 1)))
+        b.send(v3_trap(dev_b, dev_b.localized(sender_b()), sender_b(), 1, 0, v2_pdu(pdu.TRAP_V2, 2, 2)))
+        b.send(v3_trap(shared, shared.localized(sender_c()), sender_c(), 1, 0, v2_pdu(pdu.TRAP_V2, 3, 3)))
+        # device B's keys for device A's engine, and the shared user's for B: wrong digests
+        b.send(v3_trap(dev_b, dev_b.localized(sender_a()), sender_a(), 1, 0, v2_pdu(pdu.TRAP_V2, 4, 4)))
+        b.send(v3_trap(shared, shared.localized(sender_b()), sender_b(), 1, 0, v2_pdu(pdu.TRAP_V2, 5, 5)))
+        b.finish()
+
+
 
 def _test_trap_users_config() -> None:
     a = TrapUser(sender_a(), keyed("u_sha", 1))
@@ -965,169 +1047,189 @@ def _test_community_accepted() -> None:
 
 actor _test_v3_informs(t: testing.AsyncT):
     """Engine ID discovery gets a Report; informs to our engine are delivered and acknowledged at their level"""
-    t.timeout(30.0)
-    names = ["u_noauth", "u_sha256", "u_md5_des", "u_sha_aes", "u_sha_aes192", "u_md5_aes256c", "u_sha384_aes192c"]
-    users = [keyed(n) for n in names]
-    keys = [keys_for(u, our_engine()) for u in users]
-    informs = [v2_pdu(pdu.INFORM, 500 + i, 50 + i) for i in range(len(users))]
-    # net-snmp's discovery probe: empty engine ID and user, noAuthNoPriv, reportable, no varbinds
-    probe = v3_message(None, b"", message.FLAG_REPORTABLE, b"", 0, 0, Pdu(pdu.GET, 4242, 0, 0, []), 77)
+    proc def __startup__():
+        names = ["u_noauth", "u_sha256", "u_md5_des", "u_sha_aes", "u_sha_aes192", "u_md5_aes256c", "u_sha384_aes192c"]
+        users = [keyed(n) for n in names]
+        keys = [keys_for(u, our_engine()) for u in users]
+        informs = [v2_pdu(pdu.INFORM, 500 + i, 50 + i) for i in range(len(users))]
+        # net-snmp's discovery probe: empty engine ID and user, noAuthNoPriv, reportable, no varbinds
+        probe = v3_message(None, b"", message.FLAG_REPORTABLE, b"", 0, 0, Pdu(pdu.GET, 4242, 0, 0, []), 77)
 
-    def finished(b: Bench) -> None:
-        def check() -> None:
-            rs = b.replies()
-            testing.assertEqual(len(rs), 1 + len(users))
-            check_v3_reply(rs[0], None, 0, 77, report_pdu(usm.USM_STATS_UNKNOWN_ENGINE_IDS, 1, 4242), b"")
-            ns = b.notifications()
-            testing.assertEqual(len(ns), len(users))
-            for i in range(len(users)):
-                u = users[i]
-                n = ns[i]
-                testing.assertEqual((n.version, n.pdu_type, n.user, n.security_level, n.engine_id, n.context_name),
-                                    (message.SNMP_V3, pdu.INFORM, u.user.encode(), u.level(), our_engine(), b"ctx"))
-                testing.assertEqual((n.request_id, n.trap_oid, n.varbinds), (500 + i, trap_oid(50 + i), payload(50 + i)))
-                inform = informs[i]
-                check_v3_reply(rs[1 + i], keys[i], u.level(), 60 + i,
-                               Pdu(pdu.RESPONSE, inform.request_id, 0, 0, inform.varbinds), u.user.encode(), b"ctx")
-            check_stats(b.stats(), {"received": 1 + len(users), "discovery": 1, "reports": 1,
-                                    "delivered": len(users), "acked": len(users), "usmStatsUnknownEngineIDs": 1})
-        report(t, outcome(check))
+        def finished(b: Bench) -> None:
+            def check() -> None:
+                rs = b.replies()
+                testing.assertEqual(len(rs), 1 + len(users))
+                check_v3_reply(rs[0], None, 0, 77, report_pdu(usm.USM_STATS_UNKNOWN_ENGINE_IDS, 1, 4242), b"")
+                ns = b.notifications()
+                testing.assertEqual(len(ns), len(users))
+                for i in range(len(users)):
+                    u = users[i]
+                    n = ns[i]
+                    testing.assertEqual((n.version, n.pdu_type, n.user, n.security_level, n.engine_id, n.context_name),
+                                        (message.SNMP_V3, pdu.INFORM, u.user.encode(), u.level(), our_engine(), b"ctx"))
+                    testing.assertEqual((n.request_id, n.trap_oid, n.varbinds), (500 + i, trap_oid(50 + i), payload(50 + i)))
+                    inform = informs[i]
+                    check_v3_reply(rs[1 + i], keys[i], u.level(), 60 + i,
+                                   Pdu(pdu.RESPONSE, inform.request_id, 0, 0, inform.varbinds), u.user.encode(), b"ctx")
+                check_stats(b.stats(), {"received": 1 + len(users), "discovery": 1, "reports": 1,
+                                        "delivered": len(users), "acked": len(users), "usmStatsUnknownEngineIDs": 1})
+            report(t, outcome(check))
 
-    b = Bench(MemNet(), config(users), t.log_handler, finished)
-    b.send(probe)
-    for i in range(len(users)):
-        b.send(v3_inform(users[i], keys[i], informs[i], 60 + i, u64(i), b"ctx"))
-    b.finish()
+        t.timeout(30.0)
+
+        network = MemNet()
+
+        b = Bench(network, network.server(PEER, PEER_PORT), network.server(RCV, RCV_PORT), config(users), t.log_handler, finished)
+        b.send(probe)
+        for i in range(len(users)):
+            b.send(v3_inform(users[i], keys[i], informs[i], 60 + i, u64(i), b"ctx"))
+        b.finish()
+
+
 
 actor _test_v3_inform_refusals(t: testing.AsyncT):
     """Informs that fail the authoritative checks get the Reports an agent sends; SNMPv2-Traps to our engine none"""
-    sha = keyed("u_sha")
-    sha_aes = keyed("u_sha_aes")
-    noauth = keyed("u_noauth")
-    sha_keys = sha.localized(our_engine())
-    sha_aes_keys = sha_aes.localized(our_engine())
-    stale = h("80001f8880aabbccddee")
-    p = v2_pdu(pdu.INFORM, 900, 9)
-    datagrams = [
-        v3_inform(nobody(), None, p, 1),                                                 # unknown user
-        v3_message(sha_aes_keys, b"u_sha_aes", usm.LEVEL_AUTH_NO_PRIV | message.FLAG_REPORTABLE, our_engine(),
-                   BOOTS, 0, p, 2),                                                      # lower level
-        v3_inform(sha, keys_for(keyed("u_sha", 5), our_engine()), p, 3),                # wrong digest
-        v3_inform(sha, sha_keys, p, 4, u64(1), b"", 65507, 1000),                        # not in time window
-        v3_message(None, b"u_noauth", message.FLAG_REPORTABLE, stale, 1, 0, p, 5),       # a stale engine ID
-        v3_message(sha_aes.localized(stale), b"u_sha_aes", usm.LEVEL_AUTH_PRIV | message.FLAG_REPORTABLE, stale,
-                   1, 0, p, 6),                                                          # the same, encrypted
-        v3_inform(sha, sha_keys, Pdu(pdu.GET, 901, 0, 0, [VarBind(o("1.3.6.1.2.1.1.1.0"))]), 7),   # not an inform
-        v3_message(None, b"u_noauth", 0, our_engine(), BOOTS, 0, v2_pdu(pdu.TRAP_V2, 902, 9), 8),  # trap: no Report
-        v3_inform(sha_aes, keys_for(with_priv_key(sha_aes, 77), our_engine()), p, 9)]             # wrong privacy key
+    proc def __startup__():
+        sha = keyed("u_sha")
+        sha_aes = keyed("u_sha_aes")
+        noauth = keyed("u_noauth")
+        sha_keys = sha.localized(our_engine())
+        sha_aes_keys = sha_aes.localized(our_engine())
+        stale = h("80001f8880aabbccddee")
+        p = v2_pdu(pdu.INFORM, 900, 9)
+        datagrams = [
+            v3_inform(nobody(), None, p, 1),                                                 # unknown user
+            v3_message(sha_aes_keys, b"u_sha_aes", usm.LEVEL_AUTH_NO_PRIV | message.FLAG_REPORTABLE, our_engine(),
+                       BOOTS, 0, p, 2),                                                      # lower level
+            v3_inform(sha, keys_for(keyed("u_sha", 5), our_engine()), p, 3),                # wrong digest
+            v3_inform(sha, sha_keys, p, 4, u64(1), b"", 65507, 1000),                        # not in time window
+            v3_message(None, b"u_noauth", message.FLAG_REPORTABLE, stale, 1, 0, p, 5),       # a stale engine ID
+            v3_message(sha_aes.localized(stale), b"u_sha_aes", usm.LEVEL_AUTH_PRIV | message.FLAG_REPORTABLE, stale,
+                       1, 0, p, 6),                                                          # the same, encrypted
+            v3_inform(sha, sha_keys, Pdu(pdu.GET, 901, 0, 0, [VarBind(o("1.3.6.1.2.1.1.1.0"))]), 7),   # not an inform
+            v3_message(None, b"u_noauth", 0, our_engine(), BOOTS, 0, v2_pdu(pdu.TRAP_V2, 902, 9), 8),  # trap: no Report
+            v3_inform(sha_aes, keys_for(with_priv_key(sha_aes, 77), our_engine()), p, 9)]             # wrong privacy key
 
-    def finished(b: Bench) -> None:
-        def check() -> None:
-            testing.assertEqual(b.notifications(), [])
-            rs = b.replies()
-            testing.assertEqual(len(rs), 7)
-            check_v3_reply(rs[0], None, 0, 1, report_pdu(usm.USM_STATS_UNKNOWN_USER_NAMES, 1, 900), b"u_nobody")
-            check_v3_reply(rs[1], None, 0, 2, report_pdu(usm.USM_STATS_UNSUPPORTED_SEC_LEVELS, 1, 900), b"u_sha_aes")
-            check_v3_reply(rs[2], None, 0, 3, report_pdu(usm.USM_STATS_WRONG_DIGESTS, 1, 900), b"u_sha")
-            check_v3_reply(rs[3], sha_keys, usm.LEVEL_AUTH_NO_PRIV, 4,
-                           report_pdu(usm.USM_STATS_NOT_IN_TIME_WINDOWS, 1, 900), b"u_sha")
-            check_v3_reply(rs[4], None, 0, 5, report_pdu(usm.USM_STATS_UNKNOWN_ENGINE_IDS, 1, 900), b"u_noauth")
-            check_v3_reply(rs[5], None, 0, 6, report_pdu(usm.USM_STATS_UNKNOWN_ENGINE_IDS, 2, 0), b"u_sha_aes")
-            check_v3_reply(rs[6], None, 0, 7, report_pdu(usm.SNMP_UNKNOWN_PDU_HANDLERS, 1, 901), b"u_sha")
-            # a wrong privacy key gives no Report, as with snmpd. The encrypted stale inform is tried as
-            # a trap first (its MAC verifies with the keys for the stale engine ID, so they are derived
-            # once) before the engine reports it
-            check_stats(b.stats(), {"received": 9, "reports": 7, "dropped_user": 1, "dropped_level": 1,
-                                    "trap_keys_derived": 1,
-                                    "dropped_auth": 1, "dropped_time_window": 1, "dropped_engine_id": 2,
-                                    "dropped_pdu": 2, "dropped_decrypt": 1, "usmStatsUnknownUserNames": 1,
-                                    "usmStatsUnsupportedSecLevels": 1, "usmStatsWrongDigests": 1,
-                                    "usmStatsNotInTimeWindows": 1, "usmStatsUnknownEngineIDs": 2,
-                                    "snmpUnknownPDUHandlers": 2, "usmStatsDecryptionErrors": 1})
-        report(t, outcome(check))
+        def finished(b: Bench) -> None:
+            def check() -> None:
+                testing.assertEqual(b.notifications(), [])
+                rs = b.replies()
+                testing.assertEqual(len(rs), 7)
+                check_v3_reply(rs[0], None, 0, 1, report_pdu(usm.USM_STATS_UNKNOWN_USER_NAMES, 1, 900), b"u_nobody")
+                check_v3_reply(rs[1], None, 0, 2, report_pdu(usm.USM_STATS_UNSUPPORTED_SEC_LEVELS, 1, 900), b"u_sha_aes")
+                check_v3_reply(rs[2], None, 0, 3, report_pdu(usm.USM_STATS_WRONG_DIGESTS, 1, 900), b"u_sha")
+                check_v3_reply(rs[3], sha_keys, usm.LEVEL_AUTH_NO_PRIV, 4,
+                               report_pdu(usm.USM_STATS_NOT_IN_TIME_WINDOWS, 1, 900), b"u_sha")
+                check_v3_reply(rs[4], None, 0, 5, report_pdu(usm.USM_STATS_UNKNOWN_ENGINE_IDS, 1, 900), b"u_noauth")
+                check_v3_reply(rs[5], None, 0, 6, report_pdu(usm.USM_STATS_UNKNOWN_ENGINE_IDS, 2, 0), b"u_sha_aes")
+                check_v3_reply(rs[6], None, 0, 7, report_pdu(usm.SNMP_UNKNOWN_PDU_HANDLERS, 1, 901), b"u_sha")
+                # a wrong privacy key gives no Report, as with snmpd. The encrypted stale inform is tried as
+                # a trap first (its MAC verifies with the keys for the stale engine ID, so they are derived
+                # once) before the engine reports it
+                check_stats(b.stats(), {"received": 9, "reports": 7, "dropped_user": 1, "dropped_level": 1,
+                                        "trap_keys_derived": 1,
+                                        "dropped_auth": 1, "dropped_time_window": 1, "dropped_engine_id": 2,
+                                        "dropped_pdu": 2, "dropped_decrypt": 1, "usmStatsUnknownUserNames": 1,
+                                        "usmStatsUnsupportedSecLevels": 1, "usmStatsWrongDigests": 1,
+                                        "usmStatsNotInTimeWindows": 1, "usmStatsUnknownEngineIDs": 2,
+                                        "snmpUnknownPDUHandlers": 2, "usmStatsDecryptionErrors": 1})
+            report(t, outcome(check))
 
-    b = Bench(MemNet(), config([sha, sha_aes, noauth]), t.log_handler, finished)
-    for d in datagrams:
-        b.send(d)
-    b.finish()
+        network = MemNet()
+        b = Bench(network, network.server(PEER, PEER_PORT), network.server(RCV, RCV_PORT), config([sha, sha_aes, noauth]), t.log_handler, finished)
+        for d in datagrams:
+            b.send(d)
+        b.finish()
+
+
 
 actor _test_v3_inform_too_big(t: testing.AsyncT):
     """An inform whose Response exceeds the sender's msgMaxSize is acknowledged with tooBig"""
-    u = keyed("u_sha_aes")
-    keys = keys_for(u, our_engine())
-    inform = big_inform(77, 7)
+    proc def __startup__():
+        u = keyed("u_sha_aes")
+        keys = keys_for(u, our_engine())
+        inform = big_inform(77, 7)
 
-    def finished(b: Bench) -> None:
-        def check() -> None:
-            testing.assertEqual(len(b.notifications()), 1)
-            rs = b.replies()
-            testing.assertEqual(len(rs), 1)
-            check_v3_reply(rs[0], keys, usm.LEVEL_AUTH_PRIV, 3, Pdu(pdu.RESPONSE, 77, pdu.TOO_BIG, 0, []), b"u_sha_aes")
-            check_stats(b.stats(), {"received": 1, "delivered": 1, "acked": 1})
-        report(t, outcome(check))
+        def finished(b: Bench) -> None:
+            def check() -> None:
+                testing.assertEqual(len(b.notifications()), 1)
+                rs = b.replies()
+                testing.assertEqual(len(rs), 1)
+                check_v3_reply(rs[0], keys, usm.LEVEL_AUTH_PRIV, 3, Pdu(pdu.RESPONSE, 77, pdu.TOO_BIG, 0, []), b"u_sha_aes")
+                check_stats(b.stats(), {"received": 1, "delivered": 1, "acked": 1})
+            report(t, outcome(check))
 
-    b = Bench(MemNet(), config([u]), t.log_handler, finished)
-    b.send(v3_inform(u, keys, inform, 3, u64(1), b"", 484))
-    b.finish()
+        network = MemNet()
+        b = Bench(network, network.server(PEER, PEER_PORT), network.server(RCV, RCV_PORT), config([u]), t.log_handler, finished)
+        b.send(v3_inform(u, keys, inform, 3, u64(1), b"", 484))
+        b.finish()
 
 
 # Duplicates ######################################################################################
 
+
 actor _test_dedup(t: testing.AsyncT):
     """Within dedup_window, a repeated notification is acknowledged but not delivered again"""
-    u = keyed("u_sha_aes")
-    keys = keys_for(u, our_engine())
-    inform = v2c_message(b"public", v2_pdu(pdu.INFORM, 10, 1))
-    v3_pdu = v2_pdu(pdu.INFORM, 11, 2)
-    trap = v2c_message(b"public", v2_pdu(pdu.TRAP_V2, 12, 3))
-    sends: list[(bytes, str, int)] = [
-        (inform, PEER, PEER_PORT),                  # delivered
-        (inform, PEER, PEER_PORT),                  # retransmission: duplicate, acknowledged
-        (inform, PEER, PEER_PORT),
-        (inform, PEER, PEER_PORT + 1),              # another source port: delivered
-        (v2c_message(b"public", v2_pdu(pdu.INFORM, 13, 1)), PEER, PEER_PORT),   # another request-id: delivered
-        (v3_inform(u, keys, v3_pdu, 20, u64(1)), PEER, PEER_PORT),             # delivered
-        (v3_inform(u, keys, v3_pdu, 21, u64(2)), PEER, PEER_PORT),             # new msgID and salt: duplicate
-        (trap, "198.51.100.1", 1162),               # delivered
-        (trap, "198.51.100.1", 1162)]               # duplicated by the network
+    proc def __startup__():
+        u = keyed("u_sha_aes")
+        keys = keys_for(u, our_engine())
+        inform = v2c_message(b"public", v2_pdu(pdu.INFORM, 10, 1))
+        v3_pdu = v2_pdu(pdu.INFORM, 11, 2)
+        trap = v2c_message(b"public", v2_pdu(pdu.TRAP_V2, 12, 3))
+        sends: list[(bytes, str, int)] = [
+            (inform, PEER, PEER_PORT),                  # delivered
+            (inform, PEER, PEER_PORT),                  # retransmission: duplicate, acknowledged
+            (inform, PEER, PEER_PORT),
+            (inform, PEER, PEER_PORT + 1),              # another source port: delivered
+            (v2c_message(b"public", v2_pdu(pdu.INFORM, 13, 1)), PEER, PEER_PORT),   # another request-id: delivered
+            (v3_inform(u, keys, v3_pdu, 20, u64(1)), PEER, PEER_PORT),             # delivered
+            (v3_inform(u, keys, v3_pdu, 21, u64(2)), PEER, PEER_PORT),             # new msgID and salt: duplicate
+            (trap, "198.51.100.1", 1162),               # delivered
+            (trap, "198.51.100.1", 1162)]               # duplicated by the network
 
-    def finished(b: Bench) -> None:
-        def check() -> None:
-            testing.assertEqual([(n.request_id, n.source_port) for n in b.notifications()],
-                                [(10, PEER_PORT), (10, PEER_PORT + 1), (13, PEER_PORT), (11, PEER_PORT),
-                                 (12, 1162)])
-            rs = b.replies()
-            testing.assertEqual(len(rs), 6, "every inform to the peer is acknowledged")
-            for i in [0, 1, 2]:
-                check_v2c_ack(rs[i], b"public", v2_pdu(pdu.INFORM, 10, 1))
-            check_v3_reply(rs[5], keys, usm.LEVEL_AUTH_PRIV, 21,
-                           Pdu(pdu.RESPONSE, 11, 0, 0, v3_pdu.varbinds), b"u_sha_aes")
-            check_stats(b.stats(), {"received": 9, "delivered": 5, "duplicates": 4, "acked": 7})
-        report(t, outcome(check))
+        def finished(b: Bench) -> None:
+            def check() -> None:
+                testing.assertEqual([(n.request_id, n.source_port) for n in b.notifications()],
+                                    [(10, PEER_PORT), (10, PEER_PORT + 1), (13, PEER_PORT), (11, PEER_PORT),
+                                     (12, 1162)])
+                rs = b.replies()
+                testing.assertEqual(len(rs), 6, "every inform to the peer is acknowledged")
+                for i in [0, 1, 2]:
+                    check_v2c_ack(rs[i], b"public", v2_pdu(pdu.INFORM, 10, 1))
+                check_v3_reply(rs[5], keys, usm.LEVEL_AUTH_PRIV, 21,
+                               Pdu(pdu.RESPONSE, 11, 0, 0, v3_pdu.varbinds), b"u_sha_aes")
+                check_stats(b.stats(), {"received": 9, "delivered": 5, "duplicates": 4, "acked": 7})
+            report(t, outcome(check))
 
-    b = Bench(MemNet(), config([u], dedup=60.0), t.log_handler, finished)
-    for d in sends:
-        b.send(d.0, d.1, d.2)
-    b.finish()
+        network = MemNet()
+        b = Bench(network, network.server(PEER, PEER_PORT), network.server(RCV, RCV_PORT), config([u], dedup=60.0), t.log_handler, finished)
+        for d in sends:
+            b.send(d.0, d.1, d.2)
+        b.finish()
+
+
 
 actor _test_no_dedup(t: testing.AsyncT):
     """Without dedup_window every copy is delivered"""
-    inform = v2c_message(b"public", v2_pdu(pdu.INFORM, 10, 1))
+    proc def __startup__():
+        inform = v2c_message(b"public", v2_pdu(pdu.INFORM, 10, 1))
 
-    def finished(b: Bench) -> None:
-        def check() -> None:
-            testing.assertEqual(len(b.notifications()), 3)
-            testing.assertEqual(len(b.replies()), 3)
-            check_stats(b.stats(), {"received": 3, "delivered": 3, "acked": 3})
-        report(t, outcome(check))
+        def finished(b: Bench) -> None:
+            def check() -> None:
+                testing.assertEqual(len(b.notifications()), 3)
+                testing.assertEqual(len(b.replies()), 3)
+                check_stats(b.stats(), {"received": 3, "delivered": 3, "acked": 3})
+            report(t, outcome(check))
 
-    b = Bench(MemNet(), config(), t.log_handler, finished)
-    for i in range(3):
-        b.send(inform)
-    b.finish()
+        network = MemNet()
+        b = Bench(network, network.server(PEER, PEER_PORT), network.server(RCV, RCV_PORT), config(), t.log_handler, finished)
+        for i in range(3):
+            b.send(inform)
+        b.finish()
 
 
 # Lifecycle and robustness #########################################################################
+
 
 actor _test_close(t: testing.AsyncT):
     """After close() nothing more is received; close() is idempotent and stats() still answers"""
@@ -1143,9 +1245,13 @@ actor _test_close(t: testing.AsyncT):
         b.send(v2c_message(b"public", v2_pdu(pdu.TRAP_V2, 2, 2)))
         after NOTHING_WAIT: settled(b)
 
-    b = Bench(MemNet(), config(), t.log_handler, finished)
-    b.send(v2c_message(b"public", v2_pdu(pdu.TRAP_V2, 1, 1)))
-    b.finish()
+    proc def __startup__():
+        network = MemNet()
+        b = Bench(network, network.server(PEER, PEER_PORT), network.server(RCV, RCV_PORT), config(), t.log_handler, finished)
+        b.send(v2c_message(b"public", v2_pdu(pdu.TRAP_V2, 1, 1)))
+        b.finish()
+
+
 
 def fuzz_seeds() -> list[bytes]:
     """Valid notifications of every kind: what the fuzz test mutates"""
@@ -1184,32 +1290,36 @@ def mutants(seeds: list[bytes], count: int) -> list[bytes]:
 
 actor _test_fuzz(t: testing.AsyncT):
     """Mutated notifications never crash the receiver: every datagram ends up counted"""
-    t.timeout(30.0)
-    seeds = fuzz_seeds()
-    count = 600
+    proc def __startup__():
+        seeds = fuzz_seeds()
+        count = 600
 
-    def finished(b: Bench) -> None:
-        def check() -> None:
-            s = b.stats()
-            testing.assertEqual(s[receiver.RECEIVED], count + len(seeds))
-            testing.assertEqual(s[receiver.INTERNAL_ERRORS], 0)
-            testing.assertTrue(s[receiver.DELIVERED] >= len(seeds) - 1, "the seeds are delivered")
-            testing.assertTrue(s[receiver.DROPPED_DECODE] > 0 and s[receiver.DROPPED_AUTH] > 0, repr(s))
-            check_stats(s, s)
-        report(t, outcome(check))
+        def finished(b: Bench) -> None:
+            def check() -> None:
+                s = b.stats()
+                testing.assertEqual(s[receiver.RECEIVED], count + len(seeds))
+                testing.assertEqual(s[receiver.INTERNAL_ERRORS], 0)
+                testing.assertTrue(s[receiver.DELIVERED] >= len(seeds) - 1, "the seeds are delivered")
+                testing.assertTrue(s[receiver.DROPPED_DECODE] > 0 and s[receiver.DROPPED_AUTH] > 0, repr(s))
+                check_stats(s, s)
+            report(t, outcome(check))
 
-    b = Bench(MemNet(), config([keyed("u_noauth"), keyed("u_sha"), keyed("u_sha_aes"), keyed("u_md5_des")],
-                               dedup=1.0), t.log_handler, finished)
-    for d in seeds:
-        b.send(d)
-    for d in mutants(seeds, count):
-        b.send(d)
-    b.finish()
+        t.timeout(30.0)
+
+        network = MemNet()
+
+        b = Bench(network, network.server(PEER, PEER_PORT), network.server(RCV, RCV_PORT), config([keyed("u_noauth"), keyed("u_sha"), keyed("u_sha_aes"), keyed("u_md5_des")],
+                                   dedup=1.0), t.log_handler, finished)
+        for d in seeds:
+            b.send(d)
+        for d in mutants(seeds, count):
+            b.send(d)
+        b.finish()
+
 
 
 actor _test_udp_loopback(t: testing.EnvT):
     """Over UDP on 127.0.0.1 (udp_server_transport, ephemeral port), an SNMPv2c inform is delivered and acknowledged"""
-    t.timeout(10.0)
     ucap = net.UDPCap(net.NetCap(t.env.cap))
     inform = v2_pdu(pdu.INFORM, 31, 31)
     var finished = False
@@ -1255,11 +1365,15 @@ actor _test_udp_loopback(t: testing.EnvT):
     def timed_out() -> None:
         finish(AssertionError("no Response within 8 s"))
 
-    after 8.0: timed_out()
-    transport.udp_server_transport(net.UDPListenCap(ucap), "127.0.0.1", 0, listening, t.log_handler)
+    proc def __startup__():
+        t.timeout(10.0)
+
+        after 8.0: timed_out()
+        transport.udp_server_transport(net.UDPListenCap(ucap), "127.0.0.1", 0, listening, t.log_handler)
 
 
 # The lab ##########################################################################################
+
 
 class SenderKeys(object):
     """A sender's keys per (user, engine ID), localized once each (the Reeder extension is expensive)"""
@@ -1349,224 +1463,263 @@ def matrix_users(text: str, blocks: list[list[str]]) -> str:
 
 actor _test_lab_matrix(t: testing.EnvT):
     """The 86 notifications of interop/expected/notify/matrix.txt, sent to the receiver, print exactly that file"""
-    t.timeout(180.0)
-    matrix = read_text(t, MATRIX)
-    view = mibview.load_snmprec(read_text(t, SNMPREC))
-    blocks = matrix_blocks(matrix)
-    cfg = ReceiverConfig.from_users_tsv(matrix_users(read_text(t, USERS_TSV), blocks), our_engine(), ["public"],
-                                        BOOTS)
-    keys = SenderKeys(cfg.users)
-    datagrams = [block_datagram(blocks[i], i, view, keys) for i in range(len(blocks))]
-    informs = len([b for b in blocks if " INFORM " in b[0]])
 
-    def finished(b: Bench) -> None:
-        def check() -> None:
-            testing.assertEqual(len(blocks), 86, "blocks in " + MATRIX)
-            testing.assertEqual(len(cfg.users), 15, "users in the matrix")
-            ns = b.notifications()
-            testing.assertEqual(len(ns), len(blocks))
-            for i in range(len(blocks)):
-                testing.assertEqual(fmt.canon_notification(ns[i]), "\n".join(blocks[i]), "block %d" % (i + 1),
-                                    print_diff=False)
-            testing.assertEqual("\n".join([fmt.canon_notification(n) for n in ns]) + "\n", matrix, MATRIX,
-                                print_vals=False, print_diff=False)
-            testing.assertEqual(len(b.replies()), informs)
-            check_stats(b.stats(), {"received": len(blocks), "delivered": len(blocks), "acked": informs,
-                                    "trap_keys_derived": 2 * 14})
-        report_env(t, outcome(check))
+    proc def __startup__():
+        t.timeout(180.0)
+        matrix = read_text(t, MATRIX)
+        view = mibview.load_snmprec(read_text(t, SNMPREC))
+        blocks = matrix_blocks(matrix)
+        cfg = ReceiverConfig.from_users_tsv(matrix_users(read_text(t, USERS_TSV), blocks), our_engine(), ["public"],
+                                            BOOTS)
+        keys = SenderKeys(cfg.users)
+        datagrams = [block_datagram(blocks[i], i, view, keys) for i in range(len(blocks))]
+        informs = len([b for b in blocks if " INFORM " in b[0]])
 
-    b = Bench(MemNet(), cfg, t.log_handler, finished)
-    for d in datagrams:
-        b.send(d)
-    b.finish()
+        def finished(b: Bench) -> None:
+            def check() -> None:
+                testing.assertEqual(len(blocks), 86, "blocks in " + MATRIX)
+                testing.assertEqual(len(cfg.users), 15, "users in the matrix")
+                ns = b.notifications()
+                testing.assertEqual(len(ns), len(blocks))
+                for i in range(len(blocks)):
+                    testing.assertEqual(fmt.canon_notification(ns[i]), "\n".join(blocks[i]), "block %d" % (i + 1),
+                                        print_diff=False)
+                testing.assertEqual("\n".join([fmt.canon_notification(n) for n in ns]) + "\n", matrix, MATRIX,
+                                    print_vals=False, print_diff=False)
+                testing.assertEqual(len(b.replies()), informs)
+                check_stats(b.stats(), {"received": len(blocks), "delivered": len(blocks), "acked": informs,
+                                        "trap_keys_derived": 2 * 14})
+            report_env(t, outcome(check))
+
+        network = MemNet()
+
+        b = Bench(network, network.server(PEER, PEER_PORT), network.server(RCV, RCV_PORT), cfg, t.log_handler, finished)
+        for d in datagrams:
+            b.send(d)
+        b.finish()
+
+
 
 actor _test_lab_users_tsv(t: testing.EnvT):
     """Every user of interop/config/users.tsv loads with the right protocols and keys"""
-    t.timeout(120.0)
-    def check() -> None:
-        users = receiver.load_users_tsv(read_text(t, USERS_TSV))
-        testing.assertEqual(len(users), 50)
-        testing.assertEqual(users[0].user, "u_noauth")
-        testing.assertEqual(users[0].level(), usm.LEVEL_NO_AUTH_NO_PRIV)
-        byname = {u.user: u for u in users}
-        for aname, auth in AUTHS:
-            u = byname["u_" + aname]
-            testing.assertEqual((u.auth_protocol, u.priv_protocol), (auth, usm.PRIV_NONE), u.user)
-            for pname, priv in PRIVS:
-                u = byname["u_" + aname + "_" + pname]
-                testing.assertEqual((u.auth_protocol, u.priv_protocol), (auth, priv), u.user)
-        ro = byname["u_ro_sha_aes"]
-        testing.assertEqual((ro.auth_protocol, ro.priv_protocol), (usm.AUTH_SHA1, usm.PRIV_AES128))
-        testing.assertEqual(byname["u_sha_aes"].priv_ku, usm.password_to_key(usm.AUTH_SHA1, b"privpass123"))
-        testing.assertEqual(byname["u_sha512_3des"].auth_ku, usm.password_to_key(usm.AUTH_SHA512, b"authpass123"))
-    report_env(t, outcome(check))
+    proc def __startup__():
+        def check() -> None:
+            users = receiver.load_users_tsv(read_text(t, USERS_TSV))
+            testing.assertEqual(len(users), 50)
+            testing.assertEqual(users[0].user, "u_noauth")
+            testing.assertEqual(users[0].level(), usm.LEVEL_NO_AUTH_NO_PRIV)
+            byname = {u.user: u for u in users}
+            for aname, auth in AUTHS:
+                u = byname["u_" + aname]
+                testing.assertEqual((u.auth_protocol, u.priv_protocol), (auth, usm.PRIV_NONE), u.user)
+                for pname, priv in PRIVS:
+                    u = byname["u_" + aname + "_" + pname]
+                    testing.assertEqual((u.auth_protocol, u.priv_protocol), (auth, priv), u.user)
+            ro = byname["u_ro_sha_aes"]
+            testing.assertEqual((ro.auth_protocol, ro.priv_protocol), (usm.AUTH_SHA1, usm.PRIV_AES128))
+            testing.assertEqual(byname["u_sha_aes"].priv_ku, usm.password_to_key(usm.AUTH_SHA1, b"privpass123"))
+            testing.assertEqual(byname["u_sha512_3des"].auth_ku, usm.password_to_key(usm.AUTH_SHA512, b"authpass123"))
+
+        t.timeout(120.0)
+
+        report_env(t, outcome(check))
 
 
 # Communities, time records, key cache, dedup ######################################################
 
+
 actor _test_no_community_v3_only(t: testing.AsyncT):
     """An empty community list accepts no SNMPv1/v2c at all: traps dropped, informs not acknowledged"""
-    u = keyed("u_sha")
-    a = sender_a()
-    cfg = ReceiverConfig([], [u], [], our_engine(), BOOTS)
-    net0 = MemNet()
-    peer = net0.server(PEER, PEER_PORT)
-    var got: list[Notification] = []
-    var replies: list[bytes] = []
+    proc def __startup__():
+        u = keyed("u_sha")
+        a = sender_a()
+        cfg = ReceiverConfig([], [u], [], our_engine(), BOOTS)
+        net0 = MemNet()
+        got: list[Notification] = []
+        replies: list[bytes] = []
 
-    def received(r: NotificationReceiver, n: Notification) -> None:
-        got.append(n)
+        def received(r: NotificationReceiver, n: Notification) -> None:
+            got.append(n)
 
-    def peer_received(data: bytes, address: str, port: int) -> None:
-        replies.append(data)
+        def peer_received(data: bytes, address: str, port: int) -> None:
+            replies.append(data)
 
-    rcv = NotificationReceiver(net0.server(RCV, RCV_PORT), cfg, received, t.log_handler)
-    peer.set_receiver(peer_received)
-    net0.send(v2c_message(b"public", v2_pdu(pdu.TRAP_V2, 1, 1)), PEER, PEER_PORT, RCV, RCV_PORT)
-    net0.send(v1_message(b"public", v1_example()), PEER, PEER_PORT, RCV, RCV_PORT)
-    net0.send(v2c_message(b"public", v2_pdu(pdu.INFORM, 2, 2)), PEER, PEER_PORT, RCV, RCV_PORT)
-    net0.send(v3_trap(u, keys_for(u, a), a, 1, 10, v2_pdu(pdu.TRAP_V2, 3, 3)), PEER, PEER_PORT, RCV, RCV_PORT)
+        peer = net0.server(PEER, PEER_PORT)
 
-    def settled() -> None:
-        st = rcv.stats()
-        def check() -> None:
-            testing.assertEqual([n.version for n in got], [message.SNMP_V3])
-            testing.assertEqual(len(replies), 0, "no acknowledgement for a v2c inform")
-            testing.assertEqual((st["dropped_community"], st["delivered"], st["received"]), (3, 1, 4))
-        report(t, outcome(check))
+        rcv = NotificationReceiver(net0.server(RCV, RCV_PORT), cfg, received, t.log_handler)
 
-    after now NOTHING_WAIT: settled()
+        def settled() -> None:
+            st = rcv.stats()
+            def check() -> None:
+                testing.assertEqual([n.version for n in got], [message.SNMP_V3])
+                testing.assertEqual(len(replies), 0, "no acknowledgement for a v2c inform")
+                testing.assertEqual((st["dropped_community"], st["delivered"], st["received"]), (3, 1, 4))
+            report(t, outcome(check))
+
+        peer.set_receiver(peer_received)
+        net0.send(v2c_message(b"public", v2_pdu(pdu.TRAP_V2, 1, 1)), PEER, PEER_PORT, RCV, RCV_PORT)
+        net0.send(v1_message(b"public", v1_example()), PEER, PEER_PORT, RCV, RCV_PORT)
+        net0.send(v2c_message(b"public", v2_pdu(pdu.INFORM, 2, 2)), PEER, PEER_PORT, RCV, RCV_PORT)
+        net0.send(v3_trap(u, keys_for(u, a), a, 1, 10, v2_pdu(pdu.TRAP_V2, 3, 3)), PEER, PEER_PORT, RCV, RCV_PORT)
+
+        after now NOTHING_WAIT: settled()
+
+
 
 actor _test_time_record_per_user(t: testing.AsyncT):
     """Another configured user claiming the device's engine with huge boots does not lock the device's user out"""
-    device = keyed("u_sha")
-    other = keyed("u_md5")
-    a = sender_a()
-    kd = keys_for(device, a)
-    ko = keys_for(other, a)
+    proc def __startup__():
+        device = keyed("u_sha")
+        other = keyed("u_md5")
+        a = sender_a()
+        kd = keys_for(device, a)
+        ko = keys_for(other, a)
 
-    def finished(b: Bench) -> None:
-        def check() -> None:
-            testing.assertEqual([n.request_id for n in b.notifications()], [1, 2, 3, 4])
-        report(t, outcome(check))
+        def finished(b: Bench) -> None:
+            def check() -> None:
+                testing.assertEqual([n.request_id for n in b.notifications()], [1, 2, 3, 4])
+            report(t, outcome(check))
 
-    b = Bench(MemNet(), config([device, other]), t.log_handler, finished)
-    b.send(v3_trap(device, kd, a, 1, 100, v2_pdu(pdu.TRAP_V2, 1, 1), u64(1)))
-    b.send(v3_trap(other, ko, a, 2147483646, 0, v2_pdu(pdu.TRAP_V2, 2, 2), u64(2)))
-    b.send(v3_trap(device, kd, a, 1, 101, v2_pdu(pdu.TRAP_V2, 3, 3), u64(3)))
-    b.send(v3_trap(device, kd, a, 1, 5000, v2_pdu(pdu.TRAP_V2, 4, 4), u64(4)))
-    b.finish()
+        network = MemNet()
+        b = Bench(network, network.server(PEER, PEER_PORT), network.server(RCV, RCV_PORT), config([device, other]), t.log_handler, finished)
+        b.send(v3_trap(device, kd, a, 1, 100, v2_pdu(pdu.TRAP_V2, 1, 1), u64(1)))
+        b.send(v3_trap(other, ko, a, 2147483646, 0, v2_pdu(pdu.TRAP_V2, 2, 2), u64(2)))
+        b.send(v3_trap(device, kd, a, 1, 101, v2_pdu(pdu.TRAP_V2, 3, 3), u64(3)))
+        b.send(v3_trap(device, kd, a, 1, 5000, v2_pdu(pdu.TRAP_V2, 4, 4), u64(4)))
+        b.finish()
+
+
 
 actor _test_reset_engine(t: testing.AsyncT):
     """A sender that restarted without persisting boots is dropped until reset_engine(), then accepted again"""
-    device = keyed("u_sha")
-    a = sender_b()
-    kd = keys_for(device, a)
-    mn = MemNet()
-    var got: list[int] = []
+    proc def __startup__():
+        device = keyed("u_sha")
+        a = sender_b()
+        kd = keys_for(device, a)
+        mn = MemNet()
+        got: list[int] = []
 
-    def received(r: NotificationReceiver, n: Notification) -> None:
-        got.append(n.request_id)
+        def received(r: NotificationReceiver, n: Notification) -> None:
+            got.append(n.request_id)
 
-    rcv = NotificationReceiver(mn.server(RCV, RCV_PORT), config([device]), received, t.log_handler)
+        def send(boots: int, etime: int, rid: int) -> None:
+            mn.send(v3_trap(device, kd, a, boots, etime, v2_pdu(pdu.TRAP_V2, rid, 1), u64(rid)), PEER, PEER_PORT,
+                    RCV, RCV_PORT)
 
-    def send(boots: int, etime: int, rid: int) -> None:
-        mn.send(v3_trap(device, kd, a, boots, etime, v2_pdu(pdu.TRAP_V2, rid, 1), u64(rid)), PEER, PEER_PORT,
-                RCV, RCV_PORT)
+        rcv = NotificationReceiver(mn.server(RCV, RCV_PORT), config([device]), received, t.log_handler)
 
-    send(1, 100000, 1)
-    send(1, 3, 2)                 # the restart: dropped (RFC 3414 3.2 step 7b)
-    st = rcv.stats()
-    while st["received"] < 2:     # the MemNet delivers asynchronously
+        send(1, 100000, 1)
+        send(1, 3, 2)                 # the restart: dropped (RFC 3414 3.2 step 7b)
         st = rcv.stats()
-    n = rcv.reset_engine(a)
-    send(1, 4, 3)                 # accepted: the clock is learned again
-    send(1, 5, 4)
+        while st["received"] < 2:     # the MemNet delivers asynchronously
+            st = rcv.stats()
+        n = rcv.reset_engine(a)
 
-    def settled() -> None:
-        st2 = rcv.stats()
-        def check() -> None:
-            testing.assertEqual(st["dropped_time_window"], 1)
-            testing.assertEqual(n, 1, "one time record dropped")
-            testing.assertEqual(got, [1, 3, 4])
-        report(t, outcome(check))
+        def settled() -> None:
+            st2 = rcv.stats()
+            def check() -> None:
+                testing.assertEqual(st["dropped_time_window"], 1)
+                testing.assertEqual(n, 1, "one time record dropped")
+                testing.assertEqual(got, [1, 3, 4])
+            report(t, outcome(check))
 
-    after now NOTHING_WAIT: settled()
+        send(1, 4, 3)                 # accepted: the clock is learned again
+        send(1, 5, 4)
+
+        after now NOTHING_WAIT: settled()
+
+
 
 def engine_n(i: int) -> bytes:
     return ("engine%05d" % i).encode()
 
 actor _test_evicted_time_record_no_replay(t: testing.AsyncT):
     """MAX_TRAP_SENDERS other sender engines do not evict engine A's time record: an old trap stays a replay"""
-    t.timeout(120.0)
-    sha = keyed("u_sha")
-    a = sender_a()
-    ka = keys_for(sha, a)
-    old = v3_trap(sha, ka, a, 1, 1000, v2_pdu(pdu.TRAP_V2, 1, 1), u64(1))
-    new = v3_trap(sha, ka, a, 1, 100000, v2_pdu(pdu.TRAP_V2, 2, 2), u64(2))
+    proc def __startup__():
+        sha = keyed("u_sha")
+        a = sender_a()
+        ka = keys_for(sha, a)
+        old = v3_trap(sha, ka, a, 1, 1000, v2_pdu(pdu.TRAP_V2, 1, 1), u64(1))
+        new = v3_trap(sha, ka, a, 1, 100000, v2_pdu(pdu.TRAP_V2, 2, 2), u64(2))
 
-    def finished(b: Bench) -> None:
-        def check() -> None:
-            got = [n.request_id for n in b.notifications()]
-            testing.assertEqual(len([r for r in got if r >= 10000]), receiver.MAX_TRAP_SENDERS, "the other engines")
-            testing.assertEqual(len([r for r in got if r == 1]), 1, "the old trap is delivered once, never replayed")
-        report(t, outcome(check))
+        def finished(b: Bench) -> None:
+            def check() -> None:
+                got = [n.request_id for n in b.notifications()]
+                testing.assertEqual(len([r for r in got if r >= 10000]), receiver.MAX_TRAP_SENDERS, "the other engines")
+                testing.assertEqual(len([r for r in got if r == 1]), 1, "the old trap is delivered once, never replayed")
+            report(t, outcome(check))
 
-    b = Bench(MemNet(), config([sha]), t.log_handler, finished)
-    b.send(old)
-    b.send(new)
-    b.send(old)
-    for i in range(receiver.MAX_TRAP_SENDERS):
-        e = engine_n(i)
-        b.send(v3_trap(sha, keys_for(sha, e), e, 1, 0, v2_pdu(pdu.TRAP_V2, 10000 + i, 1), u64(10 + i)))
-    b.send(old)
-    b.finish()
+        t.timeout(120.0)
+
+        network = MemNet()
+
+        b = Bench(network, network.server(PEER, PEER_PORT), network.server(RCV, RCV_PORT), config([sha]), t.log_handler, finished)
+        b.send(old)
+        b.send(new)
+        b.send(old)
+        for i in range(receiver.MAX_TRAP_SENDERS):
+            e = engine_n(i)
+            b.send(v3_trap(sha, keys_for(sha, e), e, 1, 0, v2_pdu(pdu.TRAP_V2, 10000 + i, 1), u64(10 + i)))
+        b.send(old)
+        b.finish()
+
+
 
 actor _test_key_cache_lru(t: testing.AsyncT):
     """The key cache is LRU: a sender that keeps sending keeps its keys while MAX_TRAP_SENDERS others come and go"""
-    t.timeout(120.0)
-    sha = keyed("u_sha")
-    a = sender_a()
-    ka = keys_for(sha, a)
-    n = receiver.MAX_TRAP_SENDERS + 200
+    proc def __startup__():
+        sha = keyed("u_sha")
+        a = sender_a()
+        ka = keys_for(sha, a)
+        n = receiver.MAX_TRAP_SENDERS + 200
 
-    def finished(b: Bench) -> None:
-        def check() -> None:
-            st = b.stats()
-            testing.assertEqual(st["delivered"], n + n // 8 + 1)
-            testing.assertEqual(st["trap_keys_derived"], n + 1, "engine A's keys derived once")
-        report(t, outcome(check))
+        def finished(b: Bench) -> None:
+            def check() -> None:
+                st = b.stats()
+                testing.assertEqual(st["delivered"], n + n // 8 + 1)
+                testing.assertEqual(st["trap_keys_derived"], n + 1, "engine A's keys derived once")
+            report(t, outcome(check))
 
-    b = Bench(MemNet(), config([sha]), t.log_handler, finished)
-    b.send(v3_trap(sha, ka, a, 1, 10, v2_pdu(pdu.TRAP_V2, 1, 1), u64(1)))
-    for i in range(n):
-        e = engine_n(i)
-        b.send(v3_trap(sha, keys_for(sha, e), e, 1, 0, v2_pdu(pdu.TRAP_V2, 100 + i, 1), u64(100 + i)))
-        if i % 8 == 0:
-            b.send(v3_trap(sha, ka, a, 1, 10, v2_pdu(pdu.TRAP_V2, 5000 + i, 1), u64(5000 + i)))
-    b.finish()
+        t.timeout(120.0)
+
+        network = MemNet()
+
+        b = Bench(network, network.server(PEER, PEER_PORT), network.server(RCV, RCV_PORT), config([sha]), t.log_handler, finished)
+        b.send(v3_trap(sha, ka, a, 1, 10, v2_pdu(pdu.TRAP_V2, 1, 1), u64(1)))
+        for i in range(n):
+            e = engine_n(i)
+            b.send(v3_trap(sha, keys_for(sha, e), e, 1, 0, v2_pdu(pdu.TRAP_V2, 100 + i, 1), u64(100 + i)))
+            if i % 8 == 0:
+                b.send(v3_trap(sha, ka, a, 1, 10, v2_pdu(pdu.TRAP_V2, 5000 + i, 1), u64(5000 + i)))
+        b.finish()
+
+
 
 actor _test_encrypted_trap_reportable(t: testing.AsyncT):
     """An authPriv SNMPv2-Trap whose sender sets the reportableFlag is delivered; an inform with a stale engine ID is still reported"""
-    u = keyed("u_sha_aes")
-    a = sender_a()
-    trap = v3_message(keys_for(u, a), b"u_sha_aes", usm.LEVEL_AUTH_PRIV | message.FLAG_REPORTABLE, a, 1, 10,
-                      v2_pdu(pdu.TRAP_V2, 5, 5), 9, u64(3))
-    stale = v3_message(keys_for(u, a), b"u_sha_aes", usm.LEVEL_AUTH_PRIV | message.FLAG_REPORTABLE, a, 1, 10,
-                       v2_pdu(pdu.INFORM, 6, 6), 10, u64(4))
+    proc def __startup__():
+        u = keyed("u_sha_aes")
+        a = sender_a()
+        trap = v3_message(keys_for(u, a), b"u_sha_aes", usm.LEVEL_AUTH_PRIV | message.FLAG_REPORTABLE, a, 1, 10,
+                          v2_pdu(pdu.TRAP_V2, 5, 5), 9, u64(3))
+        stale = v3_message(keys_for(u, a), b"u_sha_aes", usm.LEVEL_AUTH_PRIV | message.FLAG_REPORTABLE, a, 1, 10,
+                           v2_pdu(pdu.INFORM, 6, 6), 10, u64(4))
 
-    def finished(b: Bench) -> None:
-        def check() -> None:
-            st = b.stats()
-            testing.assertEqual([n.request_id for n in b.notifications()], [5])
-            testing.assertEqual((st["reports"], st["dropped_engine_id"], st["usmStatsUnknownEngineIDs"]), (1, 1, 1))
-            testing.assertEqual(len(b.replies()), 1, "the stale inform gets a Report")
-        report(t, outcome(check))
+        def finished(b: Bench) -> None:
+            def check() -> None:
+                st = b.stats()
+                testing.assertEqual([n.request_id for n in b.notifications()], [5])
+                testing.assertEqual((st["reports"], st["dropped_engine_id"], st["usmStatsUnknownEngineIDs"]), (1, 1, 1))
+                testing.assertEqual(len(b.replies()), 1, "the stale inform gets a Report")
+            report(t, outcome(check))
 
-    b = Bench(MemNet(), config([u]), t.log_handler, finished)
-    b.send(trap)
-    b.send(stale)
-    b.finish()
+        network = MemNet()
+        b = Bench(network, network.server(PEER, PEER_PORT), network.server(RCV, RCV_PORT), config([u]), t.log_handler, finished)
+        b.send(trap)
+        b.send(stale)
+        b.finish()
+
+
 
 def _big_v2c_trap(rid: int, last: int) -> bytes:
     # An SNMPv2c SNMPv2-Trap of about 64 KB: about 9200 minimal varbinds, the last one's value is last
@@ -1577,7 +1730,6 @@ def _big_v2c_trap(rid: int, last: int) -> bytes:
 
 actor _test_dedup_large_same_key(t: testing.AsyncT):
     """dedup_window costs O(1) per notification: large traps with one (source, request-id) are not compared pairwise"""
-    t.timeout(300.0)
     k = 60
     datagrams = [_big_v2c_trap(7, i) for i in range(k)]
     sink = MemNet()
@@ -1610,4 +1762,7 @@ actor _test_dedup_large_same_key(t: testing.AsyncT):
             testing.assertTrue(on < 3.0 * off + 1.0, "dedup on %.2f s, off %.2f s" % (on, off))
         report(t, outcome(check))
 
-    go()
+    proc def __startup__():
+        t.timeout(300.0)
+
+        go()

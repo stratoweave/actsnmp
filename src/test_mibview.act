@@ -594,12 +594,14 @@ def check_dataset(snmprec: str, rules_text: str, canon: str) -> None:
 
 actor _test_lab_dataset(t: testing.EnvT):
     """Load interop/dataset/actsnmp.snmprec and write-rules.tsv, compare with interop/expected/canon/dataset.txt"""
-    t.timeout(60.0)
-    try:
-        check_dataset(read_text(t, "interop/dataset/actsnmp.snmprec"), read_text(t, "interop/dataset/write-rules.tsv"),
-                      read_text(t, "interop/expected/canon/dataset.txt"))
-        t.success()
-    except AssertionError as e:
-        t.failure(e)
-    except Exception as e:
-        t.error(e)
+
+    proc def __startup__():
+        t.timeout(60.0)
+        try:
+            check_dataset(read_text(t, "interop/dataset/actsnmp.snmprec"), read_text(t, "interop/dataset/write-rules.tsv"),
+                          read_text(t, "interop/expected/canon/dataset.txt"))
+            t.success()
+        except AssertionError as e:
+            t.failure(e)
+        except Exception as e:
+            t.error(e)

@@ -215,43 +215,23 @@ class Options(object):
                  get_root_if_empty: bool=True, max_walk_varbinds: int=1000000, v1_fix_errors: bool=True,
                  strict_response_oids: bool=True, check_community: bool=False, request_id_bits: int=31,
                  max_queued: int=0, split_too_big: bool=True, context_name: ?bytes=None):
-        if not _finite_positive(timeout):
-            raise ValueError("Options.timeout must be a positive number of seconds up to 86400")
-        if not _finite_positive(backoff):
-            raise ValueError("Options.backoff must be a positive number up to 86400")
-        if not _finite_positive(max_timeout):
-            raise ValueError("Options.max_timeout must be a positive number of seconds up to 86400")
-        if retries < 0:
-            raise ValueError("Options.retries must not be negative")
-        if max_in_flight < 1:
-            raise ValueError("Options.max_in_flight must be at least 1")
-        if max_oids_per_request < 0:
-            raise ValueError("Options.max_oids_per_request must not be negative (0: no limit)")
-        if max_repetitions < 0:
-            raise ValueError("Options.max_repetitions must not be negative")
-        if max_walk_varbinds < 1:
-            raise ValueError("Options.max_walk_varbinds must be at least 1")
-        if request_id_bits != 31 and request_id_bits != 16:
-            raise ValueError("Options.request_id_bits must be 31 or 16")
-        if max_queued < 0:
-            raise ValueError("Options.max_queued must not be negative (0: no limit)")
-        self.timeout = timeout
-        self.retries = retries
-        self.backoff = backoff
-        self.max_timeout = max_timeout
-        self.max_in_flight = max_in_flight
-        self.max_oids_per_request = max_oids_per_request
-        self.max_repetitions = max_repetitions
+        self.timeout = timeout if _finite_positive(timeout) else raise ValueError("Options.timeout must be a positive number of seconds up to 86400")
+        self.backoff = backoff if _finite_positive(backoff) else raise ValueError("Options.backoff must be a positive number up to 86400")
+        self.max_timeout = max_timeout if _finite_positive(max_timeout) else raise ValueError("Options.max_timeout must be a positive number of seconds up to 86400")
+        self.retries = retries if retries >= 0 else raise ValueError("Options.retries must not be negative")
+        self.max_in_flight = max_in_flight if max_in_flight >= 1 else raise ValueError("Options.max_in_flight must be at least 1")
+        self.max_oids_per_request = max_oids_per_request if max_oids_per_request >= 0 else raise ValueError("Options.max_oids_per_request must not be negative (0: no limit)")
+        self.max_repetitions = max_repetitions if max_repetitions >= 0 else raise ValueError("Options.max_repetitions must not be negative")
+        self.max_walk_varbinds = max_walk_varbinds if max_walk_varbinds >= 1 else raise ValueError("Options.max_walk_varbinds must be at least 1")
+        self.request_id_bits = request_id_bits if request_id_bits == 31 or request_id_bits == 16 else raise ValueError("Options.request_id_bits must be 31 or 16")
+        self.max_queued = max_queued if max_queued >= 0 else raise ValueError("Options.max_queued must not be negative (0: no limit)")
         self.use_bulk = use_bulk
         self.adaptive_bulk = adaptive_bulk
         self.check_increasing = check_increasing
         self.get_root_if_empty = get_root_if_empty
-        self.max_walk_varbinds = max_walk_varbinds
         self.v1_fix_errors = v1_fix_errors
         self.strict_response_oids = strict_response_oids
         self.check_community = check_community
-        self.request_id_bits = request_id_bits
-        self.max_queued = max_queued
         self.split_too_big = split_too_big
         self.context_name = context_name
 
@@ -2696,18 +2676,19 @@ actor Client(cap: ?net.UDPConnectCap,
 
     # Start #########################################################################################
 
-    _transport = _make_transport(cap, address, port, transport)
-    if _usm is not None:
-        seed = engine
-        if seed is not None:
-            n = len(seed.engine_id)
-            if n >= usm.MIN_ENGINE_ID_LEN and n <= usm.MAX_ENGINE_ID_LEN:
-                _engine_id = seed.engine_id
-                _times[seed.engine_id] = EngineTime(seed.engine_id, seed.boots, seed.time, 0, seed.learned_at)
-            else:
-                _log.warning("seeded engine ID ignored: not 5 to 32 octets", {"octets": n})
-    tr0 = _transport
-    if tr0 is not None:
-        _attach(tr0)
-    else:
-        _fatal = "no transport: neither cap nor transport was given"
+    proc def __startup__():
+        _transport = _make_transport(cap, address, port, transport)
+        if _usm is not None:
+            seed = engine
+            if seed is not None:
+                n = len(seed.engine_id)
+                if n >= usm.MIN_ENGINE_ID_LEN and n <= usm.MAX_ENGINE_ID_LEN:
+                    _engine_id = seed.engine_id
+                    _times[seed.engine_id] = EngineTime(seed.engine_id, seed.boots, seed.time, 0, seed.learned_at)
+                else:
+                    _log.warning("seeded engine ID ignored: not 5 to 32 octets", {"octets": n})
+        tr0 = _transport
+        if tr0 is not None:
+            _attach(tr0)
+        else:
+            _fatal = "no transport: neither cap nor transport was given"

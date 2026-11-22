@@ -37,9 +37,7 @@ class Community(Security):
     community: bytes
 
     def __init__(self, community: str, version: int=message.SNMP_V2C):
-        if version != message.SNMP_V1 and version != message.SNMP_V2C:
-            raise ValueError("a community is for SNMP version 0 (v1) or 1 (v2c), got %d" % version)
-        Security.__init__(self, version)
+        Security.__init__(self, version if version == message.SNMP_V1 or version == message.SNMP_V2C else raise ValueError("a community is for SNMP version 0 (v1) or 1 (v2c), got %d" % version))
         self.community = community.encode()
 
     def __repr__(self) -> str:
@@ -88,7 +86,7 @@ class Usm(Security):
     context_name: bytes
     context_engine_id: ?bytes
 
-    def __init__(self, user: str, auth_protocol: int, auth_ku: bytes, priv_protocol: int, priv_ku: bytes,
+    pure def __init__(self, user: str, auth_protocol: int, auth_ku: bytes, priv_protocol: int, priv_ku: bytes,
                  context_name: bytes, context_engine_id: ?bytes):
         n = len(user.encode())
         if n == 0 or n > message.MAX_USER_NAME:
@@ -275,7 +273,7 @@ def _tsv_user(fields: list[str], kus: dict[(int, str), bytes]) -> Usm:
     priv_ku = _tsv_ku(kus, auth, fields[7]) if priv != usm.PRIV_NONE else b""
     return Usm.from_keys(fields[0], auth, auth_ku, priv, priv_ku)
 
-def load_users_tsv(text: str) -> (users: list[Usm], read_only: list[str]):
+pure def load_users_tsv(text: str) -> (users: list[Usm], read_only: list[str]):
     """Return the SNMPv3 users of a users file in the format of interop/config/users.tsv, and the read-only ones
 
     One user per line, tab-separated: user, level (net-snmp -l spelling),

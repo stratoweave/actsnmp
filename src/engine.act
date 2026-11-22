@@ -155,22 +155,14 @@ class AuthoritativeEngine(object):
         Raises ValueError for an engine ID that is not 5 to 32 octets, boots
         outside 1..2^31-1 or max_size outside 484..2^31-1.
         """
-        if len(engine_id) < usm.MIN_ENGINE_ID_LEN or len(engine_id) > usm.MAX_ENGINE_ID_LEN:
-            raise ValueError("an engine ID has 5 to 32 octets, got %d" % len(engine_id))
-        if boots < 1 or boots > usm.MAX_BOOTS:
-            raise ValueError("snmpEngineBoots must be 1..2147483647, got %d" % boots)
-        if max_size < message.MIN_MAX_SIZE or max_size > values.INTEGER32_MAX:
-            raise ValueError("msgMaxSize must be 484..2147483647, got %d" % max_size)
-        self.engine_id = engine_id
-        self.boots = boots
+        self.engine_id = engine_id if len(engine_id) >= usm.MIN_ENGINE_ID_LEN and len(engine_id) <= usm.MAX_ENGINE_ID_LEN else raise ValueError("an engine ID has 5 to 32 octets, got %d" % len(engine_id))
+        self.boots = boots if boots >= 1 and boots <= usm.MAX_BOOTS else raise ValueError("snmpEngineBoots must be 1..2147483647, got %d" % boots)
+        self.max_size = max_size if max_size >= message.MIN_MAX_SIZE and max_size <= values.INTEGER32_MAX else raise ValueError("msgMaxSize must be 484..2147483647, got %d" % max_size)
         self.start = start
-        self.users = {}
+        self.users = {u.user.encode(): u for u in users}
         self.pdu_types = pdu_types
-        self.max_size = max_size
         self.stats = {name: 0 for name in COUNTERS}
         self._keys = {}
-        for u in users:
-            self.add_user(u)
 
     def add_user(self, u: Usm) -> None:
         """Add a user, or replace the user of the same name (its cached keys are dropped)"""

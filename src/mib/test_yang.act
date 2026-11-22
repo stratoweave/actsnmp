@@ -1443,29 +1443,34 @@ actor _test_yang_golden(t: testing.EnvT):
     """The 9 reference MIBs (REF_DIR) and the 43 golden modules translate without diagnostics
     of level 0-2. With `MIBYANG_OUT=<dir>` the YANG goes to `<dir>/ref/` and `<dir>/golden/`
     for `interop/mibs/compare/yang_check.sh`."""
-    t.timeout(600.0)
     fc = file.FileCap(t.env.cap)
-    out = ""
-    eo = t.env.vars.getenv("MIBYANG_OUT")
-    if eo is not None:
-        out = eo
-    # the reference SNMPv2-TC text differs from the built-in copy in blank lines
-    ref = emit_dir(fc, REF_DIR, REF_MODULES, out + "/ref" if out != "" else "", {"SNMPv2-TC": REF_DIR + "/SNMPv2-TC.txt"})
-    gold = emit_dir(fc, GOLDEN_DIR, [], out + "/golden" if out != "" else "")
     bad: list[str] = []
-    for r in ref + gold:
-        if not r.ok:
-            bad.append(r.name + " failed")
-        for d in r.diags:
-            if d.level <= 2:
-                bad.append(str(d))
-    print("ref=" + str(len(ref)) + " golden=" + str(len(gold)) + " problems=" + str(len(bad)))
-    for b in bad[:40]:
-        print(b)
-    testing.assertEqual(len(ref), 9)
-    testing.assertEqual(len(gold), 43)
-    testing.assertEqual(bad, [])
-    t.success()
+
+    proc def __startup__():
+        t.timeout(600.0)
+
+        out = ""
+        eo = t.env.vars.getenv("MIBYANG_OUT")
+        if eo is not None:
+            out = eo
+        # the reference SNMPv2-TC text differs from the built-in copy in blank lines
+        ref = emit_dir(fc, REF_DIR, REF_MODULES, out + "/ref" if out != "" else "", {"SNMPv2-TC": REF_DIR + "/SNMPv2-TC.txt"})
+        gold = emit_dir(fc, GOLDEN_DIR, [], out + "/golden" if out != "" else "")
+
+        for r in ref + gold:
+            if not r.ok:
+                bad.append(r.name + " failed")
+            for d in r.diags:
+                if d.level <= 2:
+                    bad.append(str(d))
+        print("ref=" + str(len(ref)) + " golden=" + str(len(gold)) + " problems=" + str(len(bad)))
+        for b in bad[:40]:
+            print(b)
+        testing.assertEqual(len(ref), 9)
+        testing.assertEqual(len(gold), 43)
+        testing.assertEqual(bad, [])
+        t.success()
+
 
 
 actor _test_yang_golden_vendor(t: testing.EnvT):
@@ -1476,56 +1481,60 @@ actor _test_yang_golden_vendor(t: testing.EnvT):
     into VENDOR_DIR (or `MIBGOLDEN_VENDOR`). Output goes to `MIBYANG_OUT`, by default
     `interop/mibs/cache/yang/golden-all`. Fails only on internal (level-0) diagnostics;
     translation failures and level-1/2 diagnostics are printed."""
-    t.require("mibcorpus")
-    t.timeout(600.0)
-    fc = file.FileCap(t.env.cap)
-    vdir = VENDOR_DIR
-    ev = t.env.vars.getenv("MIBGOLDEN_VENDOR")
-    if ev is not None and ev != "":
-        vdir = ev
-    out = CACHE_YANG + "/golden-all"
-    eo = t.env.vars.getenv("MIBYANG_OUT")
-    if eo is not None and eo != "":
-        out = eo
-    mkdirs(fc, out)
-    mp = mib.source.MibPath([GOLDEN_DIR, vdir], True, True)
-    dg = mib.diag.Diagnostics()
-    mib.source.index_path(mp, fc, dg)
-    names = sorted(list(mp.entries.keys()))
-    ms = mib.resolver.resolve_path(fc, mp, names)
-    tr = mib.yang.Translator(ms)
     failed: list[str] = []
     serious: list[str] = []
     internal: list[str] = []
-    n = 0
-    vendor = 0
-    for nm in ms.order:
-        r = tr.module(nm)
-        if r is not None:
-            n += 1
-            write_module(fc, out, ms, tr, r, True)
-            for e in mp.entries.get_def(nm, []):
-                if e.dir_index == 1:
-                    vendor += 1
-                    break
-            if not r.ok:
-                failed.append(nm)
-            for d in r.diags:
-                if d.level == 0:
-                    internal.append(str(d))
-                elif d.level <= 2:
-                    serious.append(str(d))
-    print("modules " + str(n) + " (vendor/IEEE " + str(vendor) + "), failed " + str(len(failed)) + ", level-1/2 " + str(len(serious)) +
-          ", internal " + str(len(internal)) + " -> " + out)
-    for x in failed:
-        print("FAILED " + x)
-    for x in serious[:40]:
-        print("DIAG " + x)
-    for x in internal[:20]:
-        print("INTERNAL " + x)
-    testing.assertTrue(vendor > 0)
-    testing.assertEqual(internal, [])
-    t.success()
+
+    proc def __startup__():
+        t.require("mibcorpus")
+        t.timeout(600.0)
+        fc = file.FileCap(t.env.cap)
+        vdir = VENDOR_DIR
+        ev = t.env.vars.getenv("MIBGOLDEN_VENDOR")
+        if ev is not None and ev != "":
+            vdir = ev
+        out = CACHE_YANG + "/golden-all"
+        eo = t.env.vars.getenv("MIBYANG_OUT")
+        if eo is not None and eo != "":
+            out = eo
+        mkdirs(fc, out)
+        mp = mib.source.MibPath([GOLDEN_DIR, vdir], True, True)
+        dg = mib.diag.Diagnostics()
+        mib.source.index_path(mp, fc, dg)
+        names = sorted(list(mp.entries.keys()))
+        ms = mib.resolver.resolve_path(fc, mp, names)
+        tr = mib.yang.Translator(ms)
+
+        n = 0
+        vendor = 0
+        for nm in ms.order:
+            r = tr.module(nm)
+            if r is not None:
+                n += 1
+                write_module(fc, out, ms, tr, r, True)
+                for e in mp.entries.get_def(nm, []):
+                    if e.dir_index == 1:
+                        vendor += 1
+                        break
+                if not r.ok:
+                    failed.append(nm)
+                for d in r.diags:
+                    if d.level == 0:
+                        internal.append(str(d))
+                    elif d.level <= 2:
+                        serious.append(str(d))
+        print("modules " + str(n) + " (vendor/IEEE " + str(vendor) + "), failed " + str(len(failed)) + ", level-1/2 " + str(len(serious)) +
+              ", internal " + str(len(internal)) + " -> " + out)
+        for x in failed:
+            print("FAILED " + x)
+        for x in serious[:40]:
+            print("DIAG " + x)
+        for x in internal[:20]:
+            print("INTERNAL " + x)
+        testing.assertTrue(vendor > 0)
+        testing.assertEqual(internal, [])
+        t.success()
+
 
 
 def corpus_chunk(spec: str, n: int) -> (int, int):
@@ -1557,84 +1566,87 @@ actor _test_yang_corpus(t: testing.EnvT):
     module's YANG does not depend on the slice and chunks can share one output directory.
     Fails only on internal (level-0) diagnostics.
     """
-    t.require("mibcorpus")
-    t.timeout(1800.0)
-    fc = file.FileCap(t.env.cap)
-    cdir = "interop/mibs/corpus/flat"
-    ed = t.env.vars.getenv("MIBCORPUS_DIR")
-    if ed is not None and ed != "":
-        cdir = ed
-    out = CACHE_YANG + "/corpus"
-    eo = t.env.vars.getenv("MIBYANG_OUT")
-    if eo is not None and eo != "":
-        out = eo
-    mkdirs(fc, out)
-    meta = False
-    em = t.env.vars.getenv("MIBYANG_META")
-    if em is not None and em.strip() == "1":
-        meta = True
-    spec = ""
-    ec = t.env.vars.getenv("MIBCORPUS_CHUNK")
-    if ec is not None:
-        spec = ec.strip()
-    mp = mib.source.MibPath([cdir], True, False)
-    dg = mib.diag.Diagnostics()
-    mib.source.index_path(mp, fc, dg)
-    allnames = sorted(list(mp.entries.keys()))
-    lo, hi = corpus_chunk(spec, len(allnames))
-    names = allnames[lo:hi]
-    sfx = "" if spec == "" else "." + spec.replace("/", "of")
-    eon = t.env.vars.getenv("MIBCORPUS_ONLY")
-    if eon is not None and eon.strip() != "":
-        names = [x.strip() for x in eon.split(",") if x.strip() != ""]
-        sfx = ".only"
-    el = t.env.vars.getenv("MIBCORPUS_LIST")
-    if el is not None and el.strip() != "":
-        rf = file.ReadFile(file.ReadFileCap(fc), el.strip())
-        names = [x.strip() for x in rf.read().decode().split("\n") if x.strip() != "" and not x.startswith("#")]
-        rf.close()
-        sfx = ".list"
-    ms = mib.resolver.resolve_path(fc, mp, names)
-    opts = mib.yang.Options()
-    opts.prefix_names = allnames
-    ecs = t.env.vars.getenv("MIBYANG_CONSISTENT_STATUS")
-    if ecs is not None and ecs.strip() == "1":
-        opts.consistent_status = True
-    tr = mib.yang.Translator(ms, opts)
     diags: list[str] = []
     failed: list[str] = []
     internal: list[str] = []
     rows: list[str] = []
-    want = set(names)
-    for nm in ms.order:
-        r = tr.module(nm)
-        if r is not None:
-            write_text(fc, out + "/" + nm + ".yang", r.text)
-            if meta:
-                mm = mib.meta.module_meta(ms, nm, tr)
-                if mm is not None:
-                    write_text(fc, out + "/" + nm + ".mibmeta.json", mib.meta.to_json(mm))
-            if nm in want:
-                rows.append(nm + "\t" + ("ok" if r.ok else "failed"))
-                if not r.ok:
-                    failed.append(nm)
-                for d in r.diags:
-                    diags.append(str(d))
-                    if d.level == 0:
-                        internal.append(str(d))
-    for nm in names:
-        if nm not in ms.modules:
-            rows.append(nm + "\tnot-loaded")
-    write_text(fc, out + "/yang-diags" + sfx + ".txt", "\n".join(diags) + "\n")
-    # the resolver's level-1/2 diagnostics of the slice (to classify MIB defects)
-    rdiags = [str(d) for d in ms.diags if d.level >= 1 and d.level <= 2 and d.module in want]
-    write_text(fc, out + "/resolve-diags" + sfx + ".txt", "\n".join(rdiags) + "\n")
-    write_text(fc, out + "/yang-modules" + sfx + ".tsv", "\n".join(rows) + "\n")
-    print("modules " + str(len(names)) + " (closure " + str(len(ms.order)) + "), failed " + str(len(failed)) +
-          ", diagnostics " + str(len(diags)) + ", internal " + str(len(internal)) + " -> " + out)
-    for x in failed[:20]:
-        print("FAILED " + x)
-    for x in internal[:20]:
-        print("INTERNAL " + x)
-    testing.assertEqual(internal, [])
-    t.success()
+
+    proc def __startup__():
+        t.require("mibcorpus")
+        t.timeout(1800.0)
+        fc = file.FileCap(t.env.cap)
+        cdir = "interop/mibs/corpus/flat"
+        ed = t.env.vars.getenv("MIBCORPUS_DIR")
+        if ed is not None and ed != "":
+            cdir = ed
+        out = CACHE_YANG + "/corpus"
+        eo = t.env.vars.getenv("MIBYANG_OUT")
+        if eo is not None and eo != "":
+            out = eo
+        mkdirs(fc, out)
+        meta = False
+        em = t.env.vars.getenv("MIBYANG_META")
+        if em is not None and em.strip() == "1":
+            meta = True
+        spec = ""
+        ec = t.env.vars.getenv("MIBCORPUS_CHUNK")
+        if ec is not None:
+            spec = ec.strip()
+        mp = mib.source.MibPath([cdir], True, False)
+        dg = mib.diag.Diagnostics()
+        mib.source.index_path(mp, fc, dg)
+        allnames = sorted(list(mp.entries.keys()))
+        lo, hi = corpus_chunk(spec, len(allnames))
+        names = allnames[lo:hi]
+        sfx = "" if spec == "" else "." + spec.replace("/", "of")
+        eon = t.env.vars.getenv("MIBCORPUS_ONLY")
+        if eon is not None and eon.strip() != "":
+            names = [x.strip() for x in eon.split(",") if x.strip() != ""]
+            sfx = ".only"
+        el = t.env.vars.getenv("MIBCORPUS_LIST")
+        if el is not None and el.strip() != "":
+            rf = file.ReadFile(file.ReadFileCap(fc), el.strip())
+            names = [x.strip() for x in rf.read().decode().split("\n") if x.strip() != "" and not x.startswith("#")]
+            rf.close()
+            sfx = ".list"
+        ms = mib.resolver.resolve_path(fc, mp, names)
+        opts = mib.yang.Options()
+        opts.prefix_names = allnames
+        ecs = t.env.vars.getenv("MIBYANG_CONSISTENT_STATUS")
+        if ecs is not None and ecs.strip() == "1":
+            opts.consistent_status = True
+        tr = mib.yang.Translator(ms, opts)
+
+        want = set(names)
+        for nm in ms.order:
+            r = tr.module(nm)
+            if r is not None:
+                write_text(fc, out + "/" + nm + ".yang", r.text)
+                if meta:
+                    mm = mib.meta.module_meta(ms, nm, tr)
+                    if mm is not None:
+                        write_text(fc, out + "/" + nm + ".mibmeta.json", mib.meta.to_json(mm))
+                if nm in want:
+                    rows.append(nm + "\t" + ("ok" if r.ok else "failed"))
+                    if not r.ok:
+                        failed.append(nm)
+                    for d in r.diags:
+                        diags.append(str(d))
+                        if d.level == 0:
+                            internal.append(str(d))
+        for nm in names:
+            if nm not in ms.modules:
+                rows.append(nm + "\tnot-loaded")
+        write_text(fc, out + "/yang-diags" + sfx + ".txt", "\n".join(diags) + "\n")
+        # the resolver's level-1/2 diagnostics of the slice (to classify MIB defects)
+        rdiags = [str(d) for d in ms.diags if d.level >= 1 and d.level <= 2 and d.module in want]
+        write_text(fc, out + "/resolve-diags" + sfx + ".txt", "\n".join(rdiags) + "\n")
+        write_text(fc, out + "/yang-modules" + sfx + ".tsv", "\n".join(rows) + "\n")
+        print("modules " + str(len(names)) + " (closure " + str(len(ms.order)) + "), failed " + str(len(failed)) +
+              ", diagnostics " + str(len(diags)) + ", internal " + str(len(internal)) + " -> " + out)
+        for x in failed[:20]:
+            print("FAILED " + x)
+        for x in internal[:20]:
+            print("INTERNAL " + x)
+        testing.assertEqual(internal, [])
+        t.success()

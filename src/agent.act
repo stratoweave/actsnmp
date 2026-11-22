@@ -169,21 +169,13 @@ class AgentConfig(object):
                  engine_boots: int=1, write_rules: list[WriteRule]=[],
                  max_bulk_varbinds: int=DEFAULT_MAX_BULK_VARBINDS, max_msg_size: int=transport_mod.MAX_DATAGRAM,
                  read_only_users: list[str]=[]):
-        if len(engine_id) < usm.MIN_ENGINE_ID_LEN or len(engine_id) > usm.MAX_ENGINE_ID_LEN:
-            raise ValueError("an engine ID has 5 to 32 octets, got %d" % len(engine_id))
-        if engine_boots < 1 or engine_boots > usm.MAX_BOOTS:
-            raise ValueError("snmpEngineBoots must be 1..2147483647, got %d" % engine_boots)
-        if max_bulk_varbinds < 1:
-            raise ValueError("max_bulk_varbinds must be at least 1, got %d" % max_bulk_varbinds)
-        if max_msg_size < message.MIN_MAX_SIZE or max_msg_size > transport_mod.MAX_DATAGRAM:
-            raise ValueError("max_msg_size must be 484..65507, got %d" % max_msg_size)
+        self.engine_id = engine_id if len(engine_id) >= usm.MIN_ENGINE_ID_LEN and len(engine_id) <= usm.MAX_ENGINE_ID_LEN else raise ValueError("an engine ID has 5 to 32 octets, got %d" % len(engine_id))
+        self.engine_boots = engine_boots if engine_boots >= 1 and engine_boots <= usm.MAX_BOOTS else raise ValueError("snmpEngineBoots must be 1..2147483647, got %d" % engine_boots)
+        self.max_bulk_varbinds = max_bulk_varbinds if max_bulk_varbinds >= 1 else raise ValueError("max_bulk_varbinds must be at least 1, got %d" % max_bulk_varbinds)
+        self.max_msg_size = max_msg_size if max_msg_size >= message.MIN_MAX_SIZE and max_msg_size <= transport_mod.MAX_DATAGRAM else raise ValueError("max_msg_size must be 484..65507, got %d" % max_msg_size)
         self.communities = communities
         self.users = users
-        self.engine_id = engine_id
-        self.engine_boots = engine_boots
         self.write_rules = write_rules
-        self.max_bulk_varbinds = max_bulk_varbinds
-        self.max_msg_size = max_msg_size
         self.read_only_users = read_only_users
 
     def __repr__(self) -> str:
@@ -463,8 +455,9 @@ actor Agent(transport: ServerTransport, view: MibView, config: AgentConfig, log_
     _read_only: set[bytes] = _name_set(config.read_only_users)
     _salts = usm.SaltCounter()
     var _view: MibView = view
-    var _start: float = _now()
-    var _engine: AuthoritativeEngine = _new_engine(config, config.engine_id, config.engine_boots, _start)
+    initial_start = _now()
+    var _start: float = initial_start
+    var _engine: AuthoritativeEngine = _new_engine(config, config.engine_id, config.engine_boots, initial_start)
     var _faults: ?Faults = faults
     var _answers = 0            # answers (Responses and Reports) since the faults were set
     var _nitw_sent = False      # Faults.report_not_in_time_window_once has fired
@@ -904,8 +897,9 @@ actor Agent(transport: ServerTransport, view: MibView, config: AgentConfig, log_
             transport.close()
             _log.info("Agent closed", None)
 
-    _view.set_value(SNMP_ENGINE_ID_0, values.OctetString(config.engine_id))
-    _set_uptime(_start)
-    transport.set_receiver(_received)
-    _log.info("Agent started", {"engine_id": config.engine_id.hex(), "boots": config.engine_boots,
-                                "variables": _view.size(), "port": transport.local_port()})
+    proc def __startup__():
+        _view.set_value(SNMP_ENGINE_ID_0, values.OctetString(config.engine_id))
+        _set_uptime(_start)
+        transport.set_receiver(_received)
+        _log.info("Agent started", {"engine_id": config.engine_id.hex(), "boots": config.engine_boots,
+                                    "variables": _view.size(), "port": transport.local_port()})
