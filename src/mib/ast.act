@@ -126,6 +126,11 @@ class Text(object):
             out.append(_strip_indent(ln, cut))
         return "\n".join(out)
 
+extension Text(Show):
+    def __str__(self) -> str:
+        base: value = self
+        return str(base)
+
     def __repr__(self) -> str:
         return _q(self.value)
 
@@ -174,6 +179,11 @@ class Name(object):
 
     def qualified(self) -> str:
         return self.module + "." + self.name if self.module != "" else self.name
+
+extension Name(Show):
+    def __str__(self) -> str:
+        base: value = self
+        return str(base)
 
     def __repr__(self) -> str:
         return self.qualified()
@@ -243,9 +253,16 @@ class Value(object):
             return self.text + "(" + (self.items[0].dump() if len(self.items) > 0 else "") + ")"
         return "{{" + " ".join([v.dump() for v in self.items]) + "}}"
 
-    def __repr__(self) -> str:
+    def representation(self) -> str:
         return self.dump()
 
+# Keep runtime subtype formatting for values stored through the base type.
+extension Value(Show):
+    def __str__(self) -> str:
+        return self.representation()
+
+    def __repr__(self) -> str:
+        return self.representation()
 
 class NamedNumber(object):
     """`label(value)` in an enumeration or BITS list. `value` is a number (possibly negative),
@@ -366,6 +383,11 @@ class Syntax(object):
             out += " " + c.dump()
         return out
 
+extension Syntax(Show):
+    def __str__(self) -> str:
+        base: value = self
+        return str(base)
+
     def __repr__(self) -> str:
         return self.dump()
 
@@ -409,6 +431,11 @@ class OidValue(object):
 
     def dump(self) -> str:
         return "{{" + " ".join([c.dump() for c in self.components]) + "}}"
+
+extension OidValue(Show):
+    def __str__(self) -> str:
+        base: value = self
+        return str(base)
 
     def __repr__(self) -> str:
         return self.dump()

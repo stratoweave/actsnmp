@@ -468,12 +468,13 @@ class LocalizedUser(object):
         """Return True if the user can encrypt and decrypt: it has a privacy protocol and its key"""
         return self.priv != PRIV_NONE and len(self.priv_key) > 0
 
+extension LocalizedUser(Show):
+    def __str__(self) -> str:
+        return self.__repr__()
+
     def __repr__(self) -> str:
         return ("LocalizedUser(user=" + repr(self.user) + ", engine_id=" + self.engine_id.hex() + ", auth="
                 + _AUTH_NAMES[self.auth] + ", priv=" + _PRIV_NAMES[self.priv] + ")")
-
-    def __str__(self) -> str:
-        return self.__repr__()
 
 
 class UsmIncomingError(errors.AuthError):
@@ -531,11 +532,12 @@ class SaltCounter(object):
         self.value += 1
         return self.value
 
-    def __repr__(self) -> str:
-        return "SaltCounter()"
-
+extension SaltCounter(Show):
     def __str__(self) -> str:
         return self.__repr__()
+
+    def __repr__(self) -> str:
+        return "SaltCounter()"
 
 
 def _be32(v: int) -> bytes:
@@ -892,13 +894,14 @@ class EngineTime(object):
         boots = self.boots + t // _INT31_WRAP
         return (boots if boots < MAX_BOOTS else MAX_BOOTS, t % _INT31_WRAP)
 
+extension EngineTime(Show):
+    def __str__(self) -> str:
+        return self.__repr__()
+
     def __repr__(self) -> str:
         return ("EngineTime(engine_id=" + self.engine_id.hex() + ", boots=%d, time=%d, latest_received_time=%d, "
                 % (self.boots, self.time, self.latest_received_time) + "learned_at=%f, authenticated=" % self.learned_at
                 + str(self.authenticated) + ")")
-
-    def __str__(self) -> str:
-        return self.__repr__()
 
 
 def check_time_authoritative(own_boots: int, own_time: int, msg_boots: int, msg_time: int) -> bool:

@@ -179,11 +179,12 @@ class TrapUser(object):
         self.engine_id = engine_id
         self.usm = usm
 
-    def __repr__(self) -> str:
-        return "TrapUser(engine_id=" + self.engine_id.hex() + ", user=" + repr(self.usm.user) + ")"
-
+extension TrapUser(Show):
     def __str__(self) -> str:
         return self.__repr__()
+
+    def __repr__(self) -> str:
+        return "TrapUser(engine_id=" + self.engine_id.hex() + ", user=" + repr(self.usm.user) + ")"
 
 
 def _check_users(users: list[Usm], trap_users: list[TrapUser]) -> None:
@@ -273,6 +274,15 @@ class ReceiverConfig(object):
         _check_config(trap_engines, engine_id, engine_boots, dedup_window)
         return ReceiverConfig(communities, load_users_tsv(text), trap_engines, engine_id, engine_boots, dedup_window)
 
+
+
+
+# SNMPv3 traps: the non-authoritative side ##########################################################
+
+extension ReceiverConfig(Show):
+    def __str__(self) -> str:
+        return self.__repr__()
+
     def __repr__(self) -> str:
         extra = ""
         if len(self.trap_users) > 0:
@@ -282,11 +292,6 @@ class ReceiverConfig(object):
                 + ", ".join([e.hex() for e in self.trap_engines]) + "], engine_id=" + self.engine_id.hex()
                 + ", engine_boots=%d, dedup_window=" % self.engine_boots + str(self.dedup_window) + extra + ")")
 
-    def __str__(self) -> str:
-        return self.__repr__()
-
-
-# SNMPv3 traps: the non-authoritative side ##########################################################
 
 def _refused(counter: str, level: int) -> Incoming:
     return Incoming(None, None, counter, level, None)

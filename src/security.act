@@ -27,6 +27,17 @@ class Security(object):
     def __init__(self, version: int):
         self.version = version
 
+    def representation(self) -> str:
+        base: value = self
+        return repr(base)
+
+# Keep runtime subtype formatting for values stored through the base type.
+extension Security(Show):
+    def __str__(self) -> str:
+        return self.representation()
+
+    def __repr__(self) -> str:
+        return self.representation()
 
 class Community(Security):
     """An SNMPv1 or SNMPv2c community
@@ -40,13 +51,9 @@ class Community(Security):
         Security.__init__(self, version if version == message.SNMP_V1 or version == message.SNMP_V2C else raise ValueError("a community is for SNMP version 0 (v1) or 1 (v2c), got %d" % version))
         self.community = community.encode()
 
-    def __repr__(self) -> str:
+    def representation(self) -> str:
         v = "1" if self.version == message.SNMP_V1 else "2c"
         return "Community(v" + v + ", community=<%d octets>)" % len(self.community)
-
-    def __str__(self) -> str:
-        return self.__repr__()
-
 
 def _check_protocols(auth: int, priv: int) -> int:
     # Return the Ku length of auth; raise ValueError for unknown protocols and privacy without authentication
@@ -202,21 +209,20 @@ class Usm(Security):
             auth_key = usm.localize(self.auth_protocol, self.auth_ku, engine_id)
         return LocalizedUser(self.user.encode(), self.auth_protocol, self.priv_protocol, auth_key, b"", engine_id)
 
-    def __repr__(self) -> str:
+    def representation(self) -> str:
         ceid = self.context_engine_id
         return ("Usm(user=" + repr(self.user) + ", level=" + usm.level_name(self.level()) + ", auth="
                 + usm.auth_name(self.auth_protocol) + ", priv=" + usm.priv_name(self.priv_protocol)
                 + ", context_name=" + repr(self.context_name) + ", context_engine_id="
                 + (ceid.hex() if ceid is not None else "None") + ")")
 
-    def __str__(self) -> str:
-        return self.__repr__()
 
 
 # The interop lab's users file #######################################################################
 
 # pysnmp's privacy protocol names in interop/config/users.tsv; they differ from net-snmp's
 # (pysnmp's AES192 is net-snmp's AES-192-C)
+
 _PYSNMP_PRIV: dict[str, int] = {"DES": usm.PRIV_DES, "AES": usm.PRIV_AES128, "AES192BLMT": usm.PRIV_AES192,
                                 "AES256BLMT": usm.PRIV_AES256, "AES192": usm.PRIV_AES192C,
                                 "AES256": usm.PRIV_AES256C, "3DES": usm.PRIV_3DES}

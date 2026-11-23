@@ -100,6 +100,7 @@ class OctetSpec(object):
         self.sep = sep
         self.term = term
 
+extension OctetSpec(Show):
     def __str__(self) -> str:
         return ("*" if self.repeat else "") + str(self.length) + self.fmt + self.sep + self.term
 
@@ -124,6 +125,7 @@ class DisplayHint(object):
         self.decimals = decimals
         self.specs = specs
 
+extension DisplayHint(Show):
     def __str__(self) -> str:
         return self.text
 
@@ -146,6 +148,15 @@ class Rendered(object):
         self.reason = reason
         self.dropped = dropped
 
+
+
+# --- parsing -------------------------------------------------------------------------------------
+
+extension Rendered(Show):
+    def __str__(self) -> str:
+        base: value = self
+        return str(base)
+
     def __repr__(self) -> str:
         if self.ok:
             if self.dropped > 0:
@@ -153,8 +164,6 @@ class Rendered(object):
             return "Rendered(" + repr(self.text) + ")"
         return "Rendered(" + repr(self.text) + ", fallback: " + self.reason + ")"
 
-
-# --- parsing -------------------------------------------------------------------------------------
 
 def _is_digit(c: str) -> bool:
     return c >= "0" and c <= "9"

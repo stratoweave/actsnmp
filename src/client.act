@@ -277,6 +277,10 @@ class Options(object):
             t = self.max_timeout
         return t if t > self.timeout else self.timeout
 
+extension Options(Show):
+    def __str__(self) -> str:
+        return self.__repr__()
+
     def __repr__(self) -> str:
         return ("Options(timeout=%s, retries=%d, backoff=%s, max_timeout=%s, max_in_flight=%d, "
                 % (str(self.timeout), self.retries, str(self.backoff), str(self.max_timeout), self.max_in_flight)
@@ -288,9 +292,6 @@ class Options(object):
                 + str(self.strict_response_oids) + ", check_community=" + str(self.check_community)
                 + ", request_id_bits=%d, max_queued=%d" % (self.request_id_bits, self.max_queued)
                 + ", split_too_big=" + str(self.split_too_big) + ", context_name=" + _repr_bytes(self.context_name) + ")")
-
-    def __str__(self) -> str:
-        return self.__repr__()
 
 
 class Response(object):
@@ -329,13 +330,14 @@ class Response(object):
         self.context_engine_id = context_engine_id
         self.context_name = context_name
 
+extension Response(Show):
+    def __str__(self) -> str:
+        return self.__repr__()
+
     def __repr__(self) -> str:
         return ("Response(" + pdu.pdu_type_name(self.pdu_type) + ", request_id=%d, error_status=%d, error_index=%d, "
                 % (self.request_id, self.error_status, self.error_index) + "varbinds=" + repr(self.varbinds)
                 + ", attempts=%d, rtt=%f)" % (self.attempts, self.rtt))
-
-    def __str__(self) -> str:
-        return self.__repr__()
 
 
 def error_response(e: errors.ErrorStatusError) -> ?Response:
@@ -371,11 +373,12 @@ class EngineInfo(object):
         self.time = time
         self.learned_at = learned_at
 
-    def __repr__(self) -> str:
-        return "EngineInfo(engine_id=" + self.engine_id.hex() + ", boots=%d, time=%d)" % (self.boots, self.time)
-
+extension EngineInfo(Show):
     def __str__(self) -> str:
         return self.__repr__()
+
+    def __repr__(self) -> str:
+        return "EngineInfo(engine_id=" + self.engine_id.hex() + ", boots=%d, time=%d)" % (self.boots, self.time)
 
 
 class Stats(object):
@@ -454,6 +457,10 @@ class Stats(object):
         self.transport_failures = transport_failures
         self.id_collisions = id_collisions
 
+extension Stats(Show):
+    def __str__(self) -> str:
+        return self.__repr__()
+
     def __repr__(self) -> str:
         counts = [("requests", self.requests), ("retries", self.retries), ("timeouts", self.timeouts),
                   ("responses", self.responses), ("drops_decode", self.drops_decode),
@@ -463,9 +470,6 @@ class Stats(object):
                   ("queued", self.queued), ("in_flight", self.in_flight),
                   ("transport_failures", self.transport_failures), ("id_collisions", self.id_collisions)]
         return "Stats(" + ", ".join([c.0 + "=" + str(c.1) for c in counts]) + ")"
-
-    def __str__(self) -> str:
-        return self.__repr__()
 
 
 class Row(object):
@@ -491,13 +495,14 @@ class Row(object):
         self.values = values
         self.cells = cells
 
+extension Row(Show):
+    def __str__(self) -> str:
+        return self.__repr__()
+
     def __repr__(self) -> str:
         cols = sorted(list(self.values.keys()))
         return ("Row(index=" + ".".join([str(a) for a in self.index]) + ", values=["
                 + ", ".join([str(c) + ": " + repr(self.values[c]) for c in cols]) + "])")
-
-    def __str__(self) -> str:
-        return self.__repr__()
 
 
 class Table(object):
@@ -515,15 +520,19 @@ class Table(object):
         self.rows = rows
         self.truncated = truncated
 
+
+
+
+# Internal request state #############################################################################
+
+extension Table(Show):
+    def __str__(self) -> str:
+        return self.__repr__()
+
     def __repr__(self) -> str:
         return ("Table(columns=[" + ", ".join([c.dotted() for c in self.columns]) + "], rows=["
                 + ", ".join([repr(r) for r in self.rows]) + "]" + (", truncated" if self.truncated else "") + ")")
 
-    def __str__(self) -> str:
-        return self.__repr__()
-
-
-# Internal request state #############################################################################
 
 class _Op(object):
     # One request of the caller (get, get_next, get_bulk, set, inform). It has

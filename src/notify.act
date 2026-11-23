@@ -142,6 +142,10 @@ class Notification(object):
             return "[" + self.source_address + "]:%d" % self.source_port
         return self.source_address + ":%d" % self.source_port
 
+extension Notification(Show):
+    def __str__(self) -> str:
+        return self.__repr__()
+
     def __repr__(self) -> str:
         if self.version == message.SNMP_V3:
             sec = ("user=" + repr(self.user) + ", security_level=" + usm.level_text(self.security_level) + ", engine_id="
@@ -156,9 +160,6 @@ class Notification(object):
         if self.problem != "":
             return head + ", problem=" + repr(self.problem) + ")"
         return head + ")"
-
-    def __str__(self) -> str:
-        return self.__repr__()
 
 
 def _repr_varbind(vb: VarBind) -> str:

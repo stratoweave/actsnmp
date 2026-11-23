@@ -104,6 +104,13 @@ class IndexPart(object):
         self.name = name
         self.kind = _kind_of(enc)
 
+    def describe(self, i: int) -> str:
+        """Part i (0-based) for messages: index part 2 (ifRcvAddressAddress, var)."""
+        if self.name != "":
+            return "index part %d (" % (i + 1) + self.name + ", " + self.__str__() + ")"
+        return "index part %d (" % (i + 1) + self.__str__() + ")"
+
+extension IndexPart(Show):
     def __str__(self) -> str:
         """The spec text: fixed(6), var, ..."""
         if self.kind == K_FIXED:
@@ -114,12 +121,6 @@ class IndexPart(object):
         if self.name != "":
             return "IndexPart(" + self.__str__() + ", " + self.name + ")"
         return "IndexPart(" + self.__str__() + ")"
-
-    def describe(self, i: int) -> str:
-        """Part i (0-based) for messages: index part 2 (ifRcvAddressAddress, var)."""
-        if self.name != "":
-            return "index part %d (" % (i + 1) + self.name + ", " + self.__str__() + ")"
-        return "index part %d (" % (i + 1) + self.__str__() + ")"
 
 
 extension IndexPart(Eq):

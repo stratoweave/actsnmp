@@ -200,14 +200,18 @@ class MibView(object):
             return pdu.NO_CREATION
         return pdu.NO_ERROR
 
-    def __repr__(self) -> str:
-        return "MibView(%d variables)" % len(self._oids)
 
-    def __str__(self) -> str:
-        return self.__repr__()
 
 
 # SET rules #########################################################################################
+
+extension MibView(Show):
+    def __str__(self) -> str:
+        return self.__repr__()
+
+    def __repr__(self) -> str:
+        return "MibView(%d variables)" % len(self._oids)
+
 
 class WriteRule(object):
     """Which variables a SET may change, and to what
@@ -233,15 +237,16 @@ class WriteRule(object):
         self.max = max
         self.writable = writable
 
+extension WriteRule(Show):
+    def __str__(self) -> str:
+        return self.__repr__()
+
     def __repr__(self) -> str:
         lo = self.min
         hi = self.max
         return ("WriteRule(" + str(self.prefix) + ", tags=" + repr(self.tags)
                 + ", min=" + (str(lo) if lo is not None else "None") + ", max=" + (str(hi) if hi is not None else "None")
                 + ", writable=" + str(self.writable) + ")")
-
-    def __str__(self) -> str:
-        return self.__repr__()
 
 
 def find_rule(rules: list[WriteRule], oid: Oid) -> ?WriteRule:

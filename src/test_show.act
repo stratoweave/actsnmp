@@ -1,0 +1,18 @@
+import testing
+from values import Value, Integer, OctetString
+from security import Security, Community
+
+
+def _test_base_typed_rendering():
+    number: Value = Integer(7)
+    text: Value = OctetString(b"ok")
+    testing.assertEqual(repr(number), "Integer(7)")
+    testing.assertEqual(str(text), repr(OctetString(b"ok")))
+    testing.assertEqual(repr([number, text]), "[Integer(7), " + repr(OctetString(b"ok")) + "]")
+
+
+def _test_base_typed_security_redaction():
+    credentials: Security = Community("private")
+    testing.assertEqual(str(credentials), "Community(v2c, community=<7 octets>)")
+    testing.assertEqual(repr(credentials), str(credentials))
+    testing.assertNotIn("private", repr(credentials))

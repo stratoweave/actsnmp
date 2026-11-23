@@ -313,16 +313,20 @@ class CliOptions(object):
             ends.append(end)
         return oid_words_of(self.command, self.args, self.version == message.SNMP_V1, ends)
 
+
+
+
+# C number scanning (strtoul, strtol, strtod), as net-snmp's parsers use it ##########################
+
+extension CliOptions(Show):
+    def __str__(self) -> str:
+        return self.__repr__()
+
     def __repr__(self) -> str:
         # never shows communities or passwords
         return ("CliOptions(" + self.command + ", peer=" + repr(self.peer) + ", version=%d" % self.version
                 + ", oids=[" + ", ".join([o.dotted() for o in self.oids]) + "], varbinds=%d)" % len(self.varbinds))
 
-    def __str__(self) -> str:
-        return self.__repr__()
-
-
-# C number scanning (strtoul, strtol, strtod), as net-snmp's parsers use it ##########################
 
 _C_SPACE = " \t\n\v\f\r"
 _U64_MAX = u64(18446744073709551615)

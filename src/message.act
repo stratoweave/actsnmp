@@ -72,13 +72,14 @@ class CommunityMessage(object):
         self.pdu = pdu
         self.trap = trap
 
+extension CommunityMessage(Show):
+    def __str__(self) -> str:
+        return self.__repr__()
+
     def __repr__(self) -> str:
         p = self.pdu
         body = repr(p) if p is not None else repr(self.trap)
         return "CommunityMessage(version=%d, community=<%d octets>, " % (self.version, len(self.community)) + body + ")"
-
-    def __str__(self) -> str:
-        return self.__repr__()
 
 
 class UsmSecurityParameters(object):
@@ -105,13 +106,14 @@ class UsmSecurityParameters(object):
         self.auth_params = auth_params
         self.priv_params = priv_params
 
+extension UsmSecurityParameters(Show):
+    def __str__(self) -> str:
+        return self.__repr__()
+
     def __repr__(self) -> str:
         return ("UsmSecurityParameters(engine_id=" + self.engine_id.hex()
                 + ", boots=%d, time=%d, user=" % (self.boots, self.time) + repr(self.user)
                 + ", auth_params=" + self.auth_params.hex() + ", priv_params=" + self.priv_params.hex() + ")")
-
-    def __str__(self) -> str:
-        return self.__repr__()
 
 
 extension UsmSecurityParameters(Eq):
@@ -132,12 +134,13 @@ class ScopedPdu(object):
         self.context_name = context_name
         self.pdu = pdu
 
+extension ScopedPdu(Show):
+    def __str__(self) -> str:
+        return self.__repr__()
+
     def __repr__(self) -> str:
         return ("ScopedPdu(context_engine_id=" + self.context_engine_id.hex() + ", context_name="
                 + repr(self.context_name) + ", " + repr(self.pdu) + ")")
-
-    def __str__(self) -> str:
-        return self.__repr__()
 
 
 extension ScopedPdu(Eq):
@@ -185,6 +188,15 @@ class V3Message(object):
         self.encrypted = encrypted
         self.auth_offset = auth_offset
 
+
+
+
+# Encoding ##########################################################################################
+
+extension V3Message(Show):
+    def __str__(self) -> str:
+        return self.__repr__()
+
     def __repr__(self) -> str:
         s = self.scoped
         e = self.encrypted
@@ -198,11 +210,6 @@ class V3Message(object):
                 % (self.msg_id, self.max_size, self.flags, self.security_model))
         return head + repr(self.usm) + ", " + data + ", auth_offset=%d)" % self.auth_offset
 
-    def __str__(self) -> str:
-        return self.__repr__()
-
-
-# Encoding ##########################################################################################
 
 def encode_community(m: CommunityMessage) -> bytes:
     """Return the complete SNMPv1/v2c datagram of m

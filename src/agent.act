@@ -178,15 +178,16 @@ class AgentConfig(object):
         self.write_rules = write_rules
         self.read_only_users = read_only_users
 
+extension AgentConfig(Show):
+    def __str__(self) -> str:
+        return self.__repr__()
+
     def __repr__(self) -> str:
         return ("AgentConfig(communities=<%d>, users=" % len(self.communities) + repr([u.user for u in self.users])
                 + ", engine_id=" + self.engine_id.hex()
                 + ", engine_boots=%d, write_rules=%d, max_bulk_varbinds=%d, max_msg_size=%d"
                 % (self.engine_boots, len(self.write_rules), self.max_bulk_varbinds, self.max_msg_size)
                 + ", read_only_users=" + repr(self.read_only_users) + ")")
-
-    def __str__(self) -> str:
-        return self.__repr__()
 
 
 def _check_faults(drop_first_n: int, too_big_over: int, truncate_bulk: int, error_status: int,
@@ -277,6 +278,15 @@ class Faults(object):
         self.respond_from_other_port = respond_from_other_port
         self.other_port = other_port
 
+
+
+
+# The lab's configuration files ######################################################################
+
+extension Faults(Show):
+    def __str__(self) -> str:
+        return self.__repr__()
+
     def __repr__(self) -> str:
         parts: list[str] = []
         if self.drop_first_n > 0:
@@ -305,11 +315,6 @@ class Faults(object):
             parts.append("respond_from_other_port")
         return "Faults(" + ", ".join(parts) + ")"
 
-    def __str__(self) -> str:
-        return self.__repr__()
-
-
-# The lab's configuration files ######################################################################
 
 def load_users(text: str) -> (users: list[Usm], read_only: list[str]):
     """Return the SNMPv3 users of the interop lab's users.tsv, and the names of the read-only ones

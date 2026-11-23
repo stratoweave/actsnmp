@@ -55,14 +55,6 @@ class Oid(object):
                 raise ValueError("invalid OID %r: arc %d exceeds 2^32-1" % (s, a))
         return Oid([int(p) for p in parts])
 
-    def __str__(self) -> str:
-        """Return the arcs joined by dots, without a leading dot: "1.3.6.1.2.1.1.1.0" """
-        text = _ARC_TEXT
-        return ".".join([text[a] if a < 1024 else str(a) for a in self.arcs])
-
-    def __repr__(self) -> str:
-        return "Oid(" + self.__str__() + ")"
-
     def dotted(self) -> str:
         """Return the net-snmp -On form with a leading dot: ".1.3.6.1.2.1.1.1.0" """
         return "." + self.__str__()
@@ -130,6 +122,15 @@ class Oid(object):
             parts.append(t[(a >> 8) & 0xff])
             parts.append(t[a & 0xff])
         return b"".join(parts)
+
+extension Oid(Show):
+    def __str__(self) -> str:
+        """Return the arcs joined by dots, without a leading dot: "1.3.6.1.2.1.1.1.0" """
+        text = _ARC_TEXT
+        return ".".join([text[a] if a < 1024 else str(a) for a in self.arcs])
+
+    def __repr__(self) -> str:
+        return "Oid(" + self.__str__() + ")"
 
 
 extension Oid(Ord):

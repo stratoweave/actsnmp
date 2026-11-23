@@ -85,6 +85,10 @@ class Incoming(object):
         self.level = level
         self.user = user
 
+extension Incoming(Show):
+    def __str__(self) -> str:
+        return self.__repr__()
+
     def __repr__(self) -> str:
         s = self.scoped
         r = self.report
@@ -98,9 +102,6 @@ class Incoming(object):
         who = repr(u.user) if u is not None else "None"
         return ("Incoming(" + outcome + ", counter=" + repr(self.counter) + ", level=" + usm.level_text(self.level)
                 + ", user=" + who + ")")
-
-    def __str__(self) -> str:
-        return self.__repr__()
 
 
 def _pdu_of(msg: V3Message, scoped: ?ScopedPdu) -> ?Pdu:
@@ -308,9 +309,10 @@ class AuthoritativeEngine(object):
         scoped = ScopedPdu(context_engine_id, context_name, response)
         return self._encode(req, req.flags & usm.LEVEL_AUTH_PRIV, scoped, user, salt, now)
 
+extension AuthoritativeEngine(Show):
+    def __str__(self) -> str:
+        return self.__repr__()
+
     def __repr__(self) -> str:
         return ("AuthoritativeEngine(engine_id=" + self.engine_id.hex() + ", boots=%d, users=%d)"
                 % (self.boots, len(self.users)))
-
-    def __str__(self) -> str:
-        return self.__repr__()

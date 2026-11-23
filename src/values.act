@@ -45,12 +45,16 @@ class Value(object):
         """Return the type's name as net-snmp prints it: "INTEGER", "STRING", "Counter32", ..."""
         raise NotImplementedError("Value.type_name")
 
-    def __repr__(self) -> str:
+    def representation(self) -> str:
         raise NotImplementedError("Value.__repr__")
 
+# Keep runtime subtype formatting for values stored through the base type.
+extension Value(Show):
     def __str__(self) -> str:
-        return self.__repr__()
+        return self.representation()
 
+    def __repr__(self) -> str:
+        return self.representation()
 
 extension Value(Eq):
     def __eq__(self, other: Value) -> bool:
@@ -90,9 +94,8 @@ class Integer(Value):
     def type_name(self) -> str:
         return "INTEGER"
 
-    def __repr__(self) -> str:
+    def representation(self) -> str:
         return "Integer(%d)" % self.value
-
 
 class OctetString(Value):
     """OCTET STRING (tag 0x04): text, binary data and BITS
@@ -116,9 +119,8 @@ class OctetString(Value):
     def type_name(self) -> str:
         return "STRING"
 
-    def __repr__(self) -> str:
+    def representation(self) -> str:
         return "OctetString(" + repr(self.value) + ")"
-
 
 class Null(Value):
     """NULL (tag 0x05), the value of every varbind in a GET/GETNEXT/GETBULK request"""
@@ -137,9 +139,8 @@ class Null(Value):
     def type_name(self) -> str:
         return "NULL"
 
-    def __repr__(self) -> str:
+    def representation(self) -> str:
         return "Null()"
-
 
 class ObjectIdentifier(Value):
     """OBJECT IDENTIFIER (tag 0x06) as a value
@@ -164,9 +165,8 @@ class ObjectIdentifier(Value):
     def type_name(self) -> str:
         return "OID"
 
-    def __repr__(self) -> str:
+    def representation(self) -> str:
         return "ObjectIdentifier(" + str(self.value) + ")"
-
 
 class IpAddress(Value):
     """IpAddress (tag 0x40): an IPv4 address in network byte order
@@ -192,12 +192,11 @@ class IpAddress(Value):
     def type_name(self) -> str:
         return "IpAddress"
 
-    def __repr__(self) -> str:
+    def representation(self) -> str:
         v = self.value
         if len(v) == 4:
             return "IpAddress(%d.%d.%d.%d)" % (v[0], v[1], v[2], v[3])
         return "IpAddress(" + repr(v) + ")"
-
 
 def _enc_unsigned(tag: int, v: int) -> bytes:
     return ber.enc_tlv(tag, ber.enc_uint_content(v))
@@ -222,9 +221,8 @@ class Counter32(Value):
     def type_name(self) -> str:
         return "Counter32"
 
-    def __repr__(self) -> str:
+    def representation(self) -> str:
         return "Counter32(%d)" % self.value
-
 
 class Gauge32(Value):
     """Gauge32, identical on the wire to Unsigned32 (tag 0x42)
@@ -248,9 +246,8 @@ class Gauge32(Value):
     def type_name(self) -> str:
         return "Gauge32"
 
-    def __repr__(self) -> str:
+    def representation(self) -> str:
         return "Gauge32(%d)" % self.value
-
 
 class TimeTicks(Value):
     """TimeTicks (tag 0x43) in hundredths of a second
@@ -274,9 +271,8 @@ class TimeTicks(Value):
     def type_name(self) -> str:
         return "Timeticks"
 
-    def __repr__(self) -> str:
+    def representation(self) -> str:
         return "TimeTicks(%d)" % self.value
-
 
 class Opaque(Value):
     """Opaque (tag 0x44): raw content octets
@@ -301,9 +297,8 @@ class Opaque(Value):
     def type_name(self) -> str:
         return "Opaque"
 
-    def __repr__(self) -> str:
+    def representation(self) -> str:
         return "Opaque(" + repr(self.value) + ")"
-
 
 class Counter64(Value):
     """Counter64 (tag 0x46); not allowed in SNMPv1 messages"""
@@ -324,9 +319,8 @@ class Counter64(Value):
     def type_name(self) -> str:
         return "Counter64"
 
-    def __repr__(self) -> str:
+    def representation(self) -> str:
         return "Counter64(" + str(self.value) + ")"
-
 
 class NoSuchObject(Value):
     """noSuchObject exception value (tag 0x80) of an SNMPv2 response"""
@@ -345,9 +339,8 @@ class NoSuchObject(Value):
     def type_name(self) -> str:
         return "noSuchObject"
 
-    def __repr__(self) -> str:
+    def representation(self) -> str:
         return "NoSuchObject()"
-
 
 class NoSuchInstance(Value):
     """noSuchInstance exception value (tag 0x81) of an SNMPv2 response"""
@@ -366,9 +359,8 @@ class NoSuchInstance(Value):
     def type_name(self) -> str:
         return "noSuchInstance"
 
-    def __repr__(self) -> str:
+    def representation(self) -> str:
         return "NoSuchInstance()"
-
 
 class EndOfMibView(Value):
     """endOfMibView exception value (tag 0x82) of an SNMPv2 response"""
@@ -387,9 +379,8 @@ class EndOfMibView(Value):
     def type_name(self) -> str:
         return "endOfMibView"
 
-    def __repr__(self) -> str:
+    def representation(self) -> str:
         return "EndOfMibView()"
-
 
 class UnknownValue(Value):
     """A value of any other tag, kept as raw content so that it round-trips
@@ -421,9 +412,8 @@ class UnknownValue(Value):
             return "UInteger32"
         return "Unknown"
 
-    def __repr__(self) -> str:
+    def representation(self) -> str:
         return "UnknownValue(0x%02x, " % self.raw_tag + repr(self.value) + ")"
-
 
 class MalformedValue(Value):
     """A value whose TLV is well-formed but whose content is invalid for its tag
@@ -462,9 +452,8 @@ class MalformedValue(Value):
     def type_name(self) -> str:
         return "Malformed"
 
-    def __repr__(self) -> str:
+    def representation(self) -> str:
         return "MalformedValue(0x%02x, " % self.raw_tag + repr(self.value) + ", " + repr(self.reason) + ")"
-
 
 class VarBind(object):
     """A variable binding: an OID and its value (NULL in requests)"""
@@ -475,11 +464,12 @@ class VarBind(object):
         self.oid = oid
         self.value = value
 
-    def __repr__(self) -> str:
-        return "VarBind(" + str(self.oid) + ", " + repr(self.value) + ")"
-
+extension VarBind(Show):
     def __str__(self) -> str:
         return self.__repr__()
+
+    def __repr__(self) -> str:
+        return "VarBind(" + str(self.oid) + ", " + repr(self.value) + ")"
 
 
 extension VarBind(Eq):

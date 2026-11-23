@@ -177,6 +177,10 @@ class Pdu(object):
         m = self.error_index
         return (n, m if m > 0 else 0)
 
+extension Pdu(Show):
+    def __str__(self) -> str:
+        return self.__repr__()
+
     def __repr__(self) -> str:
         if self.pdu_type == GETBULK:
             fields = "non_repeaters=%d, max_repetitions=%d" % (self.error_status, self.error_index)
@@ -184,9 +188,6 @@ class Pdu(object):
             fields = "error_status=%d, error_index=%d" % (self.error_status, self.error_index)
         return ("Pdu(" + pdu_type_name(self.pdu_type) + ", request_id=%d, " % self.request_id + fields
                 + ", varbinds=" + repr(self.varbinds) + ")")
-
-    def __str__(self) -> str:
-        return self.__repr__()
 
 
 extension Pdu(Eq):
@@ -227,14 +228,15 @@ class TrapV1Pdu(object):
         self.time_stamp = time_stamp
         self.varbinds = varbinds
 
+extension TrapV1Pdu(Show):
+    def __str__(self) -> str:
+        return self.__repr__()
+
     def __repr__(self) -> str:
         numbers = (", generic_trap=%d, specific_trap=%d, time_stamp=%d"
                    % (self.generic_trap, self.specific_trap, self.time_stamp))
         return ("TrapV1Pdu(enterprise=" + str(self.enterprise) + ", agent_addr=" + repr(self.agent_addr) + numbers
                 + ", varbinds=" + repr(self.varbinds) + ")")
-
-    def __str__(self) -> str:
-        return self.__repr__()
 
 
 extension TrapV1Pdu(Eq):
