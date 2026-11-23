@@ -22,11 +22,10 @@
 //   * Small fixed-size results (digests, keys) are computed into a local
 //     buffer and returned through bytes_from_buf(), which copies them into
 //     GC-managed storage, so the local copy can be wiped. Results as long as
-//     the input (ciphertext, plaintext, random bytes) are written straight
-//     into the storage of the returned bytes object, allocated with
-//     new_bytes(). Do not keep pointers to Acton objects in C state, and do
-//     not keep C state between calls: the runtime runs actors on many
-//     threads.
+//     the input (ciphertext, plaintext, random bytes) are written to a
+//     GC-managed buffer before constructing the returned bytes object.
+//     Do not keep pointers to Acton objects in C state, and do not keep
+//     C state between calls: the runtime runs actors on many threads.
 //   * Wipe local buffers that held key material, keystream or results
 //     (digests are used as keys in USM key derivation) with
 //     mbedtls_platform_zeroize() once they are no longer needed. The
@@ -72,16 +71,12 @@ static B_bytes bytes_from_buf(const unsigned char *buf, size_t len) {
     return actBytesFromCStringLengthCopy((const char *)buf, (int64_t)len);
 }
 
-// Return a new bytes object of n bytes whose content the caller then writes
-// through *buf. The storage is GC-managed and pointer-free, so there is
-// nothing to free if the caller raises before filling it in.
-static B_bytes new_bytes(int64_t n, unsigned char **buf) {
-    // one spare byte keeps *buf a valid pointer when n is 0
-    unsigned char *p = acton_malloc_atomic((size_t)n + 1);
+// Allocate a pointer-free result buffer. Keep it valid even when n is zero.
+static unsigned char *alloc_output(int64_t n) {
+    unsigned char *p = acton_malloc_atomic(n > 0 ? (size_t)n : 1);
     if (p == NULL)
         RAISE_EXC(&alloc_failed_error);
-    *buf = p;
-    return actBytesFromCStringLengthNoCopy((char *)p, n);
+    return p;
 }
 
 // HASH_* id (usmcrypto.act) -> mbedtls digest type, MBEDTLS_MD_NONE if unknown.
@@ -117,8 +112,7 @@ static B_bytes des_cbc(const char *fn, int64_t key_len, int mode, B_bytes key, B
         raise_value_error($FORMAT("usmcrypto: %s: data length must be a multiple of 8, got %lld",
                                   fn, (long long)data->nbytes));
     size_t len = (size_t)data->nbytes;
-    unsigned char *out;
-    B_bytes res = new_bytes(data->nbytes, &out);
+    unsigned char *out = alloc_output(data->nbytes);
     // mbedtls advances the IV in place; never let it write to the caller's bytes
     unsigned char ivbuf[8];
     memcpy(ivbuf, iv->str, sizeof(ivbuf));
@@ -145,7 +139,7 @@ static B_bytes des_cbc(const char *fn, int64_t key_len, int mode, B_bytes key, B
         mbedtls_platform_zeroize(out, len);
         raise_mbedtls_error(fn, rc);
     }
-    return res;
+    return actBytesFromCStringLength((char *)out, data->nbytes);
 }
 
 // AES-CFB128 with a 16, 24 or 32 byte key; any data length.
@@ -156,8 +150,7 @@ static B_bytes aes_cfb128(const char *fn, int mode, B_bytes key, B_bytes iv, B_b
                                   fn, (long long)key->nbytes));
     require_len(fn, "iv", iv, 16);
     size_t len = (size_t)data->nbytes;
-    unsigned char *out;
-    B_bytes res = new_bytes(data->nbytes, &out);
+    unsigned char *out = alloc_output(data->nbytes);
     // mbedtls advances the IV in place (after a partial last block it holds
     // unused keystream), so work on a local copy and wipe it afterwards
     unsigned char ivbuf[16];
@@ -176,7 +169,7 @@ static B_bytes aes_cfb128(const char *fn, int mode, B_bytes key, B_bytes iv, B_b
         mbedtls_platform_zeroize(out, len);
         raise_mbedtls_error(fn, rc);
     }
-    return res;
+    return actBytesFromCStringLength((char *)out, data->nbytes);
 }
 
 // --- exported functions -------------------------------------------------------
@@ -294,8 +287,7 @@ B_bytes snmpQ_usmcryptoQ_random_bytes (int64_t n) {
         raise_value_error($FORMAT("usmcrypto: random_bytes: n must be >= 0, got %lld", (long long)n));
     if (n > MAX_STR_LEN)
         raise_value_error($FORMAT("usmcrypto: random_bytes: n too large: %lld", (long long)n));
-    unsigned char *buf;
-    B_bytes res = new_bytes(n, &buf);
+    unsigned char *buf = alloc_output(n);
     int64_t got = 0;
     while (got < n) {
         // getentropy() returns at most 256 bytes per call
@@ -307,5 +299,5 @@ B_bytes snmpQ_usmcryptoQ_random_bytes (int64_t n) {
         }
         got += (int64_t)chunk;
     }
-    return res;
+    return actBytesFromCStringLength((char *)buf, n);
 }
