@@ -20,7 +20,7 @@ import pdu
 import security
 import usm
 from agent import Agent, AgentConfig, Faults
-from client import Client, EngineInfo, Options, Response, error_response
+from client import Client, EngineInfo, Options, Response, Stats, error_response
 from mibview import MibView, WriteRule
 from notify import Notification
 from oid import Oid
@@ -516,18 +516,18 @@ actor _test_v3_discover(t: testing.AsyncT):
 
 
 proc def _fault_run(t: testing.AsyncT, faults: ?Faults, net_faults: ?NetFaults, sec: security.Security, opts: Options,
-                    check: proc(list[Outcome], Client) -> None, other_port: int=0) -> _FaultRun:
+                    check: com(list[Outcome], Stats) -> None, other_port: int=0) -> _FaultRun:
     mn = MemNet(net_faults)
     agent = Agent(mn.server(AGENT, 161), make_view(), agent_config([_sha_aes()]), t.log_handler, faults)
     c = _client(mn, sec, 40001, opts, t.log_handler)
     return _FaultRun(t, c, check)
 
-actor _FaultRun(t: testing.AsyncT, c: Client, check: proc(list[Outcome], Client) -> None):
+actor _FaultRun(t: testing.AsyncT, c: Client, check: com(list[Outcome], Stats) -> None):
     """An Agent with faults on a MemNet (net_faults on the answers to the manager), one Client, and requests"""
 
     def reported(label: str, outs: list[Outcome]) -> None:
         def run() -> None:
-            check(outs, c)
+            check(outs, c.stats())
         report(t, outcome(run))
 
     col = Collector("faults", reported)
@@ -546,17 +546,17 @@ actor _FaultRun(t: testing.AsyncT, c: Client, check: proc(list[Outcome], Client)
         after now QUIET: col.expect(n)
 
 
-def _sha_aes() -> Usm:
+pure def _sha_aes() -> Usm:
     return Usm.from_passwords("u_sha_aes", usm.AUTH_SHA1, "authpass123", usm.PRIV_AES128, "privpass123")
 
 actor _test_fault_drop_first_n(t: testing.AsyncT):
     """drop_first_n: the lost answer is retried; the SET was applied once and its retry meets the same value"""
     proc def __startup__():
-        def check(outs: list[Outcome], c: Client) -> None:
+        def check(outs: list[Outcome], stats: Stats) -> None:
             r = ok(outs[0], "get")
             testing.assertEqual((r.varbinds, r.attempts), ([VarBind(SYS_DESCR, OctetString(DESCR))], 2))
             testing.assertEqual(vbs_of(outs[1], "get"), [VarBind(e([1, 1, 0]), Integer(42))])
-            testing.assertEqual(c.stats().retries, 1)
+            testing.assertEqual(stats.retries, 1)
 
         t.timeout(30.0)
 
@@ -572,10 +572,10 @@ actor _test_fault_drop_first_n(t: testing.AsyncT):
 actor _test_fault_wrong_request_id(t: testing.AsyncT):
     """wrong_request_id: the copy with another request-id is dropped, the genuine Response taken"""
     proc def __startup__():
-        def check(outs: list[Outcome], c: Client) -> None:
+        def check(outs: list[Outcome], stats: Stats) -> None:
             testing.assertEqual(vbs_of(outs[0], "get"), [VarBind(SYS_DESCR, OctetString(DESCR))])
             testing.assertEqual(vbs_of(outs[1], "get_next"), [VarBind(e([2, 1, 0]), OctetString(b"hello"))])
-            s = c.stats()
+            s = stats
             testing.assertEqual((s.drops_unknown_id, s.responses), (2, 2), str(s))
 
         t.timeout(30.0)
@@ -592,11 +592,11 @@ actor _test_fault_wrong_request_id(t: testing.AsyncT):
 actor _test_net_duplicate(t: testing.AsyncT):
     """Every answer duplicated by the network: each callback exactly once, the copies dropped"""
     proc def __startup__():
-        def check(outs: list[Outcome], c: Client) -> None:
+        def check(outs: list[Outcome], stats: Stats) -> None:
             testing.assertEqual(len(outs), 3, "exactly one callback per request")
             for o in outs:
                 testing.assertEqual(vbs_of(o, "get"), [VarBind(SYS_DESCR, OctetString(DESCR))])
-            s = c.stats()
+            s = stats
             testing.assertEqual((s.responses, s.drops_unknown_id), (3, 3), str(s))
 
         t.timeout(30.0)
@@ -613,11 +613,11 @@ actor _test_net_duplicate(t: testing.AsyncT):
 actor _test_net_late(t: testing.AsyncT):
     """Answers delayed beyond the timeout: the late answer to the first attempt completes the request"""
     proc def __startup__():
-        def check(outs: list[Outcome], c: Client) -> None:
+        def check(outs: list[Outcome], stats: Stats) -> None:
             r = ok(outs[0], "get")
             testing.assertEqual((r.varbinds, r.attempts), ([VarBind(SYS_DESCR, OctetString(DESCR))], 2))
             testing.assertTrue(r.rtt >= 0.25, "the rtt of the first attempt: %f" % r.rtt)
-            s = c.stats()
+            s = stats
             testing.assertEqual((s.responses, s.retries, s.timeouts), (1, 1, 0), str(s))
 
         t.timeout(30.0)
@@ -633,10 +633,10 @@ actor _test_net_late(t: testing.AsyncT):
 actor _test_fault_not_in_time_window_once(t: testing.AsyncT):
     """SNMPv3: a forced authenticated notInTimeWindows Report makes the Client resynchronise and resend once"""
     proc def __startup__():
-        def check(outs: list[Outcome], c: Client) -> None:
+        def check(outs: list[Outcome], stats: Stats) -> None:
             testing.assertEqual(vbs_of(outs[0], "get"), [VarBind(SYS_DESCR, OctetString(DESCR))])
             testing.assertEqual(vbs_of(outs[1], "get"), [VarBind(e([1, 1, 0]), Integer(42))])
-            s = c.stats()
+            s = stats
             testing.assertEqual((s.reports, s.timeouts), (2, 0), "discovery and notInTimeWindows: " + str(s))
 
         t.timeout(30.0)
@@ -655,7 +655,7 @@ actor _test_fault_too_big(t: testing.AsyncT):
     proc def __startup__():
         oids = [e([9, i, 0]) for i in range(1, 9)]
 
-        def check(outs: list[Outcome], c: Client) -> None:
+        def check(outs: list[Outcome], stats: Stats) -> None:
             testing.assertEqual(vbs_of(outs[0], "split get"), [VarBind(e([9, i, 0]), big(i)) for i in range(1, 9)])
             vbs = vbs_of(outs[1], "halved get_bulk")
             testing.assertTrue(len(vbs) >= 1 and len(vbs) <= 4, "repetitions halved: %d varbinds" % len(vbs))
@@ -677,7 +677,7 @@ actor _test_fault_too_big(t: testing.AsyncT):
 actor _test_fault_truncate_bulk(t: testing.AsyncT):
     """truncate_bulk: the Client returns the shortened GETBULK answer as it is"""
     proc def __startup__():
-        def check(outs: list[Outcome], c: Client) -> None:
+        def check(outs: list[Outcome], stats: Stats) -> None:
             testing.assertEqual(vbs_of(outs[0], "get_bulk"), [table(1, 1), table(2, 1)])
 
         t.timeout(30.0)
@@ -692,7 +692,7 @@ actor _test_fault_truncate_bulk(t: testing.AsyncT):
 actor _test_fault_error_at(t: testing.AsyncT):
     """error_at: the injected error-status reaches the caller with its index, OID and transient flag"""
     proc def __startup__():
-        def check(outs: list[Outcome], c: Client) -> None:
+        def check(outs: list[Outcome], stats: Stats) -> None:
             testing.assertEqual(status_of(outs[0], "get"), (pdu.RESOURCE_UNAVAILABLE, 2))
             err = outs[0].e
             if isinstance(err, errors.ErrorStatusError):
@@ -886,7 +886,7 @@ actor _NotifyV3(t: testing.AsyncT, auth: str):
     """Every lab user with authentication protocol auth sends an SNMPv3 trap and an inform to the receiver"""
     users = lab_users(auth)
 
-    def check(blocks: list[str], st: dict[str, int], outcomes: dict[str, list[Outcome]]) -> None:
+    pure def check(blocks: list[str], st: dict[str, int], outcomes: dict[str, list[Outcome]]) -> None:
         want: list[str] = []
         for i in range(len(users)):
             u = users[i]
@@ -1074,9 +1074,9 @@ actor _test_v3_agent_restart_boots_lost(t: testing.AsyncT):
 actor _test_fault_too_big_v3(t: testing.AsyncT):
     """SNMPv3 authPriv with too_big_over: the GET is split into new exchanges and merged in order"""
     proc def __startup__():
-        def check(outs: list[Outcome], c: Client) -> None:
+        def check(outs: list[Outcome], stats: Stats) -> None:
             testing.assertEqual(vbs_of(outs[0], "split get"), [VarBind(e([9, i, 0]), big(i)) for i in range(1, 9)])
-            testing.assertEqual(c.stats().timeouts, 0)
+            testing.assertEqual(stats.timeouts, 0)
 
         t.timeout(30.0)
 
