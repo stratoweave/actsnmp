@@ -290,7 +290,7 @@ def check_stats(stats: dict[str, int], want: dict[str, int]) -> None:
 
 # The harness ########################################################################################
 
-def _async_report(t: testing.AsyncT) -> proc(?Exception) -> None:
+def _async_report(t: testing.AsyncT) -> com(?Exception) -> None:
     # The outcome of an async test: None is success, an AssertionError a failure, anything else an error
     def report(e: ?Exception) -> None:
         if e is not None:
@@ -302,7 +302,7 @@ def _async_report(t: testing.AsyncT) -> proc(?Exception) -> None:
             t.success()
     return report
 
-def _env_report(t: testing.EnvT) -> proc(?Exception) -> None:
+def _env_report(t: testing.EnvT) -> com(?Exception) -> None:
     def report(e: ?Exception) -> None:
         if e is not None:
             if isinstance(e, AssertionError):
@@ -313,7 +313,7 @@ def _env_report(t: testing.EnvT) -> proc(?Exception) -> None:
             t.success()
     return report
 
-actor _exchange(report: proc(?Exception) -> None, ag: Agent, client: Transport, requests: list[bytes], expect: int,
+actor _exchange(report: com(?Exception) -> None, ag: Agent, client: Transport, requests: list[bytes], expect: int,
                 check: proc(list[Reply], dict[str, int]) -> None, watchdog: float=WATCHDOG):
     """Send requests from client to the agent ag, collect the replies, then run check(replies, ag.stats())
 
