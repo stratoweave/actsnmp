@@ -1133,7 +1133,8 @@ actor Client(cap: ?net.UDPConnectCap,
         return errors.TransportError(text, _rebuildable)
 
     proc def _trace_on() -> bool:
-        return _log.output_level >= logging.TRACE
+        # Filtering belongs to Handler now that Logger no longer samples levels.
+        return log_handler is not None
 
     proc def _time_record(eid: bytes, now: float) -> EngineTime:
         et = _times.get(eid)
