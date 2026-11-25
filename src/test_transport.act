@@ -144,7 +144,7 @@ def _test_datagram_repr() -> None:
 
 actor _test_mem_roundtrip(t: testing.AsyncT):
     """A datagram and its reply cross a mem_pair with the sources of the two ends"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
         log: list[(bytes, str, int)] = []
 
@@ -174,7 +174,7 @@ actor _test_mem_roundtrip(t: testing.AsyncT):
 
 actor _test_mem_order(t: testing.AsyncT):
     """Many datagrams in both directions keep their order"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
         count = 100
         at_server: list[bytes] = []
@@ -207,7 +207,7 @@ actor _test_mem_order(t: testing.AsyncT):
 
 actor _test_mem_many_peers(t: testing.AsyncT):
     """One server, three clients on ephemeral ports: replies reach the right client"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
         at_server: list[(bytes, str, int)] = []
         at_clients: list[(int, bytes, str, int)] = []
@@ -246,7 +246,7 @@ actor _test_mem_many_peers(t: testing.AsyncT):
 
 actor _test_mem_bind_rules(t: testing.AsyncT):
     """Ephemeral port allocation, address conflicts and invalid arguments"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
 
         # Each call uses the result, so it is synchronous and a ValueError in
@@ -299,7 +299,7 @@ actor _test_mem_bind_rules(t: testing.AsyncT):
 
 actor _test_mem_buffered_until_receiver(t: testing.AsyncT):
     """Datagrams that arrive before set_receiver are kept (up to MAX_BUFFERED) and delivered in order"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
         total = transport.MAX_BUFFERED + 5
         got: list[bytes] = []
@@ -332,7 +332,7 @@ actor _test_mem_buffered_until_receiver(t: testing.AsyncT):
 
 actor _test_mem_replace_receiver(t: testing.AsyncT):
     """set_receiver replaces the callbacks; later datagrams go to the new ones"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
         log: list[str] = []
 
@@ -364,7 +364,7 @@ actor _test_mem_replace_receiver(t: testing.AsyncT):
 
 actor _test_mem_inject_and_history(t: testing.AsyncT):
     """MemNet.send injects from any source; history records datagrams as sent, before faults"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet(NetFaults(corrupt_byte=0, to_port=40000))
         got: list[(bytes, str, int)] = []
 
@@ -390,7 +390,7 @@ actor _test_mem_inject_and_history(t: testing.AsyncT):
 
 actor _test_mem_unroutable(t: testing.AsyncT):
     """Datagrams for an unbound address are dropped; a client sender gets a non-fatal REFUSED and stays usable"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
         errors: list[(str, bool)] = []
 
@@ -429,7 +429,7 @@ actor _test_mem_unroutable(t: testing.AsyncT):
 
 actor _test_mem_errors_and_data_in_order(t: testing.AsyncT):
     """A client gets errors and datagrams in the order MemNet produced them; a server ignores errors"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
         log: list[str] = []
 
@@ -464,7 +464,7 @@ actor _test_mem_errors_and_data_in_order(t: testing.AsyncT):
 
 actor _test_mem_spoofed_copy_not_refused(t: testing.AsyncT):
     """A forged copy for an unbound address never makes MemNet send REFUSED to the forged source"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet(NetFaults(spoof_source=True))
         log: list[str] = []
 
@@ -496,7 +496,7 @@ actor _test_mem_spoofed_copy_not_refused(t: testing.AsyncT):
 
 actor _test_mem_oversize(t: testing.AsyncT):
     """A datagram above MAX_DATAGRAM is dropped with a non-fatal error; MAX_DATAGRAM itself passes"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
         errors: list[(str, bool)] = []
 
@@ -525,7 +525,7 @@ actor _test_mem_oversize(t: testing.AsyncT):
 
 actor _test_mem_close(t: testing.AsyncT):
     """close() is idempotent; nothing is delivered to or sent from a closed endpoint"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
         log: list[str] = []
 
@@ -567,7 +567,7 @@ actor _test_mem_close(t: testing.AsyncT):
 
 actor _test_mem_wrapped_transport(t: testing.AsyncT):
     """A Transport built from other procs wraps one: here it records what is sent"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
         recorded: list[bytes] = []
 
@@ -635,7 +635,7 @@ actor _fault_run(t: testing.AsyncT, faults: NetFaults, sends: list[bytes], expec
     def client_received(data: bytes, address: str, port: int) -> None:
         t.failure(AssertionError("unexpected datagram at the client"))
 
-    proc def __startup__():
+    def __startup__():
         p = mem_pair(mn)
 
         p.server.set_receiver(server_received)
@@ -651,7 +651,7 @@ def _from_client(data: list[bytes]) -> list[(bytes, int)]:
 actor _test_fault_drop_first_n(t: testing.AsyncT):
     """drop_first_n drops datagrams 1..n"""
 
-    proc def __startup__():
+    def __startup__():
         _fault_run(t, NetFaults(drop_first_n=2), _numbered(5), _from_client([b"2", b"3", b"4"]),
                    _counts(sent=5, dropped=2, delivered=3))
 
@@ -660,7 +660,7 @@ actor _test_fault_drop_first_n(t: testing.AsyncT):
 actor _test_fault_drop_every_nth(t: testing.AsyncT):
     """drop_every_nth drops the datagrams whose number is a multiple of n"""
 
-    proc def __startup__():
+    def __startup__():
         _fault_run(t, NetFaults(drop_every_nth=3), _numbered(7), _from_client([b"0", b"1", b"3", b"4", b"6"]),
                    _counts(sent=7, dropped=2, delivered=5))
 
@@ -669,7 +669,7 @@ actor _test_fault_drop_every_nth(t: testing.AsyncT):
 actor _test_fault_drops_combined(t: testing.AsyncT):
     """drop_first_n and drop_every_nth count the same datagram numbers"""
 
-    proc def __startup__():
+    def __startup__():
         _fault_run(t, NetFaults(drop_first_n=1, drop_every_nth=2), _numbered(8), _from_client([b"2", b"4", b"6"]),
                    _counts(sent=8, dropped=5, delivered=3))
 
@@ -678,7 +678,7 @@ actor _test_fault_drops_combined(t: testing.AsyncT):
 actor _test_fault_duplicate(t: testing.AsyncT):
     """duplicate delivers every datagram twice, in order"""
 
-    proc def __startup__():
+    def __startup__():
         _fault_run(t, NetFaults(duplicate=True), _numbered(3), _from_client([b"0", b"0", b"1", b"1", b"2", b"2"]),
                    _counts(sent=3, duplicated=3, delivered=6))
 
@@ -687,7 +687,7 @@ actor _test_fault_duplicate(t: testing.AsyncT):
 actor _test_fault_corrupt_byte(t: testing.AsyncT):
     """corrupt_byte inverts the octet at the offset; shorter datagrams pass unchanged"""
 
-    proc def __startup__():
+    def __startup__():
         _fault_run(t, NetFaults(corrupt_byte=1), [b"\x10\x20\x30", b"\x40", b""],
                    _from_client([b"\x10\xdf\x30", b"\x40", b""]), _counts(sent=3, corrupted=1, delivered=3))
 
@@ -696,7 +696,7 @@ actor _test_fault_corrupt_byte(t: testing.AsyncT):
 actor _test_fault_spoof_source(t: testing.AsyncT):
     """spoof_source delivers a copy from source port + 1 right before each datagram"""
 
-    proc def __startup__():
+    def __startup__():
         _fault_run(t, NetFaults(spoof_source=True), [b"a", b"b"],
                    [(b"a", 40001), (b"a", 40000), (b"b", 40001), (b"b", 40000)],
                    _counts(sent=2, spoofed=2, delivered=4))
@@ -706,7 +706,7 @@ actor _test_fault_spoof_source(t: testing.AsyncT):
 actor _test_fault_order_of_application(t: testing.AsyncT):
     """Drops come first; corruption applies to every copy; the forged copy comes first, then the datagram twice"""
 
-    proc def __startup__():
+    def __startup__():
         _fault_run(t, NetFaults(drop_first_n=1, corrupt_byte=0, spoof_source=True, duplicate=True), [b"\x00a", b"\x00b"],
                    [(b"\xffb", 40001), (b"\xffb", 40000), (b"\xffb", 40000)],
                    _counts(sent=2, dropped=1, corrupted=1, spoofed=1, duplicated=1, delivered=3))
@@ -716,7 +716,7 @@ actor _test_fault_order_of_application(t: testing.AsyncT):
 actor _test_fault_reorder_pairs(t: testing.AsyncT):
     """reorder swaps every two consecutive datagrams"""
 
-    proc def __startup__():
+    def __startup__():
         _fault_run(t, NetFaults(reorder=True), _numbered(4), _from_client([b"1", b"0", b"3", b"2"]),
                    _counts(sent=4, reordered=2, delivered=4))
 
@@ -725,7 +725,7 @@ actor _test_fault_reorder_pairs(t: testing.AsyncT):
 actor _test_fault_reorder_odd_tail(t: testing.AsyncT):
     """A held datagram that nothing overtakes is delivered after REORDER_HOLD"""
 
-    proc def __startup__():
+    def __startup__():
         _fault_run(t, NetFaults(reorder=True), _numbered(3), _from_client([b"1", b"0", b"2"]),
                    _counts(sent=3, reordered=1, delivered=3), transport.REORDER_HOLD)
 
@@ -734,7 +734,7 @@ actor _test_fault_reorder_odd_tail(t: testing.AsyncT):
 actor _test_fault_reorder_with_copies(t: testing.AsyncT):
     """reorder moves a datagram together with its duplicate"""
 
-    proc def __startup__():
+    def __startup__():
         _fault_run(t, NetFaults(reorder=True, duplicate=True), _numbered(2), _from_client([b"1", b"1", b"0", b"0"]),
                    _counts(sent=2, duplicated=2, reordered=1, delivered=4))
 
@@ -743,7 +743,7 @@ actor _test_fault_reorder_with_copies(t: testing.AsyncT):
 actor _test_fault_delay(t: testing.AsyncT):
     """delay delivers every datagram that many seconds later, in order"""
 
-    proc def __startup__():
+    def __startup__():
         _fault_run(t, NetFaults(delay=0.1), _numbered(20), _from_client(_numbered(20)),
                    _counts(sent=20, delayed=20, delivered=20), 0.1)
 
@@ -752,7 +752,7 @@ actor _test_fault_delay(t: testing.AsyncT):
 actor _test_fault_delay_with_reorder(t: testing.AsyncT):
     """delay and reorder combine: the pair is swapped, then delayed"""
 
-    proc def __startup__():
+    def __startup__():
         _fault_run(t, NetFaults(reorder=True, delay=0.05), _numbered(2), _from_client([b"1", b"0"]),
                    _counts(sent=2, reordered=1, delayed=2, delivered=2), 0.05)
 
@@ -760,7 +760,7 @@ actor _test_fault_delay_with_reorder(t: testing.AsyncT):
 
 actor _test_fault_selector(t: testing.AsyncT):
     """Faults apply only to datagrams for to_address and to_port: here only the client gets duplicates"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet(NetFaults(duplicate=True, to_address="10.0.0.2", to_port=40000))
         at_server: list[bytes] = []
         at_client: list[bytes] = []
@@ -797,7 +797,7 @@ actor _test_fault_selector(t: testing.AsyncT):
 
 actor _test_fault_set_faults(t: testing.AsyncT):
     """set_faults replaces the faults and restarts the numbering; None turns them off"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet(NetFaults(drop_first_n=1))
         got: list[bytes] = []
 
@@ -834,7 +834,7 @@ actor _test_fault_set_faults(t: testing.AsyncT):
 
 actor _test_fault_set_faults_releases_held(t: testing.AsyncT):
     """set_faults delivers a datagram that reorder holds back at once, before anything sent later"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet(NetFaults(reorder=True))
         got: list[bytes] = []
 
@@ -863,7 +863,7 @@ actor _test_fault_set_faults_releases_held(t: testing.AsyncT):
 
 actor _test_fault_set_faults_releases_delayed(t: testing.AsyncT):
     """set_faults delivers delayed datagrams at once, in order, before anything sent later"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet(NetFaults(delay=60.0))
         start = time.monotonic_ns()
         got: list[bytes] = []
@@ -953,7 +953,7 @@ actor _udp_roundtrip(t: testing.EnvT, listen_address: str, connect_address: str,
     def timed_out() -> None:
         finish(AssertionError("UDP roundtrip timed out"))
 
-    proc def __startup__():
+    def __startup__():
         # Server on listen_address port 0; client to connect_address; one
         # datagram each way, sent before the client is connected
         t.timeout(SOCKET_WATCHDOG + 2.0)
@@ -966,7 +966,7 @@ actor _udp_roundtrip(t: testing.EnvT, listen_address: str, connect_address: str,
 actor _test_udp_ipv4_roundtrip(t: testing.EnvT):
     """UDP client and server over 127.0.0.1 with an ephemeral server port"""
 
-    proc def __startup__():
+    def __startup__():
         _udp_roundtrip(t, "127.0.0.1", "127.0.0.1", False)
 
 
@@ -974,7 +974,7 @@ actor _test_udp_ipv4_roundtrip(t: testing.EnvT):
 actor _test_udp_ipv6_roundtrip(t: testing.EnvT):
     """UDP client and server over ::1 with an ephemeral server port"""
 
-    proc def __startup__():
+    def __startup__():
         _udp_roundtrip(t, "::1", "::1", True)
 
 
@@ -982,7 +982,7 @@ actor _test_udp_ipv6_roundtrip(t: testing.EnvT):
 actor _test_udp_dual_stack_source_normalized(t: testing.EnvT):
     """A server on :: sees an IPv4 client as plain 127.0.0.1, and its reply to that address arrives"""
 
-    proc def __startup__():
+    def __startup__():
         _udp_roundtrip(t, "::", "127.0.0.1", True)
 
 
@@ -1083,7 +1083,7 @@ actor _test_udp_unreachable_then_usable(t: testing.EnvT):
     def timed_out() -> None:
         finish(AssertionError("timed out; errors: " + str(errors)))
 
-    proc def __startup__():
+    def __startup__():
         t.timeout(SOCKET_WATCHDOG + 2.0)
 
         after now SOCKET_WATCHDOG: timed_out()
@@ -1147,7 +1147,7 @@ actor _test_udp_hostname_queues_until_connected(t: testing.EnvT):
     def timed_out() -> None:
         finish(AssertionError("timed out; got " + str(got)))
 
-    proc def __startup__():
+    def __startup__():
         t.timeout(SOCKET_WATCHDOG + 2.0)
 
         after now SOCKET_WATCHDOG: timed_out()
@@ -1161,7 +1161,7 @@ actor _udp_setup_failure(t: testing.EnvT, address: str, port: int, expect: str):
     var done = False
     var errors: list[(str, bool)] = []
 
-    proc def __startup__():
+    def __startup__():
         def check() -> None:
             testing.assertEqual(len(errors), 3)
             for e in errors:
@@ -1209,7 +1209,7 @@ actor _udp_setup_failure(t: testing.EnvT, address: str, port: int, expect: str):
 actor _test_udp_invalid_port_is_fatal(t: testing.EnvT):
     """Port 0 cannot be connected to: a fatal error, repeated for each send"""
 
-    proc def __startup__():
+    def __startup__():
         _udp_setup_failure(t, "127.0.0.1", 0, "port 0 is outside 1..65535")
 
 
@@ -1217,7 +1217,7 @@ actor _test_udp_invalid_port_is_fatal(t: testing.EnvT):
 actor _test_udp_port_too_high_is_fatal(t: testing.EnvT):
     """Port 65536 cannot be connected to: a fatal error, repeated for each send"""
 
-    proc def __startup__():
+    def __startup__():
         _udp_setup_failure(t, "::1", 65536, "UDP setup for [::1]:65536 failed")
 
 
@@ -1225,7 +1225,7 @@ actor _test_udp_port_too_high_is_fatal(t: testing.EnvT):
 actor _test_udp_name_resolution_failure_is_fatal(t: testing.EnvT):
     """A name that cannot be resolved is a fatal error, repeated for each send"""
 
-    proc def __startup__():
+    def __startup__():
         _udp_setup_failure(t, "", 161, "UDP setup for :161 failed")
 
 
@@ -1278,7 +1278,7 @@ actor _test_udp_server_failures(t: testing.EnvT):
     def timed_out() -> None:
         finish(AssertionError("timed out; log: " + str(log)))
 
-    proc def __startup__():
+    def __startup__():
         t.timeout(SOCKET_WATCHDOG + 2.0)
 
         after now SOCKET_WATCHDOG: timed_out()
@@ -1337,7 +1337,7 @@ actor _test_udp_close_idempotent(t: testing.EnvT):
         c.close()
         after now NOTHING_WAIT: settled()
 
-    proc def __startup__():
+    def __startup__():
         t.timeout(SOCKET_WATCHDOG + 2.0)
 
         transport.udp_server_transport(net.UDPListenCap(ucap), "127.0.0.1", 0, listening, t.log_handler)
@@ -1602,7 +1602,7 @@ actor _tcp_roundtrip(t: testing.EnvT, address: str, first_port: int, optional_ip
 
     listener = ListenTcp(net.TCPListenCap(tcap), address, first_port, TCP_RANGE, listening, t.log_handler)
 
-    proc def __startup__():
+    def __startup__():
         # Messages sent before the connection is up, one of 100000 octets, come back in order and
         # nothing else follows; the server sees session 1, the client the address and port it
         # connected to. A copy sent to the client's address instead of the session is dropped.
@@ -1615,7 +1615,7 @@ actor _tcp_roundtrip(t: testing.EnvT, address: str, first_port: int, optional_ip
 actor _test_tcp_ipv4_roundtrip(t: testing.EnvT):
     """TCP client and server over 127.0.0.1: messages of any size in order, the server sees a session"""
 
-    proc def __startup__():
+    def __startup__():
         _tcp_roundtrip(t, "127.0.0.1", _tcp_port_range(0), False)
 
 
@@ -1623,7 +1623,7 @@ actor _test_tcp_ipv4_roundtrip(t: testing.EnvT):
 actor _test_tcp_ipv6_roundtrip(t: testing.EnvT):
     """TCP client and server over ::1"""
 
-    proc def __startup__():
+    def __startup__():
         _tcp_roundtrip(t, "::1", _tcp_port_range(1), True)
 
 
@@ -1709,7 +1709,7 @@ actor _tcp_pair(t: testing.EnvT, first_port: int, server_idle_timeout: float, cl
     listener = ListenTcp(net.TCPListenCap(tcap), "127.0.0.1", first_port, TCP_RANGE, listening, t.log_handler,
                          idle_timeout=server_idle_timeout)
 
-    proc def __startup__():
+    def __startup__():
         # A TCP server on 127.0.0.1 that answers every message but those in quiet with the message
         # itself, and a tcp_transport() client of it. It records what the server saw (message, session)
         # and what the client got and reported, and tells on_event about each: "ready" once the client
@@ -1889,7 +1889,7 @@ actor _test_tcp_refused(t: testing.EnvT):
     var fds_after = 0
     var done = False
 
-    proc def __startup__():
+    def __startup__():
         t.timeout(SOCKET_WATCHDOG + 2.0)
 
         c = transport.tcp_transport(net.TCPConnectCap(tcap), "127.0.0.1", TCP_CLOSED_PORT, connect_timeout=1.0)
@@ -1949,7 +1949,7 @@ actor _test_tcp_connect_timeout(t: testing.EnvT):
     var elapsed = 0.0
     var done = False
 
-    proc def __startup__():
+    def __startup__():
         t.timeout(SOCKET_WATCHDOG + 2.0)
 
         c = transport.tcp_transport(net.TCPConnectCap(tcap), "192.0.2.1", 161, connect_timeout=0.2)
@@ -1995,7 +1995,7 @@ actor _tcp_setup_failure(t: testing.EnvT, address: str, port: int, expect: str):
     var done = False
     var errors: list[(str, bool)] = []
 
-    proc def __startup__():
+    def __startup__():
         def check() -> None:
             testing.assertEqual(errors, [(expect, True), (expect, True), (expect, True)])
 
@@ -2037,7 +2037,7 @@ actor _tcp_setup_failure(t: testing.EnvT, address: str, port: int, expect: str):
 actor _test_tcp_invalid_port_is_fatal(t: testing.EnvT):
     """Port 0 cannot be connected to: a fatal error, repeated for each send"""
 
-    proc def __startup__():
+    def __startup__():
         _tcp_setup_failure(t, "127.0.0.1", 0, "TCP setup for 127.0.0.1:0 failed: port 0 is outside 1..65535")
 
 
@@ -2045,7 +2045,7 @@ actor _test_tcp_invalid_port_is_fatal(t: testing.EnvT):
 actor _test_tcp_port_too_high_is_fatal(t: testing.EnvT):
     """Port 65536 cannot be connected to: a fatal error, repeated for each send"""
 
-    proc def __startup__():
+    def __startup__():
         _tcp_setup_failure(t, "127.0.0.1", 65536, "TCP setup for 127.0.0.1:65536 failed: port 65536 is outside 1..65535")
 
 
@@ -2053,14 +2053,14 @@ actor _test_tcp_port_too_high_is_fatal(t: testing.EnvT):
 actor _test_tcp_host_name_is_fatal(t: testing.EnvT):
     """A host name is not looked up: a fatal error, repeated for each send"""
 
-    proc def __startup__():
+    def __startup__():
         _tcp_setup_failure(t, "localhost", 161, "TCP setup for localhost:161 failed: not an IPv4 or IPv6 address")
 
 
 
 actor _test_tcp_option_validation(t: testing.EnvT):
     """tcp_transport() and tcp_server_transport() raise ValueError for invalid options"""
-    proc def __startup__():
+    def __startup__():
         tcap = net.TCPCap(net.NetCap(t.env.cap))
         ccap = net.TCPConnectCap(tcap)
         lcap = net.TCPListenCap(tcap)
@@ -2166,7 +2166,7 @@ actor _test_tcp_server_failures(t: testing.EnvT):
     def timed_out() -> None:
         finish(AssertionError("timed out; log: " + str(log)))
 
-    proc def __startup__():
+    def __startup__():
         t.timeout(SOCKET_WATCHDOG + 2.0)
 
         after now SOCKET_WATCHDOG: timed_out()
@@ -2224,5 +2224,5 @@ actor _test_tcp_close_idempotent(t: testing.EnvT):
 
     listener = ListenTcp(net.TCPListenCap(tcap), "127.0.0.1", _tcp_port_range(8), TCP_RANGE, listening, t.log_handler)
 
-    proc def __startup__():
+    def __startup__():
         t.timeout(SOCKET_WATCHDOG + 2.0)

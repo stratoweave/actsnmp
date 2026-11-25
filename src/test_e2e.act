@@ -267,7 +267,7 @@ actor _test_v2c_ops(t: testing.AsyncT):
 
     cq = Collector("private", reported)
 
-    proc def __startup__():
+    def __startup__():
         t.timeout(30.0)
 
         agent = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), t.log_handler)
@@ -334,7 +334,7 @@ actor _test_v1_ops(t: testing.AsyncT):
 
     cq = Collector("private", reported)
 
-    proc def __startup__():
+    def __startup__():
         t.timeout(30.0)
 
         agent = Agent(mn.server(AGENT, 161), make_view(), agent_config([]), t.log_handler)
@@ -406,7 +406,7 @@ actor _V3Group(t: testing.AsyncT, auth: str):
         if len(results) == len(users):
             report(t, outcome(check))
 
-    proc def __startup__():
+    def __startup__():
         agent = Agent(mn.server(AGENT, 161), make_view(), agent_config(users), None)
 
         for i in range(len(users)):
@@ -428,7 +428,7 @@ actor _test_v3_md5(t: testing.AsyncT):
     """SNMPv3 with MD5 and every privacy protocol, and u_noauth"""
     g = _V3Group(t, "MD5")
 
-    proc def __startup__():
+    def __startup__():
         t.timeout(120.0)
 
 
@@ -437,7 +437,7 @@ actor _test_v3_sha(t: testing.AsyncT):
     """SNMPv3 with SHA and every privacy protocol, and the read-only u_ro_sha_aes"""
     g = _V3Group(t, "SHA")
 
-    proc def __startup__():
+    def __startup__():
         t.timeout(120.0)
 
 
@@ -446,7 +446,7 @@ actor _test_v3_sha224(t: testing.AsyncT):
     """SNMPv3 with SHA-224 and every privacy protocol"""
     g = _V3Group(t, "SHA-224")
 
-    proc def __startup__():
+    def __startup__():
         t.timeout(120.0)
 
 
@@ -455,7 +455,7 @@ actor _test_v3_sha256(t: testing.AsyncT):
     """SNMPv3 with SHA-256 and every privacy protocol"""
     g = _V3Group(t, "SHA-256")
 
-    proc def __startup__():
+    def __startup__():
         t.timeout(120.0)
 
 
@@ -464,7 +464,7 @@ actor _test_v3_sha384(t: testing.AsyncT):
     """SNMPv3 with SHA-384 and every privacy protocol"""
     g = _V3Group(t, "SHA-384")
 
-    proc def __startup__():
+    def __startup__():
         t.timeout(120.0)
 
 
@@ -473,7 +473,7 @@ actor _test_v3_sha512(t: testing.AsyncT):
     """SNMPv3 with SHA-512 and every privacy protocol"""
     g = _V3Group(t, "SHA-512")
 
-    proc def __startup__():
+    def __startup__():
         t.timeout(120.0)
 
 
@@ -484,7 +484,7 @@ actor _test_v3_discover(t: testing.AsyncT):
     mn = MemNet()
     var info: ?EngineInfo = None
 
-    proc def __startup__():
+    def __startup__():
         t.timeout(30.0)
 
         agent = Agent(mn.server(AGENT, 161), make_view(), agent_config([u]), t.log_handler)
@@ -551,7 +551,7 @@ pure def _sha_aes() -> Usm:
 
 actor _test_fault_drop_first_n(t: testing.AsyncT):
     """drop_first_n: the lost answer is retried; the SET was applied once and its retry meets the same value"""
-    proc def __startup__():
+    def __startup__():
         def check(outs: list[Outcome], stats: Stats) -> None:
             r = ok(outs[0], "get")
             testing.assertEqual((r.varbinds, r.attempts), ([VarBind(SYS_DESCR, OctetString(DESCR))], 2))
@@ -571,7 +571,7 @@ actor _test_fault_drop_first_n(t: testing.AsyncT):
 
 actor _test_fault_wrong_request_id(t: testing.AsyncT):
     """wrong_request_id: the copy with another request-id is dropped, the genuine Response taken"""
-    proc def __startup__():
+    def __startup__():
         def check(outs: list[Outcome], stats: Stats) -> None:
             testing.assertEqual(vbs_of(outs[0], "get"), [VarBind(SYS_DESCR, OctetString(DESCR))])
             testing.assertEqual(vbs_of(outs[1], "get_next"), [VarBind(e([2, 1, 0]), OctetString(b"hello"))])
@@ -591,7 +591,7 @@ actor _test_fault_wrong_request_id(t: testing.AsyncT):
 
 actor _test_net_duplicate(t: testing.AsyncT):
     """Every answer duplicated by the network: each callback exactly once, the copies dropped"""
-    proc def __startup__():
+    def __startup__():
         def check(outs: list[Outcome], stats: Stats) -> None:
             testing.assertEqual(len(outs), 3, "exactly one callback per request")
             for o in outs:
@@ -612,7 +612,7 @@ actor _test_net_duplicate(t: testing.AsyncT):
 
 actor _test_net_late(t: testing.AsyncT):
     """Answers delayed beyond the timeout: the late answer to the first attempt completes the request"""
-    proc def __startup__():
+    def __startup__():
         def check(outs: list[Outcome], stats: Stats) -> None:
             r = ok(outs[0], "get")
             testing.assertEqual((r.varbinds, r.attempts), ([VarBind(SYS_DESCR, OctetString(DESCR))], 2))
@@ -632,7 +632,7 @@ actor _test_net_late(t: testing.AsyncT):
 
 actor _test_fault_not_in_time_window_once(t: testing.AsyncT):
     """SNMPv3: a forced authenticated notInTimeWindows Report makes the Client resynchronise and resend once"""
-    proc def __startup__():
+    def __startup__():
         def check(outs: list[Outcome], stats: Stats) -> None:
             testing.assertEqual(vbs_of(outs[0], "get"), [VarBind(SYS_DESCR, OctetString(DESCR))])
             testing.assertEqual(vbs_of(outs[1], "get"), [VarBind(e([1, 1, 0]), Integer(42))])
@@ -652,7 +652,7 @@ actor _test_fault_not_in_time_window_once(t: testing.AsyncT):
 
 actor _test_fault_too_big(t: testing.AsyncT):
     """too_big_over: a GET is split until each part fits, a GETBULK halves max-repetitions, a SET reports tooBig"""
-    proc def __startup__():
+    def __startup__():
         oids = [e([9, i, 0]) for i in range(1, 9)]
 
         def check(outs: list[Outcome], stats: Stats) -> None:
@@ -676,7 +676,7 @@ actor _test_fault_too_big(t: testing.AsyncT):
 
 actor _test_fault_truncate_bulk(t: testing.AsyncT):
     """truncate_bulk: the Client returns the shortened GETBULK answer as it is"""
-    proc def __startup__():
+    def __startup__():
         def check(outs: list[Outcome], stats: Stats) -> None:
             testing.assertEqual(vbs_of(outs[0], "get_bulk"), [table(1, 1), table(2, 1)])
 
@@ -691,7 +691,7 @@ actor _test_fault_truncate_bulk(t: testing.AsyncT):
 
 actor _test_fault_error_at(t: testing.AsyncT):
     """error_at: the injected error-status reaches the caller with its index, OID and transient flag"""
-    proc def __startup__():
+    def __startup__():
         def check(outs: list[Outcome], stats: Stats) -> None:
             testing.assertEqual(status_of(outs[0], "get"), (pdu.RESOURCE_UNAVAILABLE, 2))
             err = outs[0].e
@@ -714,7 +714,7 @@ actor _test_fault_error_at(t: testing.AsyncT):
 
 actor _test_fault_wrong_source_version_community(t: testing.AsyncT):
     """Answers from another port, in the wrong version or (checked) with the wrong community time out with a hint"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
         quick = Options(timeout=0.2, retries=0)
         results: dict[str, list[Outcome]] = {}
@@ -773,7 +773,7 @@ actor _test_fault_trailing_bytes(t: testing.AsyncT):
     k1 = Collector("v2c", reported)
     k2 = Collector("v3", reported)
 
-    proc def __startup__():
+    def __startup__():
         t.timeout(30.0)
 
         a1 = Agent(mn.server(AGENT, 161), make_view(), agent_config([u]), None, Faults(trailing_bytes=b"\x00\x00"))
@@ -841,7 +841,7 @@ actor _NotifyRun(t: testing.AsyncT, users: list[Usm], communities: list[str], wa
         expected += 1
         return Collector(label, reported)
 
-    proc def __startup__():
+    def __startup__():
         rcv = NotificationReceiver(mn.server(RECEIVER, 162), ReceiverConfig(communities, users, [], h(RECEIVER_ENGINE), 1),
                                    received, None)
 
@@ -865,7 +865,7 @@ actor _test_notify_v1_v2c(t: testing.AsyncT):
 
     run = _NotifyRun(t, [], ["public"], 3, check)
 
-    proc def __startup__():
+    def __startup__():
         t.timeout(30.0)
 
         # Deliver the rejected community before starting clients whose answers finish the test.
@@ -903,7 +903,7 @@ actor _NotifyV3(t: testing.AsyncT, auth: str):
 
     run = _NotifyRun(t, users, [], 2 * len(users), check)
 
-    proc def __startup__():
+    def __startup__():
         for i in range(len(users)):
             u = users[i]
             c = run.client(u, 43000 + i)
@@ -918,7 +918,7 @@ actor _test_notify_v3_md5(t: testing.AsyncT):
     """SNMPv3 traps and informs from u_noauth and the MD5 users"""
     g = _NotifyV3(t, "MD5")
 
-    proc def __startup__():
+    def __startup__():
         t.timeout(120.0)
 
 
@@ -927,7 +927,7 @@ actor _test_notify_v3_sha(t: testing.AsyncT):
     """SNMPv3 traps and informs from the SHA users"""
     g = _NotifyV3(t, "SHA")
 
-    proc def __startup__():
+    def __startup__():
         t.timeout(120.0)
 
 
@@ -936,7 +936,7 @@ actor _test_notify_v3_sha224(t: testing.AsyncT):
     """SNMPv3 traps and informs from the SHA-224 users"""
     g = _NotifyV3(t, "SHA-224")
 
-    proc def __startup__():
+    def __startup__():
         t.timeout(120.0)
 
 
@@ -945,7 +945,7 @@ actor _test_notify_v3_sha256(t: testing.AsyncT):
     """SNMPv3 traps and informs from the SHA-256 users"""
     g = _NotifyV3(t, "SHA-256")
 
-    proc def __startup__():
+    def __startup__():
         t.timeout(120.0)
 
 
@@ -954,7 +954,7 @@ actor _test_notify_v3_sha384(t: testing.AsyncT):
     """SNMPv3 traps and informs from the SHA-384 users"""
     g = _NotifyV3(t, "SHA-384")
 
-    proc def __startup__():
+    def __startup__():
         t.timeout(120.0)
 
 
@@ -963,14 +963,14 @@ actor _test_notify_v3_sha512(t: testing.AsyncT):
     """SNMPv3 traps and informs from the SHA-512 users"""
     g = _NotifyV3(t, "SHA-512")
 
-    proc def __startup__():
+    def __startup__():
         t.timeout(120.0)
 
 
 
 actor _test_v3_agent_reboot(t: testing.AsyncT):
     """The agent reboots (boots + 1), then changes its engine ID: the Client resynchronises, then rediscovers"""
-    proc def __startup__():
+    def __startup__():
         u = _sha_aes()
         mn = MemNet()
         new_engine = h("80001f888001020304050607")
@@ -1030,7 +1030,7 @@ actor _test_v3_agent_restart_boots_lost(t: testing.AsyncT):
     after a docker restart): two requests in flight both get authenticated notInTimeWindows Reports that fail
     RFC 3414 3.2 step 7b; the Client resynchronises from the first, the second is then in the
     window, and both are resent: no request is lost"""
-    proc def __startup__():
+    def __startup__():
         u = _sha_aes()
         mn = MemNet()
 
@@ -1073,7 +1073,7 @@ actor _test_v3_agent_restart_boots_lost(t: testing.AsyncT):
 
 actor _test_fault_too_big_v3(t: testing.AsyncT):
     """SNMPv3 authPriv with too_big_over: the GET is split into new exchanges and merged in order"""
-    proc def __startup__():
+    def __startup__():
         def check(outs: list[Outcome], stats: Stats) -> None:
             testing.assertEqual(vbs_of(outs[0], "split get"), [VarBind(e([9, i, 0]), big(i)) for i in range(1, 9)])
             testing.assertEqual(stats.timeouts, 0)
@@ -1089,7 +1089,7 @@ actor _test_fault_too_big_v3(t: testing.AsyncT):
 
 actor _test_inform_retransmission_dedup(t: testing.AsyncT):
     """A v2c inform whose Response is lost is retransmitted; the receiver's dedup_window delivers it once"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet(NetFaults(drop_first_n=1, to_address=MANAGER))
         got: list[Notification] = []
 
@@ -1141,7 +1141,7 @@ actor _test_discovery_budgets(t: testing.AsyncT):
         short_elapsed = float(time.monotonic_ns()) / 1e9 - started
         note("short:" + ("timeout" if isinstance(err, errors.TimeoutError) else describe(Outcome(r, err))))
 
-    proc def __startup__():
+    def __startup__():
         t.timeout(30.0)
 
         agent = Agent(mn.server(AGENT, 161), make_view(), agent_config([u]), t.log_handler)
@@ -1217,7 +1217,7 @@ actor _test_logs_never_show_secrets(t: testing.AsyncT):
         if err is not None:
             t.failure(AssertionError(str(err)))
 
-    proc def __startup__():
+    def __startup__():
         t.timeout(30.0)
 
         handler.add_sink(_CaptureSink(lines))
@@ -1254,7 +1254,7 @@ actor _ResyncStaleTimer(t: testing.AsyncT, delay: float, retries: int):
     mn = MemNet()
     var started = 0.0
 
-    proc def __startup__():
+    def __startup__():
         agent = Agent(mn.server(AGENT, 161), make_view(), agent_config([u]), t.log_handler)
         c = _client(mn, u, 40001, Options(timeout=0.25, retries=retries), t.log_handler)
 
@@ -1287,7 +1287,7 @@ actor _test_resync_stale_timer_retries0(t: testing.AsyncT):
     """A resynchronisation resend gets its own timeout (answers 150 ms late, timeout 250 ms, no retries)"""
     x = _ResyncStaleTimer(t, 0.15, 0)
 
-    proc def __startup__():
+    def __startup__():
         t.timeout(30.0)
 
 
@@ -1296,7 +1296,7 @@ actor _test_resync_stale_timer_retries1(t: testing.AsyncT):
     """No spurious retransmission after a resynchronisation (answers 150 ms late, timeout 250 ms, one retry)"""
     x = _ResyncStaleTimer(t, 0.15, 1)
 
-    proc def __startup__():
+    def __startup__():
         t.timeout(30.0)
 
 
@@ -1323,7 +1323,7 @@ def _gated(g: _Gate, inner: ServerTransport) -> ServerTransport:
 actor _test_resync_then_silence(t: testing.AsyncT):
     """A notInTimeWindows Report, then the agent goes silent: the request still waits its whole retry budget
     after the resend (three attempts of 0.2 s), and the retries go out one by one"""
-    proc def __startup__():
+    def __startup__():
         u = _sha_aes()
         mn = MemNet()
 

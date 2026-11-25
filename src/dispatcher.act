@@ -993,7 +993,7 @@ actor Dispatcher(server: ServerTransport, log_handler: ?logging.Handler, strict_
                 on_error(CLOSED, True)
         server.close()
 
-    proc def __startup__():
+    def __startup__():
         if server.local_port() == 0:
             _failure = "the Dispatcher's socket is not bound (its setup failed)"
         else:
@@ -1023,7 +1023,7 @@ def udp_dispatcher(cap: net.UDPListenCap, address: str, port: int,
 actor _UdpDispatcherSetup(cap: net.UDPListenCap, address: str, port: int,
                           on_ready: action(Dispatcher, ?str) -> None, log_handler: ?logging.Handler,
                           strict_source: bool, id_lifetime: float, max_ids: int):
-    proc def __startup__():
+    def __startup__():
         def _listening(st: ServerTransport, error: ?str) -> None:
             on_ready(Dispatcher(st, log_handler, strict_source, id_lifetime, max_ids, address), error)
 

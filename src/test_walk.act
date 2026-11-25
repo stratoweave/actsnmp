@@ -271,7 +271,7 @@ actor _test_walks(t: testing.AsyncT):
     mn = MemNet()
     h = Harness(t, 10, check_basic_walks)
 
-    proc def __startup__():
+    def __startup__():
         t.timeout(30.0)
 
         agent = Agent(mn.server(AGENT, 161), small_view(), config(), None)
@@ -308,7 +308,7 @@ actor _test_walk_end_of_mib_view(t: testing.AsyncT):
     view = MibView([VarBind(Oid([2, 7, n]), Integer(n)) for n in range(1, 6)] + [VarBind(SYS_DESCR, Integer(0))])
     h = Harness(t, 5, check_end_of_view)
 
-    proc def __startup__():
+    def __startup__():
         t.timeout(30.0)
 
         agent = Agent(mn.server(AGENT, 161), view, config(), None)
@@ -341,7 +341,7 @@ actor _test_walk_empty_subtree_gets_root(t: testing.AsyncT):
     mn = MemNet()
     h = Harness(t, 8, check_root_get)
 
-    proc def __startup__():
+    def __startup__():
         t.timeout(30.0)
 
         agent = Agent(mn.server(AGENT, 161), small_view(), config(), None)
@@ -387,7 +387,7 @@ actor _test_walk_not_increasing(t: testing.AsyncT):
     h = Harness(t, 9, check_non_increasing)
     unchecked = OPTS.with_(check_increasing=False)
 
-    proc def __startup__():
+    def __startup__():
         t.timeout(30.0)
 
         agent = Agent(mn.server(AGENT, 161), small_view(), config(), None, Faults(non_increasing_at=b([1, 12, 0])))
@@ -411,7 +411,7 @@ actor _test_walk_not_increasing(t: testing.AsyncT):
 actor _test_walk_disorder_scripted(t: testing.AsyncT):
     """A scripted agent: decreasing but new OIDs fail a checked walk and pass an unchecked one; a loop ends either
     way; noSuchObject answered to a GETNEXT ends a walk; SNMPv1 noSuchName with error-index 0 ends one too"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
         root = Oid([1, 3, 6, 1, 4, 1, 99])
         # GETNEXT successors: R -> R.1 -> R.3 -> R.2 (decreasing, new) -> R.4 -> out of the subtree;
@@ -506,7 +506,7 @@ actor _test_walk_truncated_bulk(t: testing.AsyncT):
     h = Harness(t, 4, check_truncated)
     s = Sink("cut to 3", h.got)
 
-    proc def __startup__():
+    def __startup__():
         t.timeout(30.0)
 
         agent = Agent(mn.server(AGENT, 161), small_view(), config(), None, Faults(truncate_bulk=3))
@@ -535,7 +535,7 @@ actor _test_walk_adaptive_too_big(t: testing.AsyncT):
     var reps: dict[str, list[int]] = {}
     var calls = 0
 
-    proc def __startup__():
+    def __startup__():
         def sent_reps(port: int) -> list[int]:
             return bulk_reps(requests_sent([d.data for d in mn.history() if d.src_port == port]))
 
@@ -587,7 +587,7 @@ actor _test_walk_adaptive_timeout(t: testing.AsyncT):
     var results: dict[str, Got] = {}
     var calls = 0
 
-    proc def __startup__():
+    def __startup__():
         def sent_reps(port: int) -> list[int]:
             return bulk_reps(requests_sent([d.data for d in mn.history() if d.src_port == port]))
 
@@ -630,7 +630,7 @@ actor _test_walk_adaptive_timeout(t: testing.AsyncT):
 actor _test_walk_adaptive_timeout_v3(t: testing.AsyncT):
     """adaptive_bulk on a timeout with SNMPv3 (noAuthNoPriv, so the requests can be read): the retry's ScopedPDU
     is encoded again with half the max-repetitions"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
         noauth = Usm.from_passwords("u_noauth")
         want = [VarBind(b([5, n, 0]), big(n)) for n in range(1, 61)]
@@ -677,7 +677,7 @@ def regrow_sequence(top: int, low: int, length: int) -> list[int]:
 actor _test_walk_adaptive_regrow(t: testing.AsyncT):
     """The learned max-repetitions grows back: tooBig teaches 12, then the agent answers everything; after
     BULK_REGROW_AFTER clean responses at 12 the walks use 24, after as many at 24 the Options' 25, which stays"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
         extra = [VarBind(b([6, k, 0]), Integer(k)) for k in range(1, 401)]
         results: dict[str, Got] = {}
@@ -714,7 +714,7 @@ actor _test_walk_adaptive_regrow_backoff(t: testing.AsyncT):
     """An agent that answers tooBig above 2 rows, walked with max_repetitions 4: each doubling to 4 fails and
     is answered at 2, and the next one waits twice as long: 8, 16, ... clean responses, at most
     BULK_REGROW_AFTER_MAX (one failed try per 256 requests: bounded oscillation)"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
         extra = [VarBind(b([7, k, 0]), big(k)) for k in range(1, 1601)]
         walks: list[Got] = []
@@ -751,7 +751,7 @@ actor _test_walk_retries_mid_walk(t: testing.AsyncT):
     var delivered: list[VarBind] = []
     var done: list[Got] = []
 
-    proc def __startup__():
+    def __startup__():
         t.timeout(30.0)
 
         agent = Agent(mn.server(AGENT, 161), small_view(), config(), None)
@@ -803,7 +803,7 @@ actor _test_walk_errors_and_limits(t: testing.AsyncT):
     mn2 = MemNet()
     h = Harness(t, 7, check_errors)
 
-    proc def __startup__():
+    def __startup__():
         t.timeout(30.0)
 
         agent = Agent(mn.server(AGENT, 161), small_view(), config(), None, Faults(error_at=b([1, 5, 0])))
@@ -835,7 +835,7 @@ actor _test_walk_cancel(t: testing.AsyncT):
     var batches = 0
     var delivered: list[VarBind] = []
 
-    proc def __startup__():
+    def __startup__():
         t.timeout(30.0)
 
         agent = Agent(mn.server(AGENT, 161), small_view(), config(), None)
@@ -896,7 +896,7 @@ actor _test_walk_close(t: testing.AsyncT):
     var results: dict[str, list[Got]] = {}
     var closed = False
 
-    proc def __startup__():
+    def __startup__():
         def check() -> None:
             for label in ["a", "b", "table", "stream", "late", "late table"]:
                 testing.assertEqual(len(results[label]), 1, label + ": exactly one callback")
@@ -948,7 +948,7 @@ com def check_invalid(r: dict[str, Got]) -> None:
 
 actor _test_walk_invalid_arguments(t: testing.AsyncT):
     """Invalid roots and columns, and a full queue, are reported through the callback"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
         h = Harness(t, 8, check_invalid)
 
@@ -1015,7 +1015,7 @@ actor _test_tables(t: testing.AsyncT):
     h = Harness(t, 11, check_tables)
     cols = [b([2, 1, 1]), b([2, 1, 2]), b([2, 1, 3])]
 
-    proc def __startup__():
+    def __startup__():
         t.timeout(30.0)
 
         agent = Agent(mn.server(AGENT, 161), small_view(), config(), None)
@@ -1044,7 +1044,7 @@ actor _test_tables(t: testing.AsyncT):
 actor _test_table_cancel_sends_once(t: testing.AsyncT):
     """A table with three column groups and max_in_flight 1, cancelled while its first request is out: the
     queued groups are cancelled without ever being sent"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet(NetFaults(delay=0.3, to_address=MANAGER))
         got: list[Got] = []
 
@@ -1073,7 +1073,7 @@ actor _test_table_cancel_sends_once(t: testing.AsyncT):
 
 actor _test_table_timeout_sends_once(t: testing.AsyncT):
     """No agent: the table's first column group times out and ends the table; the queued groups are not sent"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
         got: list[Got] = []
 
@@ -1108,7 +1108,7 @@ actor _test_walk_adaptive_slow_agent(t: testing.AsyncT):
     """A slow but lossless agent (every answer 300 ms late, timeout 200 ms): each walk's GETBULK times out
     once and its retry is halved, but the late answer to the full-size attempt arrives first and is taken.
     It proves the agent handles 25 rows, so later walks keep starting at 25 (no collapse to 1)"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet(NetFaults(delay=0.3, to_address=MANAGER))
         rows: list[int] = []
 
@@ -1195,7 +1195,7 @@ actor _test_tables_shared_index(t: testing.AsyncT):
     mn = MemNet()
     h = Harness(t, 5, check_shared_index)
 
-    proc def __startup__():
+    def __startup__():
         t.timeout(30.0)
 
         agent = Agent(mn.server(AGENT, 161), if_view(), config(), None)
@@ -1252,7 +1252,7 @@ def check_lab(results: dict[str, Got], calls: int, want: int, expected: str, lab
 
 actor _test_lab_walks_v2c(t: testing.EnvT):
     """SNMPv2c walks of the lab dataset, GETNEXT, GETBULK and walk_stream, equal expected/canon/dataset.txt"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
 
         t.timeout(120.0)
@@ -1278,7 +1278,7 @@ actor _test_lab_walks_v2c(t: testing.EnvT):
 
 actor _test_lab_walks_v1(t: testing.EnvT):
     """SNMPv1 walk of the lab dataset (GETNEXT, Counter64 skipped) equals expected/canon/dataset-v1.txt"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
 
         t.timeout(120.0)
@@ -1299,7 +1299,7 @@ actor _test_lab_walks_v1(t: testing.EnvT):
 
 actor _test_lab_walks_v3(t: testing.EnvT):
     """SNMPv3 (authPriv, SHA/AES) walks of the lab dataset, GETNEXT and GETBULK, equal expected/canon/dataset.txt"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
 
         t.timeout(120.0)
@@ -1325,7 +1325,7 @@ def lab_columns(table: int, n: int) -> list[Oid]:
 
 actor _test_lab_tables(t: testing.EnvT):
     """get_table of the lab tables (B.10 with sparse column 7, B.11 string-indexed, B.12 2000 rows) equals the expected files"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
         mn2 = MemNet()
 
@@ -1383,7 +1383,7 @@ actor _test_lab_bulk_walk_time(t: testing.EnvT):
     var started = 0.0
     var times: list[float] = []
 
-    proc def __startup__():
+    def __startup__():
         def ms() -> float:
             return float(time.monotonic_ns()) / 1000000.0
 

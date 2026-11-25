@@ -421,7 +421,7 @@ actor HostLookup(cap: net.DNSCap, name: str, ipv6_only: bool, on_done: action(st
         else:
             _ipv4_failed(name, "no IPv4 address")
 
-    proc def __startup__():
+    def __startup__():
         if ipv6_only:
             net.lookup_aaaa(cap, name, _ipv6_resolved, _ipv6_failed)
         else:
@@ -826,7 +826,7 @@ actor Command(o: CliOptions, c: Client, out: action(str) -> None, err: action(st
             err("actsnmp: " + cmd + " is not a client command\n")
             _finish(1)
 
-    proc def __startup__():
+    def __startup__():
         _run()
 
 
@@ -874,7 +874,7 @@ actor AgentServer(ucap: net.UDPListenCap, tcap: net.TCPListenCap, o: CliOptions,
         err("actsnmp agent: serving on " + listen_text(o, t.local_port()) + " (engine ID 0x"
             + config.engine_id.hex() + ")\n")
 
-    proc def __startup__():
+    def __startup__():
         listen(ucap, tcap, o, _listening)
 
 
@@ -894,7 +894,7 @@ actor TrapdServer(ucap: net.UDPListenCap, tcap: net.TCPListenCap, o: CliOptions,
         err("actsnmp trapd: listening on " + listen_text(o, t.local_port()) + " (engine ID 0x"
             + config.engine_id.hex() + ")\n")
 
-    proc def __startup__():
+    def __startup__():
         listen(ucap, tcap, o, _listening)
 
 
@@ -1179,5 +1179,5 @@ actor main(env):
             return
         _start(opts)
 
-    proc def __startup__():
+    def __startup__():
         _main()
