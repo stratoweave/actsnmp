@@ -98,14 +98,14 @@ proc def outcome(check: proc() -> None) -> ?Exception:
         return e
     return None
 
-proc def report(t: testing.AsyncT, error: ?Exception) -> None:
+com def report(t: testing.AsyncT, error: ?Exception) -> None:
     """End an async test: t.failure(error), or t.success() when error is None"""
     if error is not None:
         t.failure(error)
     else:
         t.success()
 
-proc def report_env(t: testing.EnvT, error: ?Exception) -> None:
+com def report_env(t: testing.EnvT, error: ?Exception) -> None:
     """End an env test: t.failure(error), or t.success() when error is None"""
     if error is not None:
         t.failure(error)
@@ -134,5 +134,5 @@ actor ListenTcp(cap: net.TCPListenCap, address: str, first_port: int, count: int
             return
         on_ready(s, error)
 
-    proc def __startup__():
+    def __startup__():
         transport.tcp_server_transport(cap, address, _port, _listening, log_handler, max_connections, idle_timeout)

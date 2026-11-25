@@ -322,7 +322,7 @@ actor Bench(network: MemNet, peer: ServerTransport, receiver_transport: ServerTr
         _receiver.close()
         _receiver.close()
 
-    proc def __startup__():
+    def __startup__():
         # Wait until the receiver startup has queued its callback registration.
         await async _receiver.stats()
         peer.set_receiver(_peer_received)
@@ -483,7 +483,7 @@ def v1_example() -> TrapV1Pdu:
 
 actor _test_v1_traps(t: testing.AsyncT):
     """SNMPv1 Trap-PDUs are delivered in SNMPv2 form (RFC 3584 3.1); nothing is sent back"""
-    proc def __startup__():
+    def __startup__():
         traps = ([v1_example()]
                  + [TrapV1Pdu(o("1.3.6.1.4.1.8072.9999.3"), h("0a000001"), g, 0, g * 100, v1_payload(g)) for g in range(6)]
                  + [TrapV1Pdu(o("1.3.6.1.4.1.8072.9999.3"), h("00000000"), 6, 2147483647, 4294967295, [])])
@@ -521,7 +521,7 @@ actor _test_v1_traps(t: testing.AsyncT):
 
 actor _test_v2c_traps_and_informs(t: testing.AsyncT):
     """SNMPv2c traps are delivered; informs are delivered and acknowledged with their request-id and varbinds"""
-    proc def __startup__():
+    def __startup__():
         cold = Pdu(pdu.TRAP_V2, 1, 0, 0, notify.build_trap_v2(0, notify.TRAP_COLD_START, []))
         trap = v2_pdu(pdu.TRAP_V2, 2, 20)
         inform = v2_pdu(pdu.INFORM, 3, 23)
@@ -557,7 +557,7 @@ actor _test_v2c_traps_and_informs(t: testing.AsyncT):
 actor _test_v2c_inform_not_encodable(t: testing.AsyncT):
     """An inform whose varbinds cannot be encoded again is delivered and answered with genErr"""
     # an INTEGER of 2^32: it decodes (as net-snmp does), but Integer.encode() refuses it
-    proc def __startup__():
+    def __startup__():
         datagram = v2c_message(b"public", Pdu(pdu.INFORM, 9, 0, 0, notify.build_trap_v2(5, notify.TRAP_COLD_START, [
             vb("1.3.6.1.4.1.8072.1", raw_value(0x02, "01 00 00 00 00"))])))
 
@@ -581,7 +581,7 @@ actor _test_v2c_inform_not_encodable(t: testing.AsyncT):
 
 actor _test_communities(t: testing.AsyncT):
     """Only the configured communities are accepted; others are dropped without an answer"""
-    proc def __startup__():
+    def __startup__():
         def finished(b: Bench) -> None:
             def check() -> None:
                 ns = b.notifications()
@@ -608,7 +608,7 @@ actor _test_communities(t: testing.AsyncT):
 
 actor _test_any_community(t: testing.AsyncT):
     """The community "*" accepts any community"""
-    proc def __startup__():
+    def __startup__():
         def finished(b: Bench) -> None:
             def check() -> None:
                 testing.assertEqual([n.community for n in b.notifications()], [b"", b"anything", b"\x00\xff"])
@@ -626,7 +626,7 @@ actor _test_any_community(t: testing.AsyncT):
 
 actor _test_wrong_pdu_for_version(t: testing.AsyncT):
     """PDUs that are not notifications of the message's version are dropped without an answer"""
-    proc def __startup__():
+    def __startup__():
         v2_trap = v2c_message(b"public", v2_pdu(pdu.TRAP_V2, 1, 1))
         v2_inform = v2c_message(b"public", v2_pdu(pdu.INFORM, 2, 2))
         get = Pdu(pdu.GET, 3, 0, 0, [VarBind(o("1.3.6.1.2.1.1.1.0"))])
@@ -659,7 +659,7 @@ actor _test_wrong_pdu_for_version(t: testing.AsyncT):
 
 actor _test_malformed(t: testing.AsyncT):
     """Undecodable datagrams are dropped; malformed notification content is delivered with a problem"""
-    proc def __startup__():
+    def __startup__():
         good = v2c_message(b"public", v2_pdu(pdu.TRAP_V2, 1, 1))
         v3 = v3_message(None, b"u_noauth", 0, sender_a(), 1, 0, v2_pdu(pdu.TRAP_V2, 2, 2))
         undecodable = [b"", b"\x00", b"\x30", b"\x30\x00", b"hello world", good[:len(good) - 1], good[:20],
@@ -733,7 +733,7 @@ pure def v3_traps_round(auth_name: str, with_noauth: bool) -> (list[Usm], list[b
 
 actor _v3_traps_test(t: testing.AsyncT, auth_name: str, with_noauth: bool):
     """Shared body of the _test_v3_traps_* tests"""
-    proc def __startup__():
+    def __startup__():
         r = v3_traps_round(auth_name, with_noauth)
         users = r.0
         datagrams = r.1
@@ -766,7 +766,7 @@ actor _v3_traps_test(t: testing.AsyncT, auth_name: str, with_noauth: bool):
 actor _test_v3_traps_md5(t: testing.AsyncT):
     """SNMPv3 traps of u_noauth and every MD5 user (all privacy protocols) from two sender engines"""
 
-    proc def __startup__():
+    def __startup__():
         _v3_traps_test(t, "md5", True)
 
 
@@ -774,7 +774,7 @@ actor _test_v3_traps_md5(t: testing.AsyncT):
 actor _test_v3_traps_sha(t: testing.AsyncT):
     """The same for the SHA users"""
 
-    proc def __startup__():
+    def __startup__():
         _v3_traps_test(t, "sha", False)
 
 
@@ -782,7 +782,7 @@ actor _test_v3_traps_sha(t: testing.AsyncT):
 actor _test_v3_traps_sha224(t: testing.AsyncT):
     """The same for the SHA-224 users"""
 
-    proc def __startup__():
+    def __startup__():
         _v3_traps_test(t, "sha224", False)
 
 
@@ -790,7 +790,7 @@ actor _test_v3_traps_sha224(t: testing.AsyncT):
 actor _test_v3_traps_sha256(t: testing.AsyncT):
     """The same for the SHA-256 users"""
 
-    proc def __startup__():
+    def __startup__():
         _v3_traps_test(t, "sha256", False)
 
 
@@ -798,7 +798,7 @@ actor _test_v3_traps_sha256(t: testing.AsyncT):
 actor _test_v3_traps_sha384(t: testing.AsyncT):
     """The same for the SHA-384 users"""
 
-    proc def __startup__():
+    def __startup__():
         _v3_traps_test(t, "sha384", False)
 
 
@@ -806,14 +806,14 @@ actor _test_v3_traps_sha384(t: testing.AsyncT):
 actor _test_v3_traps_sha512(t: testing.AsyncT):
     """The same for the SHA-512 users"""
 
-    proc def __startup__():
+    def __startup__():
         _v3_traps_test(t, "sha512", False)
 
 
 
 actor _test_v3_trap_canon(t: testing.AsyncT):
     """Received SNMPv3 traps print as canonical NOTIFICATION blocks"""
-    proc def __startup__():
+    def __startup__():
         users = [keyed("u_noauth"), keyed("u_sha_aes"), keyed("u_md5")]
         vbs = [vb("1.3.6.1.4.1.8072.9999.1.1.2.0", Integer(1)), vb("1.3.6.1.4.1.8072.9999.1.2.1.0", OctetString(b"Hello, SNMP!"))]
         datagrams = [v3_trap(users[0], None, sender_a(), 1, 5, Pdu(pdu.TRAP_V2, 1, 0, 0, notify.build_trap_v2(3000000, trap_oid(27), vbs))),
@@ -848,7 +848,7 @@ actor _test_v3_trap_canon(t: testing.AsyncT):
 
 actor _test_v3_trap_refusals(t: testing.AsyncT):
     """Each way an SNMPv3 trap fails is dropped and counted; nothing is answered, no keys are derived for forgeries"""
-    proc def __startup__():
+    def __startup__():
         noauth = keyed("u_noauth")
         sha = keyed("u_sha")
         sha_aes = keyed("u_sha_aes")
@@ -945,7 +945,7 @@ pure def time_window_steps(sha: Usm, sha_aes: Usm, noauth: Usm) -> list[(bytes, 
 
 actor _test_v3_trap_time_window(t: testing.AsyncT):
     """Each sender engine's clock is learned from its first authenticated trap; older ones are dropped (RFC 3414 3.2 7b)"""
-    proc def __startup__():
+    def __startup__():
         sha = keyed("u_sha")
         sha_aes = keyed("u_sha_aes")
         noauth = keyed("u_noauth")
@@ -970,7 +970,7 @@ actor _test_v3_trap_time_window(t: testing.AsyncT):
 
 actor _test_v3_trap_engines(t: testing.AsyncT):
     """With trap_engines set, SNMPv3 traps from other sender engines are dropped before any key work"""
-    proc def __startup__():
+    def __startup__():
         sha = keyed("u_sha")
         noauth = keyed("u_noauth")
 
@@ -995,7 +995,7 @@ actor _test_v3_trap_users_per_engine(t: testing.AsyncT):
     """Two devices whose trap user has the same name and different keys (a fleet's "u_sha" with one password
     per device): TrapUser entries per sender engine deliver both, and a third engine falls back to the
     name-only user of users; each engine's traps are checked with its own keys"""
-    proc def __startup__():
+    def __startup__():
         dev_a = keyed("u_sha", 1)
         dev_b = keyed("u_sha", 2)
         shared = keyed("u_sha")
@@ -1047,7 +1047,7 @@ def _test_community_accepted() -> None:
 
 actor _test_v3_informs(t: testing.AsyncT):
     """Engine ID discovery gets a Report; informs to our engine are delivered and acknowledged at their level"""
-    proc def __startup__():
+    def __startup__():
         names = ["u_noauth", "u_sha256", "u_md5_des", "u_sha_aes", "u_sha_aes192", "u_md5_aes256c", "u_sha384_aes192c"]
         users = [keyed(n) for n in names]
         keys = [keys_for(u, our_engine()) for u in users]
@@ -1089,7 +1089,7 @@ actor _test_v3_informs(t: testing.AsyncT):
 
 actor _test_v3_inform_refusals(t: testing.AsyncT):
     """Informs that fail the authoritative checks get the Reports an agent sends; SNMPv2-Traps to our engine none"""
-    proc def __startup__():
+    def __startup__():
         sha = keyed("u_sha")
         sha_aes = keyed("u_sha_aes")
         noauth = keyed("u_noauth")
@@ -1145,7 +1145,7 @@ actor _test_v3_inform_refusals(t: testing.AsyncT):
 
 actor _test_v3_inform_too_big(t: testing.AsyncT):
     """An inform whose Response exceeds the sender's msgMaxSize is acknowledged with tooBig"""
-    proc def __startup__():
+    def __startup__():
         u = keyed("u_sha_aes")
         keys = keys_for(u, our_engine())
         inform = big_inform(77, 7)
@@ -1170,7 +1170,7 @@ actor _test_v3_inform_too_big(t: testing.AsyncT):
 
 actor _test_dedup(t: testing.AsyncT):
     """Within dedup_window, a repeated notification is acknowledged but not delivered again"""
-    proc def __startup__():
+    def __startup__():
         u = keyed("u_sha_aes")
         keys = keys_for(u, our_engine())
         inform = v2c_message(b"public", v2_pdu(pdu.INFORM, 10, 1))
@@ -1211,7 +1211,7 @@ actor _test_dedup(t: testing.AsyncT):
 
 actor _test_no_dedup(t: testing.AsyncT):
     """Without dedup_window every copy is delivered"""
-    proc def __startup__():
+    def __startup__():
         inform = v2c_message(b"public", v2_pdu(pdu.INFORM, 10, 1))
 
         def finished(b: Bench) -> None:
@@ -1245,7 +1245,7 @@ actor _test_close(t: testing.AsyncT):
         b.send(v2c_message(b"public", v2_pdu(pdu.TRAP_V2, 2, 2)))
         after NOTHING_WAIT: settled(b)
 
-    proc def __startup__():
+    def __startup__():
         network = MemNet()
         b = Bench(network, network.server(PEER, PEER_PORT), network.server(RCV, RCV_PORT), config(), t.log_handler, finished)
         b.send(v2c_message(b"public", v2_pdu(pdu.TRAP_V2, 1, 1)))
@@ -1290,7 +1290,7 @@ def mutants(seeds: list[bytes], count: int) -> list[bytes]:
 
 actor _test_fuzz(t: testing.AsyncT):
     """Mutated notifications never crash the receiver: every datagram ends up counted"""
-    proc def __startup__():
+    def __startup__():
         seeds = fuzz_seeds()
         count = 600
 
@@ -1365,7 +1365,7 @@ actor _test_udp_loopback(t: testing.EnvT):
     def timed_out() -> None:
         finish(AssertionError("no Response within 8 s"))
 
-    proc def __startup__():
+    def __startup__():
         t.timeout(10.0)
 
         after 8.0: timed_out()
@@ -1464,7 +1464,7 @@ def matrix_users(text: str, blocks: list[list[str]]) -> str:
 actor _test_lab_matrix(t: testing.EnvT):
     """The 86 notifications of interop/expected/notify/matrix.txt, sent to the receiver, print exactly that file"""
 
-    proc def __startup__():
+    def __startup__():
         t.timeout(180.0)
         matrix = read_text(t, MATRIX)
         view = mibview.load_snmprec(read_text(t, SNMPREC))
@@ -1502,7 +1502,7 @@ actor _test_lab_matrix(t: testing.EnvT):
 
 actor _test_lab_users_tsv(t: testing.EnvT):
     """Every user of interop/config/users.tsv loads with the right protocols and keys"""
-    proc def __startup__():
+    def __startup__():
         def check() -> None:
             users = receiver.load_users_tsv(read_text(t, USERS_TSV))
             testing.assertEqual(len(users), 50)
@@ -1530,7 +1530,7 @@ actor _test_lab_users_tsv(t: testing.EnvT):
 
 actor _test_no_community_v3_only(t: testing.AsyncT):
     """An empty community list accepts no SNMPv1/v2c at all: traps dropped, informs not acknowledged"""
-    proc def __startup__():
+    def __startup__():
         u = keyed("u_sha")
         a = sender_a()
         cfg = ReceiverConfig([], [u], [], our_engine(), BOOTS)
@@ -1568,7 +1568,7 @@ actor _test_no_community_v3_only(t: testing.AsyncT):
 
 actor _test_time_record_per_user(t: testing.AsyncT):
     """Another configured user claiming the device's engine with huge boots does not lock the device's user out"""
-    proc def __startup__():
+    def __startup__():
         device = keyed("u_sha")
         other = keyed("u_md5")
         a = sender_a()
@@ -1592,7 +1592,7 @@ actor _test_time_record_per_user(t: testing.AsyncT):
 
 actor _test_reset_engine(t: testing.AsyncT):
     """A sender that restarted without persisting boots is dropped until reset_engine(), then accepted again"""
-    proc def __startup__():
+    def __startup__():
         device = keyed("u_sha")
         a = sender_b()
         kd = keys_for(device, a)
@@ -1635,7 +1635,7 @@ def engine_n(i: int) -> bytes:
 
 actor _test_evicted_time_record_no_replay(t: testing.AsyncT):
     """MAX_TRAP_SENDERS other sender engines do not evict engine A's time record: an old trap stays a replay"""
-    proc def __startup__():
+    def __startup__():
         sha = keyed("u_sha")
         a = sender_a()
         ka = keys_for(sha, a)
@@ -1667,7 +1667,7 @@ actor _test_evicted_time_record_no_replay(t: testing.AsyncT):
 
 actor _test_key_cache_lru(t: testing.AsyncT):
     """The key cache is LRU: a sender that keeps sending keeps its keys while MAX_TRAP_SENDERS others come and go"""
-    proc def __startup__():
+    def __startup__():
         sha = keyed("u_sha")
         a = sender_a()
         ka = keys_for(sha, a)
@@ -1697,7 +1697,7 @@ actor _test_key_cache_lru(t: testing.AsyncT):
 
 actor _test_encrypted_trap_reportable(t: testing.AsyncT):
     """An authPriv SNMPv2-Trap whose sender sets the reportableFlag is delivered; an inform with a stale engine ID is still reported"""
-    proc def __startup__():
+    def __startup__():
         u = keyed("u_sha_aes")
         a = sender_a()
         trap = v3_message(keys_for(u, a), b"u_sha_aes", usm.LEVEL_AUTH_PRIV | message.FLAG_REPORTABLE, a, 1, 10,
@@ -1762,7 +1762,7 @@ actor _test_dedup_large_same_key(t: testing.AsyncT):
             testing.assertTrue(on < 3.0 * off + 1.0, "dedup on %.2f s, off %.2f s" % (on, off))
         report(t, outcome(check))
 
-    proc def __startup__():
+    def __startup__():
         t.timeout(300.0)
 
         go()

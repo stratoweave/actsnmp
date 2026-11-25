@@ -233,7 +233,7 @@ def _test_response_and_stats_repr() -> None:
 
 actor _test_get_v2c(t: testing.AsyncT):
     """A GET returns the agent's varbinds; the request is a v2c GET with a random 31-bit id and our community"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
         oids = _oids(3)
         seen: list[CommunityMessage] = []
@@ -274,7 +274,7 @@ actor _test_get_v2c(t: testing.AsyncT):
 
 actor _test_get_next_and_bulk_v2c(t: testing.AsyncT):
     """GETNEXT and GETBULK carry their PDU type and fields; GETBULK -1 takes opts.max_repetitions"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
         seen: list[Pdu] = []
         responses: list[Response] = []
@@ -315,7 +315,7 @@ actor _test_get_next_and_bulk_v2c(t: testing.AsyncT):
 
 actor _test_set_v2c(t: testing.AsyncT):
     """A SET sends the values; the echoed response is returned"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
         vbs = [VarBind(Oid.parse("1.3.6.1.2.1.1.5.0"), OctetString(b"name")), VarBind(Oid.parse("1.3.6.1.2.1.1.6.0"), Integer(3))]
         seen: list[Pdu] = []
@@ -344,7 +344,7 @@ actor _test_set_v2c(t: testing.AsyncT):
 
 actor _test_error_status_keeps_response(t: testing.AsyncT):
     """genErr: ErrorStatusError with status, index, the OID, the net-snmp text and the Response"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
         oids = _oids(3)
 
@@ -391,7 +391,7 @@ actor _test_retries_backoff_fresh_ids(t: testing.AsyncT):
     var at: list[float] = []
     var start = _now()
 
-    proc def __startup__():
+    def __startup__():
         def received(data: bytes, address: str, port: int) -> None:
             ids.append(_pdu(_cm(data)).request_id)
             at.append(_now())
@@ -434,7 +434,7 @@ actor _test_retries_backoff_fresh_ids(t: testing.AsyncT):
 
 actor _test_retry_then_answer(t: testing.AsyncT):
     """The responder ignores two attempts and answers the third: attempts 3, the third id answered"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
         ids: list[int] = []
 
@@ -469,7 +469,7 @@ actor _test_late_reply_to_earlier_attempt(t: testing.AsyncT):
     var ids: list[int] = []
     var done_count = 0
 
-    proc def __startup__():
+    def __startup__():
         def check(r: ?Response, e: ?errors.SnmpError) -> None:
             resp = _ok(r, e)
             testing.assertEqual(resp.request_id, ids[0], "the answer to attempt 1 was accepted")
@@ -516,7 +516,7 @@ actor _test_duplicate_response_ignored(t: testing.AsyncT):
     mn = MemNet(NetFaults(duplicate=True, to_address=MANAGER))
     var calls = 0
 
-    proc def __startup__():
+    def __startup__():
         p = mem_pair(mn)
 
         def received(data: bytes, address: str, port: int) -> None:
@@ -545,7 +545,7 @@ actor _test_duplicate_response_ignored(t: testing.AsyncT):
 
 actor _test_wrong_id_dropped(t: testing.AsyncT):
     """An answer with an id nobody waits for is dropped and counted; the right one completes"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
 
         p = mem_pair(mn)
@@ -572,7 +572,7 @@ actor _test_wrong_id_dropped(t: testing.AsyncT):
 
 actor _test_spoofed_source_dropped(t: testing.AsyncT):
     """Answers from another port (NetFaults.spoof_source) or another address are dropped and counted"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet(NetFaults(spoof_source=True, to_address=MANAGER))
 
         p = mem_pair(mn)
@@ -600,7 +600,7 @@ actor _test_spoofed_source_dropped(t: testing.AsyncT):
 
 actor _test_corrupt_datagrams_dropped(t: testing.AsyncT):
     """Garbage, a truncated message and a corrupted one are dropped as undecodable"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
 
         p = mem_pair(mn)
@@ -630,7 +630,7 @@ actor _test_corrupt_datagrams_dropped(t: testing.AsyncT):
 
 actor _test_wrong_version_and_pdu_type_dropped(t: testing.AsyncT):
     """An SNMPv1 answer to a v2c request and answers with a non-Response PDU type are dropped"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
 
         p = mem_pair(mn)
@@ -665,7 +665,7 @@ actor _test_community_check_option(t: testing.AsyncT):
     mn = MemNet()
     var phase = 0
 
-    proc def __startup__():
+    def __startup__():
         p = mem_pair(mn)
 
         def received(data: bytes, address: str, port: int) -> None:
@@ -700,7 +700,7 @@ actor _test_community_check_option(t: testing.AsyncT):
 
 actor _test_timeout_hint_drops(t: testing.AsyncT):
     """Every answer fails the community check: the TimeoutError says so"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
 
         def check(r: ?Response, e: ?errors.SnmpError) -> None:
@@ -731,7 +731,7 @@ actor _test_timeout_hint_drops(t: testing.AsyncT):
 
 actor _test_icmp_unreachable_hint(t: testing.AsyncT):
     """Nobody at the agent's address: MemNet reports ICMP unreachable, which the TimeoutError mentions"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
 
         tr = mn.client(MANAGER, 40000, AGENT, 161)
@@ -755,7 +755,7 @@ actor _test_icmp_unreachable_hint(t: testing.AsyncT):
 
 actor _test_request_id_bits_16(t: testing.AsyncT):
     """request_id_bits=16: every attempt id is in 1..32767"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
         ids: list[int] = []
 
@@ -788,7 +788,7 @@ actor _test_shape_checks(t: testing.AsyncT):
     var step = 0
     var results: list[str] = []
 
-    proc def __startup__():
+    def __startup__():
         def outcome(r: ?Response, e: ?errors.SnmpError) -> str:
             if e is not None:
                 return "invalid" if isinstance(e, errors.InvalidResponseError) else "error: " + str(e)
@@ -840,7 +840,7 @@ actor _test_shape_checks(t: testing.AsyncT):
 
 actor _test_too_big_split(t: testing.AsyncT):
     """tooBig for more than one varbind splits the GET in halves, recursively, and merges the answers"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
         oids = _oids(5)
         sizes: list[int] = []
@@ -874,7 +874,7 @@ actor _test_too_big_split(t: testing.AsyncT):
 
 actor _test_too_big_single_and_set(t: testing.AsyncT):
     """tooBig for one varbind is an error; a SET is never split (40 varbinds in one PDU, tooBig reported)"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
         sizes: list[int] = []
         statuses: list[int] = []
@@ -919,7 +919,7 @@ actor _test_max_oids_per_request(t: testing.AsyncT):
     var sizes: list[int] = []
     var fail_part = False
 
-    proc def __startup__():
+    def __startup__():
         def check_error(r: ?Response, e: ?errors.SnmpError) -> None:
             err = _failed(r, e)
             if isinstance(err, errors.ErrorStatusError):
@@ -971,7 +971,7 @@ actor _test_max_oids_per_request(t: testing.AsyncT):
 
 actor _test_bulk_too_big_halves(t: testing.AsyncT):
     """A tooBig GETBULK is resent with half the max-repetitions until it fits"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
         reps: list[int] = []
 
@@ -1006,7 +1006,7 @@ actor _test_too_big_no_split(t: testing.AsyncT):
 
     The CLI uses it, so its get and bulkget report tooBig as net-snmp's tools do.
     """
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
         opts = SLOW.with_(split_too_big=False)
         sizes: list[int] = []
@@ -1054,7 +1054,7 @@ actor _test_too_big_no_split(t: testing.AsyncT):
 
 actor _test_v1_bulk_as_getnext(t: testing.AsyncT):
     """SNMPv1 has no GETBULK: it is sent as a GETNEXT of the OIDs with zero fields"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
         seen: list[CommunityMessage] = []
 
@@ -1084,7 +1084,7 @@ actor _test_v1_bulk_as_getnext(t: testing.AsyncT):
 
 actor _test_v1_get_no_such_name_fixed(t: testing.AsyncT):
     """SNMPv1 GET: noSuchName drops that varbind, resends the rest and reports NoSuchObject for it"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
         oids = _oids(4)
         missing = [oids[1], oids[3]]
@@ -1134,7 +1134,7 @@ actor _test_v1_get_no_such_name_fixed(t: testing.AsyncT):
 
 actor _test_v1_getnext_no_such_name_end(t: testing.AsyncT):
     """SNMPv1 GETNEXT: noSuchName (end of MIB) becomes EndOfMibView for that varbind; a lone one needs no resend"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
         last = Oid.parse("1.3.6.1.9.9.9")
         first = _oids(1)[0]
@@ -1182,7 +1182,7 @@ actor _test_cancel_exactly_once(t: testing.AsyncT):
     var log: list[str] = []
     var h1 = 0
 
-    proc def __startup__():
+    def __startup__():
         def received(data: bytes, address: str, port: int) -> None:
             held.append(_cm(data))
 
@@ -1247,7 +1247,7 @@ actor _test_close_exactly_once(t: testing.AsyncT):
     var log: list[str] = []
     var sent = 0
 
-    proc def __startup__():
+    def __startup__():
         def received(data: bytes, address: str, port: int) -> None:
             sent += 1
 
@@ -1305,7 +1305,7 @@ actor _test_queueing_max_in_flight(t: testing.AsyncT):
     var order: list[Oid] = []
     var done_order: list[Oid] = []
 
-    proc def __startup__():
+    def __startup__():
         def check() -> None:
             testing.assertEqual(order, oids)
             testing.assertEqual(done_order, oids)
@@ -1342,7 +1342,7 @@ actor _test_queueing_one_at_a_time(t: testing.AsyncT):
     mn = MemNet()
     var count = 0
 
-    proc def __startup__():
+    def __startup__():
         def check() -> None:
             hist = mn.history()
             directions = ["req" if d.dst_address == AGENT else "resp" for d in hist]
@@ -1370,7 +1370,7 @@ actor _test_queueing_one_at_a_time(t: testing.AsyncT):
 
 actor _test_invalid_arguments(t: testing.AsyncT):
     """Invalid arguments reach the callback as EncodeError; nothing is sent"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
         log: list[str] = []
         expected = 13
@@ -1435,7 +1435,7 @@ proc def _failing_receiver(on_data: action(bytes, str, int) -> None, on_error: a
 
 actor _test_transport_failures(t: testing.AsyncT):
     """A fatal transport error fails requests with TransportError; so does a Client without any transport"""
-    proc def __startup__():
+    def __startup__():
         broken = Transport(_no_send, _failing_receiver, _no_close)
         c = Client(None, AGENT, Community("public"), t.log_handler, opts=SLOW, transport=broken)
         none = Client(None, AGENT, Community("public"), t.log_handler, opts=SLOW)
@@ -1502,7 +1502,7 @@ def _switch_transport(s: _TransportSwitch) -> Transport:
 
 actor _test_transport_fails_pending(t: testing.AsyncT):
     """A fatal error while requests are pending and queued fails all of them at once"""
-    proc def __startup__():
+    def __startup__():
         sw = _TransportSwitch()
         c = Client(None, AGENT, Community("public"), t.log_handler, opts=SLOW, transport=_switch_transport(sw))
         log: list[str] = []
@@ -1557,7 +1557,7 @@ actor _test_logs_never_show_the_community(t: testing.AsyncT):
     mn = MemNet()
     var count = 0
 
-    proc def __startup__():
+    def __startup__():
         def check() -> None:
             texts = col.all()
             testing.assertTrue(len(texts) > 3, "something was logged")
@@ -1778,14 +1778,14 @@ actor _V3Agent(srv: ServerTransport, users: list[Usm], engine_id: bytes, pdu_typ
     def seen() -> list[str]:
         return log
 
-    proc def __startup__():
+    def __startup__():
         srv.set_receiver(received)
 
 
 
 actor _test_v3_discovery_hint_two_round_trips(t: testing.AsyncT):
     """authPriv GET to an unknown engine: probe, then the request with the Report's boots/time: two round trips"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
         oids = _oids(2)
 
@@ -1840,7 +1840,7 @@ actor _test_v3_every_user_level(t: testing.AsyncT):
         cl = Client(None, AGENT, users[n], t.log_handler, opts=SLOW, transport=tr)
         cl.get(got, _oids(1))
 
-    proc def __startup__():
+    def __startup__():
         p = mem_pair(mn)
         agent = _V3Agent(p.server, _users(), _engine_id())
 
@@ -1850,7 +1850,7 @@ actor _test_v3_every_user_level(t: testing.AsyncT):
 
 actor _test_v3_time_sync_fallback(t: testing.AsyncT):
     """A discovery Report without boots/time: the request is refused (notInTimeWindows), resynced and resent"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
 
         p = mem_pair(mn)
@@ -1878,7 +1878,7 @@ actor _test_v3_time_sync_fallback(t: testing.AsyncT):
 
 actor _test_v3_resync_after_reboot(t: testing.AsyncT):
     """The agent reboots (boots 2): the next request gets notInTimeWindows, resyncs and succeeds"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
 
         p = mem_pair(mn)
@@ -1912,7 +1912,7 @@ actor _test_v3_resync_after_reboot(t: testing.AsyncT):
 
 actor _test_v3_resync_budget(t: testing.AsyncT):
     """notInTimeWindows again after the one resync: ReportError, and the engine state is reset"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
 
         p = mem_pair(mn)
@@ -1942,7 +1942,7 @@ actor _test_v3_resync_budget(t: testing.AsyncT):
 
 actor _test_v3_rediscovery_on_engine_change(t: testing.AsyncT):
     """unknownEngineIDs after success (a replaced device): rediscover, resend once, succeed with the new engine"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
 
         p = mem_pair(mn)
@@ -1990,7 +1990,7 @@ actor _test_v3_report_kinds(t: testing.AsyncT):
 
     var transient: list[bool] = []
 
-    proc def __startup__():
+    def __startup__():
         def check() -> None:
             testing.assertEqual(names, [usm.USM_STATS_UNKNOWN_USER_NAMES, usm.USM_STATS_WRONG_DIGESTS,
                                         usm.USM_STATS_UNSUPPORTED_SEC_LEVELS, usm.USM_STATS_DECRYPTION_ERRORS,
@@ -2032,7 +2032,7 @@ actor _test_v3_report_kinds(t: testing.AsyncT):
 actor _test_v3_forged_response_dropped(t: testing.AsyncT):
     """A response with a broken MAC, an unauthenticated one and one from another engine are dropped (drops_auth);
     the genuine ones complete"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
 
         p = mem_pair(mn)
@@ -2076,7 +2076,7 @@ actor _test_v3_reset_after_timeouts(t: testing.AsyncT):
     mn = MemNet()
     var step = 0
 
-    proc def __startup__():
+    def __startup__():
         p = mem_pair(mn)
         agent = _V3Agent(p.server, _users(), _engine_id())
 
@@ -2115,7 +2115,7 @@ actor _test_v3_discovery_failures(t: testing.AsyncT):
     var n = 0
     var log: list[str] = []
 
-    proc def __startup__():
+    def __startup__():
         def name_of(e: ?errors.SnmpError) -> str:
             if isinstance(e, errors.TimeoutError):
                 return "timeout" if e.hint == "SNMPv3 engine discovery" else "timeout, hint " + str(e.hint)
@@ -2169,7 +2169,7 @@ actor _test_v3_discovery_failures(t: testing.AsyncT):
 
 actor _test_v3_discover(t: testing.AsyncT):
     """discover() reports the engine ID and the Report's boots/time; requests then skip the probe"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
         infos: list[EngineInfo] = []
 
@@ -2202,7 +2202,7 @@ actor _test_v3_discover(t: testing.AsyncT):
 
 actor _test_v3_seeded_engine(t: testing.AsyncT):
     """A Client seeded with EngineInfo skips discovery; the seed's boots/time are used as a hint"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
         seed = EngineInfo(_engine_id(), 1, 1000, _now())
 
@@ -2227,7 +2227,7 @@ actor _test_v3_concurrent_requests_share_discovery(t: testing.AsyncT):
     mn = MemNet()
     var count = 0
 
-    proc def __startup__():
+    def __startup__():
         p = mem_pair(mn)
         agent = _V3Agent(p.server, _users(), _engine_id())
 
@@ -2249,7 +2249,7 @@ actor _test_v3_concurrent_requests_share_discovery(t: testing.AsyncT):
 
 actor _test_v3_wire_format(t: testing.AsyncT):
     """The probe is RFC 3414's; requests carry fresh msgIDs per attempt, the same request-id, reportable authPriv"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
         users = _users()
         eng = AuthoritativeEngine(_engine_id(), 1, _now() - 1000.0, users)
@@ -2308,7 +2308,7 @@ actor _test_v3_wire_format(t: testing.AsyncT):
 
 actor _test_v3_context(t: testing.AsyncT):
     """context_name and context_engine_id of the credentials go into the ScopedPDU and must come back"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
         sec = Usm.from_passwords("shaaes", usm.AUTH_SHA1, "authpassword", usm.PRIV_AES128, "privpassword",
                                  context_name="vrf1", context_engine_id=h("8000000001"))
@@ -2333,7 +2333,7 @@ actor _test_v3_context(t: testing.AsyncT):
 
 actor _test_trap_v2c(t: testing.AsyncT):
     """trap(): an SNMPv2-Trap with sysUpTime.0, snmpTrapOID.0 and the payload; on_done once handed over"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
         payload = [VarBind(Oid.parse("1.3.6.1.4.1.8072.2.3.2.1"), Integer(42))]
         got: list[notify.Notification] = []
@@ -2392,7 +2392,7 @@ actor _test_trap_v1(t: testing.AsyncT):
             return
         after now QUIET: _finish(t, check)
 
-    proc def __startup__():
+    def __startup__():
         p = mem_pair(mn, server_port=162)
         c = Client(None, AGENT, Community("public", message.SNMP_V1), t.log_handler, port=162, opts=SLOW, transport=p.client)
 
@@ -2439,7 +2439,7 @@ actor _test_trap_v3(t: testing.AsyncT):
         if len(errs) == 2:
             after now QUIET: _finish(t, check)
 
-    proc def __startup__():
+    def __startup__():
         p = mem_pair(mn, server_port=162)
 
         c = Client(None, AGENT, _shaaes(), t.log_handler, port=162, opts=SLOW, transport=p.client, local_engine_id=local)
@@ -2453,7 +2453,7 @@ actor _test_trap_v3(t: testing.AsyncT):
 
 actor _test_inform_v2c(t: testing.AsyncT):
     """inform(): an InformRequest, retried after a loss, completed by the receiver's Response"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
         payload = [VarBind(Oid.parse("1.3.6.1.4.1.8072.2.3.2.1"), Integer(42))]
         seen: list[Pdu] = []
@@ -2489,7 +2489,7 @@ actor _test_inform_v2c(t: testing.AsyncT):
 
 actor _test_inform_v3(t: testing.AsyncT):
     """SNMPv3 inform: the receiver is authoritative and is discovered first"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
         payload = [VarBind(Oid.parse("1.3.6.1.4.1.8072.2.3.2.1"), Integer(42))]
 
@@ -2512,7 +2512,7 @@ actor _test_inform_v3(t: testing.AsyncT):
 
 actor _test_inform_wrong_echo(t: testing.AsyncT):
     """An inform Response that does not echo the varbinds is an InvalidResponseError"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
 
         def check(r: ?Response, e: ?errors.SnmpError) -> None:
@@ -2536,7 +2536,7 @@ actor _test_inform_wrong_echo(t: testing.AsyncT):
 
 actor _test_v3_unknown_engine_twice(t: testing.AsyncT):
     """unknownEngineIDs again after the one rediscovery: ReportError"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
 
         p = mem_pair(mn)
@@ -2564,7 +2564,7 @@ actor _test_v3_unknown_engine_twice(t: testing.AsyncT):
 
 actor _test_v3_forged_discovery_cannot_lock_out(t: testing.AsyncT):
     """A discovery Report with huge boots is only a hint: the authenticated notInTimeWindows Report wins"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
 
         p = mem_pair(mn)
@@ -2592,7 +2592,7 @@ actor _test_v3_boots_went_down_resyncs(t: testing.AsyncT):
     """The agent restarts with lower boots (it did not keep them): its authenticated notInTimeWindows Report
     fails RFC 3414 3.2 step 7b, but it answers our outstanding msgID and its MAC verifies, so the Client
     resynchronises from it and resends: no request is lost"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
 
         p = mem_pair(mn)
@@ -2634,7 +2634,7 @@ actor _test_v3_time_went_back_resyncs(t: testing.AsyncT):
     """The agent restarts with the same boots and its time from (almost) 0 again, as the lab's snmpd does after
     a docker restart: 990 s back, far outside the window. The Client resynchronises from the authenticated
     Report and resends"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
 
         p = mem_pair(mn)
@@ -2680,7 +2680,7 @@ actor _test_v3_clock_back_once_per_request(t: testing.AsyncT):
     mn = MemNet()
     var step = 0
 
-    proc def __startup__():
+    def __startup__():
         p = mem_pair(mn)
         agent = _V3Agent(p.server, _users(), _engine_id())
 
@@ -2727,7 +2727,7 @@ actor _test_v3_clock_back_once_per_request(t: testing.AsyncT):
 actor _test_v3_duplicated_time_window_report(t: testing.AsyncT):
     """Every answer duplicated by the network: the copy of the notInTimeWindows Report answers an attempt from
     before the resynchronisation and is ignored (it must not exhaust the budget)"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet(NetFaults(duplicate=True, to_address=MANAGER))
         outcomes: list[str] = []
 
@@ -2765,7 +2765,7 @@ actor _test_v3_stale_engine_user_report_rediscovers(t: testing.AsyncT):
     """snmpsim's answer to a stale engine ID: an unauthenticated unknownUserNames Report that names its own
     engine. It answers the request's msgID, so the Client rediscovers (a fresh probe; the engine ID in the
     Report is not used) and resends once"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
         seed = EngineInfo(h(ENGINE2_HEX), 1, 1000, _now())
 
@@ -2798,7 +2798,7 @@ actor _test_v3_stale_engine_user_report_rediscovers(t: testing.AsyncT):
 actor _test_v3_other_engine_report_bounded(t: testing.AsyncT):
     """Reports that keep naming another engine than discovery found: one rediscovery and resend, then the next
     such Report fails the request with its ReportError instead of looping"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
         outcomes: list[str] = []
 
@@ -2832,7 +2832,7 @@ actor _test_v3_late_reply_and_wrong_request_id(t: testing.AsyncT):
     mn = MemNet()
     var step = 0
 
-    proc def __startup__():
+    def __startup__():
         p = mem_pair(mn)
         agent = _V3Agent(p.server, _users(), _engine_id())
 
@@ -2870,7 +2870,7 @@ actor _test_v3_late_reply_and_wrong_request_id(t: testing.AsyncT):
 
 actor _test_v3_cancel_and_close_while_discovering(t: testing.AsyncT):
     """A request waiting for discovery can be cancelled; close() cancels the discovery callbacks"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
         log: list[str] = []
 
@@ -2973,7 +2973,7 @@ actor _test_udp_loopback(t: testing.EnvT):
         st.set_receiver(received)
         udp_server_transport(net.UDPListenCap(ucap), "127.0.0.1", 0, closed_port_listening)
 
-    proc def __startup__():
+    def __startup__():
         t.timeout(8.0)
 
         udp_server_transport(net.UDPListenCap(ucap), "127.0.0.1", 0, listening)
@@ -2993,7 +2993,7 @@ actor _test_rv_encrypted_report(t: testing.AsyncT):
     salt = SaltCounter(u64(77))
     var started = _now()
 
-    proc def __startup__():
+    def __startup__():
         t.timeout(10.0)
 
         p = mem_pair(mn)
@@ -3060,7 +3060,7 @@ actor _BigQueue(t: testing.AsyncT, n: int, use_close: bool, limit: float):
     def ignored(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
         pass
 
-    proc def __startup__():
+    def __startup__():
         for i in range(n):
             c.get(got, _oids(1))
         # a synchronous call: every get() above has been queued when it returns
@@ -3074,7 +3074,7 @@ actor _test_rv_fatal_queue_5k(t: testing.AsyncT):
     """A fatal transport error with 5000 queued requests: all fail with TransportError"""
     b = _BigQueue(t, 5000, False, 1000.0)
 
-    proc def __startup__():
+    def __startup__():
         t.timeout(120.0)
 
 
@@ -3083,7 +3083,7 @@ actor _test_rv_close_queue_5k(t: testing.AsyncT):
     """close() with 5000 queued requests"""
     b = _BigQueue(t, 5000, True, 1000.0)
 
-    proc def __startup__():
+    def __startup__():
         t.timeout(120.0)
 
 
@@ -3092,7 +3092,7 @@ actor _test_rv_close_queue_20k(t: testing.AsyncT):
     """close() with 20000 queued requests must not take seconds (quadratic queue filtering)"""
     b = _BigQueue(t, 20000, True, 2.0)
 
-    proc def __startup__():
+    def __startup__():
         t.timeout(300.0)
 
 # Discovery follows the request's Options ##########################################################
@@ -3116,7 +3116,7 @@ actor _test_rv_discovery_uses_request_opts(t: testing.AsyncT):
         elapsed = _now() - started
         _finish(t, lambda: check(e, elapsed))
 
-    proc def __startup__():
+    def __startup__():
         t.timeout(20.0)
 
         p = mem_pair(mn)
@@ -3138,7 +3138,7 @@ actor _test_rv_trap_v3_after_restart(t: testing.AsyncT):
     new traps for a day, so the Client passes local_engine_boots=2 (RFC 3414
     section 2.2.2).
     """
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
         eid = h("80001f888001aabbccddeeff")
         u = Usm.from_passwords("shaonly", usm.AUTH_SHA1, "authpassword")
@@ -3207,14 +3207,14 @@ actor _TooBigV3Agent(srv: ServerTransport, u: Usm, eid: bytes):
     def seen() -> list[int]:
         return sizes
 
-    proc def __startup__():
+    def __startup__():
         srv.set_receiver(received)
 
 
 
 actor _test_rv_v3_too_big_split(t: testing.AsyncT):
     """SNMPv3 authPriv: tooBig splits like v2c, each part a new exchange; merged in order"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
         eid = h(ENGINE_HEX)
         oids = _oids(3)
@@ -3245,7 +3245,7 @@ actor _test_rv_v3_too_big_split(t: testing.AsyncT):
 
 actor _test_rv_fatal_during_discovery(t: testing.AsyncT):
     """A fatal transport error while two requests and a discover() wait for discovery: three TransportErrors"""
-    proc def __startup__():
+    def __startup__():
         sw = _TransportSwitch()
         c = Client(None, AGENT, _shaaes(), t.log_handler, opts=Options(timeout=5.0, retries=0, max_in_flight=1),
                    transport=_switch_transport(sw))
@@ -3279,7 +3279,7 @@ actor _test_rv_error_index_outside_part(t: testing.AsyncT):
     mn = MemNet()
     var parts = 0
 
-    proc def __startup__():
+    def __startup__():
         def check(e: ?errors.SnmpError) -> None:
             if isinstance(e, errors.ErrorStatusError):
                 testing.assertEqual((e.status, e.index), (pdu.GEN_ERR, 0))
@@ -3313,7 +3313,7 @@ actor _test_rv_error_index_outside_part(t: testing.AsyncT):
 
 actor _test_rv_stats_queue(t: testing.AsyncT):
     """Stats.queued and Stats.in_flight show the backlog of a slow agent"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
 
         def ignored(cl: Client, r: ?Response, e: ?errors.SnmpError) -> None:
@@ -3362,7 +3362,7 @@ actor _test_rv_trap_boots_validated(t: testing.AsyncT):
         if len(log) == 3:
             _finish(t, verify)
 
-    proc def __startup__():
+    def __startup__():
         srv = mn.server("10.0.0.9", 162)
 
         bad_transport = mn.client(MANAGER, 40001, "10.0.0.9", 162)
@@ -3405,7 +3405,7 @@ actor _test_rv_max_queued(t: testing.AsyncT):
         if len(log) == 4:
             _finish(t, check)
 
-    proc def __startup__():
+    def __startup__():
         p = mem_pair(mn)
         c = Client(None, AGENT, Community("public"), t.log_handler, opts=Options(timeout=5.0, retries=0, max_queued=2),
                    transport=p.client)
@@ -3428,7 +3428,7 @@ actor _test_v3_many_discovery_waiters(t: testing.AsyncT):
     var wrong = 0
     var t0 = 0.0
 
-    proc def __startup__():
+    def __startup__():
         def received(data: bytes, address: str, port: int) -> None:
             pass
 
@@ -3470,7 +3470,7 @@ actor _test_v3_late_joiner_keeps_budget(t: testing.AsyncT):
     var a_waited = 0.0
     var t0 = 0.0
 
-    proc def __startup__():
+    def __startup__():
         def received(data: bytes, address: str, port: int) -> None:
             pass
 
@@ -3509,7 +3509,7 @@ actor _Ipv6Agent(srv: ServerTransport):
         c = _cm(data)
         srv.send_to(_reply(c, _answer(_pdu(c).varbinds)), address, port)
 
-    proc def __startup__():
+    def __startup__():
         srv.set_receiver(received)
 
 
@@ -3517,7 +3517,7 @@ actor _Ipv6Agent(srv: ServerTransport):
 actor _test_ipv6_address_forms(t: testing.AsyncT):
     """With a supplied transport the Client checks the source address itself: an IPv6 address written in
     another legal form than the network reports it (upper case, zeros, an embedded IPv4 tail) is the same address"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
         log: list[str] = []
 
@@ -3562,7 +3562,7 @@ actor _test_id16_exhaustion(t: testing.AsyncT):
     var full: list[str] = []
     var others = 0
 
-    proc def __startup__():
+    def __startup__():
         def received(data: bytes, address: str, port: int) -> None:
             pass
 
@@ -3604,7 +3604,7 @@ actor _test_id16_exhaustion(t: testing.AsyncT):
 actor _test_v3_context_per_request(t: testing.AsyncT):
     """Options.context_name selects the SNMPv3 context of one request (BRIDGE-MIB per VLAN with one Client);
     Usm.with_context gives the same credentials for another context without a password-to-key"""
-    proc def __startup__():
+    def __startup__():
         mn = MemNet()
         u = _shaaes()
         got: list[bytes] = []
@@ -3650,7 +3650,7 @@ actor _test_transport_set_up_again(t: testing.EnvT):
     """A Client whose UDP socket could not be set up (a name that does not resolve: a DNS outage, or too
     many open files) reports transient TransportErrors and sets the socket up again for a request after
     the retry wait, instead of failing every later request at once forever"""
-    proc def __startup__():
+    def __startup__():
         cap = net.UDPConnectCap(net.UDPCap(net.NetCap(t.env.cap)))
         c = Client(cap, "no-such-host.invalid", Community("public"), None, opts=Options(timeout=10.0, retries=0))
         seen: list[str] = []

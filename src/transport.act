@@ -460,7 +460,7 @@ actor _UdpClient(cap: net.UDPConnectCap, address: str, port: int):
             c.close()
             _fail(_tidy(error))
 
-    proc def __startup__():
+    def __startup__():
         if port > 0 and port <= 65535:
             _conn = net.UDPConnection(cap, address, port, _connected, _received, _net_failed)
         else:
@@ -549,7 +549,7 @@ actor _UdpServer(cap: net.UDPListenCap, address: str, port: int,
         if not _closed:
             _log.warning("UDP error", {"local": _peer_text(address, port), "error": error})
 
-    proc def __startup__():
+    def __startup__():
         if port >= 0 and port <= 65535:
             _listener = net.UDPListener(cap, address, port, _listening, _received, _net_failed)
         else:
@@ -1015,7 +1015,7 @@ actor _TcpClient(cap: net.TCPConnectCap, address: str, port: int, connect_timeou
         _inbox.clear()
         _drop()
 
-    proc def __startup__():
+    def __startup__():
         if port <= 0 or port > 65535:
             _failure = "TCP setup for " + _peer + " failed: port %d is outside 1..65535" % port
         elif not (net.is_ipv4(address) or net.is_ipv6(address)):
@@ -1219,7 +1219,7 @@ actor _TcpServer(cap: net.TCPListenCap, address: str, port: int,
         if idle_timeout > 0.0:
             after now idle_timeout: _idle_expired(sid)
 
-    proc def __startup__():
+    def __startup__():
         if port == 0:
             _report_ready(0, "TCP listen on " + _local + " failed: port 0 is not supported: the port picked for it "
                           + "cannot be learned")
